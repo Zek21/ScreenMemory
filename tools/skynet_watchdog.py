@@ -363,9 +363,10 @@ def write_status(status: dict):
     STATUS_FILE.write_text(json.dumps(status, indent=2))
 
 
-def run_daemon():
+def run_daemon(args=None):
     """Main watchdog loop."""
     import os
+    max_runtime = getattr(args, 'max_runtime', 0) if args else 0
     if PID_FILE.exists():
         try:
             old_pid = int(PID_FILE.read_text().strip())
@@ -387,6 +388,8 @@ def run_daemon():
     PID_FILE.write_text(str(os.getpid()))
 
     log("Skynet Watchdog v2 starting (auto-recovery + heartbeat + HWND checks)")
+    start_time = time.time()
+    cycle = 0
     last_god_check = 0.0
     last_skynet_check = 0.0
     last_sse_check = 0.0
@@ -407,6 +410,12 @@ def run_daemon():
     try:
         while True:
             now = time.time()
+            cycle += 1
+
+            # Max runtime guard
+            if max_runtime and (now - start_time) >= max_runtime:
+                log(f"Max runtime {max_runtime}s reached -- shutting down gracefully")
+                break
 
             # ── GOD Console check + auto-restart ──
             if now - last_god_check >= GOD_CHECK_INTERVAL:
@@ -609,6 +618,16 @@ def run_daemon():
 
             write_status(status)
             time.sleep(10)
+    except KeyboardInterrupt:
+        log("Watchdog shutting down (Ctrl+C)")
+        try:
+            data = json.dumps({"sender": "watchdog", "topic": "orchestrator", "type": "lifecycle",
+                "content": f"Watchdog shutdown: KeyboardInterrupt after {cycle} cycles"}).encode()
+            req = urllib.request.Request(f"{SKYNET_URL}/bus/publish", data=data,
+                                        headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            pass
     finally:
         try:
             PID_FILE.unlink(missing_ok=True)
@@ -626,12 +645,14 @@ def show_status():
 def main():
     parser = argparse.ArgumentParser(description="Skynet Watchdog Daemon")
     parser.add_argument("action", choices=["start", "status"], help="start daemon or show status")
+    parser.add_argument("--max-runtime", type=int, default=0,
+                        help="Max runtime in seconds (0=unlimited)")
     args = parser.parse_args()
 
     if args.action == "status":
         show_status()
     else:
-        run_daemon()
+        run_daemon(args)
 
 
 if __name__ == "__main__":

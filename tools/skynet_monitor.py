@@ -132,6 +132,10 @@ def check_window(hwnd: int) -> tuple[bool, bool]:
 _dead_consecutive: dict[str, int] = {}
 DEAD_DEBOUNCE_THRESHOLD = 3  # must fail 3 consecutive checks before reporting DEAD
 
+# Alert dedup: suppress repeated identical alerts per worker
+_last_alert: dict[str, float] = {}  # worker_name -> last alert timestamp
+ALERT_DEDUP_WINDOW = 300  # suppress same DEAD alert for 5 minutes after first post
+
 # Dispatch lock file path — suppress DEAD alerts during active dispatch
 _DISPATCH_LOCK_FILE = DATA_DIR / "dispatch_active.lock"
 
@@ -287,8 +291,15 @@ def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_or
             h.update({"model": "UNKNOWN", "status": "DEAD"})
             log(f"{name.upper()}: DEAD (hwnd={hwnd} alive={alive} visible={visible}, consecutive={consecutive})", "CRIT")
             skynet_post(f"/worker/{name}/heartbeat", {"hwnd_alive": False, "visible": False, "model": ""})
-            skynet_post("/bus/publish", {"sender": "monitor", "topic": "orchestrator", "type": "alert",
-                "content": f"WORKER {name.upper()} DEAD -- hwnd={hwnd} alive={alive} visible={visible} (confirmed {consecutive}x)"})
+            # Alert dedup: only post bus alert once per ALERT_DEDUP_WINDOW
+            now_ts = time.time()
+            last_ts = _last_alert.get(name, 0)
+            if (now_ts - last_ts) >= ALERT_DEDUP_WINDOW:
+                skynet_post("/bus/publish", {"sender": "monitor", "topic": "orchestrator", "type": "alert",
+                    "content": f"WORKER {name.upper()} DEAD -- hwnd={hwnd} alive={alive} visible={visible} (confirmed {consecutive}x)"})
+                _last_alert[name] = now_ts
+            else:
+                log(f"{name.upper()}: DEAD alert suppressed (dedup window {ALERT_DEDUP_WINDOW}s)", "WARN")
             health[name] = h
             any_bad = True
             continue
@@ -818,6 +829,8 @@ def main():
     parser.add_argument("--status", action="store_true", help="Print current health.json")
     parser.add_argument("--hwnd-interval", type=int, default=HWND_CHECK_INTERVAL)
     parser.add_argument("--model-interval", type=int, default=MODEL_CHECK_INTERVAL)
+    parser.add_argument("--max-runtime", type=int, default=0,
+                        help="Max runtime in seconds (0=unlimited). Daemon exits gracefully after this.")
     args = parser.parse_args()
 
     if args.status:
@@ -869,84 +882,97 @@ def _run_monitor(args):
         print(json.dumps(health, indent=2))
         return
 
+    max_runtime = getattr(args, 'max_runtime', 0)
+    start_time = time.time()
     last_model_check = 0.0
     last_orch_check = 0.0
     last_daemon_restart_check = 0.0
     cycle = 0
     DAEMON_CHECK_INTERVAL = 120  # check daemon health every 2 minutes
 
-    while True:
-        try:
-            cycle += 1
-            now = time.time()
+    try:
+        while True:
+            # Max runtime guard
+            if max_runtime and (time.time() - start_time) >= max_runtime:
+                log(f"Max runtime {max_runtime}s reached -- shutting down gracefully", "INFO")
+                skynet_post("/bus/publish", {"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",
+                    "content": f"Monitor shutdown: max_runtime={max_runtime}s reached after {cycle} cycles"})
+                break
+            try:
+                cycle += 1
+                now = time.time()
 
-            # ── AUTO-RELOAD workers.json if changed ────────────────────
-            new_workers, new_orch, changed = _reload_workers_if_changed()
-            if changed and new_workers is not None:
-                workers = new_workers
-                orch_hwnd = new_orch
-                log(f"Workers reloaded: {len(workers)} workers, orch_hwnd={orch_hwnd}", "OK")
+                # ── AUTO-RELOAD workers.json if changed ────────────────────
+                new_workers, new_orch, changed = _reload_workers_if_changed()
+                if changed and new_workers is not None:
+                    workers = new_workers
+                    orch_hwnd = new_orch
+                    log(f"Workers reloaded: {len(workers)} workers, orch_hwnd={orch_hwnd}", "OK")
 
-            do_model = (now - last_model_check) >= args.model_interval
-            do_orch = (now - last_orch_check) >= ORCH_MODEL_CHECK_INTERVAL
+                do_model = (now - last_model_check) >= args.model_interval
+                do_orch = (now - last_orch_check) >= ORCH_MODEL_CHECK_INTERVAL
 
-            health = run_check(workers, orch_hwnd, check_model=do_model, check_orch=do_orch)
-            write_health(health)
-
-            # ── Stuck worker detection with auto-recovery ───────────────
-            _check_stuck_workers(workers)
-
-            # ── Productivity tracking (every cycle) ─────────────────────
-            _track_productivity(workers, health)
-            productivity = _get_productivity_summary()
-            pending_work = _get_pending_work_count()
-
-            # ── Health trend logging (every cycle) ──────────────────────
-            _record_health_trend(health, productivity, pending_work)
-
-            if do_model:
-                last_model_check = now
-            if do_orch:
-                last_orch_check = now
-
-            # Post periodic bus heartbeat from monitor (with productivity data)
-            if cycle % 6 == 0:  # every ~60s
-                alive_count = sum(1 for h in health.values() if isinstance(h, dict) and h.get("alive"))
-                prod_summary = "; ".join(
-                    f"{n}={p.get('tasks_per_hour', 0):.1f}t/h"
-                    for n, p in productivity.items()
-                )
-                skynet_post("/bus/publish", {
-                    "sender": "monitor", "topic": "orchestrator", "type": "heartbeat",
-                    "content": f"Monitor cycle {cycle}: {alive_count}/{len(workers)} alive, pending={pending_work}. Productivity: {prod_summary}",
-                    "metadata": {k: (v.get("status", "?") if isinstance(v, dict) else str(v)) for k, v in health.items()}
-                })
-
-            # Collect intelligence metrics (knowledge flow + convene sessions)
-            if cycle % 6 == 0:
-                intel = _collect_intelligence_metrics()
-                health["intelligence"] = intel
-
-                # Check realtime daemon liveness
-                rt_status = _check_realtime_daemon()
-                health["realtime_daemon"] = rt_status
-                if not rt_status["alive"]:
-                    skynet_post("/bus/publish", {
-                        "sender": "monitor", "topic": "orchestrator", "type": "alert",
-                        "content": "REALTIME DAEMON DOWN -- data/realtime.json stale or missing"
-                    })
-
+                health = run_check(workers, orch_hwnd, check_model=do_model, check_orch=do_orch)
                 write_health(health)
 
-            # ── Auto-restart stale daemons (every 2 minutes) ────────────
-            if (now - last_daemon_restart_check) >= DAEMON_CHECK_INTERVAL:
-                last_daemon_restart_check = now
-                _auto_restart_stale_daemons()
+                # ── Stuck worker detection with auto-recovery ───────────────
+                _check_stuck_workers(workers)
 
-        except Exception as e:
-            log(f"Monitor cycle error: {e}", "ERR")
+                # ── Productivity tracking (every cycle) ─────────────────────
+                _track_productivity(workers, health)
+                productivity = _get_productivity_summary()
+                pending_work = _get_pending_work_count()
 
-        time.sleep(args.hwnd_interval)
+                # ── Health trend logging (every cycle) ──────────────────────
+                _record_health_trend(health, productivity, pending_work)
+
+                if do_model:
+                    last_model_check = now
+                if do_orch:
+                    last_orch_check = now
+
+                # Post periodic bus heartbeat from monitor (with productivity data)
+                if cycle % 6 == 0:  # every ~60s
+                    alive_count = sum(1 for h in health.values() if isinstance(h, dict) and h.get("alive"))
+                    prod_summary = "; ".join(
+                        f"{n}={p.get('tasks_per_hour', 0):.1f}t/h"
+                        for n, p in productivity.items()
+                    )
+                    skynet_post("/bus/publish", {
+                        "sender": "monitor", "topic": "orchestrator", "type": "heartbeat",
+                        "content": f"Monitor cycle {cycle}: {alive_count}/{len(workers)} alive, pending={pending_work}. Productivity: {prod_summary}",
+                        "metadata": {k: (v.get("status", "?") if isinstance(v, dict) else str(v)) for k, v in health.items()}
+                    })
+
+                # Collect intelligence metrics (knowledge flow + convene sessions)
+                if cycle % 6 == 0:
+                    intel = _collect_intelligence_metrics()
+                    health["intelligence"] = intel
+
+                    # Check realtime daemon liveness
+                    rt_status = _check_realtime_daemon()
+                    health["realtime_daemon"] = rt_status
+                    if not rt_status["alive"]:
+                        skynet_post("/bus/publish", {
+                            "sender": "monitor", "topic": "orchestrator", "type": "alert",
+                            "content": "REALTIME DAEMON DOWN -- data/realtime.json stale or missing"
+                        })
+
+                    write_health(health)
+
+                # ── Auto-restart stale daemons (every 2 minutes) ────────────
+                if (now - last_daemon_restart_check) >= DAEMON_CHECK_INTERVAL:
+                    last_daemon_restart_check = now
+                    _auto_restart_stale_daemons()
+
+            except Exception as e:
+                log(f"Monitor cycle error: {e}", "ERR")
+
+            time.sleep(args.hwnd_interval)
+    except KeyboardInterrupt:
+        log("Monitor shutting down (Ctrl+C)", "INFO")
+        skynet_post("/bus/publish", {"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",
+            "content": f"Monitor shutdown: KeyboardInterrupt after {cycle} cycles"})
 
 
 if __name__ == "__main__":

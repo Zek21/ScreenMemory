@@ -131,35 +131,30 @@ Add-Type @"
 using System; using System.Runtime.InteropServices; using System.Text;
 public class BusWorkerType {{
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr wp, IntPtr lp);
-    [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr c, string cls, string w);
     [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
-    [StructLayout(LayoutKind.Sequential)] public struct POINT {{ public int x, y; }}
-    public static void PostClick(IntPtr render, int sx, int sy) {{
-        var p = new POINT {{ x=sx, y=sy }};
-        ScreenToClient(render, ref p);
-        var lp = (IntPtr)((p.y << 16) | (p.x & 0xFFFF));
-        PostMessage(render, 0x0201, (IntPtr)1, lp);
-        PostMessage(render, 0x0202, (IntPtr)0, lp);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
+    public static bool FocusViaAttach(IntPtr target) {{
+        uint targetTid = GetWindowThreadProcessId(target, out _);
+        uint myTid = GetCurrentThreadId();
+        if (targetTid == 0) return false;
+        AttachThreadInput(myTid, targetTid, true);
+        SetFocus(target);
+        return true;
     }}
-    public static IntPtr FindRender(IntPtr hwnd) {{
-        var h = FindWindowEx(hwnd, IntPtr.Zero, null, null);
-        while (h != IntPtr.Zero) {{
-            var sb = new StringBuilder(256); GetClassName(h, sb, 256);
-            if (sb.ToString() == "Chrome_RenderWidgetHostHWND") return h;
-            var f = FindRender(h); if (f != IntPtr.Zero) return f;
-            h = FindWindowEx(hwnd, h, null, null);
-        }}
-        return IntPtr.Zero;
+    public static void DetachThread(IntPtr target) {{
+        uint targetTid = GetWindowThreadProcessId(target, out _);
+        uint myTid = GetCurrentThreadId();
+        AttachThreadInput(myTid, targetTid, false);
     }}
 }}
 "@
 
 $hwnd = [IntPtr]{hwnd}
 $orchHwnd = [IntPtr]{orch_hwnd}
-[BusWorkerType]::SetForegroundWindow($hwnd)
-Start-Sleep -Milliseconds 500
 
 # Find bottommost Edit (chat input box)
 $wnd = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
@@ -179,41 +174,50 @@ foreach ($e in $allEdits) {{
     }} catch {{}}
 }}
 
-$render = [BusWorkerType]::FindRender($hwnd)
+if ($edit) {{
+    # Save user clipboard
+    $savedClip = $null
+    try {{ $savedClip = [System.Windows.Forms.Clipboard]::GetText() }} catch {{}}
 
-if ($edit -and $render -ne [IntPtr]::Zero) {{
-    $rect = $edit.Current.BoundingRectangle
-    $cx = [int]($rect.X + $rect.Width / 2)
-    $cy = [int]($rect.Y + $rect.Height / 2)
-    [BusWorkerType]::PostClick($render, $cx, $cy)
-    Start-Sleep -Milliseconds 500
     [System.Windows.Forms.Clipboard]::SetText("{safe_text}")
-    Start-Sleep -Milliseconds 200
-    [System.Windows.Forms.SendKeys]::SendWait("^v")
-    Start-Sleep -Milliseconds 300
-    [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
-    Write-Host "OK"
-}} elseif ($edit) {{
-    try {{ $edit.SetFocus() }} catch {{}}
-    [BusWorkerType]::SetForegroundWindow($hwnd)
-    Start-Sleep -Milliseconds 400
-    [System.Windows.Forms.Clipboard]::SetText("{safe_text}")
-    Start-Sleep -Milliseconds 200
-    [System.Windows.Forms.SendKeys]::SendWait("^v")
-    Start-Sleep -Milliseconds 300
-    [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
-    Write-Host "OK"
+    Start-Sleep -Milliseconds 50
+
+    # PRIMARY: AttachThreadInput (no Z-order change = no blink)
+    $attached = [BusWorkerType]::FocusViaAttach($hwnd)
+    if ($attached) {{
+        try {{ $edit.SetFocus() }} catch {{}}
+        Start-Sleep -Milliseconds 80
+        [System.Windows.Forms.SendKeys]::SendWait("^v")
+        Start-Sleep -Milliseconds 80
+        [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+        [BusWorkerType]::DetachThread($hwnd)
+        Write-Host "OK"
+    }} else {{
+        # Fallback: brief SetForegroundWindow
+        try {{ $edit.SetFocus() }} catch {{}}
+        [BusWorkerType]::SetForegroundWindow($hwnd)
+        Start-Sleep -Milliseconds 80
+        [System.Windows.Forms.SendKeys]::SendWait("^v")
+        Start-Sleep -Milliseconds 80
+        [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+        [BusWorkerType]::SetForegroundWindow($orchHwnd)
+        Write-Host "OK"
+    }}
+
+    # Restore user clipboard
+    if ($savedClip -and $savedClip.Length -gt 0) {{
+        Start-Sleep -Milliseconds 50
+        try {{ [System.Windows.Forms.Clipboard]::SetText($savedClip) }} catch {{}}
+    }}
 }} else {{
     Write-Host "NO_EDIT"
 }}
-
-Start-Sleep -Milliseconds 300
-[BusWorkerType]::SetForegroundWindow($orchHwnd)
 '''
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True, text=True, timeout=20
+            capture_output=True, text=True, timeout=20,
+            creationflags=0x08000000  # CREATE_NO_WINDOW
         )
         return "OK" in r.stdout
     except Exception as e:

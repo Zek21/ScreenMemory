@@ -526,7 +526,8 @@ Write-Host "OK-STEER-BYPASS"
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True, text=True, timeout=20
+            capture_output=True, text=True, timeout=20,
+            creationflags=0x08000000  # CREATE_NO_WINDOW
         )
         cancelled = "STEERING-CANCELLED" in r.stdout
         log(f"STEERING cancel result: {r.stdout.strip()}", "OK" if cancelled else "WARN")
@@ -609,8 +610,7 @@ public class GhostType {{
 $hwnd = [IntPtr]{hwnd}
 $orchHwnd = [IntPtr]{orch_hwnd}
 
-# Auto-cancel STEERING if present -- "Cancel (Alt+Backspace)" button dismisses it
-# UIA InvokePattern works without focus
+# Auto-cancel STEERING if present (UIA InvokePattern -- no focus needed)
 $wnd = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
 $cancelBtn = $wnd.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
     (New-Object System.Windows.Automation.PropertyCondition(
@@ -618,13 +618,12 @@ $cancelBtn = $wnd.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
 if ($cancelBtn) {{
     try {{
         $cancelBtn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-        Write-Host "DEBUG: STEERING cancelled via Cancel button"
+        Write-Host "DEBUG: STEERING cancelled"
         Start-Sleep -Milliseconds 800
-    }} catch {{ Write-Host "DEBUG: Cancel button invoke failed: $_" }}
+    }} catch {{ Write-Host "DEBUG: Cancel invoke failed: $_" }}
 }}
 
-# Locate the chat input Edit via UIA -- find ALL Edit elements, pick the one
-# with the HIGHEST Y (bottommost = real chat input, not steering draft cards)
+# Locate bottommost Edit (chat input box) via UIA
 $wnd = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
 $allEdits = $wnd.FindAll(
     [System.Windows.Automation.TreeScope]::Descendants,
@@ -641,27 +640,43 @@ foreach ($e in $allEdits) {{
         if ($r.Y -gt $maxY) {{ $maxY = $r.Y; $edit = $e }}
     }} catch {{}}
 }}
-Write-Host "DEBUG: found $($allEdits.Count) Edit elements, bottommost Y=$maxY"
-
-$render = [GhostType]::FindRender($hwnd)
-
 if ($edit) {{
-    # FOCUSLESS PATH: Set clipboard without focus, then minimal focus-steal for paste+enter
-    # PostMessage keyboard events don't work on Chromium (RawInput pipeline)
-    # Strategy: set clipboard bg -> SetForeground -> instant Ctrl+V+Enter -> restore
-    # Total focus steal: ~30ms (vs ~500ms before)
+    # Save user clipboard before overwriting
+    $savedClip = $null
+    try {{ $savedClip = [System.Windows.Forms.Clipboard]::GetText() }} catch {{}}
 
-    # Step 1: Set clipboard while NOT focused (no focus steal)
+    # Set dispatch text to clipboard
     [System.Windows.Forms.Clipboard]::SetText("{safe_text}")
+    Start-Sleep -Milliseconds 50
 
-    # Step 2: Brief focus steal for paste+enter (Chromium requires actual focus for key input)
-    [GhostType]::SetForegroundWindow($hwnd)
-    [System.Windows.Forms.SendKeys]::SendWait("^v")
-    [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+    # PRIMARY: AttachThreadInput -- transfers keyboard focus without changing
+    # the foreground window (no Z-order change = no visible CMD blink)
+    $attached = [GhostType]::FocusViaAttach($hwnd)
+    if ($attached) {{
+        try {{ $edit.SetFocus() }} catch {{}}
+        Start-Sleep -Milliseconds 80
+        [System.Windows.Forms.SendKeys]::SendWait("^v")
+        Start-Sleep -Milliseconds 80
+        [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+        [GhostType]::DetachThread($hwnd)
+        Write-Host "OK_ATTACHED"
+    }} else {{
+        # FALLBACK: Brief SetForegroundWindow (minimized to ~160ms)
+        try {{ $edit.SetFocus() }} catch {{}}
+        [GhostType]::SetForegroundWindow($hwnd)
+        Start-Sleep -Milliseconds 80
+        [System.Windows.Forms.SendKeys]::SendWait("^v")
+        Start-Sleep -Milliseconds 80
+        [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+        [GhostType]::SetForegroundWindow($orchHwnd)
+        Write-Host "OK_FALLBACK"
+    }}
 
-    # Step 3: Immediately restore orchestrator focus
-    [GhostType]::SetForegroundWindow($orchHwnd)
-    Write-Host "OK_FOCUSLESS"
+    # Restore user clipboard (don't leave dispatch text in clipboard)
+    if ($savedClip -and $savedClip.Length -gt 0) {{
+        Start-Sleep -Milliseconds 50
+        try {{ [System.Windows.Forms.Clipboard]::SetText($savedClip) }} catch {{}}
+    }}
 }} else {{
     Write-Host "NO_EDIT"
 }}
@@ -681,7 +696,8 @@ if ($edit) {{
             log(f"Ghost targeting HWND={hwnd} (orch={orch_hwnd})", "SYS")
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps],
-                capture_output=True, text=True, timeout=20
+                capture_output=True, text=True, timeout=20,
+                creationflags=0x08000000  # CREATE_NO_WINDOW
             )
 
             # Post-dispatch: no foreground check needed (focusless dispatch)
@@ -695,7 +711,7 @@ if ($edit) {{
             # Inter-dispatch cooldown — prevent clipboard races between workers
             time.sleep(0.5)
 
-        ok = ("OK_FOCUSLESS" in r.stdout or "OK_FALLBACK" in r.stdout) and "NO_EDIT" not in r.stdout
+        ok = ("OK_ATTACHED" in r.stdout or "OK_FALLBACK" in r.stdout) and "NO_EDIT" not in r.stdout
         if not ok and r.stdout:
             log(f"Ghost output: {r.stdout.strip()[:200]}", "WARN")
         if r.stderr and r.stderr.strip():
