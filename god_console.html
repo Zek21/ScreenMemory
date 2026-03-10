@@ -1,0 +1,2544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GOD Console — SKYNET v2</title>
+<style>
+/* ═══════════════════════════════════════════════════════════════════
+   GOD CONSOLE v2 — Futuristic Control Center
+   VS Code-inspired panel layout with real-time SSE streaming
+   ═══════════════════════════════════════════════════════════════════ */
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
+:root {
+  --bg: #06080c; --bg2: #0a0e14; --surface: #0d1117; --card: #111820;
+  --elevated: #161d27; --border: #1b2230; --border2: #252d3a;
+  --text: #e6edf3; --text2: #9da5ae; --dim: #6e7681; --muted: #30363d;
+  --gold: #f0c000; --gold-dim: rgba(240,192,0,0.1); --gold-glow: rgba(240,192,0,0.3);
+  --red: #ff6b6b; --red-dim: rgba(255,107,107,0.1);
+  --green: #4ade80; --green-dim: rgba(74,222,128,0.1);
+  --blue: #60a5fa; --blue-dim: rgba(96,165,250,0.1);
+  --purple: #c084fc; --purple-dim: rgba(192,132,252,0.1);
+  --pink: #f472b6; --pink-dim: rgba(244,114,182,0.1);
+  --cyan: #22d3ee; --cyan-dim: rgba(34,211,238,0.1);
+  --orange: #fb923c;
+  --radius: 8px; --radius-lg: 12px;
+  --shadow: 0 4px 24px rgba(0,0,0,0.5);
+  --glass: rgba(17,24,32,0.85); --glass-border: rgba(255,255,255,0.06);
+  --font: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+  --font-ui: 'Inter', system-ui, -apple-system, sans-serif;
+  --sidebar-w: 48px;
+  --topbar-h: 40px;
+  --statusbar-h: 28px;
+  --cmdbar-h: 52px;
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { height:100%; overflow:hidden; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--dim); }
+
+/* ── Animations ── */
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+@keyframes glow { 0%,100% { box-shadow: 0 0 4px var(--gold-glow); } 50% { box-shadow: 0 0 16px var(--gold-glow), 0 0 32px rgba(240,192,0,0.1); } }
+@keyframes slideIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+@keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
+@keyframes scanline { 0% { transform:translateY(-100%); } 100% { transform:translateY(100vh); } }
+@keyframes dataFlow { 0% { background-position: 200% center; } 100% { background-position: -200% center; } }
+@keyframes breathe { 0%,100% { opacity:0.6; } 50% { opacity:1; } }
+@keyframes ripple { 0% { transform:scale(0.8); opacity:1; } 100% { transform:scale(2.5); opacity:0; } }
+@keyframes typeIn { from { width:0; } to { width:100%; } }
+@keyframes blink { 0%,100% { opacity:1; } 50% { opacity:0; } }
+@keyframes spin { 0% { transform:rotate(0deg); } 100% { transform:rotate(360deg); } }
+@keyframes countUp { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+
+/* ── Particle Canvas ── */
+#particles { position:fixed; inset:0; z-index:0; pointer-events:none; opacity:0.4; }
+
+/* ── Grid Overlay ── */
+body::before {
+  content:''; position:fixed; inset:0; z-index:0; pointer-events:none;
+  background-image: radial-gradient(rgba(255,255,255,0.015) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+/* ── Scanline Effect ── */
+body::after {
+  content:''; position:fixed; inset:0; z-index:9999; pointer-events:none;
+  background: linear-gradient(transparent 50%, rgba(0,0,0,0.03) 50%);
+  background-size: 100% 4px;
+}
+
+/* ═══ TOP BAR (VS Code title bar) ═══ */
+.topbar {
+  height: var(--topbar-h);
+  background: var(--bg2);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  z-index: 10;
+  position: relative;
+  -webkit-app-region: drag;
+}
+.topbar-left { display:flex; align-items:center; gap:12px; }
+.topbar-eye {
+  width:24px; height:24px; display:flex; align-items:center; justify-content:center;
+  font-size:14px; animation: breathe 3s ease-in-out infinite;
+}
+.topbar-title { font-family:var(--font-ui); font-weight:700; font-size:13px; color:var(--gold); letter-spacing:1px; }
+.topbar-subtitle { font-size:11px; color:var(--dim); margin-left:4px; }
+.topbar-center { flex:1; text-align:center; }
+.topbar-status {
+  display:inline-flex; align-items:center; gap:6px;
+  font-size:11px; color:var(--text2); padding:3px 10px;
+  background: var(--surface); border:1px solid var(--border); border-radius:20px;
+}
+.topbar-right { display:flex; align-items:center; gap:10px; }
+.topbar-clock { font-size:13px; color:var(--text); font-weight:500; font-variant-numeric:tabular-nums; }
+.topbar-uptime { font-size:10px; color:var(--dim); }
+
+/* ═══ COMMAND BAR (VS Code command palette style) ═══ */
+.cmdbar {
+  height: var(--cmdbar-h);
+  background: linear-gradient(90deg, var(--gold-dim) 0%, var(--surface) 30%, var(--surface) 70%, var(--gold-dim) 100%);
+  border-bottom: 1px solid rgba(240,192,0,0.15);
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  gap: 12px;
+  z-index: 10;
+  position: relative;
+}
+.cmd-icon { font-size:18px; color:var(--gold); animation: glow 3s infinite; }
+.cmd-input-wrap {
+  flex:1; position:relative; display:flex; align-items:center;
+}
+.cmd-input {
+  width:100%; padding:8px 14px 8px 36px;
+  background: var(--card); border:1px solid var(--border); border-radius:6px;
+  color:var(--gold); font-family:var(--font); font-size:13px;
+  outline:none; transition: all 0.2s;
+}
+.cmd-input:focus { border-color:var(--gold); box-shadow:0 0 0 2px rgba(240,192,0,0.15); }
+.cmd-input::placeholder { color:var(--dim); }
+.cmd-prefix {
+  position:absolute; left:12px; color:var(--gold); font-weight:600; font-size:14px;
+  pointer-events:none;
+}
+.cmd-btn {
+  padding:8px 20px; background:var(--gold); color:#000; font-family:var(--font-ui);
+  font-weight:700; font-size:12px; letter-spacing:0.5px; border:none; border-radius:6px;
+  cursor:pointer; transition:all 0.15s; text-transform:uppercase;
+}
+.cmd-btn:hover { background:#ffd500; transform:translateY(-1px); box-shadow:0 4px 12px rgba(240,192,0,0.3); }
+.cmd-btn:active { transform:translateY(0); }
+.cmd-history {
+  display:flex; gap:6px; align-items:center; overflow-x:auto; max-width:400px;
+  scrollbar-width:none;
+}
+.cmd-history::-webkit-scrollbar { display:none; }
+.cmd-chip {
+  padding:3px 10px; background:var(--card); border:1px solid var(--border);
+  border-radius:12px; font-size:10px; color:var(--text2); white-space:nowrap;
+  cursor:pointer; transition:all 0.15s;
+}
+.cmd-chip:hover { border-color:var(--gold); color:var(--gold); }
+
+/* ═══ MAIN LAYOUT (VS Code: sidebar + editor area) ═══ */
+.main-layout {
+  flex:1; display:flex; overflow:hidden; position:relative; z-index:1;
+}
+
+/* ── Activity Bar (VS Code left icons) ── */
+.activity-bar {
+  width: var(--sidebar-w);
+  background: var(--bg2);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0;
+  gap: 4px;
+}
+.ab-icon {
+  width:40px; height:40px; display:flex; align-items:center; justify-content:center;
+  font-size:18px; color:var(--dim); cursor:pointer; border-radius:6px;
+  transition:all 0.15s; position:relative;
+}
+.ab-icon:hover { color:var(--text); background:rgba(255,255,255,0.05); }
+.ab-icon.active { color:var(--gold); }
+.ab-icon.active::before {
+  content:''; position:absolute; left:0; top:8px; bottom:8px; width:2px;
+  background:var(--gold); border-radius:0 2px 2px 0;
+}
+.ab-icon .badge {
+  position:absolute; top:4px; right:4px; min-width:16px; height:16px;
+  background:var(--gold); color:#000; font-size:10px; font-weight:700;
+  border-radius:8px; display:flex; align-items:center; justify-content:center;
+  padding:0 4px; animation: countUp 0.3s ease-out;
+}
+.ab-spacer { flex:1; }
+
+/* ── Content Area ── */
+.content-area {
+  flex:1; display:flex; flex-direction:column; overflow:hidden;
+}
+
+/* ── Panel Grid (main dashboard area) ── */
+.panel-grid {
+  flex:1; display:grid;
+  grid-template-columns: 1fr 1fr 1fr 1fr;
+  grid-template-rows: auto 110px 1fr 1fr auto auto auto auto;
+  grid-template-areas:
+    "metrics  metrics  metrics  metrics"
+    "network  network  network  network"
+    "workers  workers  orch     bus"
+    "workers  workers  orch     bus"
+    "intel    intel    tasks    tasks"
+    "engines  engines  engines  engines"
+    "killreq  killreq  killreq  killreq"
+    "godfeed  godfeed  godfeed  godfeed";
+  gap: 1px;
+  background: var(--border);
+  overflow: hidden;
+  position: relative;
+}
+
+/* ── Metrics Strip ── */
+.metrics-strip {
+  grid-area: metrics;
+  background: var(--surface);
+  display: flex;
+  align-items: center;
+  padding: 4px 12px;
+  gap: 16px;
+  overflow-x: auto;
+}
+.metric-item {
+  display:flex; flex-direction:column; align-items:center; gap:1px; min-width:60px;
+}
+.metric-value {
+  font-size:16px; font-weight:700; font-variant-numeric:tabular-nums;
+  transition: all 0.3s ease;
+}
+.metric-value.flash { animation: countUp 0.4s ease-out; }
+.metric-label { font-size:10px; color:var(--dim); text-transform:uppercase; letter-spacing:1px; }
+.metric-bar {
+  width:100%; height:3px; background:var(--border); border-radius:2px; overflow:hidden; margin-top:2px;
+}
+.metric-bar-fill {
+  height:100%; border-radius:2px; transition: width 0.6s ease;
+  background: linear-gradient(90deg, var(--gold), var(--green));
+}
+
+/* ── Panel (generic container) ── */
+.panel {
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+  min-height: 0;
+}
+.panel-header {
+  display:flex; align-items:center; padding:8px 12px; gap:8px;
+  background: var(--bg2); border-bottom:1px solid var(--border);
+  font-size:11px; text-transform:uppercase; letter-spacing:1px;
+  user-select:none; flex-shrink:0;
+}
+.panel-header-icon { font-size:13px; }
+.panel-header-title { font-family:var(--font-ui); font-weight:600; flex:1; }
+.panel-header-badge {
+  font-size:10px; padding:1px 6px; border-radius:10px;
+  font-weight:600; min-width:20px; text-align:center;
+}
+.panel-body {
+  flex:1; overflow-y:auto; padding:0; position:relative;
+}
+
+/* ═══ WORKER CARDS ═══ */
+.workers-grid {
+  display:grid; grid-template-columns:1fr 1fr; gap:4px;
+  padding:4px;
+}
+/* When in 2-col responsive layout, show all 4 workers in 1 row */
+@media (max-width: 1200px) {
+  .workers-grid { grid-template-columns:repeat(4, 1fr); }
+}
+.worker-card {
+  background: var(--card);
+  border:1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  transition: all 0.3s ease;
+  position: relative;
+  overflow: hidden;
+}
+.worker-card::before {
+  content:''; position:absolute; top:0; left:0; right:0; height:2px;
+  background: var(--dim); transition: background 0.3s;
+}
+.worker-card.idle::before { background: var(--blue); }
+.worker-card.working::before {
+  background: linear-gradient(90deg, transparent, var(--green), transparent);
+  background-size: 200% 100%;
+  animation: dataFlow 1.5s linear infinite;
+}
+.worker-card.error::before { background: var(--red); animation: pulse 1s infinite; }
+.worker-card.circuit-open::before { background: var(--orange); animation: pulse 0.5s infinite; }
+.worker-card:hover { border-color:var(--border2); transform:translateY(-1px); }
+
+.wc-header { display:flex; align-items:center; gap:6px; margin-bottom:3px; }
+.wc-dot {
+  width:7px; height:7px; border-radius:50%; background:var(--dim);
+  transition:all 0.3s; flex-shrink:0;
+}
+.wc-dot.idle { background:var(--blue); box-shadow:0 0 6px var(--blue-dim); }
+.wc-dot.working { background:var(--green); box-shadow:0 0 8px var(--green-dim); animation:pulse 1.5s infinite; }
+.wc-dot.error { background:var(--red); box-shadow:0 0 8px var(--red-dim); }
+.wc-name { font-weight:700; font-size:11px; letter-spacing:1px; }
+.wc-chip {
+  margin-left:auto; padding:1px 6px; border-radius:10px; font-size:10px;
+  font-weight:600; text-transform:uppercase; letter-spacing:0.5px;
+}
+.wc-chip.idle { background:var(--blue-dim); color:var(--blue); }
+.wc-chip.working { background:var(--green-dim); color:var(--green); }
+.wc-chip.error { background:var(--red-dim); color:var(--red); }
+
+.wc-stats {
+  display:grid; grid-template-columns:1fr 1fr 1fr; gap:2px; margin:3px 0;
+}
+.wc-stat { display:flex; flex-direction:column; }
+.wc-stat-val { font-size:12px; font-weight:600; font-variant-numeric:tabular-nums; }
+.wc-stat-lbl { font-size:10px; color:var(--dim); text-transform:uppercase; letter-spacing:0.5px; }
+
+.wc-task {
+  font-size:10px; color:var(--text2); padding:2px 0;
+  border-top:1px solid var(--border); margin-top:2px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.wc-task.active { color:var(--green); }
+
+.wc-progress {
+  width:100%; height:2px; background:var(--border); border-radius:1px;
+  margin-top:4px; overflow:hidden;
+}
+.wc-progress-fill {
+  height:100%; background:var(--green); border-radius:1px;
+  transition:width 0.5s ease;
+}
+
+.wc-circuit {
+  font-size:10px; color:var(--orange); margin-top:4px;
+  display:none; align-items:center; gap:4px;
+}
+.wc-circuit.visible { display:flex; }
+.wc-circuit-icon { animation:pulse 1s infinite; }
+
+/* ── Worker Utilization Bar ── */
+.wc-utilization {
+  display:flex; align-items:center; gap:4px; margin:2px 0;
+}
+.wc-util-bar {
+  flex:1; height:3px; background:var(--border); border-radius:2px; overflow:hidden;
+}
+.wc-util-fill {
+  height:100%; border-radius:2px; transition:width 0.6s ease, background 0.3s;
+  background: linear-gradient(90deg, var(--blue), var(--green));
+}
+.wc-util-label { font-size:10px; color:var(--dim); min-width:28px; text-align:right; }
+
+/* ── Worker Heartbeat ── */
+.wc-heartbeat {
+  display:flex; align-items:center; gap:4px; font-size:10px; color:var(--dim); margin-top:1px;
+}
+.wc-hb-pulse {
+  width:5px; height:5px; border-radius:50%; background:var(--green);
+  animation: pulse 2s infinite;
+}
+.wc-hb-pulse.stale { background:var(--orange); animation: pulse 0.5s infinite; }
+.wc-hb-pulse.dead { background:var(--red); animation: none; }
+
+/* ── Worker Queue Depth ── */
+.wc-queue {
+  display:none; align-items:center; gap:4px; margin-top:2px;
+}
+.wc-queue-blocks {
+  display:flex; gap:1px;
+}
+.wc-queue-block {
+  width:6px; height:10px; border-radius:1px; background:var(--border);
+  transition: background 0.3s;
+}
+.wc-queue-block.filled { background:var(--gold); }
+
+/* ── Worker Log Feed (expanded) ── */
+.wc-logs {
+  margin-top:2px; max-height:40px; overflow-y:auto; font-size:10px;
+  color:var(--dim); border-top:1px solid var(--border); padding-top:2px;
+}
+.wc-log-line {
+  padding:1px 0; animation:slideIn 0.2s ease-out;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.wc-log-line.success { color:var(--green); }
+.wc-log-line.error { color:var(--red); }
+.wc-log-line.thinking { color:var(--purple); font-style:italic; }
+.wc-log-line.routing { color:var(--cyan); }
+
+/* ═══ FEED PANELS ═══ */
+.feed-line {
+  padding:4px 12px; font-size:11px; border-bottom:1px solid rgba(255,255,255,0.02);
+  animation: slideIn 0.25s ease-out; display:flex; gap:8px;
+  transition: background 0.15s;
+}
+.feed-line:hover { background:rgba(255,255,255,0.02); }
+.feed-time { color:var(--dim); font-size:10px; flex-shrink:0; min-width:55px; font-variant-numeric:tabular-nums; }
+.feed-icon { flex-shrink:0; width:16px; text-align:center; }
+.feed-text { flex:1; word-break:break-word; }
+.feed-sender {
+  font-size:10px; padding:0 5px; border-radius:3px; flex-shrink:0;
+  font-weight:600; text-transform:uppercase; letter-spacing:0.5px;
+}
+
+/* Feed type colors */
+.feed-line.gold .feed-text { color:var(--gold); }
+.feed-line.purple .feed-text { color:var(--purple); }
+.feed-line.cyan .feed-text { color:var(--cyan); }
+.feed-line.green .feed-text { color:var(--green); }
+.feed-line.red .feed-text { color:var(--red); }
+.feed-line.blue .feed-text { color:var(--blue); }
+
+/* ── Orchestrator Thought Sections ── */
+.orch-section {
+  border-bottom:1px solid var(--border); padding:6px 0;
+}
+.orch-section-header {
+  display:flex; align-items:center; gap:6px; padding:4px 12px;
+  font-size:10px; text-transform:uppercase; letter-spacing:1px;
+  color:var(--dim); cursor:pointer; user-select:none;
+}
+.orch-section-header:hover { color:var(--text2); }
+.orch-section-header .orch-arrow { transition:transform 0.2s; font-size:10px; }
+.orch-section-header .orch-arrow.collapsed { transform:rotate(-90deg); }
+.orch-section-count {
+  font-size:10px; padding:0 5px; border-radius:8px;
+  background:var(--purple-dim); color:var(--purple);
+}
+.orch-section-body { }
+.orch-section-body.collapsed { display:none; }
+
+/* ── Typing Indicator ── */
+.orch-typing {
+  display:flex; align-items:center; gap:6px; padding:6px 12px;
+  font-size:11px; color:var(--purple); font-style:italic;
+  animation:breathe 1.5s infinite;
+}
+.orch-typing-dots span {
+  display:inline-block; width:4px; height:4px; border-radius:50%;
+  background:var(--purple); margin:0 1px;
+  animation:pulse 1.4s infinite;
+}
+.orch-typing-dots span:nth-child(2) { animation-delay:0.2s; }
+.orch-typing-dots span:nth-child(3) { animation-delay:0.4s; }
+
+/* ── Bus Topic Filter Tabs ── */
+.bus-tabs {
+  display:flex; gap:2px; padding:4px 8px; border-bottom:1px solid var(--border);
+  overflow-x:auto; scrollbar-width:none;
+}
+.bus-tabs::-webkit-scrollbar { display:none; }
+.bus-tab {
+  padding:3px 10px; border-radius:12px; font-size:10px; font-weight:600;
+  text-transform:uppercase; letter-spacing:0.5px; cursor:pointer;
+  background:var(--card); border:1px solid var(--border); color:var(--dim);
+  transition:all 0.15s; white-space:nowrap;
+}
+.bus-tab:hover { border-color:var(--cyan); color:var(--cyan); }
+.bus-tab.active { background:var(--cyan-dim); border-color:var(--cyan); color:var(--cyan); }
+.bus-tab .tab-count { margin-left:4px; font-size:10px; }
+.bus-rate {
+  margin-left:auto; display:flex; align-items:center; gap:4px;
+  font-size:10px; color:var(--dim);}
+.bus-rate-value { color:var(--cyan); font-weight:600; }
+
+/* ── Ring Chart (SVG-based) ── */
+.ring-chart {
+  position:relative; width:44px; height:44px; display:inline-block;
+}
+.ring-chart svg { transform:rotate(-90deg); }
+.ring-chart-value {
+  position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+  font-size:10px; font-weight:700; font-variant-numeric:tabular-nums;
+}
+
+/* ═══ ORCHESTRATOR ═══ */
+.orch-panel { grid-column: span 2; }
+
+/* ═══ TIMELINE (bottom panel) ═══ */
+.timeline-panel { /* grid-area set inline */ }
+.timeline-body {
+  display:flex; flex-direction:column;
+}
+
+/* ═══ KILL REQUEST PANEL ═══ */
+.kill-panel { display:none; }
+.kill-panel.has-requests { display:block; }
+.kill-card {
+  background:#1a0a0a; border:1px solid rgba(239,68,68,0.4); border-radius:6px;
+  padding:10px 14px; margin:4px 6px;
+}
+.kill-card-header {
+  display:flex; align-items:center; gap:8px; margin-bottom:8px;
+}
+.kill-pid { font-family:var(--font-mono); font-size:13px; color:var(--red); font-weight:700; }
+.kill-name { font-size:11px; color:var(--text2); }
+.kill-reason { font-size:10px; color:var(--dim); margin-left:auto; max-width:200px; text-align:right; }
+.kill-requester { font-size:10px; color:var(--cyan); }
+.kill-timer { font-size:10px; color:var(--orange); font-family:var(--font-mono); margin-left:8px; }
+.kill-votes {
+  display:grid; grid-template-columns:1fr 1fr 1fr 1fr; gap:4px; margin:8px 0;
+}
+.kill-vote {
+  background:var(--card); border:1px solid var(--border); border-radius:4px;
+  padding:4px 6px; text-align:center; font-size:10px;
+}
+.kill-vote .vote-worker { font-weight:600; color:var(--text2); text-transform:uppercase; }
+.kill-vote .vote-status { margin-top:2px; font-family:var(--font-mono); }
+.kill-vote .vote-reason { font-size:10px; color:var(--dim); margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.kill-vote.pending .vote-status { color:var(--orange); }
+.kill-vote.safe .vote-status { color:var(--green); }
+.kill-vote.blocked { border-color:var(--red); background:rgba(239,68,68,0.08); }
+.kill-vote.blocked .vote-status { color:var(--red); font-weight:700; }
+.kill-actions {
+  display:flex; gap:8px; justify-content:flex-end; margin-top:8px;
+}
+.kill-btn {
+  padding:4px 16px; border:none; border-radius:4px; font-size:10px; font-weight:700;
+  cursor:pointer; text-transform:uppercase; letter-spacing:0.5px; transition:opacity 0.2s;
+}
+.kill-btn.authorize {
+  background:var(--green); color:#000;
+}
+.kill-btn.authorize:disabled {
+  background:var(--border); color:var(--dim); cursor:not-allowed; opacity:0.5;
+}
+.kill-btn.deny {
+  background:var(--red); color:#fff;
+}
+.kill-btn:hover:not(:disabled) { opacity:0.85; }
+.kill-badge {
+  position:absolute; top:-4px; right:-6px; background:var(--red); color:#fff;
+  font-size:10px; font-weight:700; min-width:14px; height:14px; border-radius:7px;
+  display:flex; align-items:center; justify-content:center; padding:0 3px;
+}
+
+/* ═══ STATUS BAR (VS Code bottom bar) ═══ */
+.statusbar {
+  height: var(--statusbar-h);
+  background: var(--gold);
+  color: #000;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  font-family: var(--font-ui);
+  font-size: 11px;
+  font-weight: 500;
+  z-index: 10;
+  position: relative;
+  gap: 2px;
+}
+.statusbar.offline { background: var(--red); color:#fff; }
+.sb-item {
+  display:flex; align-items:center; gap:4px; padding:0 8px;
+  height:100%; cursor:default; transition:background 0.1s;
+}
+.sb-item:hover { background:rgba(0,0,0,0.1); }
+.sb-sep { width:1px; height:14px; background:rgba(0,0,0,0.15); margin:0 2px; }
+.sb-spacer { flex:1; }
+.sb-icon { font-size:12px; }
+
+/* ═══ NETWORK TOPOLOGY OVERLAY ═══ */
+.network-band {
+  grid-area: network;
+  height:110px;
+  background:var(--bg2);
+  position:relative;
+  overflow:hidden;
+  border-bottom:1px solid var(--border);
+}
+.network-band::before {
+  content:''; position:absolute; inset:0; z-index:0; pointer-events:none;
+  background-image: 
+    radial-gradient(rgba(240,192,0,0.04) 1px, transparent 1px),
+    linear-gradient(rgba(34,211,238,0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(34,211,238,0.03) 1px, transparent 1px);
+  background-size: 24px 24px, 48px 48px, 48px 48px;
+  animation: gridPan 20s linear infinite;
+}
+@keyframes gridPan {
+  0%   { background-position: 0 0, 0 0, 0 0; }
+  100% { background-position: 24px 24px, 48px 48px, 48px 48px; }
+}
+.network-band canvas {
+  position:absolute; top:0; left:0; width:100%; height:100%;
+  z-index:0;
+}
+.network-band::after {
+  content:''; position:absolute; top:0; left:0; right:0; height:2px;
+  background:linear-gradient(90deg, transparent, var(--cyan), transparent);
+  opacity:0.4; z-index:1; pointer-events:none;
+  animation:scanLine 4s ease-in-out infinite;
+}
+@keyframes scanLine {
+  0%   { top:0; opacity:0.4; }
+  50%  { top:calc(100% - 34px); opacity:0.2; }
+  100% { top:0; opacity:0.4; }
+}
+.network-band-label {
+  position:absolute; top:6px; left:12px; z-index:2;
+  font-size:10px; color:var(--dim); letter-spacing:1px; text-transform:uppercase;
+}
+.network-band-stats {
+  position:absolute; top:6px; right:12px; z-index:2;
+  font-size:10px; color:var(--dim); letter-spacing:0.5px;
+}
+.network-band-stats .stat { display:flex; align-items:center; gap:4px; }
+.network-band-stats .stat-dot { width:5px; height:5px; border-radius:50%; }
+.network-band-legend {
+  position:absolute; top:6px; right:12px; z-index:2;
+  font-size:10px; color:var(--dim); letter-spacing:0.5px;
+  display:flex; gap:10px; font-family:var(--font-ui); font-weight:600;
+}
+.network-band-legend .leg { display:flex; align-items:center; gap:3px; }
+.network-band-legend .leg-dot { width:6px; height:6px; border-radius:50%; }
+
+/* ═══ BUS LANE ANIMATION ═══ */
+.bus-lane {
+  position:absolute; bottom:0; left:0; right:0; height:34px;
+  overflow:hidden; z-index:1;
+  background:linear-gradient(180deg, transparent, rgba(6,8,12,0.8));
+}
+.bus-lane-track {
+  position:absolute; top:50%; left:0; right:0; height:3px;
+  background:var(--border2); transform:translateY(-50%);
+  box-shadow: 0 0 8px rgba(34,211,238,0.15);
+}
+.bus-lane-track::after {
+  content:''; position:absolute; inset:0;
+  background:linear-gradient(90deg, transparent 0%, var(--cyan) 20%, var(--cyan) 80%, transparent 100%);
+  background-size:200% 100%;
+  animation:dataFlow 2s linear infinite;
+  opacity:0.4;
+}
+.bus-pill {
+  position:absolute; top:50%; transform:translateY(-50%);
+  padding:3px 10px; border-radius:10px; font-size:10px; font-weight:600;
+  white-space:nowrap; letter-spacing:0.5px;
+  animation:busPillSlide 4s linear forwards;
+  pointer-events:none; z-index:2;
+  box-shadow: 0 0 12px rgba(34,211,238,0.2);
+}
+@keyframes busPillSlide {
+  0%   { left:-120px; opacity:0; }
+  5%   { opacity:1; }
+  90%  { opacity:1; }
+  100% { left:calc(100% + 20px); opacity:0; }
+}
+.bus-pill.system  { background:var(--green-dim); color:var(--green); border:1px solid rgba(74,222,128,0.3); }
+.bus-pill.dispatch { background:var(--gold-dim); color:var(--gold); border:1px solid rgba(240,192,0,0.3); }
+.bus-pill.result  { background:var(--green-dim); color:var(--green); border:1px solid rgba(74,222,128,0.3); }
+.bus-pill.heartbeat { background:var(--cyan-dim); color:var(--cyan); border:1px solid rgba(34,211,238,0.3); }
+.bus-pill.error   { background:var(--red-dim); color:var(--red); border:1px solid rgba(255,107,107,0.3); }
+.bus-pill.subtask { background:var(--purple-dim); color:var(--purple); border:1px solid rgba(192,132,252,0.3); }
+.bus-pill.worker  { background:var(--purple-dim); color:var(--purple); border:1px solid rgba(192,132,252,0.3); }
+.bus-pill.default { background:rgba(30,36,48,0.8); color:var(--dim); border:1px solid rgba(139,148,158,0.2); }
+.bus-pill .pill-arrow { color:var(--dim); font-size:10px; margin:0 2px; }
+
+.bus-lane-label {
+  position:absolute; left:8px; top:50%; transform:translateY(-50%);
+  font-size:10px; color:var(--dim); letter-spacing:1px; text-transform:uppercase;
+  z-index:3; font-weight:600;
+}
+
+/* ═══ WORKER ACTIVITY RIPPLE ═══ */
+.worker-card .wc-ripple {
+  position:absolute; width:40px; height:40px; border-radius:50%;
+  pointer-events:none; z-index:0;
+  animation:workerRipple 1s ease-out forwards;
+}
+@keyframes workerRipple {
+  0%   { transform:scale(0); opacity:0.6; }
+  100% { transform:scale(6); opacity:0; }
+}
+.wc-ripple.recv  { background:var(--gold); }
+.wc-ripple.done  { background:var(--green); }
+.wc-ripple.error { background:var(--red); }
+
+/* ═══ ENGINE HEARTBEAT ═══ */
+.engine-card.online {
+  animation:enginePulse 3s ease-in-out infinite;
+}
+@keyframes enginePulse {
+  0%,100% { box-shadow:0 0 0 rgba(74,222,128,0); }
+  50%     { box-shadow:0 0 8px rgba(74,222,128,0.15); }
+}
+.engine-card .engine-dot.online {
+  animation:dotPulse 2s ease-in-out infinite;
+}
+@keyframes dotPulse {
+  0%,100% { box-shadow:0 0 4px var(--green); }
+  50%     { box-shadow:0 0 10px var(--green), 0 0 20px rgba(74,222,128,0.3); }
+}
+
+/* ═══ TOPOLOGY NODE LABELS ═══ */
+.topo-label {
+  position:absolute; font-size:10px; font-weight:700; letter-spacing:1px;
+  color:var(--gold); text-transform:uppercase; pointer-events:none; z-index:2;
+  text-shadow:0 0 10px rgba(240,192,0,0.5);
+}
+
+/* ═══ MESSAGE FLASH ON FEED ═══ */
+.feed-line { animation:feedSlideIn 0.3s ease-out; }
+@keyframes feedSlideIn {
+  from { opacity:0; transform:translateX(-8px); }
+  to   { opacity:1; transform:translateX(0); }
+}
+
+/* ═══ METRICS STRIP GLOW ON UPDATE ═══ */
+.metric-value.flash {
+  animation:metricFlash 0.6s ease-out;
+}
+@keyframes metricFlash {
+  0%   { text-shadow:0 0 8px currentColor; transform:scale(1.15); }
+  100% { text-shadow:none; transform:scale(1); }
+}
+
+/* ═══ CONNECTION BEAM EFFECT ═══ */
+.conn-beam {
+  position:absolute; pointer-events:none; z-index:1;
+  width:2px; background:linear-gradient(to bottom, transparent, var(--gold), transparent);
+  opacity:0; animation:connBeam 2s ease-in-out;
+}
+@keyframes connBeam {
+  0%   { opacity:0; }
+  20%  { opacity:0.6; }
+  80%  { opacity:0.6; }
+  100% { opacity:0; }
+}
+
+/* ═══ ENGINE STATUS ═══ */
+.engine-panel { /* grid-area set inline */ }
+.engine-grid {
+  display:grid; grid-template-columns:repeat(auto-fill, minmax(130px, 1fr));
+  gap:4px; padding:4px;
+}
+.engine-card {
+  background:var(--elevated); border:1px solid var(--border2); border-radius:5px;
+  padding:5px 8px; border-left:3px solid var(--dim); transition:border-color 0.3s;
+}
+.engine-card.online  { border-left-color:var(--green); }
+.engine-card.offline { border-left-color:var(--red); }
+.engine-card.available { border-left-color:var(--gold); }
+.engine-name { font-size:11px; font-weight:600; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.engine-type { font-size:10px; color:var(--dim); margin-top:2px; }
+.engine-dot {
+  display:inline-block; width:6px; height:6px; border-radius:50%;
+  margin-right:4px; vertical-align:middle;
+}
+.engine-dot.online  { background:var(--green); box-shadow:0 0 6px var(--green); }
+.engine-dot.offline { background:var(--red); box-shadow:0 0 6px var(--red); }
+.engine-dot.available { background:var(--gold); box-shadow:0 0 6px var(--gold); }
+.engine-health-bar {
+  width:100%; height:4px; background:var(--border2); border-radius:2px;
+  margin-top:4px; overflow:hidden;
+}
+.engine-health-fill {
+  height:100%; background:var(--green); border-radius:2px;
+  transition:width 0.5s ease;
+}
+
+/* ═══ EMPTY STATE ═══ */
+.empty-state {
+  display:flex; align-items:center; justify-content:center; height:100%;
+  color:var(--dim); font-size:11px; font-style:italic;
+}
+
+/* ═══ TOOLTIP ═══ */
+.tooltip {
+  position:fixed; padding:6px 10px; background:var(--elevated);
+  border:1px solid var(--border2); border-radius:4px; font-size:11px;
+  color:var(--text); pointer-events:none; z-index:9999;
+  animation:fadeIn 0.15s; max-width:300px;
+}
+
+/* ═══ CONNECTION INDICATOR ═══ */
+.conn-dot {
+  width:7px; height:7px; border-radius:50%; display:inline-block;
+  transition:all 0.3s;
+}
+.conn-dot.connected { background:var(--green); box-shadow:0 0 6px var(--green); }
+.conn-dot.disconnected { background:var(--red); animation:pulse 1s infinite; }
+.conn-dot.connecting { background:var(--orange); animation:pulse 0.5s infinite; }
+
+/* ═══ IQ GAUGE ═══ */
+.iq-gauge {
+  display:flex; align-items:center; gap:8px; padding:4px 8px;
+}
+.iq-number {
+  font-size:36px; font-weight:800; font-family:'JetBrains Mono',monospace;
+  line-height:1; letter-spacing:-2px;
+}
+.iq-label { font-size:10px; color:var(--dim); text-transform:uppercase; }
+.iq-trend-arrow { font-size:18px; font-weight:700; }
+.iq-bar-track {
+  flex:1; height:8px; background:var(--border2); border-radius:4px;
+  overflow:hidden; min-width:60px;
+}
+.iq-bar-fill {
+  height:100%; border-radius:4px;
+  transition:width 0.8s ease, background 0.5s;
+}
+
+/* ═══ TASKS PANEL ═══ */
+.task-list { padding:4px; max-height:160px; overflow-y:auto; }
+.task-item {
+  display:flex; align-items:center; gap:6px;
+  padding:3px 6px; font-size:10px; border-bottom:1px solid var(--border);
+}
+.task-item:last-child { border-bottom:none; }
+.task-status {
+  display:inline-block; width:8px; height:8px; border-radius:50%;
+  flex-shrink:0;
+}
+.task-status.pending   { background:var(--gold); }
+.task-status.claimed   { background:var(--blue); animation:pulse 1s infinite; }
+.task-status.completed { background:var(--green); }
+.task-status.failed    { background:var(--red); }
+.task-summary-strip {
+  display:flex; gap:8px; padding:3px 8px; font-size:10px; color:var(--dim);
+  border-bottom:1px solid var(--border);
+}
+.task-summary-strip .ts-val { font-weight:700; font-family:var(--font-mono); }
+.task-id { font-family:var(--font-mono); color:var(--dim); font-size:10px; flex-shrink:0; }
+.task-desc { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text2); }
+.task-worker { font-size:10px; color:var(--cyan); font-weight:600; text-transform:uppercase; flex-shrink:0; }
+.task-age { font-size:10px; color:var(--dim); font-family:var(--font-mono); flex-shrink:0; min-width:32px; text-align:right; }
+.task-desc { flex:1; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.task-worker { color:var(--dim); font-size:10px; }
+
+/* ═══ BUS HEALTH ═══ */
+.bus-health-strip {
+  display:flex; align-items:center; gap:10px; padding:4px 8px;
+  font-size:10px; color:var(--dim); border-bottom:1px solid var(--border);
+}
+.bus-health-strip .bh-val { color:var(--text); font-weight:600; font-family:'JetBrains Mono',monospace; }
+
+/* ═══ CONVENE PANEL ═══ */
+.convene-item {
+  padding:4px 8px; font-size:10px; border-bottom:1px solid var(--border);
+}
+.convene-item .cv-topic { color:var(--cyan); font-weight:600; }
+.convene-item .cv-status { font-size:10px; padding:1px 5px; border-radius:3px; }
+.convene-item .cv-status.active { background:var(--green-dim); color:var(--green); }
+.convene-item .cv-status.resolved { background:var(--border2); color:var(--dim); }
+.convene-item .cv-participants { color:var(--dim); font-size:10px; margin-top:2px; }
+
+/* ═══ RESPONSIVE ═══ */
+@media (max-width: 1200px) {
+  .panel-grid {
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas:
+      "metrics  metrics"
+      "network  network"
+      "workers  workers"
+      "orch     bus"
+      "intel    tasks"
+      "engines  engines"
+      "killreq  killreq"
+      "godfeed  godfeed";
+    grid-template-rows: auto 110px 1fr auto auto auto auto auto;
+  }
+}
+@media (max-width: 768px) {
+  .panel-grid {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "metrics"
+      "network"
+      "workers"
+      "orch"
+      "bus"
+      "intel"
+      "tasks"
+      "engines"
+      "killreq"
+      "godfeed";
+    grid-template-rows: auto 80px auto auto auto auto auto auto auto auto;
+  }
+  .workers-grid { grid-template-columns: 1fr; }
+  .activity-bar { display:none; }
+  .topbar { flex-wrap:wrap; height:auto; padding:6px 10px; }
+  .cmdbar { flex-wrap:wrap; height:auto; padding:6px 10px; }
+  .cmd-input { min-width:0; }
+  .metrics-strip { flex-wrap:wrap; padding:6px; }
+  body { overflow-y:auto; }
+}
+
+/* ═══ KEYBOARD & FOCUS ═══ */
+[role="button"]:focus-visible,
+[role="tab"]:focus-visible,
+.ab-icon:focus-visible,
+.bus-tab:focus-visible,
+.orch-section-header:focus-visible,
+.cmd-btn:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 2px;
+  border-radius: var(--radius);
+}
+.cmd-input:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 0;
+}
+</style>
+</head>
+<body>
+
+<!-- ═══ PARTICLES ═══ -->
+<canvas id="particles"></canvas>
+
+<!-- ═══ TOP BAR ═══ -->
+<header class="topbar" role="banner">
+  <div class="topbar-left">
+    <div class="topbar-eye">👁</div>
+    <span class="topbar-title">GOD CONSOLE</span>
+    <span class="topbar-subtitle">SKYNET v2</span>
+  </div>
+  <div class="topbar-center">
+    <div class="topbar-status">
+      <span class="conn-dot disconnected" id="connDot"></span>
+      <span id="connLabel">Connecting…</span>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span class="topbar-uptime" id="uptimeLabel">—</span>
+    <span class="topbar-clock" id="clock">00:00:00</span>
+  </div>
+</header>
+<div class="cmdbar">
+  <div class="cmd-icon">⚡</div>
+  <div class="cmd-input-wrap">
+    <span class="cmd-prefix">›</span>
+    <input class="cmd-input" id="cmdInput" type="text" placeholder="Enter directive… (press Enter to dispatch)" autocomplete="off" spellcheck="false" aria-label="Dispatch command input">
+  </div>
+  <button class="cmd-btn" id="cmdBtn" onclick="sendDirective()" aria-label="Dispatch directive">⚡ DISPATCH</button>
+  <div class="cmd-history" id="cmdHistory"></div>
+</div>
+
+<!-- ═══ MAIN LAYOUT ═══ -->
+<div class="main-layout">
+
+  <!-- Activity Bar -->
+  <nav class="activity-bar" aria-label="Main navigation">
+    <div class="ab-icon active" title="Dashboard" data-panel="dashboard" role="button" tabindex="0" aria-label="Dashboard panel">📊</div>
+    <div class="ab-icon" title="Workers" data-panel="workers" role="button" tabindex="0" aria-label="Workers panel">🤖</div>
+    <div class="ab-icon" title="Bus Messages" data-panel="bus" role="button" tabindex="0" aria-label="Bus Messages panel">📡</div>
+    <div class="ab-icon" title="Orchestrator" data-panel="orch" role="button" tabindex="0" aria-label="Orchestrator panel">🧠</div>
+    <div class="ab-icon" title="Metrics" data-panel="metrics" role="button" tabindex="0" aria-label="Metrics panel">📈</div>
+    <div class="ab-spacer"></div>
+    <div class="ab-icon" title="Directives" id="abDirectives" role="button" tabindex="0" aria-label="Directives">📋<span class="badge" id="directiveBadge" style="display:none">0</span></div>
+    <div class="ab-icon" title="Kill Requests" id="abKillReq" style="position:relative" role="button" tabindex="0" aria-label="Kill Requests">☠️<span class="kill-badge" id="killReqHeaderBadge" style="display:none">0</span></div>
+    <div class="ab-icon" title="Settings" role="button" tabindex="0" aria-label="Settings">⚙️</div>
+  </nav>
+
+  <!-- Content -->
+  <div class="content-area">
+    <main class="panel-grid" aria-label="Dashboard panels">
+
+      <!-- ── Network Operations Band (topology + bus lane) ── -->
+      <div class="network-band">
+        <span class="network-band-label">🌐 NETWORK OPERATIONS</span>
+        <div class="network-band-legend">
+          <div class="leg"><div class="leg-dot" style="background:#f0c000"></div>DISPATCH</div>
+          <div class="leg"><div class="leg-dot" style="background:#4ade80"></div>RESULT</div>
+          <div class="leg"><div class="leg-dot" style="background:#22d3ee"></div>HEARTBEAT</div>
+          <div class="leg"><div class="leg-dot" style="background:#ff6b6b"></div>ERROR</div>
+          <div class="leg"><div class="leg-dot" style="background:#c084fc"></div>SUB-TASK</div>
+        </div>
+        <canvas id="networkCanvas"></canvas>
+        <div class="bus-lane" id="busLane">
+          <div class="bus-lane-track"></div>
+        </div>
+      </div>
+
+      <!-- ── Metrics Strip ── -->
+      <div class="metrics-strip">
+        <div class="metric-item">
+          <span class="metric-value" id="mWorkers" style="color:var(--blue)">0</span>
+          <span class="metric-label">Workers</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-value" id="mDispatched" style="color:var(--gold)">0</span>
+          <span class="metric-label">Dispatched</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-value" id="mCompleted" style="color:var(--green)">0</span>
+          <span class="metric-label">Completed</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-value" id="mFailed" style="color:var(--red)">0</span>
+          <span class="metric-label">Failed</span>
+        </div>
+        <div class="metric-item">
+          <div class="ring-chart" id="mSuccessRing">
+            <svg width="44" height="44" viewBox="0 0 44 44">
+              <circle cx="22" cy="22" r="18" fill="none" stroke="var(--border)" stroke-width="3"/>
+              <circle cx="22" cy="22" r="18" fill="none" stroke="var(--green)" stroke-width="3"
+                stroke-dasharray="113.1" stroke-dashoffset="113.1" stroke-linecap="round"
+                id="mSuccessArc" style="transition:stroke-dashoffset 0.6s ease"/>
+            </svg>
+            <div class="ring-chart-value" id="mSuccessRate" style="color:var(--green)">—</div>
+          </div>
+          <span class="metric-label">Success</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-value" id="mBusDepth" style="color:var(--cyan)">0</span>
+          <span class="metric-label">Bus Depth</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-value" id="mGoroutines" style="color:var(--purple)">0</span>
+          <span class="metric-label">Goroutines</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-value" id="mUptime" style="color:var(--text2)">0s</span>
+          <span class="metric-label">Uptime</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-value" id="mReqSec" style="color:var(--orange)">0</span>
+          <span class="metric-label">Req/s</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-value" id="mLatency" style="color:var(--purple)">0ms</span>
+          <span class="metric-label">Latency</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-value" id="mMemMB" style="color:var(--dim)">0</span>
+          <span class="metric-label">Mem MB</span>
+        </div>
+      </div>
+
+      <!-- ── Workers Panel ── -->
+      <div class="panel" style="grid-area: workers;">
+        <div class="panel-header">
+          <span class="panel-header-icon">🤖</span>
+          <span class="panel-header-title" style="color:var(--blue)">Worker Pool</span>
+          <span class="panel-header-badge" id="workerCountBadge" style="background:var(--blue-dim);color:var(--blue)">0</span>
+        </div>
+        <div class="panel-body">
+          <div class="workers-grid" id="workersGrid" aria-live="polite" aria-label="Worker status cards"></div>
+        </div>
+      </div>
+
+      <!-- ── Orchestrator Panel ── -->
+      <div class="panel" style="grid-area: orch;">
+        <div class="panel-header">
+          <span class="panel-header-icon">🧠</span>
+          <span class="panel-header-title" style="color:var(--purple)">Orchestrator</span>
+          <span class="panel-header-badge" id="orchBadge" style="background:var(--purple-dim);color:var(--purple)">0</span>
+        </div>
+        <div class="panel-body" id="orchFeed" aria-live="polite">
+          <div class="orch-typing" id="orchTyping" style="display:none">
+            <div class="orch-typing-dots"><span></span><span></span><span></span></div>
+            <span id="orchTypingText">Processing…</span>
+          </div>
+          <div id="orchDirectives" class="orch-section">
+            <div class="orch-section-header" onclick="toggleOrchSection('orchDirectivesBody')" role="button" tabindex="0" aria-label="Toggle Directives section" aria-expanded="true">
+              <span class="orch-arrow" id="orchDirectivesArrow">▼</span>
+              ⚡ Directives <span class="orch-section-count" id="orchDirectiveCount">0</span>
+            </div>
+            <div class="orch-section-body" id="orchDirectivesBody"></div>
+          </div>
+          <div id="orchThinking" class="orch-section">
+            <div class="orch-section-header" onclick="toggleOrchSection('orchThinkingBody')" role="button" tabindex="0" aria-label="Toggle Thinking section" aria-expanded="true">
+              <span class="orch-arrow" id="orchThinkingArrow">▼</span>
+              💭 Thinking <span class="orch-section-count" id="orchThinkingCount">0</span>
+            </div>
+            <div class="orch-section-body" id="orchThinkingBody"></div>
+          </div>
+          <div id="orchRouting" class="orch-section">
+            <div class="orch-section-header" onclick="toggleOrchSection('orchRoutingBody')" role="button" tabindex="0" aria-label="Toggle Routing section" aria-expanded="true">
+              <span class="orch-arrow" id="orchRoutingArrow">▼</span>
+              ▸ Routing <span class="orch-section-count" id="orchRoutingCount">0</span>
+            </div>
+            <div class="orch-section-body" id="orchRoutingBody"></div>
+          </div>
+          <div id="orchSystem" class="orch-section">
+            <div class="orch-section-header" onclick="toggleOrchSection('orchSystemBody')" role="button" tabindex="0" aria-label="Toggle System section" aria-expanded="true">
+              <span class="orch-arrow" id="orchSystemArrow">▼</span>
+              ♦ System <span class="orch-section-count" id="orchSystemCount">0</span>
+            </div>
+            <div class="orch-section-body" id="orchSystemBody"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Bus Panel ── -->
+      <div class="panel" style="grid-area: bus;">
+        <div class="panel-header">
+          <span class="panel-header-icon">📡</span>
+          <span class="panel-header-title" style="color:var(--cyan)">Message Bus</span>
+          <span class="panel-header-badge" id="busBadge" style="background:var(--cyan-dim);color:var(--cyan)">0</span>
+        </div>
+        <div class="bus-tabs" id="busTabs" role="tablist" aria-label="Bus message filters">
+          <div class="bus-tab active" data-topic="all" onclick="filterBusTopic('all')" role="tab" tabindex="0" aria-label="All messages" aria-selected="true">All</div>
+          <div class="bus-tab" data-topic="system" onclick="filterBusTopic('system')" role="tab" tabindex="0" aria-label="System messages">System</div>
+          <div class="bus-tab" data-topic="dispatch" onclick="filterBusTopic('dispatch')" role="tab" tabindex="0" aria-label="Dispatch messages">Dispatch</div>
+          <div class="bus-tab" data-topic="results" onclick="filterBusTopic('results')" role="tab" tabindex="0" aria-label="Result messages">Results</div>
+          <div class="bus-tab" data-topic="directives" onclick="filterBusTopic('directives')" role="tab" tabindex="0" aria-label="Directive messages">Directives</div>
+          <div class="bus-rate"><span>Rate:</span> <span class="bus-rate-value" id="busRate">0</span> <span>msg/s</span></div>
+        </div>
+        <div class="panel-body" id="busFeed" aria-live="polite">
+          <div class="empty-state">No bus messages yet…</div>
+        </div>
+      </div>
+
+      <!-- ── Intelligence Panel ── -->
+      <div class="panel" style="grid-area: intel;">
+        <div class="panel-header">
+          <span class="panel-header-icon">🧠</span>
+          <span class="panel-header-title" style="color:var(--cyan)">Intelligence</span>
+          <span class="panel-header-badge" id="iqBadge" style="background:rgba(34,211,238,0.15);color:var(--cyan)">--</span>
+        </div>
+        <div class="panel-body" style="padding:0">
+          <div class="iq-gauge">
+            <div>
+              <div class="iq-number" id="iqBigNumber" style="color:var(--cyan)">--</div>
+              <div class="iq-label">Collective IQ</div>
+            </div>
+            <span class="iq-trend-arrow" id="iqBigTrend"></span>
+            <div style="flex:1">
+              <div class="iq-bar-track">
+                <div class="iq-bar-fill" id="iqBarFill" style="width:0%;background:var(--cyan)"></div>
+              </div>
+              <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--dim);margin-top:2px">
+                <span>0</span><span>50</span><span>100</span>
+              </div>
+            </div>
+          </div>
+          <div class="bus-health-strip" id="busHealthStrip">
+            <span>Bus: <span class="bh-val" id="bhMsgCount">0</span> msgs</span>
+            <span>Rate: <span class="bh-val" id="bhRate">0</span>/min</span>
+            <span>Last: <span class="bh-val" id="bhLastMsg">--</span></span>
+          </div>
+          <div id="conveneList" style="max-height:60px;overflow-y:auto">
+            <div class="empty-state" style="height:auto;padding:4px;font-size:10px">No active convene sessions</div>
+      <div class="panel" style="grid-area: tasks;">
+        <div class="panel-header">
+          <span class="panel-header-icon">📋</span>
+          <span class="panel-header-title" style="color:var(--purple)">Task Queue</span>
+          <span class="panel-header-badge" id="taskBadge" style="background:var(--purple-dim);color:var(--purple)">0</span>
+        </div>
+        <div class="panel-body" style="padding:0">
+          <div class="task-list" id="taskList">
+            <div class="empty-state">No tasks in queue</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Engine Status Panel ── -->
+      <div class="panel engine-panel" style="grid-area: engines;">
+        <div class="panel-header">
+          <span class="panel-header-icon">⚙️</span>
+          <span class="panel-header-title" style="color:var(--green)">ScreenMemory Engines</span>
+          <div class="engine-health-bar" style="width:80px;margin-left:6px">
+            <div class="engine-health-fill" id="engineHealthFill" style="width:0%"></div>
+          </div>
+          <span style="font-size:10px;color:var(--dim);margin-left:4px" id="engineHealthPct">0%</span>
+          <span class="panel-header-badge" id="engineBadge" style="background:var(--green-dim);color:var(--green)">0</span>
+          <span style="margin-left:auto;font-size:10px;color:var(--cyan);font-weight:600" id="iqDisplay">IQ: --</span>
+          <span style="font-size:10px;color:var(--dim);margin-left:4px" id="iqTrend"></span>
+        </div>
+        <div class="panel-body" style="padding:3px">
+          <div class="engine-grid" id="engineGrid">
+            <div class="empty-state">Scanning engines…</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Kill Requests Panel (hidden when no requests) ── -->
+      <div class="panel kill-panel" id="killPanel" style="grid-area: killreq;">
+        <div class="panel-header">
+          <span class="panel-header-icon">☠️</span>
+          <span class="panel-header-title" style="color:var(--red)">Kill Requests — Consensus Required</span>
+          <span class="panel-header-badge" id="killBadge" style="background:rgba(239,68,68,0.2);color:var(--red)">0</span>
+        </div>
+        <div class="panel-body" id="killRequestsBody" style="padding:0">
+          <div class="empty-state">No pending kill requests</div>
+        </div>
+      </div>
+
+      <!-- ── Timeline (bottom) ── -->
+      <div class="panel timeline-panel" style="grid-area: godfeed;">
+        <div class="panel-header">
+          <span class="panel-header-icon">📜</span>
+          <span class="panel-header-title" style="color:var(--gold)">GOD Feed — Live Activity</span>
+          <span class="panel-header-badge" id="feedBadge" style="background:var(--gold-dim);color:var(--gold)">0</span>
+        </div>
+        <div class="panel-body" id="godFeed" style="max-height:70px;" aria-live="polite">
+          <div class="empty-state">System feed will appear here…</div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+</div>
+<div class="statusbar offline" id="statusbar">
+  <div class="sb-item"><span class="sb-icon">⚡</span> GOD Console v2</div>
+  <div class="sb-sep"></div>
+  <div class="sb-item" id="sbSkynet"><span class="sb-icon">🔴</span> SKYNET OFFLINE</div>
+  <div class="sb-sep"></div>
+  <div class="sb-item" id="sbWorkers">Workers: 0</div>
+  <div class="sb-sep"></div>
+  <div class="sb-item" id="sbTasks">Tasks: 0</div>
+  <div class="sb-sep"></div>
+  <div class="sb-item" id="sbBus">Bus: 0</div>
+  <div class="sb-spacer"></div>
+  <div class="sb-item" id="sbLatency">Latency: —</div>
+  <div class="sb-sep"></div>
+  <div class="sb-item" id="sbMem">Mem: —</div>
+  <div class="sb-sep"></div>
+  <div class="sb-item" id="sbVersion">v2.0.0</div>
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════
+   GOD CONSOLE v2 — Runtime Engine
+   Real-time SSE streaming + animated dashboard
+   ═══════════════════════════════════════════════════════════════════ */
+
+const SKYNET = 'http://localhost:8420';
+const FEED_MAX = 300;
+
+// ── State ──
+let state = {
+  connected: false,
+  agents: {},
+  orchThoughts: [],
+  busMessages: [],
+  godFeed: [],
+  metrics: {},
+  cmdHistory: [],
+  seenOrchIds: new Set(),
+  seenBusIds: new Set(),
+  seenFeedIds: new Set(),
+  workerLogSeen: {},
+  lastData: null,
+  sseRetries: 0,
+};
+
+// ── Particle System ──
+(function initParticles() {
+  const c = document.getElementById('particles');
+  const ctx = c.getContext('2d');
+  let particles = [];
+  const resize = () => { c.width = window.innerWidth; c.height = window.innerHeight; };
+  resize();
+  window.addEventListener('resize', resize);
+
+  for (let i = 0; i < 60; i++) {
+    particles.push({
+      x: Math.random() * c.width, y: Math.random() * c.height,
+      vx: (Math.random() - 0.5) * 0.3, vy: (Math.random() - 0.5) * 0.3,
+      r: Math.random() * 1.5 + 0.5, a: Math.random() * 0.3 + 0.1,
+    });
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, c.width, c.height);
+    for (const p of particles) {
+      p.x += p.vx; p.y += p.vy;
+      if (p.x < 0) p.x = c.width;
+      if (p.x > c.width) p.x = 0;
+      if (p.y < 0) p.y = c.height;
+      if (p.y > c.height) p.y = 0;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(240,192,0,${p.a})`;
+      ctx.fill();
+    }
+    // Connection lines
+    for (let i = 0; i < particles.length; i++) {
+      for (let j = i + 1; j < particles.length; j++) {
+        const dx = particles[i].x - particles[j].x;
+        const dy = particles[i].y - particles[j].y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        if (dist < 120) {
+          ctx.beginPath();
+          ctx.moveTo(particles[i].x, particles[i].y);
+          ctx.lineTo(particles[j].x, particles[j].y);
+          ctx.strokeStyle = `rgba(240,192,0,${0.05 * (1 - dist/120)})`;
+          ctx.stroke();
+        }
+      }
+    }
+    requestAnimationFrame(draw);
+  }
+  draw();
+})();
+
+// ── Clock ──
+setInterval(() => {
+  const now = new Date();
+  document.getElementById('clock').textContent = now.toLocaleTimeString('en-GB');
+}, 500);
+
+// ── Helpers ──
+function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+function fmt(ms) {
+  const s = Math.floor(ms); if (s < 60) return s+'s';
+  const m = Math.floor(s/60); if (m < 60) return m+'m '+s%60+'s';
+  const h = Math.floor(m/60); return h+'h '+m%60+'m';
+}
+function animateValue(el, newVal) {
+  const old = el.textContent;
+  if (old !== String(newVal)) {
+    el.textContent = newVal;
+    el.classList.remove('flash');
+    void el.offsetWidth;
+    el.classList.add('flash');
+  }
+}
+
+// ── SSE Connection ──
+let sse = null;
+function connectSSE() {
+  const dot = document.getElementById('connDot');
+  const label = document.getElementById('connLabel');
+  dot.className = 'conn-dot connecting';
+  label.textContent = 'Connecting…';
+
+  sse = new EventSource(SKYNET + '/stream');
+
+  sse.onopen = () => {
+    state.connected = true;
+    state.sseRetries = 0;
+    dot.className = 'conn-dot connected';
+    label.textContent = 'SSE LIVE';
+    document.getElementById('statusbar').classList.remove('offline');
+    document.getElementById('sbSkynet').innerHTML = '<span class="sb-icon">🟢</span> SKYNET ONLINE';
+    addGodFeed('system', 'SSE connection established', 'green');
+  };
+
+  sse.onmessage = (e) => {
+    try {
+      const d = JSON.parse(e.data);
+      state.lastData = d;
+      processUpdate(d);
+    } catch(err) {}
+  };
+
+  sse.onerror = () => {
+    state.connected = false;
+    dot.className = 'conn-dot disconnected';
+    label.textContent = 'Disconnected';
+    document.getElementById('statusbar').classList.add('offline');
+    document.getElementById('sbSkynet').innerHTML = '<span class="sb-icon">🔴</span> SKYNET OFFLINE';
+    sse.close();
+    state.sseRetries++;
+    const delay = Math.min(1000 * Math.pow(2, state.sseRetries), 10000);
+    setTimeout(connectSSE, delay);
+  };
+}
+
+// ── Process SSE Update ──
+function processUpdate(d) {
+  // Metrics
+  const dispatched = d.tasks_dispatched || 0;
+  const completed = d.tasks_completed || 0;
+  const failed = d.tasks_failed || 0;
+  const busDepth = d.bus_depth || 0;
+  const goroutines = d.goroutines || 0;
+  const uptime = d.uptime_s || 0;
+
+  animateValue(document.getElementById('mDispatched'), dispatched);
+  animateValue(document.getElementById('mCompleted'), completed);
+  animateValue(document.getElementById('mFailed'), failed);
+  animateValue(document.getElementById('mBusDepth'), busDepth);
+  animateValue(document.getElementById('mGoroutines'), goroutines);
+  document.getElementById('mUptime').textContent = fmt(uptime);
+  document.getElementById('uptimeLabel').textContent = 'Uptime: ' + fmt(uptime);
+
+  const rate = (completed + failed) > 0 ? Math.round(completed / (completed + failed) * 100) : 0;
+  document.getElementById('mSuccessRate').textContent = rate + '%';
+  // Ring chart arc
+  const arc = document.getElementById('mSuccessArc');
+  if (arc) { arc.style.strokeDashoffset = 113.1 * (1 - rate/100); }
+
+  // Status bar
+  document.getElementById('sbTasks').textContent = 'Tasks: ' + completed;
+  document.getElementById('sbBus').textContent = 'Bus: ' + busDepth;
+
+  // Workers
+  const agents = d.agents || {};
+  const names = Object.keys(agents).sort();
+  animateValue(document.getElementById('mWorkers'), names.length);
+  document.getElementById('workerCountBadge').textContent = names.length;
+  document.getElementById('sbWorkers').textContent = 'Workers: ' + names.length;
+  updateWorkers(agents);
+  window._lastAgents = Object.values(agents);
+
+  // Orchestrator
+  const thoughts = d.orch_thinking || [];
+  updateOrchestrator(thoughts);
+
+  // Bus
+  const bus = d.bus || [];
+  updateBus(bus);
+}
+
+// ── Workers ──
+function updateWorkers(agents) {
+  const grid = document.getElementById('workersGrid');
+  const names = Object.keys(agents).sort();
+
+  for (const name of names) {
+    const a = agents[name];
+    let card = document.getElementById('wc-' + name);
+
+    if (!card) {
+      card = document.createElement('div');
+      card.id = 'wc-' + name;
+      card.className = 'worker-card idle';
+      card.innerHTML = `
+        <div class="wc-header">
+          <div class="wc-dot idle" id="wcd-${name}"></div>
+          <span class="wc-name">${name.toUpperCase()}</span>
+          <span class="wc-chip idle" id="wcchip-${name}">IDLE</span>
+        </div>
+        <div class="wc-stats">
+          <div class="wc-stat"><span class="wc-stat-val" id="wcs-tasks-${name}" style="color:var(--green)">0</span><span class="wc-stat-lbl">Tasks</span></div>
+          <div class="wc-stat"><span class="wc-stat-val" id="wcs-errors-${name}" style="color:var(--red)">0</span><span class="wc-stat-lbl">Errors</span></div>
+          <div class="wc-stat"><span class="wc-stat-val" id="wcs-avg-${name}" style="color:var(--cyan)">—</span><span class="wc-stat-lbl">Avg ms</span></div>
+        </div>
+        <div class="wc-utilization">
+          <div class="wc-util-bar"><div class="wc-util-fill" id="wcutil-${name}" style="width:0"></div></div>
+          <span class="wc-util-label" id="wcutil-lbl-${name}">0%</span>
+        </div>
+        <div class="wc-task" id="wctask-${name}">No active task</div>
+        <div class="wc-progress"><div class="wc-progress-fill" id="wcprog-${name}" style="width:0"></div></div>
+        <div class="wc-queue" id="wcqueue-${name}">
+          <span style="font-size:10px;color:var(--dim)">Queue:</span>
+          <div class="wc-queue-blocks" id="wcqblocks-${name}"></div>
+        </div>
+        <div class="wc-heartbeat" id="wchb-${name}">
+          <div class="wc-hb-pulse" id="wchbdot-${name}"></div>
+          <span id="wchb-time-${name}">—</span>
+        </div>
+        <div class="wc-circuit" id="wccircuit-${name}"><span class="wc-circuit-icon">⚡</span> <span id="wccstate-${name}"></span></div>
+        <div class="wc-logs" id="wclogs-${name}"></div>
+      `;
+      grid.appendChild(card);
+      state.workerLogSeen[name] = new Set();
+    }
+
+    // Update state
+    const status = (a.status || 'OFFLINE').toLowerCase();
+    card.className = 'worker-card ' + status;
+    if (a.circuit_state === 'CIRCUIT_OPEN') card.className += ' circuit-open';
+
+    const dot = document.getElementById('wcd-' + name);
+    dot.className = 'wc-dot ' + status;
+
+    const chip = document.getElementById('wcchip-' + name);
+    chip.textContent = a.status || 'OFFLINE';
+    chip.className = 'wc-chip ' + status;
+
+    animateValue(document.getElementById('wcs-tasks-' + name), a.tasks_completed || 0);
+    animateValue(document.getElementById('wcs-errors-' + name), a.total_errors || 0);
+    document.getElementById('wcs-avg-' + name).textContent = a.avg_task_ms ? a.avg_task_ms.toFixed(1) : '—';
+
+    const taskEl = document.getElementById('wctask-' + name);
+    if (a.current_task) {
+      taskEl.textContent = '▶ ' + a.current_task;
+      taskEl.className = 'wc-task active';
+    } else {
+      taskEl.textContent = 'No active task';
+      taskEl.className = 'wc-task';
+    }
+
+    document.getElementById('wcprog-' + name).style.width = (a.progress || 0) + '%';
+
+    // Utilization bar — computed from real server data (busy_time / uptime)
+    const utilEl = document.getElementById('wcutil-' + name);
+    const utilLbl = document.getElementById('wcutil-lbl-' + name);
+    if (utilEl) {
+      // Server provides avg_task_ms and tasks_completed — estimate busy time
+      const totalBusyMs = (a.avg_task_ms || 0) * (a.tasks_completed || 0);
+      const uptimeMs = (a.uptime_s || 0) * 1000;
+      let busyRatio = 0;
+      if (uptimeMs > 0 && totalBusyMs > 0) {
+        busyRatio = Math.min(100, Math.round((totalBusyMs / uptimeMs) * 100));
+      } else if (a.status === 'WORKING') {
+        busyRatio = 1; // show minimal activity, not a fake 80%
+      }
+      utilEl.style.width = busyRatio + '%';
+      utilLbl.textContent = busyRatio + '%';
+      if (busyRatio > 70) utilEl.style.background = 'linear-gradient(90deg, var(--orange), var(--red))';
+      else if (busyRatio > 40) utilEl.style.background = 'linear-gradient(90deg, var(--green), var(--gold))';
+      else utilEl.style.background = '';
+    }
+
+    // Queue depth blocks
+    const qBlocks = document.getElementById('wcqblocks-' + name);
+    if (qBlocks) {
+      const depth = a.queue_depth || 0;
+      let html = '';
+      for (let i = 0; i < 8; i++) {
+        html += `<div class="wc-queue-block${i < depth ? ' filled' : ''}"></div>`;
+      }
+      qBlocks.innerHTML = html;
+    }
+
+    // Heartbeat
+    const hbDot = document.getElementById('wchbdot-' + name);
+    const hbTime = document.getElementById('wchb-time-' + name);
+    if (hbDot && a.last_heartbeat) {
+      hbTime.textContent = '♥ ' + a.last_heartbeat;
+      hbDot.className = 'wc-hb-pulse';
+    }
+
+    // Circuit breaker
+    const circuitEl = document.getElementById('wccircuit-' + name);
+    const circuitState = document.getElementById('wccstate-' + name);
+    if (a.circuit_state && a.circuit_state !== '') {
+      circuitEl.classList.add('visible');
+      circuitState.textContent = a.circuit_state + ' (' + a.consecutive_fails + ' fails)';
+    } else {
+      circuitEl.classList.remove('visible');
+    }
+
+    // Logs
+    const logs = a.recent_logs || [];
+    if (typeof logs === 'string') {
+      // Single log line
+      const logArr = [logs];
+      updateWorkerLogs(name, logArr);
+    } else {
+      updateWorkerLogs(name, logs);
+    }
+  }
+}
+
+function updateWorkerLogs(name, logs) {
+  const el = document.getElementById('wclogs-' + name);
+  if (!el) return;
+  const seen = state.workerLogSeen[name];
+
+  for (const log of logs) {
+    const id = log;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    if (seen.size > 200) {
+      const arr = [...seen]; seen.clear();
+      arr.slice(-100).forEach(x => seen.add(x));
+    }
+
+    const line = document.createElement('div');
+    line.className = 'wc-log-line';
+    if (log.includes('✓') || log.includes('success') || log.includes('completed')) line.className += ' success';
+    else if (log.includes('✗') || log.includes('error') || log.includes('Failed') || log.includes('ERROR')) line.className += ' error';
+    else if (log.includes('thinking') || log.includes('analyzing') || log.includes('THINKING')) line.className += ' thinking';
+    else if (log.includes('routing') || log.includes('dispatching') || log.includes('ROUTING')) line.className += ' routing';
+    line.textContent = log;
+    el.appendChild(line);
+  }
+  el.scrollTop = el.scrollHeight;
+}
+
+// ── Orchestrator (sectioned) ──
+let activeBusTopic = 'all';
+function toggleOrchSection(bodyId) {
+  const body = document.getElementById(bodyId);
+  const arrow = document.getElementById(bodyId.replace('Body','Arrow'));
+  if (body.style.display === 'none') { body.style.display = 'block'; if(arrow) arrow.textContent = '▼'; }
+  else { body.style.display = 'none'; if(arrow) arrow.textContent = '▶'; }
+}
+function classifyThought(t) {
+  const type = (t.type||'').toLowerCase();
+  const text = (t.text||'').toLowerCase();
+  if (type === 'directive' || text.includes('directive')) return 'directives';
+  if (type === 'route' || type === 'decide' || text.includes('routing') || text.includes('dispatch')) return 'routing';
+  if (type === 'system' || text.includes('system') || text.includes('heartbeat')) return 'system';
+  return 'thinking';
+}
+function updateOrchestrator(thoughts) {
+  const typing = document.getElementById('orchTyping');
+  let newCount = 0;
+
+  for (const t of thoughts) {
+    const id = t.id || (t.type + '__' + t.time + '__' + t.text);
+    if (state.seenOrchIds.has(id)) continue;
+    state.seenOrchIds.add(id);
+    newCount++;
+
+    const category = classifyThought(t);
+    const bodyId = 'orch' + category.charAt(0).toUpperCase() + category.slice(1) + 'Body';
+    const countId = 'orch' + (category === 'directives' ? 'Directive' : category === 'routing' ? 'Routing' : category === 'system' ? 'System' : 'Thinking') + 'Count';
+    const body = document.getElementById(bodyId);
+    const countEl = document.getElementById(countId);
+
+    if (body) {
+      let icon = '💭', cls = 'purple';
+      if (category === 'routing') { icon = '▸'; cls = 'cyan'; }
+      else if (category === 'system') { icon = '♦'; cls = 'green'; }
+      else if (category === 'directives') { icon = '⚡'; cls = 'gold'; }
+
+      const line = document.createElement('div');
+      line.className = 'feed-line ' + cls;
+      line.innerHTML = `<span class="feed-time">${esc(t.time||'')}</span><span class="feed-icon">${icon}</span><span class="feed-text">${esc(t.text||'')}</span>`;
+      body.appendChild(line);
+      while (body.children.length > 50) body.removeChild(body.firstChild);
+    }
+    if (countEl) countEl.textContent = body ? body.children.length : 0;
+
+    addGodFeed('orch', (t.text||''), category === 'directives' ? 'gold' : category === 'routing' ? 'cyan' : 'purple');
+  }
+
+  // Show typing indicator if any worker is WORKING
+  if (typing && window._lastAgents) {
+    const anyWorking = window._lastAgents.some(a => a.status === 'WORKING');
+    typing.style.display = anyWorking ? 'flex' : 'none';
+    if (anyWorking) {
+      const workingNames = window._lastAgents.filter(a => a.status === 'WORKING').map(a => a.name.toUpperCase());
+      document.getElementById('orchTypingText').textContent = workingNames.join(', ') + ' processing…';
+    }
+  }
+
+  if (newCount) {
+    const badge = document.getElementById('orchBadge');
+    badge.textContent = state.seenOrchIds.size;
+  }
+}
+
+// ── Bus (with topic filtering + rate) ──
+let busRateHistory = [];
+function filterBusTopic(topic) {
+  activeBusTopic = topic;
+  document.querySelectorAll('.bus-tab').forEach(t => t.classList.toggle('active', t.dataset.topic === topic));
+  const feed = document.getElementById('busFeed');
+  Array.from(feed.children).forEach(el => {
+    if (topic === 'all') { el.style.display = ''; return; }
+    const elTopic = el.dataset.topic || '';
+    el.style.display = elTopic.includes(topic) ? '' : 'none';
+  });
+}
+const senderColors = { alpha:'blue', beta:'purple', gamma:'pink', delta:'red', orchestrator:'purple', system:'green' };
+function updateBus(messages) {
+  const feed = document.getElementById('busFeed');
+  let newCount = 0;
+
+  for (const m of messages) {
+    const id = m.id || (m.sender + '__' + m.content);
+    if (state.seenBusIds.has(id)) continue;
+    state.seenBusIds.add(id);
+    newCount++;
+    busRateHistory.push(Date.now());
+
+    if (feed.querySelector('.empty-state')) feed.innerHTML = '';
+
+    const sender = m.sender || '?';
+    const cls = senderColors[sender] || 'cyan';
+    const ts = m.timestamp ? new Date(m.timestamp).toLocaleTimeString('en-GB') : '';
+    const topic = (m.topic || m.content || '').toLowerCase();
+
+    const line = document.createElement('div');
+    line.className = 'feed-line ' + cls;
+    line.dataset.topic = topic;
+    line.innerHTML = `
+      <span class="feed-time">${esc(ts)}</span>
+      <span class="feed-sender" style="background:var(--${cls}-dim);color:var(--${cls})">${esc(sender)}</span>
+      <span class="feed-text">${esc(m.content||'')}</span>
+    `;
+    // Respect active filter
+    if (activeBusTopic !== 'all' && !topic.includes(activeBusTopic)) line.style.display = 'none';
+    feed.appendChild(line);
+  }
+
+  if (newCount) {
+    feed.scrollTop = feed.scrollHeight;
+    const badge = document.getElementById('busBadge');
+    badge.textContent = state.seenBusIds.size;
+  }
+
+  // Trim
+  while (feed.children.length > FEED_MAX) feed.removeChild(feed.firstChild);
+
+  // Update message rate (msgs in last 10 seconds)
+  const now = Date.now();
+  busRateHistory = busRateHistory.filter(t => now - t < 10000);
+  const rateEl = document.getElementById('busRate');
+  if (rateEl) rateEl.textContent = (busRateHistory.length / 10).toFixed(1);
+}
+
+// ── GOD Feed ──
+function addGodFeed(type, text, cls = 'text') {
+  const feed = document.getElementById('godFeed');
+  if (feed.querySelector('.empty-state')) feed.innerHTML = '';
+
+  const now = new Date().toLocaleTimeString('en-GB');
+  const icons = { system:'⚙', directive:'⚡', orch:'🧠', bus:'📡', error:'🔴' };
+  const icon = icons[type] || '•';
+
+  const line = document.createElement('div');
+  line.className = 'feed-line ' + cls;
+  line.innerHTML = `<span class="feed-time">${now}</span><span class="feed-icon">${icon}</span><span class="feed-text">${esc(text)}</span>`;
+  feed.appendChild(line);
+  feed.scrollTop = feed.scrollHeight;
+
+  // Badge counts only server-sourced events (orch, bus, directive responses), not local UI messages
+  if (type !== 'system') {
+    const badge = document.getElementById('feedBadge');
+    badge.textContent = parseInt(badge.textContent || 0) + 1;
+  }
+
+  while (feed.children.length > FEED_MAX) feed.removeChild(feed.firstChild);
+}
+
+// ── Directives ──
+function sendDirective() {
+  const input = document.getElementById('cmdInput');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+
+  addGodFeed('directive', text, 'gold');
+
+  // Add to history chips
+  state.cmdHistory.unshift(text);
+  if (state.cmdHistory.length > 10) state.cmdHistory.pop();
+  renderCmdHistory();
+
+  // POST to Skynet
+  fetch(SKYNET + '/directive', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ goal: text, priority: 1 }),
+  }).then(r => {
+    if (r.ok) addGodFeed('system', 'Directive dispatched: "' + text + '"', 'green');
+    else addGodFeed('error', 'Directive failed (HTTP ' + r.status + ')', 'red');
+  }).catch(() => {
+    addGodFeed('error', 'Directive failed — Skynet offline?', 'red');
+  });
+}
+
+function renderCmdHistory() {
+  const el = document.getElementById('cmdHistory');
+  el.innerHTML = '';
+  for (const cmd of state.cmdHistory) {
+    const chip = document.createElement('div');
+    chip.className = 'cmd-chip';
+    chip.textContent = cmd.length > 30 ? cmd.slice(0,27) + '…' : cmd;
+    chip.title = cmd;
+    chip.onclick = () => { document.getElementById('cmdInput').value = cmd; };
+    el.appendChild(chip);
+  }
+}
+
+document.getElementById('cmdInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendDirective();
+});
+
+// ── GOD Feed Polling (supplements SSE) ──
+let lastFeedLen = 0;
+async function pollGodFeed() {
+  try {
+    const r = await fetch(SKYNET + '/god_feed');
+    if (!r.ok) return;
+    const data = await r.json();
+    if (!Array.isArray(data)) return;
+
+    for (let i = 0; i < data.length; i++) {
+      const item = data[i];
+      const id = (item.type||'') + '__' + (item.time||'') + '__' + i;
+      if (state.seenFeedIds.has(id)) continue;
+      state.seenFeedIds.add(id);
+
+      const type = item.type || '';
+      const text = item.text || '';
+      let cls = 'text';
+      if (type === 'god_prompt') cls = 'gold';
+      else if (type.startsWith('orch')) cls = 'purple';
+      addGodFeed(type.includes('god') ? 'directive' : 'orch', text, cls);
+    }
+  } catch(e) {}
+}
+setInterval(pollGodFeed, 3000);
+
+// ── Metrics Polling ──
+async function pollMetrics() {
+  try {
+    const r = await fetch(SKYNET + '/metrics');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d.mem_alloc_mb) {
+      document.getElementById('sbMem').textContent = 'Mem: ' + d.mem_alloc_mb.toFixed(1) + 'MB';
+      document.getElementById('mMemMB').textContent = d.mem_alloc_mb.toFixed(1);
+    }
+    if (d.avg_latency_us) {
+      const latMs = (d.avg_latency_us/1000).toFixed(1);
+      document.getElementById('sbLatency').textContent = 'Latency: ' + latMs + 'ms';
+      document.getElementById('mLatency').textContent = latMs + 'ms';
+    }
+    if (d.requests_per_sec !== undefined) {
+      document.getElementById('mReqSec').textContent = d.requests_per_sec.toFixed(1);
+    }
+  } catch(e) {}
+}
+setInterval(pollMetrics, 5000);
+
+// ── Engine Status ──
+async function pollEngines() {
+  try {
+    const r = await fetch('http://localhost:8421/engines');
+    if (!r.ok) return;
+    const data = await r.json();
+    updateEnginePanel(data);
+  } catch(e) {}
+}
+function updateEnginePanel(data) {
+  const raw = data.engines || data;
+  const engines = Array.isArray(raw) ? raw : Object.entries(raw).map(([k,v]) => ({key:k, ...v}));
+  const grid = document.getElementById('engineGrid');
+  const badge = document.getElementById('engineBadge');
+  const pct = document.getElementById('engineHealthPct');
+  const fill = document.getElementById('engineHealthFill');
+  if (!grid) return;
+  const sorted = [...engines].sort((a,b) => {
+    const order = {online:0, available:1, offline:2};
+    return (order[a.status]||2) - (order[b.status]||2);
+  });
+  const onlineCount = engines.filter(e => e.status === 'online').length;
+  const total = engines.length || 1;
+  const healthPct = Math.round((onlineCount / total) * 100);
+  badge.textContent = onlineCount + '/' + engines.length;
+  if (pct) pct.textContent = healthPct + '%';
+  if (fill) fill.style.width = healthPct + '%';
+  grid.innerHTML = sorted.map(e => {
+    const s = e.status || 'offline';
+    return '<div class="engine-card ' + s + '">' +
+      '<div class="engine-name"><span class="engine-dot ' + s + '"></span>' + (e.name||'unknown') + '</div>' +
+      '<div class="engine-type">' + (e.type||e.module||'engine') + '</div>' +
+    '</div>';
+  }).join('');
+}
+pollEngines();
+setInterval(pollEngines, 5000);
+
+// ── Self-Awareness IQ ──
+async function pollIQ() {
+  try {
+    const r = await fetch('http://localhost:8421/skynet/self/pulse');
+    if (!r.ok) return;
+    const d = await r.json();
+    // intelligence_score is already 0-100 integer from god_console.py
+    const iq = typeof d.intelligence_score === 'object' ? d.intelligence_score.score : (d.intelligence_score || 0);
+    const trend = typeof d.intelligence_score === 'object' ? d.intelligence_score.trend : (d.iq_trend || '');
+
+    // Header compact display
+    const iqEl = document.getElementById('iqDisplay');
+    const trendEl = document.getElementById('iqTrend');
+    if (iqEl) {
+      iqEl.textContent = 'IQ: ' + iq;
+      iqEl.style.color = iq >= 70 ? 'var(--green)' : iq >= 40 ? 'var(--gold)' : 'var(--red)';
+    }
+    if (trendEl && trend) {
+      const arrows = {rising:'↑', falling:'↓', stable:'→'};
+      const colors = {rising:'var(--green)', falling:'var(--red)', stable:'var(--dim)'};
+      trendEl.textContent = arrows[trend] || '';
+      trendEl.style.color = colors[trend] || 'var(--dim)';
+    }
+
+    // Big gauge display
+    const bigNum = document.getElementById('iqBigNumber');
+    const bigTrend = document.getElementById('iqBigTrend');
+    const iqBar = document.getElementById('iqBarFill');
+    const iqBadge = document.getElementById('iqBadge');
+    if (bigNum) {
+      bigNum.textContent = iq;
+      bigNum.style.color = iq >= 70 ? 'var(--green)' : iq >= 40 ? 'var(--gold)' : 'var(--red)';
+    }
+    if (bigTrend && trend) {
+      const arrows = {rising:'▲', falling:'▼', stable:'●'};
+      const colors = {rising:'var(--green)', falling:'var(--red)', stable:'var(--dim)'};
+      bigTrend.textContent = arrows[trend] || '';
+      bigTrend.style.color = colors[trend] || 'var(--dim)';
+    }
+    if (iqBar) {
+      iqBar.style.width = Math.min(iq, 100) + '%';
+      iqBar.style.background = iq >= 70 ? 'var(--green)' : iq >= 40 ? 'var(--gold)' : 'var(--red)';
+    }
+    if (iqBadge) iqBadge.textContent = iq;
+
+    // Convene sessions
+    const sessions = d.convene_sessions || [];
+    updateConvene(sessions);
+  } catch(e) {}
+}
+
+function updateConvene(sessions) {
+  const el = document.getElementById('conveneList');
+  if (!el) return;
+  if (!sessions.length) {
+    el.innerHTML = '<div class="empty-state" style="height:auto;padding:4px;font-size:10px">No active convene sessions</div>';
+    return;
+  }
+  el.innerHTML = sessions.map(s => {
+    const status = s.status || 'active';
+    const parts = (s.participants || []).join(', ');
+    return '<div class="convene-item">' +
+      '<span class="cv-topic">' + (s.topic||'untitled') + '</span> ' +
+      '<span class="cv-status ' + status + '">' + status + '</span>' +
+      '<div class="cv-participants">👥 ' + parts + '</div>' +
+    '</div>';
+  }).join('');
+}
+
+// ── Bus Health ──
+async function pollBusHealth() {
+  try {
+    const [healthR, msgsR] = await Promise.all([
+      fetch(SKYNET + '/health'),
+      fetch(SKYNET + '/bus/messages?limit=1')
+    ]);
+    if (healthR.ok) {
+      const h = await healthR.json();
+      const count = h.bus_depth || 0;
+      const uptime = h.uptime_s || 0;
+      const rate = uptime > 0 ? Math.round(count / (uptime / 60)) : 0;
+      document.getElementById('bhMsgCount').textContent = count;
+      document.getElementById('bhRate').textContent = rate;
+    }
+    if (msgsR.ok) {
+      const msgs = await msgsR.json();
+      if (msgs.length > 0) {
+        const ts = msgs[0].timestamp || '';
+        const parts = ts.split('T');
+        document.getElementById('bhLastMsg').textContent = parts[1] ? parts[1].substring(0,8) : ts.substring(0,19);
+      }
+    }
+  } catch(e) {}
+}
+
+// ── Task Queue ──
+async function pollTasks() {
+  try {
+    const r = await fetch(SKYNET + '/bus/tasks?all=true');
+    if (!r.ok) return;
+    const tasks = await r.json();
+    const el = document.getElementById('taskList');
+    const badge = document.getElementById('taskBadge');
+    if (!el) return;
+    if (!Array.isArray(tasks) || !tasks.length) {
+      el.innerHTML = '<div class="empty-state">No tasks in queue</div>';
+      if (badge) badge.textContent = '0';
+      return;
+    }
+    // Sort: pending/claimed first, then by created_at desc
+    const statusOrder = {pending:0, claimed:1, completed:2, failed:3};
+    tasks.sort((a,b) => {
+      const sa = statusOrder[a.status] ?? 2, sb = statusOrder[b.status] ?? 2;
+      if (sa !== sb) return sa - sb;
+      return new Date(b.created_at) - new Date(a.created_at);
+    });
+    const counts = {total:tasks.length, pending:0, claimed:0, completed:0, failed:0};
+    tasks.forEach(t => { counts[t.status] = (counts[t.status]||0) + 1; });
+    const active = counts.pending + counts.claimed;
+    if (badge) badge.textContent = active || tasks.length;
+
+    const now = Date.now();
+    const ageStr = (iso) => {
+      if (!iso) return '--';
+      const ms = now - new Date(iso).getTime();
+      if (ms < 60000) return Math.round(ms/1000) + 's';
+      if (ms < 3600000) return Math.round(ms/60000) + 'm';
+      return Math.round(ms/3600000) + 'h';
+    };
+
+    const summary = '<div class="task-summary-strip">' +
+      '<span>Total: <span class="ts-val">' + counts.total + '</span></span>' +
+      '<span style="color:var(--gold)">Pending: <span class="ts-val">' + counts.pending + '</span></span>' +
+      '<span style="color:var(--blue)">Claimed: <span class="ts-val">' + counts.claimed + '</span></span>' +
+      '<span style="color:var(--green)">Done: <span class="ts-val">' + counts.completed + '</span></span>' +
+      '<span style="color:var(--red)">Failed: <span class="ts-val">' + counts.failed + '</span></span>' +
+    '</div>';
+
+    el.innerHTML = summary + tasks.slice(0, 50).map(t => {
+      const status = t.status || 'pending';
+      const desc = t.task || t.description || t.content || 'unnamed';
+      const worker = t.claimed_by || t.source || '';
+      const id = t.id || '?';
+      const age = ageStr(t.created_at);
+      return '<div class="task-item">' +
+        '<span class="task-status ' + status + '" title="' + status + '"></span>' +
+        '<span class="task-id">' + id + '</span>' +
+        '<span class="task-desc" title="' + desc.replace(/"/g,'&quot;') + '">' + desc.substring(0,60) + '</span>' +
+        (worker ? '<span class="task-worker">' + worker + '</span>' : '') +
+        '<span class="task-age">' + age + '</span>' +
+      '</div>';
+    }).join('');
+  } catch(e) {}
+}
+
+// Also try /bus/convene directly for richer data
+async function pollConvene() {
+  try {
+    const r = await fetch(SKYNET + '/bus/convene');
+    if (!r.ok) return;
+    const sessions = await r.json();
+    if (Array.isArray(sessions) && sessions.length) {
+      updateConvene(sessions);
+    }
+  } catch(e) {}
+}
+
+pollIQ();
+pollBusHealth();
+pollTasks();
+pollConvene();
+setInterval(pollIQ, 15000);
+setInterval(pollBusHealth, 10000);
+setInterval(pollTasks, 3000);
+setInterval(pollConvene, 15000);
+
+// ── Activity Bar Click ──
+document.querySelectorAll('.ab-icon[data-panel]').forEach(icon => {
+  icon.addEventListener('click', () => {
+    document.querySelectorAll('.ab-icon').forEach(i => i.classList.remove('active'));
+    icon.classList.add('active');
+  });
+});
+
+// ── Keyboard Shortcuts ──
+document.addEventListener('keydown', (e) => {
+  // Ctrl+K: Focus command input
+  if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+    e.preventDefault();
+    document.getElementById('cmdInput').focus();
+  }
+  // Ctrl+Shift+P: Command palette style focus
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'P') {
+    e.preventDefault();
+    document.getElementById('cmdInput').focus();
+  }
+  // Enter/Space on role=button and role=tab triggers click
+  if (e.key === 'Enter' || e.key === ' ') {
+    const t = e.target;
+    if (t.getAttribute('role') === 'button' || t.getAttribute('role') === 'tab') {
+      e.preventDefault();
+      t.click();
+    }
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// ANIMATION ENGINE — Network Topology, Bus Lane, Activity Ripples
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Network Topology (Canvas overlay) ──
+const topoState = {
+  nodes: {},         // {id: {x, y, r, color, label, status}}
+  particles: [],     // {x, y, fromId, toId, progress, speed, color}
+  edges: [],         // {from, to}
+  lastWorkers: {},
+  lastBus: [],
+  busPillQueue: [],  // queued bus pills for lane animation
+};
+
+function initTopology() {
+  const canvas = document.getElementById('networkCanvas');
+  if (!canvas) return;
+  const band = canvas.parentElement;
+  const resize = () => {
+    canvas.width = band.offsetWidth;
+    canvas.height = band.offsetHeight;
+    layoutTopoNodes();
+  };
+  resize();
+  window.addEventListener('resize', resize);
+  requestAnimationFrame(drawTopology);
+}
+
+// Convert a hex color to rgba with alpha (0-1)
+function hexAlpha(hex, alpha) {
+  const c = hex.replace('#','');
+  const r = parseInt(c.substring(0,2), 16);
+  const g = parseInt(c.substring(2,4), 16);
+  const b = parseInt(c.substring(4,6), 16);
+  return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
+}
+
+function layoutTopoNodes() {
+  const canvas = document.getElementById('networkCanvas');
+  if (!canvas) return;
+  const W = canvas.width, H = canvas.height;
+  const cy = H * 0.42; // center line above bus lane
+
+  // Orchestrator at center
+  topoState.nodes['orch'] = {
+    x: W / 2, y: cy, r: 16,
+    color: '#f0c000', glowColor: 'rgba(240,192,0,0.3)',
+    label: 'ORCHESTRATOR', status: 'online'
+  };
+
+  // Workers spaced evenly on either side
+  const spacing = W / 6;
+  const positions = {
+    alpha: { x: spacing,       y: cy - 12 },
+    beta:  { x: spacing * 2,   y: cy + 12 },
+    gamma: { x: W - spacing * 2, y: cy + 12 },
+    delta: { x: W - spacing,   y: cy - 12 },
+  };
+  const colors = {
+    alpha: '#60a5fa', beta: '#c084fc',
+    gamma: '#f472b6', delta: '#fb923c',
+  };
+  for (const [name, pos] of Object.entries(positions)) {
+    topoState.nodes[name] = {
+      x: pos.x, y: pos.y, r: 10,
+      color: colors[name] || '#60a5fa',
+      glowColor: hexAlpha(colors[name] || '#60a5fa', 0.25),
+      label: name.toUpperCase(), status: 'idle'
+    };
+    if (!topoState.edges.find(e => e.from === 'orch' && e.to === name)) {
+      topoState.edges.push({ from: 'orch', to: name });
+    }
+  }
+  // Add inter-worker mesh edges (for worker-to-worker particle flow)
+  const workerNames = Object.keys(positions);
+  for (let i = 0; i < workerNames.length; i++) {
+    for (let j = i + 1; j < workerNames.length; j++) {
+      const a = workerNames[i], b = workerNames[j];
+      if (!topoState.edges.find(e => (e.from === a && e.to === b) || (e.from === b && e.to === a))) {
+        topoState.edges.push({ from: a, to: b });
+      }
+    }
+  }
+}
+
+function drawTopology() {
+  const canvas = document.getElementById('networkCanvas');
+  if (!canvas || canvas.width === 0) { requestAnimationFrame(drawTopology); return; }
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const now = Date.now();
+
+  // Draw edges with animated dash (bezier curves)
+  for (const edge of topoState.edges) {
+    const from = topoState.nodes[edge.from];
+    const to = topoState.nodes[edge.to];
+    if (!from || !to) continue;
+
+    // Inter-worker edges are more subtle than orch edges
+    const isWorkerEdge = edge.from !== 'orch' && edge.to !== 'orch';
+    const opA = isWorkerEdge ? 0.08 : 0.25;
+    const opM = isWorkerEdge ? 0.03 : 0.08;
+
+    const gradient = ctx.createLinearGradient(from.x, from.y, to.x, to.y);
+    gradient.addColorStop(0, hexAlpha(from.color, opA));
+    gradient.addColorStop(0.5, hexAlpha(from.color, opM));
+    gradient.addColorStop(1, hexAlpha(to.color, opA));
+
+    // Bezier control point (arc upward)
+    const mx = (from.x + to.x) / 2;
+    const my = Math.min(from.y, to.y) - (isWorkerEdge ? 10 : 20);
+
+    ctx.beginPath();
+    ctx.moveTo(from.x, from.y);
+    ctx.quadraticCurveTo(mx, my, to.x, to.y);
+    ctx.strokeStyle = gradient;
+    ctx.lineWidth = isWorkerEdge ? 0.6 : 1.2;
+    ctx.setLineDash([4, 6]);
+    ctx.lineDashOffset = -(now / 40) % 10;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Draw particles along edges
+  for (let i = topoState.particles.length - 1; i >= 0; i--) {
+    const p = topoState.particles[i];
+    p.progress += p.speed;
+    if (p.progress > 1) {
+      topoState.particles.splice(i, 1);
+      continue;
+    }
+
+    const from = topoState.nodes[p.fromId];
+    const to = topoState.nodes[p.toId];
+    if (!from || !to) continue;
+
+    // Follow bezier curve
+    const t = p.progress;
+    const mx = (from.x + to.x) / 2;
+    const my = Math.min(from.y, to.y) - 20;
+    const x = (1-t)*(1-t)*from.x + 2*(1-t)*t*mx + t*t*to.x;
+    const y = (1-t)*(1-t)*from.y + 2*(1-t)*t*my + t*t*to.y;
+
+    // Glow (sized by importance)
+    const glowR = p.msgType === 'error' ? 9 : (p.msgType === 'dispatch' ? 8 : 6);
+    ctx.beginPath();
+    ctx.arc(x, y, glowR, 0, Math.PI * 2);
+    ctx.fillStyle = hexAlpha(p.color, 0.15);
+    ctx.fill();
+
+    // Core particle
+    const coreR = p.msgType === 'heartbeat' ? 2 : 3;
+    ctx.beginPath();
+    ctx.arc(x, y, coreR, 0, Math.PI * 2);
+    ctx.fillStyle = p.color;
+    ctx.fill();
+
+    // Label above particle
+    if (p.label && p.progress > 0.1 && p.progress < 0.9) {
+      ctx.font = '600 6px Inter, sans-serif';
+      ctx.fillStyle = hexAlpha(p.color, 0.9);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText(p.label, x, y - coreR - 3);
+    }
+
+    // Trail
+    const tb = Math.max(0, t - 0.06);
+    const tx = (1-tb)*(1-tb)*from.x + 2*(1-tb)*tb*mx + tb*tb*to.x;
+    const ty = (1-tb)*(1-tb)*from.y + 2*(1-tb)*tb*my + tb*tb*to.y;
+    const trailGrad = ctx.createLinearGradient(tx, ty, x, y);
+    trailGrad.addColorStop(0, 'transparent');
+    trailGrad.addColorStop(1, hexAlpha(p.color, 0.37));
+    ctx.beginPath();
+    ctx.moveTo(tx, ty);
+    ctx.lineTo(x, y);
+    ctx.strokeStyle = trailGrad;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+
+  // Draw nodes
+  for (const [id, node] of Object.entries(topoState.nodes)) {
+    // Glow ring
+    const glowSize = node.status === 'working' ? 6 + Math.sin(now / 200) * 3 : 3;
+    ctx.beginPath();
+    ctx.arc(node.x, node.y, node.r + glowSize, 0, Math.PI * 2);
+    ctx.fillStyle = node.glowColor || 'rgba(255,255,255,0.05)';
+    ctx.fill();
+
+    // Core circle
+    ctx.beginPath();
+    ctx.arc(node.x, node.y, node.r, 0, Math.PI * 2);
+    const nodeGrad = ctx.createRadialGradient(node.x - 3, node.y - 3, 0, node.x, node.y, node.r);
+    nodeGrad.addColorStop(0, node.color);
+    nodeGrad.addColorStop(1, hexAlpha(node.color, 0.5));
+    ctx.fillStyle = nodeGrad;
+    ctx.fill();
+
+    // Border
+    ctx.beginPath();
+    ctx.arc(node.x, node.y, node.r, 0, Math.PI * 2);
+    ctx.strokeStyle = hexAlpha(node.color, 0.5);
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Label
+    ctx.font = '700 8px Inter, sans-serif';
+    ctx.fillStyle = node.color;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    ctx.fillText(node.label, node.x, node.y + node.r + 6);
+
+    // Pulse ring for working nodes
+    if (node.status === 'working') {
+      const pulsePhase = (now % 2000) / 2000;
+      const pulseR = node.r + pulsePhase * 25;
+      const pulseAlpha = 0.4 * (1 - pulsePhase);
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, pulseR, 0, Math.PI * 2);
+      ctx.strokeStyle = hexAlpha(node.color, pulseAlpha);
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  }
+
+  requestAnimationFrame(drawTopology);
+}
+
+// Message type → color and label mapping
+const MSG_STYLE = {
+  dispatch:  { color: '#f0c000', label: 'DSP' },
+  result:    { color: '#4ade80', label: 'RES' },
+  heartbeat: { color: '#22d3ee', label: 'HB'  },
+  error:     { color: '#ff6b6b', label: 'ERR' },
+  'sub-task':{ color: '#c084fc', label: 'SUB' },
+  alert:     { color: '#ff6b6b', label: 'ALT' },
+  request:   { color: '#c084fc', label: 'REQ' },
+  default:   { color: '#8b949e', label: 'MSG' },
+};
+
+function classifyMsgType(topic, type, content) {
+  if (type === 'heartbeat') return 'heartbeat';
+  if (type === 'error' || type === 'alert') return 'error';
+  if (type === 'result') return 'result';
+  if (type === 'directive' || type === 'dispatch' || topic === 'dispatch') return 'dispatch';
+  if (type === 'sub-task' || type === 'request') return 'sub-task';
+  if (content && /error|fail|crash|exception/i.test(content)) return 'error';
+  if (content && /dispatch|task|assign/i.test(content)) return 'dispatch';
+  if (content && /result|done|complete/i.test(content)) return 'result';
+  return 'default';
+}
+
+function resolveMsgTarget(sender, topic, content) {
+  const workers = ['alpha','beta','gamma','delta'];
+  if (topic === 'orchestrator') return 'orch';
+  if (workers.includes(topic)) return topic;
+  // Check content for worker mentions
+  if (content) {
+    const lc = content.toLowerCase();
+    for (const w of workers) { if (lc.includes(w)) return w; }
+  }
+  if (sender === 'orchestrator' || sender === 'system') {
+    return workers.find(w => topoState.nodes[w]) || 'orch';
+  }
+  return 'orch';
+}
+
+function spawnTopoParticle(fromId, toId, color, msgType) {
+  const style = MSG_STYLE[msgType] || MSG_STYLE.default;
+  topoState.particles.push({
+    fromId, toId,
+    progress: 0,
+    speed: 0.008 + Math.random() * 0.006,
+    color: color || style.color,
+    msgType: msgType || 'default',
+    label: style.label
+  });
+}
+
+// ── Bus Lane Animation ──
+function spawnBusPill(sender, content, topic, msgType, targetId) {
+  const lane = document.getElementById('busLane');
+  if (!lane) return;
+
+  const mType = msgType || classifyMsgType(topic, '', content);
+  const pillClass = ['dispatch','result','heartbeat','error','subtask','system','worker'].includes(mType)
+    ? mType : (mType === 'sub-task' ? 'subtask' : 'default');
+  const pill = document.createElement('div');
+  pill.className = 'bus-pill ' + pillClass;
+
+  const senderLabel = (sender || '?').toUpperCase();
+  const targetLabel = (targetId || topic || '?').toUpperCase();
+  const short = (content || '').substring(0, 32) + ((content||'').length > 32 ? '…' : '');
+  pill.innerHTML = senderLabel + '<span class="pill-arrow"> → </span>' + targetLabel + ': ' + short;
+
+  const yOffset = -4 + Math.random() * 8;
+  pill.style.marginTop = yOffset + 'px';
+  const duration = 3 + Math.random() * 3;
+  pill.style.animationDuration = duration + 's';
+
+  lane.appendChild(pill);
+  pill.addEventListener('animationend', () => pill.remove());
+
+  // Spawn topology particle from real sender to real receiver
+  const fromNode = sender === 'orchestrator' || sender === 'system' ? 'orch' : sender;
+  const toNode = targetId || resolveMsgTarget(sender, topic, content);
+  if (topoState.nodes[fromNode] && topoState.nodes[toNode] && fromNode !== toNode) {
+    const style = MSG_STYLE[mType] || MSG_STYLE.default;
+    spawnTopoParticle(fromNode, toNode, style.color, mType);
+  }
+}
+
+// ── Worker Activity Ripple ──
+function spawnWorkerRipple(workerName, type) {
+  const card = document.getElementById('wc-' + workerName);
+  if (!card) return;
+  const ripple = document.createElement('div');
+  ripple.className = 'wc-ripple ' + (type || 'recv');
+  ripple.style.top = '50%';
+  ripple.style.left = '50%';
+  card.appendChild(ripple);
+  ripple.addEventListener('animationend', () => ripple.remove());
+
+  // Also send a topo particle
+  const node = topoState.nodes[workerName];
+  if (node && type === 'recv') {
+    spawnTopoParticle('orch', workerName, node.color, 'dispatch');
+  } else if (node && type === 'done') {
+    spawnTopoParticle(workerName, 'orch', '#4ade80', 'result');
+  } else if (node && type === 'error') {
+    spawnTopoParticle(workerName, 'orch', '#ff6b6b', 'error');
+  }
+}
+
+// ── Hook into SSE updates for animations ──
+const _origProcessUpdate = processUpdate;
+processUpdate = function(d) {
+  _origProcessUpdate(d);
+
+  // Animate worker status changes
+  const agents = d.agents || {};
+  for (const [name, a] of Object.entries(agents)) {
+    const node = topoState.nodes[name];
+    if (!node) continue;
+
+    const oldStatus = topoState.lastWorkers[name]?.status;
+    const newStatus = (a.status || 'IDLE').toLowerCase();
+    node.status = newStatus;
+
+    if (oldStatus && oldStatus !== newStatus) {
+      if (newStatus === 'working') {
+        spawnWorkerRipple(name, 'recv');
+        spawnTopoParticle('orch', name, '#f0c000', 'dispatch');
+      } else if (newStatus === 'idle' && oldStatus === 'working') {
+        spawnWorkerRipple(name, 'done');
+        spawnTopoParticle(name, 'orch', '#4ade80', 'result');
+      } else if (newStatus === 'error') {
+        spawnWorkerRipple(name, 'error');
+        spawnTopoParticle(name, 'orch', '#ff6b6b', 'error');
+      }
+    }
+    topoState.lastWorkers[name] = { status: newStatus };
+  }
+
+  // Animate bus messages with real routing
+  const bus = d.bus || [];
+  for (const m of bus) {
+    const id = m.id || (m.sender + '__' + m.content);
+    if (!topoState.lastBus.includes(id)) {
+      topoState.lastBus.push(id);
+      if (topoState.lastBus.length > 200) topoState.lastBus = topoState.lastBus.slice(-100);
+
+      const mType = classifyMsgType(m.topic || '', m.type || '', m.content || '');
+      const target = resolveMsgTarget(m.sender, m.topic || '', m.content || '');
+      spawnBusPill(m.sender, m.content, m.topic || '', mType, target);
+    }
+  }
+
+  // No fake heartbeat pulse — heartbeats only appear when real heartbeat bus messages arrive
+};
+
+// ── Init Topology ──
+initTopology();
+
+// ═══════════════════════════════════════════════════════════════
+// KILL REQUEST CONSENSUS PANEL
+// Polls GOD Console /kill/pending every 2s when requests exist
+// ═══════════════════════════════════════════════════════════════
+const WORKERS = ['alpha','beta','gamma','delta'];
+let killPollTimer = null;
+
+function renderKillRequests(requests) {
+  const panel = document.getElementById('killPanel');
+  const body = document.getElementById('killRequestsBody');
+  const badge = document.getElementById('killBadge');
+  const headerBadge = document.getElementById('killReqHeaderBadge');
+  const count = requests.length;
+
+  badge.textContent = count;
+  headerBadge.textContent = count;
+  headerBadge.style.display = count > 0 ? 'flex' : 'none';
+
+  if (count === 0) {
+    panel.classList.remove('has-requests');
+    body.innerHTML = '<div class="empty-state">No pending kill requests</div>';
+    if (killPollTimer) { clearInterval(killPollTimer); killPollTimer = null; }
+    return;
+  }
+  panel.classList.add('has-requests');
+
+  body.innerHTML = requests.map(req => {
+    const votes = req.votes || {};
+    const now = Date.now() / 1000;
+    const elapsed = now - (req.timestamp || now);
+    const remaining = Math.max(0, Math.round(30 - elapsed));
+    const allSafe = WORKERS.every(w => votes[w] && votes[w].safe === true);
+    const anyBlocked = WORKERS.some(w => votes[w] && votes[w].safe === false);
+
+    const voteCards = WORKERS.map(w => {
+      const v = votes[w];
+      if (!v) return `<div class="kill-vote pending"><div class="vote-worker">${w}</div><div class="vote-status">⏳ PENDING</div></div>`;
+      if (v.safe) return `<div class="kill-vote safe"><div class="vote-worker">${w}</div><div class="vote-status">✅ SAFE</div><div class="vote-reason">${v.reason || ''}</div></div>`;
+      return `<div class="kill-vote blocked"><div class="vote-worker">${w}</div><div class="vote-status">🚫 BLOCKED</div><div class="vote-reason">${v.reason || 'No reason'}</div></div>`;
+    }).join('');
+
+    return `<div class="kill-card">
+      <div class="kill-card-header">
+        <span class="kill-pid">PID ${req.pid}</span>
+        <span class="kill-name">${req.name || 'unknown'}</span>
+        <span class="kill-requester">by ${req.requester || '?'}</span>
+        <span class="kill-timer">${remaining > 0 ? remaining + 's' : 'EXPIRED'}</span>
+        <span class="kill-reason">${req.reason || ''}</span>
+      </div>
+      <div class="kill-votes">${voteCards}</div>
+      <div class="kill-actions">
+        <button class="kill-btn deny" onclick="killAction('deny','${req.id}')">✗ DENY</button>
+        <button class="kill-btn authorize" ${allSafe ? '' : 'disabled'} onclick="killAction('authorize','${req.id}')" title="${allSafe ? 'All workers voted SAFE' : 'Waiting for all workers to vote SAFE'}">✓ AUTHORIZE</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  // Start fast polling when requests are pending
+  if (!killPollTimer) {
+    killPollTimer = setInterval(pollKillRequests, 2000);
+  }
+}
+
+async function pollKillRequests() {
+  try {
+    const res = await fetch('http://localhost:8421/kill/pending');
+    if (!res.ok) { renderKillRequests([]); return; }
+    const data = await res.json();
+    renderKillRequests(data.requests || []);
+  } catch(e) {
+    renderKillRequests([]);
+  }
+}
+
+async function killAction(action, reqId) {
+  try {
+    const res = await fetch(`http://localhost:8421/kill/${action}`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({id: reqId})
+    });
+    const result = await res.json();
+    addGodFeed('kill', `Kill ${action}: ${result.message || result.status || 'done'}`, action === 'authorize' ? 'red' : 'green');
+    pollKillRequests();
+  } catch(e) {
+    addGodFeed('error', `Kill ${action} failed: ${e.message}`, 'red');
+  }
+}
+
+// Poll kill requests every 10s (upgrades to 2s when requests exist)
+setInterval(pollKillRequests, 10000);
+pollKillRequests();
+
+// ── Init ──
+addGodFeed('system', 'GOD Console v2 initialized -- connecting to Skynet...', 'gold');
+connectSSE();
+pollGodFeed();
+pollMetrics();
+</script>
+</body>
+</html>

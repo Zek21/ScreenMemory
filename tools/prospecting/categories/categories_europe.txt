@@ -1,0 +1,49 @@
+bakery
+car wash
+motor repair shop
+3d printing service
+barber shop
+beauty salon
+laundry service
+tailor
+florist
+pet grooming
+locksmith
+dry cleaner
+nail salon
+tattoo shop
+car detailing
+printing service
+photography studio
+catering
+cleaning service
+plumber
+electrician
+carpenter
+painter
+upholstery
+shoe repair
+key cutting
+mobile phone repair
+computer repair
+appliance repair
+auto body shop
+tire shop
+pest control
+moving company
+handyman
+landscaping
+roofing contractor
+fence contractor
+paving contractor
+demolition contractor
+glass repair
+welding
+furniture repair
+carpet cleaning
+window cleaning
+chimney sweep
+gutter cleaning
+pool cleaning
+tree service
+garage door service

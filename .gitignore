@@ -1,0 +1,66 @@
+# Credentials and secrets
+.env
+*.key
+keystore.dat
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# Data directory -- exclude all runtime state, whitelist config
+data/
+!data/.gitkeep
+!data/agent_profiles.json
+!data/boot_protocol.json
+!data/brain_config.json
+!data/critical_processes.json
+!data/incidents.json
+!data/level4_architecture.md
+!data/skynet_bootstrap.md
+!data/version_history.json
+
+# Logs
+logs/
+!logs/.gitkeep
+!logs/__init__.py
+
+# Screenshots (runtime captures)
+screenshots/
+!screenshots/.gitkeep
+
+# Runtime PID/state files
+*.pid
+
+# IDE
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Node
+node_modules/
+
+# Chrome bridge dist/proof artifacts
+tools/chrome_bridge/dist/proof/chrome-profile/
+tools/chrome_bridge/server-live.log
+
+# Playwright MCP logs
+tools/.playwright-mcp/
+
+# Lance vector DB
+*.lance/

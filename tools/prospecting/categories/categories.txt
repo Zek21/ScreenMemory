@@ -1,0 +1,416 @@
+bakeshop
+car wash
+motor repair shop
+3d printing service
+abarth dealer
+abbey
+accountant
+accounting firm
+acupuncture clinic
+adhesives and glue supplier
+advertising agency
+aerial photographer
+african restaurant
+aged care
+air conditioning contractor
+air conditioning repair service
+air duct cleaning service
+airline ticket agency
+airport shuttle service
+airsoft supply shop
+aluminium supplier
+aluminium window
+amusement center
+animal hospital
+animal shelter
+animation studio
+antique shop
+apartment rental agency
+appliance repair service
+aquarium shop
+architect
+architecture firm
+art gallery
+art school
+art supply shop
+asphalt contractor
+auto body shop
+auto glass shop
+auto parts store
+auto repair shop
+auto upholsterer
+awning supplier
+ayurvedic clinic
+baby clothing shop
+baby shop
+bag shop
+bakery
+balloon shop
+barber shop
+bathroom supply shop
+battery shop
+beauty salon
+beauty supply store
+bed shop
+bedding shop
+bicycle repair shop
+bicycle shop
+blinds shop
+bookkeeping service
+book shop
+boot repair shop
+boutique
+bowling alley
+bridal shop
+building materials store
+burglar alarm shop
+butcher shop
+cabinet maker
+cafe
+cake shop
+camera shop
+camping shop
+candle shop
+car accessories shop
+car detailing service
+car rental agency
+car wash
+carpet cleaning service
+carpenter
+catering
+cell phone store
+cement supplier
+ceramic manufacturer
+charity shop
+chemical supplier
+chimney services
+chocolate shop
+cleaning products supplier
+clock repair service
+clothing store
+coffee shop
+comic book store
+computer repair service
+computer store
+concrete contractor
+confectionery
+construction company
+consultant
+convenience store
+copy shop
+cosmetics store
+costume shop
+craft shop
+curtain shop
+custom tailor
+dance school
+day spa
+deli
+dental clinic
+dental laboratory
+dentist
+department store
+designer clothing store
+dessert shop
+detective agency
+diesel fuel supplier
+digital printer
+discount store
+diving center
+dog groomer
+door supplier
+driving school
+dry cleaner
+electrical appliance shop
+electrical contractor
+electrician
+electronics repair shop
+electronics store
+embroidery shop
+employment agency
+engineering consultant
+engraving shop
+event management company
+event planner
+excavation contractor
+exercise equipment store
+eye care center
+fabric shop
+fencing contractor
+fertility clinic
+financial consultant
+fire protection service
+fireplace store
+fishing shop
+fitness center
+flooring contractor
+flooring store
+florist
+food delivery service
+food truck
+footwear store
+frame shop
+freight forwarding service
+fruit and vegetable shop
+funeral home
+furniture repair shop
+furniture shop
+garage door supplier
+garden center
+gardener
+gas station
+general contractor
+gift shop
+glass repair service
+glass shop
+glazier
+gold shop
+golf shop
+graphic designer
+green grocer
+grocery store
+gun shop
+gym
+hair salon
+hand car wash
+handicraft shop
+hardware store
+hat shop
+health food store
+heating contractor
+hobby shop
+home builder
+home cleaning service
+home decorator
+home health care service
+home inspection service
+home security company
+horse riding school
+hospital
+hotel
+hvac contractor
+ice cream shop
+immigration consultant
+industrial equipment supplier
+interior decorator
+interior designer
+internet cafe
+iron works
+irrigation equipment supplier
+janitorial service
+jeweler
+juice bar
+junk yard
+karate school
+key cutting service
+kitchen remodeler
+knife shop
+landscaper
+language school
+laser cutting service
+laundry service
+lawn care service
+leather goods shop
+legal service
+lighting shop
+limo service
+lingerie shop
+locksmith
+luggage shop
+machine shop
+maid service
+mailbox rental service
+marketing agency
+martial arts school
+massage therapist
+mattress store
+meat shop
+mechanic
+medical clinic
+medical equipment supplier
+medical laboratory
+meditation center
+metal fabricator
+metal supplier
+mobile phone repair shop
+money transfer service
+monument maker
+mortgage broker
+motorcycle dealer
+motorcycle repair shop
+moving company
+music school
+music store
+nail salon
+nanny service
+natural stone supplier
+newspaper publisher
+notary public
+nursery school
+nursing home
+nutritionist
+office furniture store
+office supply store
+oil change service
+optician
+optometrist
+organic food store
+orthodontist
+outdoor furniture store
+packaging supply store
+paint store
+painter
+painting contractor
+party supply store
+paving contractor
+pawn shop
+pediatrician
+perfume store
+pest control service
+pet groomer
+pet shop
+pet store
+pharmacy
+photo lab
+photo studio
+photographer
+physiotherapist
+piano store
+picture frame shop
+pizza delivery
+pizza restaurant
+plant nursery
+plumber
+plumbing supply store
+pool cleaning service
+pool supply store
+portrait studio
+post office
+pottery shop
+power tool repair service
+print shop
+printer repair service
+printing service
+private investigator
+produce market
+promotional products supplier
+property management company
+psychiatrist
+psychologist
+pub
+public relations firm
+publishing company
+pump supplier
+quick oil change service
+real estate agency
+recycling center
+refrigerator repair service
+rehabilitation center
+remodeling contractor
+rental agency
+restaurant
+restaurant supply store
+resume service
+roofing contractor
+rug shop
+safety equipment supplier
+sailing school
+sandwich shop
+sauna
+scaffolding rental service
+school
+screen printing shop
+scuba diving shop
+seafood restaurant
+security guard service
+security system supplier
+sewing machine shop
+shoe repair shop
+shoe shop
+sign shop
+silk plant shop
+skating rink
+ski shop
+skin care clinic
+smoke shop
+smoothie bar
+snack bar
+social services organisation
+solar energy company
+souvenir shop
+spa
+sporting goods store
+stationery store
+steel distributor
+storage facility
+stove shop
+supermarket
+surveyor
+swimming pool contractor
+swimming pool supply store
+tailor
+tanning salon
+tattoo shop
+tax consultant
+taxi service
+tea shop
+telecommunications service provider
+tent rental service
+textile shop
+therapy center
+tile shop
+tire shop
+tobacco shop
+tool repair shop
+tool shop
+tourist information center
+towing service
+toy shop
+trading company
+translation service
+travel agency
+tree service
+trophy shop
+truck repair shop
+tutoring service
+tyre shop
+uniform shop
+upholstery shop
+used car dealer
+vacuum cleaner repair shop
+vacuum cleaner store
+variety store
+vending machine supplier
+venetian blind shop
+veterinarian
+video game store
+video production service
+vinyl shop
+vitamin and supplement shop
+wallpaper store
+warehouse
+waste management service
+watch repair service
+watch shop
+water damage restoration service
+water filter supplier
+water heater repair service
+water purification company
+waterproofing company
+web design company
+wedding planner
+welding service
+wheel alignment service
+wholesale bakery
+wholesale florist
+wholesale grocer
+wig shop
+window cleaning service
+window installer
+wine shop
+women's clothing store
+wood floor installation service
+woodworking shop
+x-ray lab
+yacht broker
+yoga studio

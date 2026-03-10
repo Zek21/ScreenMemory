@@ -1,0 +1,100 @@
+{
+  "capture": {
+    "interval_seconds": 3,
+    "method": "dxgi",
+    "monitor_index": 0,
+    "capture_all_monitors": true,
+    "save_screenshots": false,
+    "screenshot_quality": 85,
+    "max_screenshots_gb": 10,
+    "screenshot_dir": "screenshots"
+  },
+  "change_detection": {
+    "method": "dhash",
+    "hash_size": 16,
+    "threshold": 8,
+    "min_change_percent": 5
+  },
+  "analysis": {
+    "backend": "ollama",
+    "model": "moondream",
+    "fallback_model": "minicpm-v",
+    "max_tokens": 512,
+    "prompt_template": "Describe what is visible on this screen. Include: active application, window titles, visible text content, any UI elements, and the general activity being performed. Be concise but thorough."
+  },
+  "ocr": {
+    "engine": "rapidocr",
+    "lang": "en",
+    "min_confidence": 0.5,
+    "enabled": true
+  },
+  "embeddings": {
+    "model": "siglip2",
+    "onnx_provider": "DmlExecutionProvider",
+    "fallback_provider": "CPUExecutionProvider",
+    "dimension": 768
+  },
+  "database": {
+    "path": "data/screen_memory.db",
+    "lance_path": "data/lance_memory",
+    "encryption": true,
+    "fts_enabled": true,
+    "vacuum_interval_hours": 24,
+    "retention_days": 90
+  },
+  "privacy": {
+    "excluded_apps": ["KeePass", "1Password", "Bitwarden"],
+    "excluded_window_titles": ["password", "private", "incognito"],
+    "excluded_urls": [],
+    "blur_sensitive": true,
+    "pause_on_lock": true
+  },
+  "performance": {
+    "max_cpu_percent": 15,
+    "max_memory_mb": 2048,
+    "gpu_memory_limit_mb": 1024,
+    "batch_size": 4,
+    "worker_threads": 2
+  },
+  "orchestrator": {
+    "backends": {
+      "moondream": {
+        "type": "vlm",
+        "speed": "fast",
+        "cost": 0.1,
+        "capabilities": ["vision", "description"],
+        "max_tokens": 512
+      },
+      "qwen3:8b": {
+        "type": "llm",
+        "speed": "medium",
+        "cost": 0.4,
+        "capabilities": ["reasoning", "code", "analysis", "planning"],
+        "max_tokens": 8192
+      }
+    },
+    "daao": {
+      "history_weight": 0.3,
+      "cost_lambda": 0.5
+    },
+    "guard": {
+      "block_threshold": 0.75,
+      "warn_threshold": 0.40,
+      "audit_all": true
+    },
+    "dag": {
+      "max_feedback_loops": 3,
+      "default_timeout_seconds": 60,
+      "max_retries": 2
+    }
+  },
+  "browser": {
+    "engine": "cdp",
+    "cdp_port": 9222,
+    "chrome_path": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "chrome_flags": ["--remote-debugging-port=9222", "--remote-allow-origins=*"],
+    "user_data_dir": null,
+    "auto_launch": true,
+    "playwright_allowed": false
+  }
+}

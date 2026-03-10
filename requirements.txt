@@ -1,0 +1,31 @@
+# ScreenMemory Dependencies
+# Core
+Pillow>=10.0
+numpy>=1.24
+psutil>=5.9
+
+# Screen capture (DXGI-backed on Windows)
+mss>=9.0
+
+# Database
+sqlite-vec>=0.1.1
+
+# VLM Analysis (via Ollama — install separately: https://ollama.ai)
+# No pip dependency — uses HTTP API
+
+# Embeddings (choose one approach):
+# Option A: Full transformer models (requires torch)
+# torch>=2.0
+# transformers>=4.40
+# torch-directml  # AMD GPU acceleration
+
+# Option B: ONNX Runtime (lighter, faster inference)
+# onnxruntime-directml>=1.17  # AMD GPU
+# onnxruntime>=1.17           # CPU only
+
+# Optional: Encryption
+# pysqlcipher3>=1.2  # SQLCipher bindings (requires sqlcipher lib)
+
+# Optional: Advanced OCR fallback
+# doctr[torch]>=0.9
+# paddleocr>=2.7

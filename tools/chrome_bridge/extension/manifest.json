@@ -1,0 +1,49 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Bridge",
+  "version": "4.0.0",
+  "minimum_chrome_version": "116",
+  "description": "Ultimate browser automation bridge — 265+ commands, full stealth suite, performance tracing, vision simulation, network mocking, CDP overlays, WebAuthn, animation control, and multi-profile orchestration",
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "scripting",
+    "debugger",
+    "windows",
+    "storage",
+    "cookies",
+    "downloads",
+    "alarms",
+    "tabGroups",
+    "browsingData",
+    "history",
+    "bookmarks",
+    "notifications",
+    "webNavigation"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
