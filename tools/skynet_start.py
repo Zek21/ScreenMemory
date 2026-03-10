@@ -256,151 +256,49 @@ Write-Host $count
 
 
 def open_chat_window(orch_hwnd):
-    """Open a new detached chat window from the orchestrator.
+    """Open a new detached chat window using tools/new_chat.ps1.
 
-    Multi-strategy approach (all in one PowerShell call):
-      1. Find the narrow ▾ dropdown button (name='New Chat', w<=20) → ghost click → invoke 'New Chat Window' menu item
-      2. If no narrow button, find "Views and More Actions..." button near chat header → look for 'Open Chat in New Window'
-      3. Fallback: command palette Ctrl+Shift+P → type "Chat: Open Chat in New Window" → Enter
+    new_chat.ps1 is the proven, battle-tested script that:
+      1. Finds the narrow dropdown ▾ button (right side of the chat panel header)
+      2. Ghost-clicks it via PostMessage (no cursor movement)
+      3. Invokes 'New Chat Window' menu item via UIA InvokePattern
+      4. Waits 4000ms for the window to appear
+      5. Runs model guard (ensures Claude Opus 4.6 fast + Copilot CLI)
+
+    We skip new_chat.ps1's built-in grid positioning (we handle that ourselves)
+    and its empty-chat blocker (we manage sequential opens).
 
     Returns the new HWND on success, None on failure.
     """
     before = {w["hwnd"] for w in find_vscode_windows()}
 
-    ps = f'''
-Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
-Add-Type @"
-using System; using System.Runtime.InteropServices;
-public class CW {{
-    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr wp, IntPtr lp);
-    [DllImport("user32.dll")] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string c, string w);
-    [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref POINT p);
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [StructLayout(LayoutKind.Sequential)] public struct POINT {{ public int X, Y; }}
-    public static void Click(IntPtr rh, int sx, int sy) {{
-        POINT pt; pt.X=sx; pt.Y=sy; ScreenToClient(rh,ref pt);
-        IntPtr lp=(IntPtr)((pt.Y<<16)|(pt.X&0xFFFF));
-        PostMessage(rh,0x0201,(IntPtr)1,lp); System.Threading.Thread.Sleep(50);
-        PostMessage(rh,0x0202,IntPtr.Zero,lp);
-    }}
-    public static IntPtr FindRender(IntPtr p) {{
-        IntPtr r=FindWindowEx(p,IntPtr.Zero,"Chrome_RenderWidgetHostHWND",null);
-        if(r!=IntPtr.Zero)return r;
-        IntPtr c=FindWindowEx(p,IntPtr.Zero,null,null);
-        while(c!=IntPtr.Zero){{r=FindWindowEx(c,IntPtr.Zero,"Chrome_RenderWidgetHostHWND",null);if(r!=IntPtr.Zero)return r;c=FindWindowEx(p,c,null,null);}}
-        return p;
-    }}
-}}
-"@
-
-$h=[IntPtr]{orch_hwnd}
-$render=[CW]::FindRender($h)
-[CW]::SetForegroundWindow($h)
-Start-Sleep -Milliseconds 300
-
-$root=[System.Windows.Automation.AutomationElement]::FromHandle($h)
-$btns=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
-    (New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Button)))
-
-# --- Strategy 1: Find the narrowest "New Chat" button (the dropdown arrow) ---
-$dropdown=$null; $dropdownW=999
-foreach($b in $btns) {{
-    $n=$b.Current.Name; $bw=[int]$b.Current.BoundingRectangle.Width
-    if($n -eq 'New Chat' -and $bw -gt 0 -and $bw -lt $dropdownW -and [int]$b.Current.BoundingRectangle.Height -gt 10) {{
-        $dropdown=$b; $dropdownW=$bw
-    }}
-}}
-
-$opened=$false
-
-if($dropdown) {{
-    $r=$dropdown.Current.BoundingRectangle
-    [CW]::Click($render,[int]($r.X+$r.Width/2),[int]($r.Y+$r.Height/2))
-    Start-Sleep -Milliseconds 1000
-
-    $desktop=[System.Windows.Automation.AutomationElement]::RootElement
-    $mis=$desktop.FindAll([System.Windows.Automation.TreeScope]::Descendants,
-        (New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::MenuItem)))
-    foreach($mi in $mis) {{
-        if($mi.Current.Name -eq 'New Chat Window') {{
-            $mi.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-            $opened=$true; Write-Host "OPENED_VIA_DROPDOWN"; break
-        }}
-    }}
-    if(-not $opened) {{
-        # Dismiss menu
-        [System.Windows.Forms.SendKeys]::SendWait("{{ESC}}")
-        Start-Sleep -Milliseconds 300
-    }}
-}}
-
-# --- Strategy 2: "Views and More Actions..." button near chat area ---
-if(-not $opened) {{
-    foreach($b in $btns) {{
-        $n=$b.Current.Name
-        if($n -match 'Views and More Actions' -or ($n -match 'More Actions' -and [int]$b.Current.BoundingRectangle.Y -gt 80 -and [int]$b.Current.BoundingRectangle.Y -lt 120)) {{
-            $r=$b.Current.BoundingRectangle
-            [CW]::Click($render,[int]($r.X+$r.Width/2),[int]($r.Y+$r.Height/2))
-            Start-Sleep -Milliseconds 1500
-            $desktop=[System.Windows.Automation.AutomationElement]::RootElement
-            $mis=$desktop.FindAll([System.Windows.Automation.TreeScope]::Descendants,
-                (New-Object System.Windows.Automation.PropertyCondition(
-                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                    [System.Windows.Automation.ControlType]::MenuItem)))
-            foreach($mi in $mis) {{
-                if($mi.Current.Name -match 'New Chat Window|Open Chat in New Window') {{
-                    $mi.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-                    $opened=$true; Write-Host "OPENED_VIA_MORE_ACTIONS"; break
-                }}
-            }}
-            if(-not $opened) {{ [System.Windows.Forms.SendKeys]::SendWait("{{ESC}}"); Start-Sleep -Milliseconds 300 }}
-            break
-        }}
-    }}
-}}
-
-# --- Strategy 3: Command palette fallback ---
-if(-not $opened) {{
-    [CW]::SetForegroundWindow($h)
-    Start-Sleep -Milliseconds 300
-    [System.Windows.Forms.SendKeys]::SendWait("^+p")
-    Start-Sleep -Milliseconds 1200
-    [System.Windows.Forms.SendKeys]::SendWait("Chat: Open Chat in New Window")
-    Start-Sleep -Milliseconds 1200
-    [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
-    $opened=$true
-    Write-Host "OPENED_VIA_PALETTE"
-}}
-
-[CW]::SetForegroundWindow($h)
-'''
+    script_path = str(ROOT / "tools" / "new_chat.ps1")
     try:
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True, text=True, timeout=30
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", script_path, "-Monitor", "2"],
+            capture_output=True, text=True, timeout=45,
+            cwd=str(ROOT)
         )
-        strategy = "unknown"
-        if "OPENED_VIA_DROPDOWN" in r.stdout:
-            strategy = "dropdown"
-        elif "OPENED_VIA_MORE_ACTIONS" in r.stdout:
-            strategy = "more-actions"
-        elif "OPENED_VIA_PALETTE" in r.stdout:
-            strategy = "command-palette"
-        else:
-            log(f"open_chat_window: no strategy succeeded. stdout={r.stdout.strip()}", "ERR")
+        if r.returncode != 0:
+            stderr = r.stderr.strip()[:200] if r.stderr else ""
+            stdout = r.stdout.strip()[:200] if r.stdout else ""
+            if "BLOCKED" in (r.stdout or ""):
+                log(f"new_chat.ps1: blocked (all slots full or consecutive failures)", "WARN")
+            else:
+                log(f"new_chat.ps1 failed (rc={r.returncode}): {stdout} {stderr}", "ERR")
             return None
 
-        log(f"Chat window opened via {strategy}", "OK")
+        log(f"Chat window opened via command-palette", "OK")
+    except subprocess.TimeoutExpired:
+        log("new_chat.ps1 timed out after 45s", "ERR")
+        return None
     except Exception as e:
         log(f"open_chat_window failed: {e}", "ERR")
         return None
 
-    # Poll for new window (up to 6 seconds)
-    for _ in range(6):
+    # Poll for new window (up to 8 seconds — new_chat.ps1 already waits 4s internally)
+    for _ in range(8):
         time.sleep(1)
         after = {w["hwnd"] for w in find_vscode_windows()}
         new_hwnds = after - before - {orch_hwnd}
@@ -409,7 +307,7 @@ if(-not $opened) {{
             log(f"New chat window detected: HWND={new_hwnd}", "OK")
             return new_hwnd
 
-    log("New chat window not detected after 6s", "ERR")
+    log("New chat window not detected after 8s", "ERR")
     return None
 
 
@@ -1445,7 +1343,8 @@ def close_non_essential_windows():
     else:
         log("Window hygiene: all windows are Skynet-essential", "OK")
 
-
+
+
 # ─── Daemon Lifecycle ──────────────────────────────────
 
 def _is_daemon_running(pid_file):
