@@ -62,7 +62,7 @@ class DPAPIKeyManager:
             None,   # optional entropy (additional secret)
             None,   # reserved
             None,   # prompt struct
-            0x01,   # CRYPTPROTECT_LOCAL_MACHINE flag — tied to this machine
+            0x04,   # CRYPTPROTECT_LOCAL_MACHINE (0x04 per wincrypt.h) — tied to this machine
         )
         return encrypted
 

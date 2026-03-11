@@ -21,6 +21,11 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from pathlib import Path
 
+try:
+    import psutil
+except Exception:
+    psutil = None
+
 ROOT = Path(__file__).parent
 DATA_DIR = ROOT / "data"
 PID_FILE = DATA_DIR / "god_console.pid"
@@ -64,6 +69,7 @@ _cache = {
     "introspect": None, "introspect_t": 0,
     "assess": None, "assess_t": 0,
     "backend_status": None, "backend_status_t": 0,
+    "consultants": None, "consultants_t": 0,
     "bus": None, "bus_t": 0, "bus_limit": 20,
     "engines": None, "engines_t": 0,
     "dashboard_data": None, "dashboard_data_t": 0,
@@ -73,6 +79,7 @@ _PULSE_TTL = 15      # pulse is expensive; 15s cache avoids stampede
 _STATUS_TTL = 10
 _INTROSPECT_TTL = 30
 _BACKEND_TTL = 3     # backend status cached 3s
+_CONSULTANT_TTL = 2  # consultant bridge state cached 2s
 _BUS_TTL = 2         # bus messages cached 2s
 _ENGINES_TTL = 30    # engine probes are expensive; 30s cache
 _DASHBOARD_TTL = 3   # combined dashboard data
@@ -80,6 +87,23 @@ _WINDOWS_TTL = 5     # window scan cached 5s
 _cache_lock = threading.Lock()
 _pulse_compute_lock = threading.Lock()   # prevents stampeding herd on pulse
 _skynet_self_instance = None
+
+
+def _pid_alive(pid: int) -> bool:
+    if not pid:
+        return False
+    if psutil is not None:
+        try:
+            return psutil.pid_exists(pid)
+        except Exception:
+            pass
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except Exception:
+        return False
 
 def _get_skynet_self():
     global _skynet_self_instance
@@ -168,6 +192,23 @@ def _cached_status():
         _cache["status_t"] = _time.time()
     return data
 
+def _cached_consultants():
+    """Cached live consultant bridge state."""
+    now = _time.time()
+    with _cache_lock:
+        if _cache["consultants"] and (now - _cache["consultants_t"]) < _CONSULTANT_TTL:
+            return _cache["consultants"]
+    try:
+        from skynet_consultant_bridge import get_consultant_view
+        consultant = get_consultant_view()
+        data = {"consultant": consultant} if consultant else {}
+    except Exception as e:
+        data = {"error": str(e)}
+    with _cache_lock:
+        _cache["consultants"] = data
+        _cache["consultants_t"] = _time.time()
+    return data
+
 def _cached_backend_status():
     """Cached backend /status with per-worker enrichment."""
     now = _time.time()
@@ -186,6 +227,7 @@ def _cached_backend_status():
         wdata["mission_count"] = mission_count
         hb = wdata.get("last_heartbeat", "")
         wdata["last_active"] = hb if hb else wdata.get("recent_logs", [""])[0][:20]
+    backend["consultants"] = _cached_consultants()
     with _cache_lock:
         _cache["backend_status"] = backend
         _cache["backend_status_t"] = _time.time()
@@ -261,6 +303,7 @@ def _build_dashboard_data():
         "status": results.get("status", {}),
         "pulse": results.get("pulse", {}),
         "bus": results.get("bus", []),
+        "consultants": results.get("status", {}).get("consultants", {}),
         "errors": errors if errors else None,
         "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S"),
         "cached": True,
@@ -543,7 +586,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                          "/skynet/self/introspect", "/skynet/self/goals",
                          "/skynet/self/assess", "/skynet/status",
                          "/status", "/god_state", "/bus", "/bus/tasks", "/bus/convene", "/bus/stats",
-                         "/windows", "/workers/health", "/dashboard/data", "/ws/info", "/todos",
+                         "/windows", "/workers/health", "/dashboard/data", "/ws/info", "/todos", "/consultants",
                          "/processes", "/overseer", "/stream/dashboard",
                          "/kill/pending", "/kill/log"]
             self._json_response({
@@ -709,6 +752,9 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         elif self.path == "/todos":
             data = _load_todos()
             self._json_response(data)
+        elif self.path == "/consultants":
+            data = _cached_consultants()
+            self._json_response(data)
         elif self.path == "/processes":
             try:
                 from skynet_process_guard import _load_registry
@@ -724,10 +770,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 try:
                     pid = int(open(pid_file).read().strip())
                     result["pid"] = pid
-                    import subprocess as _sp
-                    out = _sp.check_output(["tasklist", "/fi", f"pid eq {pid}", "/fo", "csv", "/nh"],
-                                           text=True, timeout=5, stderr=_sp.DEVNULL)
-                    result["running"] = str(pid) in out
+                    result["running"] = _pid_alive(pid)
                 except Exception:
                     pass
             if os.path.exists(status_file):
@@ -864,6 +907,10 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                         payload["status"] = _cached_backend_status()
                     except Exception:
                         payload["status"] = None
+                    try:
+                        payload["consultants"] = _cached_consultants()
+                    except Exception:
+                        payload["consultants"] = {}
                     try:
                         payload["bus"] = _cached_bus(20)
                     except Exception:

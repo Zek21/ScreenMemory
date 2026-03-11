@@ -21,7 +21,11 @@ PORT = 8420
 
 TARGET_SCRIPTS = ["dashboard_server.py", "auto_orchestrator.py", "agent_worker.py", "worker_pool.py"]
 
-CREATION_FLAGS = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+CREATION_FLAGS = (
+    subprocess.CREATE_NEW_PROCESS_GROUP
+    | subprocess.DETACHED_PROCESS
+    | subprocess.CREATE_NO_WINDOW
+)
 
 
 def kill_existing():

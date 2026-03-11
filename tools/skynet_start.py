@@ -2,7 +2,7 @@
 """
 Skynet Start — Unified orchestrator bootstrap.
 
-Trigger word: "skynet-start"
+Trigger words: "skynet-start", "orchestrator-start", "CC-Start"
 
 Starts Skynet backend, GOD Console, opens worker chat windows (ghost mouse),
 prompts each, registers with Skynet, and connects ScreenMemory engines.
@@ -35,6 +35,11 @@ from pathlib import Path
 from datetime import datetime
 from urllib.request import Request, urlopen
 from urllib.error import URLError
+
+# Force UTF-8 output on Windows to handle emoji and box-drawing characters
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -82,6 +87,11 @@ PYTHON, _DAEMON_ENV = _resolve_real_python()
 DATA_DIR       = ROOT / "data"
 WORKERS_FILE   = DATA_DIR / "workers.json"
 ORCH_FILE      = DATA_DIR / "orchestrator.json"
+BACKGROUND_SPAWN_FLAGS = (
+    subprocess.CREATE_NEW_PROCESS_GROUP
+    | subprocess.DETACHED_PROCESS
+    | subprocess.CREATE_NO_WINDOW
+)
 NEW_CHAT_PS1   = str(ROOT / "tools" / "new_chat.ps1")
 
 BOOT_IN_PROGRESS_FILE = DATA_DIR / "boot_in_progress.json"
@@ -276,7 +286,7 @@ def open_chat_window(orch_hwnd):
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-File", script_path, "-Monitor", "2"],
+             "-File", script_path, "-Monitor", "2", "-SkipEmptyCheck"],
             capture_output=True, text=True, timeout=45,
             cwd=str(ROOT)
         )
@@ -289,7 +299,20 @@ def open_chat_window(orch_hwnd):
                 log(f"new_chat.ps1 failed (rc={r.returncode}): {stdout} {stderr}", "ERR")
             return None
 
-        log(f"Chat window opened via command-palette", "OK")
+        # rc=0 but still blocked (e.g. BLOCKED: all slots full)
+        if "BLOCKED" in (r.stdout or "") and "OK HWND=" not in (r.stdout or ""):
+            log(f"new_chat.ps1: blocked — {(r.stdout or '').strip()[:120]}", "WARN")
+            return None
+
+        log(f"Chat window opened via new_chat.ps1", "OK")
+
+        # Parse HWND directly from new_chat.ps1 output: "OK HWND=<n> pos=..."
+        import re as _re
+        m = _re.search(r'OK HWND=(\d+)', r.stdout or "")
+        if m:
+            hwnd = int(m.group(1))
+            log(f"New chat window: HWND={hwnd}", "OK")
+            return hwnd
     except subprocess.TimeoutExpired:
         log("new_chat.ps1 timed out after 45s", "ERR")
         return None
@@ -341,12 +364,15 @@ public class SR {{
         PostMessage(rh,0x0204,(IntPtr)2,lp); System.Threading.Thread.Sleep(60);
         PostMessage(rh,0x0205,IntPtr.Zero,lp);
     }}
+    public delegate bool EnumWP(IntPtr h,IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p,EnumWP cb,IntPtr l);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h,System.Text.StringBuilder sb,int n);
+    private static IntPtr _found;
+    private static bool _enumCb(IntPtr h,IntPtr l){{var sb=new System.Text.StringBuilder(256);GetClassName(h,sb,256);if(sb.ToString()=="Chrome_RenderWidgetHostHWND"){{_found=h;return false;}}return true;}}
     public static IntPtr FindRender(IntPtr p) {{
-        IntPtr r=FindWindowEx(p,IntPtr.Zero,"Chrome_RenderWidgetHostHWND",null);
-        if(r!=IntPtr.Zero)return r;
-        IntPtr c=FindWindowEx(p,IntPtr.Zero,null,null);
-        while(c!=IntPtr.Zero){{r=FindWindowEx(c,IntPtr.Zero,"Chrome_RenderWidgetHostHWND",null);if(r!=IntPtr.Zero)return r;c=FindWindowEx(p,c,null,null);}}
-        return p;
+        _found=IntPtr.Zero;
+        EnumChildWindows(p,new EnumWP(_enumCb),IntPtr.Zero);
+        return _found!=IntPtr.Zero?_found:p;
     }}
 }}
 "@
@@ -442,12 +468,15 @@ public class MG {{
         PostMessage(rh,0x0201,(IntPtr)1,lp); System.Threading.Thread.Sleep(50);
         PostMessage(rh,0x0202,IntPtr.Zero,lp);
     }}
+    public delegate bool EnumWP(IntPtr h,IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p,EnumWP cb,IntPtr l);
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h,System.Text.StringBuilder sb,int n);
+    private static IntPtr _found;
+    private static bool _enumCb(IntPtr h,IntPtr l){{var sb=new System.Text.StringBuilder(256);GetClassName(h,sb,256);if(sb.ToString()=="Chrome_RenderWidgetHostHWND"){{_found=h;return false;}}return true;}}
     public static IntPtr FindRender(IntPtr p) {{
-        IntPtr r=FindWindowEx(p,IntPtr.Zero,"Chrome_RenderWidgetHostHWND",null);
-        if(r!=IntPtr.Zero)return r;
-        IntPtr c=FindWindowEx(p,IntPtr.Zero,null,null);
-        while(c!=IntPtr.Zero){{r=FindWindowEx(c,IntPtr.Zero,"Chrome_RenderWidgetHostHWND",null);if(r!=IntPtr.Zero)return r;c=FindWindowEx(p,c,null,null);}}
-        return p;
+        _found=IntPtr.Zero;
+        EnumChildWindows(p,new EnumWP(_enumCb),IntPtr.Zero);
+        return _found!=IntPtr.Zero?_found:p;
     }}
 }}
 "@
@@ -463,7 +492,7 @@ $btns=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
 $modelOk=$false; $targetOk=$false
 foreach($b in $btns) {{
     $n=$b.Current.Name
-    if($n -match 'Pick Model.*Opus 4\.6.*fast') {{ $modelOk=$true }}
+    if($n -match 'Pick Model.*Opus 4\\.6.*fast') {{ $modelOk=$true }}
     if($n -match 'Copilot CLI') {{ $targetOk=$true }}
 }}
 
@@ -475,9 +504,9 @@ if(-not $modelOk) {{
             $r=$b.Current.BoundingRectangle
             [MG]::Click($render,[int]($r.X+$r.Width/2),[int]($r.Y+$r.Height/2))
             Start-Sleep -Milliseconds 1500
-            # Type "fast" to filter, then Down+Enter to select Opus fast
+            # Type "opus" to filter to Claude Opus only (avoids "Grok Code Fast" false match)
             Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-            [System.Windows.Forms.SendKeys]::SendWait("fast")
+            [System.Windows.Forms.SendKeys]::SendWait("opus")
             Start-Sleep -Milliseconds 1000
             [System.Windows.Forms.SendKeys]::SendWait("{{DOWN}}{{ENTER}}")
             Start-Sleep -Milliseconds 800
@@ -533,6 +562,117 @@ if($modelOk -and $targetOk) {{ Write-Host "GUARD_OK" }}
             log(f"Model guard: HWND={hwnd} already correct", "OK")
     except Exception as e:
         log(f"Model guard failed for HWND={hwnd}: {e}", "WARN")
+
+
+def guard_permissions(hwnd, orch_hwnd):
+    """Ensure a chat window has Bypass Approvals set.
+    
+    Uses the same PostMessage ghost keyboard approach as new_chat.ps1:
+    1. SetForegroundWindow(hwnd) to give the target window OS focus
+    2. UIA ExpandCollapsePattern to open the permissions dropdown
+    3. PostMessage ghost DOWN+ENTER to Chrome_RenderWidgetHostHWND
+       (dropdown highlights current=Default, Down moves to Bypass, Enter selects)
+    4. SetForegroundWindow(orch_hwnd) to restore orchestrator focus
+    
+    No mouse, no SendKeys. Pure PostMessage ghost keyboard.
+    """
+    ps = f'''
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+Add-Type @"
+using System; using System.Runtime.InteropServices; using System.Text;
+public class PG {{
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    public delegate bool EnumChildWP(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, EnumChildWP cb, IntPtr l);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int n);
+    private static IntPtr _renderFound;
+    private static bool _renderCb(IntPtr h, IntPtr l) {{
+        var sb = new StringBuilder(256);
+        GetClassName(h, sb, 256);
+        if (sb.ToString() == "Chrome_RenderWidgetHostHWND") {{ _renderFound = h; return false; }}
+        return true;
+    }}
+    public static IntPtr FindRenderSurface(IntPtr parentHwnd) {{
+        _renderFound = IntPtr.Zero;
+        EnumChildWindows(parentHwnd, new EnumChildWP(_renderCb), IntPtr.Zero);
+        return _renderFound != IntPtr.Zero ? _renderFound : parentHwnd;
+    }}
+}}
+"@
+$hwnd=[IntPtr]{hwnd}
+$orchHwnd=[IntPtr]{orch_hwnd}
+$root=[System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+$btns=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+    (New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button)))
+$alreadyBypass=$false
+$defaultBtn=$null
+foreach($b in $btns) {{
+    $n=$b.Current.Name
+    if($n -eq 'Set Permissions - Bypass Approvals') {{ $alreadyBypass=$true; break }}
+    if($n -eq 'Set Permissions - Default Approvals') {{ $defaultBtn=$b }}
+}}
+if($alreadyBypass) {{ Write-Host "PERMS_OK"; exit 0 }}
+if($defaultBtn) {{
+    $render=[PG]::FindRenderSurface($hwnd)
+    # Give the window OS focus so PostMessage ghost keys work
+    [PG]::SetForegroundWindow($hwnd) | Out-Null
+    Start-Sleep -Milliseconds 300
+    # Open dropdown via ExpandCollapsePattern (pure UIA, no mouse)
+    try {{
+        $exp=$defaultBtn.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+        $exp.Expand()
+    }} catch {{
+        Write-Host "PERMS_EXPAND_FAILED:$($_.Exception.Message)"
+        if($orchHwnd -ne [IntPtr]::Zero) {{ [PG]::SetForegroundWindow($orchHwnd) | Out-Null }}
+        exit 1
+    }}
+    Start-Sleep -Milliseconds 1200
+    # Ghost DOWN key (VK=0x28, scan=0x50) -- moves from Default to Bypass
+    [PG]::PostMessage($render, 0x0100, [IntPtr]0x28, [IntPtr]0x00500001) | Out-Null
+    Start-Sleep -Milliseconds 50
+    [PG]::PostMessage($render, 0x0101, [IntPtr]0x28, [IntPtr]::new(0xC0500001L)) | Out-Null
+    Start-Sleep -Milliseconds 200
+    # Ghost ENTER key (VK=0x0D, scan=0x1C) -- selects Bypass
+    [PG]::PostMessage($render, 0x0100, [IntPtr]0x0D, [IntPtr]0x001C0001) | Out-Null
+    Start-Sleep -Milliseconds 50
+    [PG]::PostMessage($render, 0x0101, [IntPtr]0x0D, [IntPtr]::new(0xC01C0001L)) | Out-Null
+    Start-Sleep -Milliseconds 1500
+    # Restore orchestrator focus
+    if($orchHwnd -ne [IntPtr]::Zero) {{ [PG]::SetForegroundWindow($orchHwnd) | Out-Null }}
+    Start-Sleep -Milliseconds 300
+    # Verify
+    $root2=[System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    $btns2=$root2.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+        (New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button)))
+    $perm=""
+    foreach($b in $btns2) {{ if($b.Current.Name -match 'Set Permissions') {{ $perm=$b.Current.Name; break }} }}
+    if($perm -match 'Bypass') {{ Write-Host "PERMS_FIXED" }}
+    else {{ Write-Host "PERMS_FAILED:$perm" }}
+}}
+'''
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=20
+        )
+        if "PERMS_FIXED" in r.stdout:
+            log(f"Permissions: Bypass Approvals set for HWND={hwnd}", "OK")
+        elif "PERMS_OK" in r.stdout:
+            log(f"Permissions: HWND={hwnd} already Bypass Approvals", "OK")
+        elif "PERMS_FAILED" in r.stdout:
+            perm_state = r.stdout.split("PERMS_FAILED:")[-1].strip() if "PERMS_FAILED:" in r.stdout else "unknown"
+            log(f"Permissions: FAILED to set Bypass for HWND={hwnd} (still '{perm_state}')", "WARN")
+        elif "PERMS_EXPAND_FAILED" in r.stdout:
+            log(f"Permissions: ExpandCollapse failed for HWND={hwnd}", "WARN")
+        else:
+            log(f"Permissions: Unexpected result for HWND={hwnd}: {r.stdout.strip()[:100]}", "WARN")
+    except Exception as e:
+        log(f"Permissions guard failed for HWND={hwnd}: {e}", "WARN")
 
 
 def prompt_worker(hwnd, worker_name, orch_hwnd, boot_memories=None):
@@ -839,7 +979,7 @@ def phase_1_backend():
     subprocess.Popen(
         [SKYNET_EXE],
         cwd=str(ROOT / "Skynet"),
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+        creationflags=BACKGROUND_SPAWN_FLAGS,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
@@ -870,7 +1010,7 @@ def phase_2_dashboard():
         [PYTHON, god_script],
         cwd=str(ROOT),
         env=_DAEMON_ENV,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+        creationflags=BACKGROUND_SPAWN_FLAGS,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
@@ -974,6 +1114,8 @@ def phase_3_workers(num_workers=4, orch_hwnd=None, fresh=False, boot_memories=No
 
         # Guard model + target on the window (restored or fresh)
         guard_model(new_hwnd, orch_hwnd)
+        time.sleep(0.5)
+        guard_permissions(new_hwnd, orch_hwnd)
         time.sleep(1)
 
         # Prompt the worker
@@ -1184,6 +1326,11 @@ def reconnect():
     """Reconnect to existing workers without opening new windows."""
     log("Reconnecting to existing workers...", "SYS")
 
+    if not phase_1_backend():
+        log("Reconnect aborted — Skynet backend required", "ERR")
+        return False
+    phase_2_dashboard()
+
     orch_hwnd = get_orchestrator_hwnd()
     if not orch_hwnd:
         log("No orchestrator HWND", "ERR")
@@ -1220,6 +1367,8 @@ def reconnect():
     if alive:
         log("Reconnect: Identity Injection", "SYS")
         phase_4b_identity(alive)
+
+    _start_post_boot_daemons()
 
     # Update state
     data["engines"] = list(engines.keys())
@@ -1381,7 +1530,7 @@ def _start_daemon_safe(script_path, pid_file, label, extra_args=None):
             cmd,
             cwd=str(ROOT),
             env=_DAEMON_ENV,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+            creationflags=BACKGROUND_SPAWN_FLAGS,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         log(f"{label} started (PID {proc.pid})", "OK")
@@ -1389,6 +1538,32 @@ def _start_daemon_safe(script_path, pid_file, label, extra_args=None):
     except Exception as e:
         log(f"{label} failed to start: {e}", "ERR")
         return None
+
+
+def _start_post_boot_daemons():
+    """Ensure the daemon set used by CC-Start is running."""
+    _start_daemon_safe(
+        str(ROOT / "tools" / "skynet_self_prompt.py"),
+        DATA_DIR / "self_prompt.pid",
+        "Self-prompt daemon",
+        extra_args=["start"],
+    )
+    _start_daemon_safe(
+        str(ROOT / "tools" / "skynet_self_improve.py"),
+        DATA_DIR / "self_improve.pid",
+        "Self-improvement engine",
+        extra_args=["start"],
+    )
+    _start_daemon_safe(
+        str(ROOT / "tools" / "skynet_bus_relay.py"),
+        DATA_DIR / "bus_relay.pid",
+        "Bus relay daemon",
+    )
+    _start_daemon_safe(
+        str(ROOT / "tools" / "skynet_consultant_bridge.py"),
+        DATA_DIR / "consultant_bridge.pid",
+        "Codex Consultant bridge",
+    )
 
 
 # ─── Main ─────────────────────────────────────────────
@@ -1484,29 +1659,9 @@ def main():
     elapsed = time.time() - t0
     log(f"SKYNET ONLINE — {len(workers)} workers, {len(engines)} engines — {elapsed:.1f}s", "OK")
 
-    # Phase 8: Self-Prompt Daemon (orchestrator heartbeat)
-    log("Phase 8: Self-Prompt Daemon", "SYS")
-    _start_daemon_safe(
-        str(ROOT / "tools" / "skynet_self_prompt.py"),
-        DATA_DIR / "self_prompt.pid",
-        "Self-prompt daemon",
-        extra_args=["start"],
-    )
-
-    # Phase 8b: Self-Improvement Engine
-    _start_daemon_safe(
-        str(ROOT / "tools" / "skynet_self_improve.py"),
-        DATA_DIR / "self_improve.pid",
-        "Self-improvement engine",
-        extra_args=["start"],
-    )
-
-    # Phase 8c: Bus Relay Daemon (delivers bus messages to worker windows)
-    _start_daemon_safe(
-        str(ROOT / "tools" / "skynet_bus_relay.py"),
-        DATA_DIR / "bus_relay.pid",
-        "Bus relay daemon",
-    )
+    # Phase 8: Background daemons
+    log("Phase 8: Background Daemons", "SYS")
+    _start_post_boot_daemons()
 
     print()
     show_status()

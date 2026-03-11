@@ -22,6 +22,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import psutil
+except Exception:
+    psutil = None
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 sys.path.insert(0, str(ROOT))
@@ -32,6 +37,23 @@ REGISTRY_FILE = DATA / "skynet_windows.json"
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
+
+
+def _hidden_subprocess_kwargs(**kwargs):
+    merged = dict(kwargs)
+    if sys.platform == "win32":
+        merged["creationflags"] = merged.get("creationflags", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startupinfo = merged.get("startupinfo")
+        if startupinfo is None and hasattr(subprocess, "STARTUPINFO"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            merged["startupinfo"] = startupinfo
+    return merged
+
+
+def _hidden_run(args, **kwargs):
+    return subprocess.run(args, **_hidden_subprocess_kwargs(**kwargs))
 
 
 # ── Win32 Helpers ──────────────────────────────────────────────
@@ -208,26 +230,44 @@ def _load_known_hwnds() -> dict:
 
 
 def _find_processes() -> list:
-    """Find Skynet-related background processes using Win32 + fast netstat."""
+    """Find Skynet-related background processes without shelling out."""
     procs = []
 
-    # Use netstat for port lookups (faster than PowerShell Get-NetTCPConnection)
-    try:
-        result = subprocess.run(
-            ["netstat", "-ano", "-p", "TCP"],
-            capture_output=True, text=True, timeout=5
-        )
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 5 and "LISTENING" in parts:
-                addr = parts[1]
-                pid = parts[-1]
-                if addr.endswith(":8420") and pid.isdigit():
-                    procs.append({"pid": int(pid), "service": "skynet_backend", "port": 8420})
-                elif addr.endswith(":8421") and pid.isdigit():
-                    procs.append({"pid": int(pid), "service": "god_console", "port": 8421})
-    except Exception:
-        pass
+    found_ports = set()
+
+    if psutil is not None:
+        try:
+            for conn in psutil.net_connections(kind="tcp"):
+                laddr = getattr(conn, "laddr", None)
+                if not laddr:
+                    continue
+                port = getattr(laddr, "port", None)
+                if port not in (8420, 8421):
+                    continue
+                if conn.status != psutil.CONN_LISTEN or not conn.pid:
+                    continue
+                service = "skynet_backend" if port == 8420 else "god_console"
+                procs.append({"pid": int(conn.pid), "service": service, "port": port})
+                found_ports.add(port)
+        except Exception:
+            pass
+
+    if psutil is not None:
+        try:
+            for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+                try:
+                    name = (proc.info.get("name") or "").lower()
+                    cmdline = " ".join(proc.info.get("cmdline") or [])
+                    if name == "skynet.exe" and 8420 not in found_ports:
+                        procs.append({"pid": int(proc.info["pid"]), "service": "skynet_backend", "port": 8420})
+                        found_ports.add(8420)
+                    elif "god_console.py" in cmdline and 8421 not in found_ports:
+                        procs.append({"pid": int(proc.info["pid"]), "service": "god_console", "port": 8421})
+                        found_ports.add(8421)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception:
+            pass
 
     # Watchdog
     pid_file = DATA / "watchdog.pid"

@@ -34,6 +34,23 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 
+def _hidden_subprocess_kwargs(**kwargs):
+    merged = dict(kwargs)
+    if sys.platform == "win32":
+        merged["creationflags"] = merged.get("creationflags", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startupinfo = merged.get("startupinfo")
+        if startupinfo is None and hasattr(subprocess, "STARTUPINFO"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            merged["startupinfo"] = startupinfo
+    return merged
+
+
+def _hidden_run(args, **kwargs):
+    return subprocess.run(args, **_hidden_subprocess_kwargs(**kwargs))
+
+
 def _get_all_hwnds():
     """Get all Skynet window HWNDs (workers + orchestrator) with names."""
     hwnds = {}
@@ -190,7 +207,7 @@ def check_model(hwnd):
     """Check model status for a window. Returns dict with model_ok, target_ok, model_name."""
     ps = _CHECK_PS.format(hwnd=int(hwnd))
     try:
-        r = subprocess.run(
+        r = _hidden_run(
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True, text=True, timeout=15
         )
@@ -220,7 +237,7 @@ def fix_model(hwnd, orch_hwnd=None):
 
     ps = _FIX_PS.format(hwnd=int(hwnd), orch_hwnd=int(orch_hwnd))
     try:
-        r = subprocess.run(
+        r = _hidden_run(
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True, text=True, timeout=25
         )

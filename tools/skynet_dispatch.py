@@ -169,6 +169,7 @@ def _log_dispatch(worker_name, task, state, success, target_hwnd=0):
             "success": success,
             "target_hwnd": target_hwnd,
             "result_received": False,
+            "strategy": os.environ.get("SKYNET_STRATEGY", "direct"),
         })
         # Keep last 200 entries
         if len(log_data) > 200:

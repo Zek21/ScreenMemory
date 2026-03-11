@@ -408,7 +408,7 @@ class SkynetLearner:
                 task_result = {
                     "task_id": str(uuid.uuid4()),
                     "category": category,
-                    "strategy_id": f"default_{category}",
+                    "strategy_id": dispatch.get("strategy", f"default_{category}") if dispatch else f"default_{category}",
                     "success": success,
                     "latency_ms": min(latency_ms, 3600000),  # cap at 1 hour
                     "quality_score": 0.8 if success else 0.3,

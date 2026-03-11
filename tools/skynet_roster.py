@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 SKYNET Roster -- 'Who are we?' command.
-Prints formatted roster of all workers with capabilities, status, mission history, and IQ.
+Prints formatted roster of all registered agents with capabilities, status, mission history, and IQ.
 
 Usage:
     python skynet_roster.py              # full roster
-    python skynet_roster.py --brief      # one-line per worker
-    python skynet_roster.py --worker beta # single worker detail
+    python skynet_roster.py --brief      # one-line per agent
+    python skynet_roster.py --worker beta # single agent detail
     python skynet_roster.py --json       # raw JSON output
 """
 
@@ -17,10 +17,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PROFILES = ROOT / "data" / "agent_profiles.json"
-WORKER_ORDER = ["orchestrator", "alpha", "beta", "gamma", "delta"]
-WORKER_SYMBOLS = {"orchestrator": "[O]", "alpha": "[A]", "beta": "[B]", "gamma": "[G]", "delta": "[D]"}
-WORKER_COLORS = {
+AGENT_ORDER = ["orchestrator", "consultant", "alpha", "beta", "gamma", "delta"]
+AGENT_SYMBOLS = {
+    "orchestrator": "[O]",
+    "consultant": "[C]",
+    "alpha": "[A]",
+    "beta": "[B]",
+    "gamma": "[G]",
+    "delta": "[D]",
+}
+AGENT_COLORS = {
     "orchestrator": "\033[92m",  # green
+    "consultant": "\033[96m",    # cyan
     "alpha": "\033[94m",         # blue
     "beta": "\033[95m",          # purple
     "gamma": "\033[35m",         # magenta
@@ -36,6 +44,16 @@ def load_profiles():
         print(f"ERROR: {PROFILES} not found", file=sys.stderr)
         sys.exit(1)
     return json.loads(PROFILES.read_text(encoding="utf-8"))
+
+
+def is_agent_profile(profile):
+    return isinstance(profile, dict) and ("role" in profile or "model" in profile)
+
+
+def ordered_agents(profiles):
+    known_profiles = [name for name, profile in profiles.items() if is_agent_profile(profile)]
+    extras = sorted(name for name in known_profiles if name not in AGENT_ORDER)
+    return [name for name in AGENT_ORDER if name in known_profiles] + extras
 
 
 def get_live_status():
@@ -63,6 +81,7 @@ def print_divider(char="-", width=72):
 
 
 def print_roster_full(profiles, live):
+    agent_ids = ordered_agents(profiles)
     pulse = get_pulse()
     iq = pulse.get("intelligence_score", "??")
     health = pulse.get("health", "UNKNOWN")
@@ -70,18 +89,18 @@ def print_roster_full(profiles, live):
 
     print()
     print_divider()
-    print(f"  {BOLD}SKYNET v3.0 Level 3 -- Worker Roster{RESET}")
+    print(f"  {BOLD}SKYNET v3.0 Level 3 -- Agent Roster{RESET}")
     print(f"  {DIM}IQ: {RESET}{BOLD}{iq}{RESET}  {DIM}Health: {RESET}{health}  {DIM}Engines: {RESET}{engines}")
     print(f"  {DIM}Profiles: {PROFILES}{RESET}")
     print_divider()
     print()
 
-    for wid in WORKER_ORDER:
+    for wid in agent_ids:
         p = profiles.get(wid)
         if not p:
             continue
-        color = WORKER_COLORS.get(wid, "")
-        sym = WORKER_SYMBOLS.get(wid, "?")
+        color = AGENT_COLORS.get(wid, "")
+        sym = AGENT_SYMBOLS.get(wid, f"[{wid[:1].upper()}]")
         live_status = live.get(wid, {}).get("status", p.get("current_status", "UNKNOWN"))
         missions = p.get("missions_completed", 0)
 
@@ -121,23 +140,24 @@ def print_roster_full(profiles, live):
         print()
 
     # Summary
-    total_missions = sum(profiles.get(w, {}).get("missions_completed", 0) for w in WORKER_ORDER)
-    active = sum(1 for w in WORKER_ORDER if live.get(w, {}).get("status") in ("IDLE", "WORKING"))
-    working = sum(1 for w in WORKER_ORDER if live.get(w, {}).get("status") == "WORKING")
+    total_missions = sum(profiles.get(w, {}).get("missions_completed", 0) for w in agent_ids)
+    active = sum(1 for w in agent_ids if live.get(w, {}).get("status") in ("IDLE", "WORKING"))
+    working = sum(1 for w in agent_ids if live.get(w, {}).get("status") == "WORKING")
     print_divider("─")
-    print(f"  {DIM}Total:{RESET} {len(WORKER_ORDER)} agents | {active} connected | {working} working | {total_missions} missions completed")
+    print(f"  {DIM}Total:{RESET} {len(agent_ids)} profiles | {active} live | {working} working | {total_missions} missions completed")
     print_divider("─")
     print()
 
 
 def print_roster_brief(profiles, live):
+    agent_ids = ordered_agents(profiles)
     print(f"\n  {BOLD}SKYNET Roster (brief){RESET}\n")
-    for wid in WORKER_ORDER:
+    for wid in agent_ids:
         p = profiles.get(wid)
         if not p:
             continue
-        color = WORKER_COLORS.get(wid, "")
-        sym = WORKER_SYMBOLS.get(wid, "?")
+        color = AGENT_COLORS.get(wid, "")
+        sym = AGENT_SYMBOLS.get(wid, f"[{wid[:1].upper()}]")
         status = live.get(wid, {}).get("status", p.get("current_status", "?"))
         missions = p.get("missions_completed", 0)
         specs = ", ".join(p.get("specializations", [])[:3])
@@ -145,14 +165,14 @@ def print_roster_brief(profiles, live):
     print()
 
 
-def print_worker_detail(wid, profiles, live):
+def print_agent_detail(wid, profiles, live):
     p = profiles.get(wid)
     if not p:
-        print(f"Unknown worker: {wid}")
+        print(f"Unknown agent: {wid}")
         sys.exit(1)
-    color = WORKER_COLORS.get(wid, "")
+    color = AGENT_COLORS.get(wid, "")
     status = live.get(wid, {}).get("status", p.get("current_status", "?"))
-    print(f"\n{color}{BOLD}{WORKER_SYMBOLS.get(wid, '?')} {p['name'].upper()} -- {p.get('role', '')}{RESET}")
+    print(f"\n{color}{BOLD}{AGENT_SYMBOLS.get(wid, f'[{wid[:1].upper()}]')} {p['name'].upper()} -- {p.get('role', '')}{RESET}")
     print(f"  Model: {p.get('model', '?')}  |  Status: {status}  |  Missions: {p.get('missions_completed', 0)}")
     print(f"\n  Capabilities:")
     for c in p.get("capabilities", []):
@@ -167,9 +187,9 @@ def print_worker_detail(wid, profiles, live):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SKYNET Worker Roster")
-    parser.add_argument("--brief", action="store_true", help="One-line summary per worker")
-    parser.add_argument("--worker", type=str, help="Show detail for one worker")
+    parser = argparse.ArgumentParser(description="SKYNET Agent Roster")
+    parser.add_argument("--brief", action="store_true", help="One-line summary per agent")
+    parser.add_argument("--worker", type=str, help="Show detail for one agent")
     parser.add_argument("--json", action="store_true", help="Output raw JSON")
     args = parser.parse_args()
 
@@ -178,12 +198,12 @@ def main():
 
     if args.json:
         # Merge live status
-        for wid in WORKER_ORDER:
+        for wid in ordered_agents(profiles):
             if wid in profiles and wid in live:
                 profiles[wid]["live_status"] = live[wid].get("status", "UNKNOWN")
         print(json.dumps(profiles, indent=2))
     elif args.worker:
-        print_worker_detail(args.worker, profiles, live)
+        print_agent_detail(args.worker, profiles, live)
     elif args.brief:
         print_roster_brief(profiles, live)
     else:

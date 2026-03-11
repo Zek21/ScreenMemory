@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 import urllib.error
@@ -29,36 +30,68 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 SKYNET_URL = "http://localhost:8420"
 
+
+def _resolve_real_python():
+    """Return (real_python_path, env_dict) to avoid venv launcher duplicate processes."""
+    venv_dir = ROOT.parent / "env"
+    cfg = venv_dir / "pyvenv.cfg"
+    base_python = None
+    if cfg.exists():
+        for line in cfg.read_text().splitlines():
+            if line.strip().startswith("executable"):
+                _, _, val = line.partition("=")
+                candidate = val.strip()
+                if Path(candidate).exists():
+                    base_python = candidate
+                    break
+    if not base_python:
+        base_python = str(Path(sys.executable))
+    env = os.environ.copy()
+    site_packages = str(venv_dir / "Lib" / "site-packages")
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{site_packages};{existing}" if existing else site_packages
+    env["VIRTUAL_ENV"] = str(venv_dir)
+    return base_python, env
+
+
+PYTHON, DAEMON_ENV = _resolve_real_python()
+BACKGROUND_FLAGS = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+
+
+def _python_cmd(script: str, *args: str) -> list[str]:
+    return [PYTHON, str(ROOT / "tools" / script), *args]
+
+
 # Registry of all known daemons with PID file locations and start commands
 DAEMONS = {
     "monitor": {
         "pid_file": DATA_DIR / "monitor.pid",
-        "start_cmd": [sys.executable, str(ROOT / "tools" / "skynet_monitor.py")],
+        "start_cmd": _python_cmd("skynet_monitor.py"),
         "description": "Worker window health monitor",
     },
     "watchdog": {
         "pid_file": DATA_DIR / "watchdog.pid",
-        "start_cmd": [sys.executable, str(ROOT / "tools" / "skynet_watchdog.py"), "start"],
+        "start_cmd": _python_cmd("skynet_watchdog.py", "start"),
         "description": "Service health watchdog",
     },
     "self_prompt": {
         "pid_file": DATA_DIR / "self_prompt.pid",
-        "start_cmd": [sys.executable, str(ROOT / "tools" / "skynet_self_prompt.py"), "start"],
+        "start_cmd": _python_cmd("skynet_self_prompt.py", "start"),
         "description": "Orchestrator heartbeat daemon",
     },
     "self_improve": {
         "pid_file": DATA_DIR / "self_improve.pid",
-        "start_cmd": [sys.executable, str(ROOT / "tools" / "skynet_self_improve.py"), "start"],
+        "start_cmd": _python_cmd("skynet_self_improve.py", "start"),
         "description": "Self-improvement scanner",
     },
     "bus_relay": {
         "pid_file": DATA_DIR / "bus_relay.pid",
-        "start_cmd": [sys.executable, str(ROOT / "tools" / "skynet_bus_relay.py")],
+        "start_cmd": _python_cmd("skynet_bus_relay.py"),
         "description": "Bus message relay to workers",
     },
     "sse_daemon": {
         "pid_file": DATA_DIR / "sse_daemon.pid",
-        "start_cmd": [sys.executable, str(ROOT / "tools" / "skynet_sse_daemon.py")],
+        "start_cmd": _python_cmd("skynet_sse_daemon.py"),
         "description": "SSE real-time state streamer",
     },
 }
@@ -221,15 +254,15 @@ def start_daemon(name: str):
         print(f"[{_ts()}] {name}: already running (PID {pid})")
         return True
 
-    import subprocess
     print(f"[{_ts()}] {name}: starting...")
     try:
         proc = subprocess.Popen(
             info["start_cmd"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-            cwd=str(ROOT)
+            env=DAEMON_ENV,
+            creationflags=BACKGROUND_FLAGS,
+            cwd=str(ROOT),
         )
         time.sleep(1)
         if proc.poll() is None:

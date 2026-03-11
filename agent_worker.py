@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import json
+import subprocess
 import threading
 import argparse
 from datetime import datetime
@@ -53,6 +54,19 @@ WHITE = "\033[97m"
 
 # Shared command queue file for receiving tasks from orchestrator
 QUEUE_DIR = Path(r"D:\Prospects\ScreenMemory\data\agent_queues")
+
+
+def _hidden_popen_kwargs(**kwargs):
+    merged = dict(kwargs)
+    if os.name == "nt":
+        merged["creationflags"] = merged.get("creationflags", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startupinfo = merged.get("startupinfo")
+        if startupinfo is None and hasattr(subprocess, "STARTUPINFO"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            merged["startupinfo"] = startupinfo
+    return merged
 
 
 class AgentWorker:
@@ -181,11 +195,11 @@ class AgentWorker:
                 self.log(f"  {WHITE}$ {command[:48]}{RESET}")
                 self.render()
 
-                import subprocess
                 proc = subprocess.Popen(
                     command, shell=True,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1,
+                    **_hidden_popen_kwargs(),
                 )
                 # Stream every line live
                 for line in proc.stdout:
@@ -212,11 +226,11 @@ class AgentWorker:
                 self.log(f"  {WHITE}Running Python code...{RESET}")
                 self.render()
 
-                import subprocess
                 proc = subprocess.Popen(
                     [sys.executable, "-u", "-c", command],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1,
+                    **_hidden_popen_kwargs(),
                 )
                 for line in proc.stdout:
                     line = line.rstrip()

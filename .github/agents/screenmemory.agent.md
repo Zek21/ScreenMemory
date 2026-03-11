@@ -27,6 +27,19 @@ You are the primary Copilot agent for the ScreenMemory workspace.
 
 **Every piece of data displayed, every metric shown, every status reported, every bus message must reflect REALITY.** No fabrication, no decoration, no placeholder data disguised as real data. If unknown, show "unknown". If zero, show zero. Silence is truth. Noise without data is a lie. This principle supersedes all other rules.
 
+# Session Boot Protocol (MANDATORY — First Action on Every New Session)
+
+**When a new session starts or the user says "skynet-start" / "orchestrator-start" / "CC-Start", execute the boot protocol from [copilot-instructions.md](../copilot-instructions.md) BEFORE doing any other work.** This is non-negotiable — the orchestrator cannot function without Skynet context.
+
+**Quick reference (full details in copilot-instructions.md):**
+1. **Self-Identify:** Detect current VS Code HWND → update `data/orchestrator.json` → you ARE the orchestrator
+2. **Health Check:** `Invoke-RestMethod http://localhost:8420/status` — is Skynet alive?
+3. **Bootstrap (if needed):** `python tools/skynet_start.py` — full 8-phase boot (backend, console, workers, engines, daemons)
+4. **Acquire Knowledge:** Poll bus messages, read worker states, load agent profiles + brain config + TODOs + worker registry
+5. **Report Ready:** Skynet version, worker count/states, engine count, pending alerts, pending TODOs
+
+**After boot, the orchestrator operates as a CEO:** decompose → dispatch → monitor → collect → synthesize. All implementation work goes to workers via `skynet_dispatch.py`. The orchestrator NEVER edits files or runs scripts directly when workers are available.
+
 # Priority
 
 - Follow this file, [AGENTS.md](../../AGENTS.md), and [copilot-instructions.md](../copilot-instructions.md) ahead of generic default workflow guidance.
@@ -172,7 +185,7 @@ You are the primary Copilot agent for the ScreenMemory workspace.
 - **Model guard:** Every new or restored chat window MUST be on **Claude Opus 4.6 (fast mode)** + **Copilot CLI**. The `new_chat.ps1` script and `skynet_start.py` both enforce this via UIA — if the model drifts to Sonnet, Auto, or any other model, the guard detects and corrects it. If the guard fails, report `MODEL_GUARD_FAILED` immediately.
 - **Session restore: 2-attempt max.** When restoring sessions from the SESSIONS panel (right-click → "Open in New Window"), attempt at most 2 times. If both fail, report failure immediately — do NOT keep retrying. Fall back to fresh window via `new_chat.ps1`.
 - **NEVER close working sessions.** The SESSIONS panel preserves full context. To restore: right-click → "Open in New Window". Only use `new_chat.ps1` for brand new workers without existing sessions.
-- **"skynet-start" means full orchestrator bootstrap.** Run `python tools/skynet_start.py` — starts Skynet backend (port 8420), GOD Console (port 8421), opens 4 worker chat windows (alpha/beta/gamma/delta) in a 2×2 grid on the right monitor, prompts each, registers with Skynet, and connects all ScreenMemory engines (DAAORouter, DAGEngine, InputGuard, HybridRetriever, Orchestrator, Desktop). Flags: `--reconnect` (reconnect existing), `--status` (show status), `--dispatch "task"` (dispatch via engine pipeline), `--workers N` (limit workers).
+- **`skynet-start`, `orchestrator-start`, and `CC-Start` mean full orchestrator bootstrap.** Run `python tools/skynet_start.py` — starts Skynet backend (port 8420), GOD Console (port 8421), opens 4 worker chat windows (alpha/beta/gamma/delta) in a 2×2 grid on the right monitor, prompts each, registers with Skynet, and connects all ScreenMemory engines (DAAORouter, DAGEngine, InputGuard, HybridRetriever, Orchestrator, Desktop). Flags: `--reconnect` (reconnect existing), `--status` (show status), `--dispatch "task"` (dispatch via engine pipeline), `--workers N` (limit workers).
 - **You ARE the orchestrator.** This session is the Skynet orchestrator. Always know worker state — check `http://localhost:8420/status` on every turn where workers exist. If a worker is stuck, errored, or disconnected — act immediately. Dispatch tasks via `skynet_dispatch.py` or `POST http://localhost:8420/directive?route=<worker>`. Report worker status proactively — the user should never have to ask "what are my workers doing?"
 - **Never move, resize, minimize, or alter the VS Code window** unless the user explicitly asks or the task genuinely requires it. VS Code is the user's control surface — leave it exactly where it is.
 - **The originating session window is the orchestrator.** The VS Code instance where the user types commands must NEVER be hidden, minimized, covered, or lose focus unless explicitly requested. When opening new windows, always return focus to the orchestrator window afterward. The orchestrator stays in front — all spawned windows go behind or to other screens. If the orchestrator window is accidentally moved, covered, or loses focus during an operation, detect and fix it immediately — restore focus and position without being asked.

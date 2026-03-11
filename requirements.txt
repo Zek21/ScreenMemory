@@ -29,3 +29,5 @@ sqlite-vec>=0.1.1
 # Optional: Advanced OCR fallback
 # doctr[torch]>=0.9
 # paddleocr>=2.7
+
+comtypes>=1.1.14  # Windows COM automation (UIA engine)

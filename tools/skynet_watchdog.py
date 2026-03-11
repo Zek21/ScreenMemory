@@ -18,8 +18,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import psutil
+except Exception:
+    psutil = None
 
 ROOT = Path(__file__).resolve().parent.parent
 # Ensure repo root is on sys.path so 'tools.*' imports work when run standalone
@@ -62,6 +67,58 @@ PYTHON, _DAEMON_ENV = _resolve_real_python()
 
 GOD_CHECK_INTERVAL = 30
 SKYNET_CHECK_INTERVAL = 60
+
+
+def _hidden_subprocess_kwargs(**kwargs):
+    merged = dict(kwargs)
+    if sys.platform == "win32":
+        merged["creationflags"] = merged.get("creationflags", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startupinfo = merged.get("startupinfo")
+        if startupinfo is None and hasattr(subprocess, "STARTUPINFO"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            merged["startupinfo"] = startupinfo
+    return merged
+
+
+def _hidden_run(args, **kwargs):
+    return subprocess.run(args, **_hidden_subprocess_kwargs(**kwargs))
+
+
+def _hidden_check_output(args, **kwargs):
+    return subprocess.check_output(args, **_hidden_subprocess_kwargs(**kwargs))
+
+
+def _read_state_timestamp_age(path: Path, *keys: str) -> tuple[object | None, float | None]:
+    """Read a JSON timestamp field and return (raw_value, age_seconds)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None, None
+
+    raw_value = None
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            raw_value = value
+            break
+
+    if raw_value in (None, ""):
+        return None, None
+
+    try:
+        if isinstance(raw_value, str):
+            dt = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+            if dt.tzinfo:
+                age = (datetime.now(timezone.utc) - dt).total_seconds()
+            else:
+                age = (datetime.now() - dt).total_seconds()
+        else:
+            age = time.time() - float(raw_value)
+        return raw_value, max(age, 0.0)
+    except Exception:
+        return raw_value, None
 
 
 def log(msg: str):
@@ -168,9 +225,8 @@ def restart_sse_daemon():
         rt_file = DATA_DIR / "realtime.json"
         if rt_file.exists():
             try:
-                rt = json.loads(rt_file.read_text())
-                age = time.time() - rt.get("last_update", 0)
-                if age < 10:
+                _, age = _read_state_timestamp_age(rt_file, "last_update", "timestamp")
+                if age is not None and age < 10:
                     new_pid = _get_service_pid("sse_daemon")
                     log(f"SSE daemon restarted (old={old_pid}, new={new_pid})")
                     _post_restart_alert("skynet_sse_daemon.py", old_pid, new_pid)
@@ -186,17 +242,79 @@ def restart_sse_daemon():
         return False
 
 
+def restart_learner():
+    """Restart skynet_learner.py as a hidden background daemon."""
+    learner_pid_file = DATA_DIR / "learner.pid"
+    if learner_pid_file.exists():
+        try:
+            old_pid_val = int(learner_pid_file.read_text().strip())
+            import os
+            os.kill(old_pid_val, 0)
+            log(f"Learner daemon already running (PID {old_pid_val}) -- skipping restart")
+            return True
+        except (OSError, ValueError):
+            pass  # Stale PID file -- proceed with restart
+
+    log("Learner daemon DOWN -- attempting restart")
+    old_pid = _get_service_pid("learner")
+    try:
+        subprocess.Popen(
+            [PYTHON, str(ROOT / "tools" / "skynet_learner.py"), "--daemon"],
+            cwd=str(ROOT),
+            env=_DAEMON_ENV,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+        )
+        time.sleep(3)
+        if learner_pid_file.exists():
+            try:
+                new_pid_val = int(learner_pid_file.read_text().strip())
+                import os
+                os.kill(new_pid_val, 0)
+                log(f"Learner daemon restarted (old={old_pid}, new={new_pid_val})")
+                _post_restart_alert("skynet_learner.py", old_pid, new_pid_val)
+                _refresh_protected_registry()
+                _log_incident("learner_restart", old_pid, new_pid_val)
+                return True
+            except (OSError, ValueError):
+                pass
+        log("Learner daemon restart -- cannot verify (may be starting)")
+        return True
+    except Exception as e:
+        log(f"Learner daemon restart error: {e}")
+        return False
+
+
 def _get_service_pid(service_name):
     """Get the PID of a known service by name. Returns 0 if not found."""
     try:
         if service_name == "skynet":
-            import socket
-            return _port_to_pid(8420)
+            pid = _port_to_pid(8420)
+            if pid:
+                return pid
+            if psutil is not None:
+                for proc in psutil.process_iter(["pid", "name"]):
+                    try:
+                        if (proc.info.get("name") or "").lower() == "skynet.exe":
+                            return int(proc.info["pid"])
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
         elif service_name == "god_console":
-            return _port_to_pid(8421)
+            pid = _port_to_pid(8421)
+            if pid:
+                return pid
+            if psutil is not None:
+                for proc in psutil.process_iter(["pid", "cmdline"]):
+                    try:
+                        cmdline = " ".join(proc.info.get("cmdline") or [])
+                        if "god_console.py" in cmdline:
+                            return int(proc.info["pid"])
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
         elif service_name == "sse_daemon":
             # Find python processes running skynet_sse_daemon
-            out = subprocess.check_output(
+            out = _hidden_check_output(
                 ["wmic", "process", "where", "Name like '%python%'",
                  "get", "ProcessId,CommandLine", "/format:csv"],
                 text=True, timeout=10, stderr=subprocess.DEVNULL
@@ -209,27 +327,37 @@ def _get_service_pid(service_name):
                             return int(parts[-1].strip())
                         except ValueError:
                             pass
+        elif service_name == "learner":
+            learner_pid_file = DATA_DIR / "learner.pid"
+            if learner_pid_file.exists():
+                try:
+                    pid_val = int(learner_pid_file.read_text().strip())
+                    import os
+                    os.kill(pid_val, 0)
+                    return pid_val
+                except (OSError, ValueError):
+                    pass
     except Exception:
         pass
     return 0
 
 
 def _port_to_pid(port):
-    """Get PID listening on a port using netstat."""
-    try:
-        out = subprocess.check_output(
-            ["netstat", "-ano", "-p", "TCP"], text=True, timeout=5, stderr=subprocess.DEVNULL
-        )
-        for line in out.split("\n"):
-            if f":{port}" in line and "LISTENING" in line:
-                parts = line.split()
-                if parts:
-                    try:
-                        return int(parts[-1])
-                    except ValueError:
-                        pass
-    except Exception:
-        pass
+    """Get PID listening on a port without shelling out."""
+    if psutil is not None:
+        try:
+            for conn in psutil.net_connections(kind="tcp"):
+                laddr = getattr(conn, "laddr", None)
+                if not laddr:
+                    continue
+                if getattr(laddr, "port", None) != port:
+                    continue
+                if conn.status != psutil.CONN_LISTEN:
+                    continue
+                if conn.pid:
+                    return int(conn.pid)
+        except Exception:
+            pass
     return 0
 
 
@@ -373,7 +501,7 @@ def run_daemon(args=None):
             os.kill(old_pid, 0)  # check if alive
             # Verify it's actually a watchdog process (not a recycled PID)
             import subprocess
-            result = subprocess.run(
+            result = _hidden_run(
                 ["powershell", "-NoProfile", "-Command",
                  f"(Get-CimInstance Win32_Process -Filter \"ProcessId = {old_pid}\").CommandLine"],
                 capture_output=True, text=True, timeout=5
@@ -398,14 +526,16 @@ def run_daemon(args=None):
     last_stuck_check = 0.0
     last_guard_refresh = 0.0
     last_hwnd_check = 0.0
+    last_learner_check = 0.0
     AWARENESS_INTERVAL = 60
     WINDOW_SCAN_INTERVAL = 30
     STUCK_CHECK_INTERVAL = 30
     GUARD_REFRESH_INTERVAL = 60
     SSE_CHECK_INTERVAL = 30
     HWND_CHECK_INTERVAL = 30
+    LEARNER_CHECK_INTERVAL = 60
     stuck_detector = None
-    status = {"god_console": "unknown", "skynet": "unknown", "sse_daemon": "unknown"}
+    status = {"god_console": "unknown", "skynet": "unknown", "sse_daemon": "unknown", "learner": "unknown"}
 
     try:
         while True:
@@ -462,9 +592,8 @@ def run_daemon(args=None):
                     rt_file = DATA_DIR / "realtime.json"
                     if rt_file.exists():
                         try:
-                            rt = json.loads(rt_file.read_text())
-                            age = time.time() - rt.get("last_update", 0)
-                            sse_ok = age < 15
+                            _, age = _read_state_timestamp_age(rt_file, "last_update", "timestamp")
+                            sse_ok = age is not None and age < 15
                         except Exception:
                             pass
 
@@ -476,6 +605,27 @@ def run_daemon(args=None):
                     status["sse_daemon"] = "restarted" if restarted else "down"
                 status["sse_last_check"] = datetime.now().isoformat()
                 last_sse_check = now
+
+            # ── Learner daemon check + auto-restart ──
+            if now - last_learner_check >= LEARNER_CHECK_INTERVAL:
+                learner_ok = False
+                learner_pid_file = DATA_DIR / "learner.pid"
+                if learner_pid_file.exists():
+                    try:
+                        learner_pid_val = int(learner_pid_file.read_text().strip())
+                        import os
+                        os.kill(learner_pid_val, 0)
+                        learner_ok = True
+                    except (OSError, ValueError):
+                        pass
+                _update_heartbeat("learner", learner_ok)
+                if learner_ok:
+                    status["learner"] = "ok"
+                else:
+                    restarted = restart_learner()
+                    status["learner"] = "restarted" if restarted else "down"
+                status["learner_last_check"] = datetime.now().isoformat()
+                last_learner_check = now
 
             # ── Worker HWND health check ──
             if now - last_hwnd_check >= HWND_CHECK_INTERVAL:

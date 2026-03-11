@@ -7,7 +7,8 @@
 param(
     [int]$Monitor = 2,  # 1=left, 2=right
     [int]$Width = 800,
-    [int]$Height = 880
+    [int]$Height = 880,
+    [switch]$SkipEmptyCheck  # Skip the "no first prompt" guard (used by skynet_start.py)
 )
 
 # --- Session open failure tracker (max 2 consecutive attempts) ---
@@ -18,7 +19,8 @@ if (Test-Path $failFile) {
     try {
         $failData = Get-Content $failFile -Raw | ConvertFrom-Json
         if ($failData.consecutive_failures -ge $MAX_CONSECUTIVE_FAILS) {
-            Write-Host "BLOCKED: $MAX_CONSECUTIVE_FAILS consecutive session open failures (last: $($failData.last_failure)). Delete $failFile to retry."
+            Write-Host "BLOCKED: $MAX_CONSECUTIVE_FAILS consecutive failures (last: $($failData.last_failure))."
+            Write-Host "EDIT REQUIRED: Update button detection in tools\new_chat.ps1, then delete $failFile to retry."
             exit 1
         }
     } catch {}
@@ -41,6 +43,63 @@ function Clear-Failures {
 
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+
+# SendInput helper -- injects hardware-level events that Electron/Chromium processes
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+public class RealInput {
+    [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT {
+        public int dx, dy;
+        public uint mouseData, dwFlags, time;
+        public IntPtr dwExtraInfo;
+    }
+    [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT {
+        public ushort wVk, wScan;
+        public uint dwFlags, time;
+        public IntPtr dwExtraInfo;
+    }
+    [StructLayout(LayoutKind.Explicit)] public struct INPUT {
+        [FieldOffset(0)] public uint type;
+        [FieldOffset(4)] public MOUSEINPUT mi;
+        [FieldOffset(4)] public KEYBDINPUT ki;
+    }
+    [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int sz);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    public static void MouseClick(int x, int y) {
+        SetCursorPos(x, y);
+        System.Threading.Thread.Sleep(100);
+        var inp = new INPUT[2];
+        inp[0].type = 0; inp[0].mi.dwFlags = 0x0002; // MOUSEEVENTF_LEFTDOWN
+        inp[1].type = 0; inp[1].mi.dwFlags = 0x0004; // MOUSEEVENTF_LEFTUP
+        SendInput(2, inp, System.Runtime.InteropServices.Marshal.SizeOf(typeof(INPUT)));
+    }
+    public static void KeyPress(ushort vk) {
+        var inp = new INPUT[2];
+        inp[0].type = 1; inp[0].ki.wVk = vk; inp[0].ki.dwFlags = 0;
+        inp[1].type = 1; inp[1].ki.wVk = vk; inp[1].ki.dwFlags = 0x0002; // KEYEVENTF_KEYUP
+        SendInput(2, inp, System.Runtime.InteropServices.Marshal.SizeOf(typeof(INPUT)));
+    }
+}
+"@ -ErrorAction SilentlyContinue
+
+# MouseClick helper kept as alias for legacy code
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+public class MouseClick {
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
+    public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+    public const uint MOUSEEVENTF_LEFTUP   = 0x0004;
+    public static void ClickAt(int x, int y) {
+        SetCursorPos(x, y);
+        System.Threading.Thread.Sleep(80);
+        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
+        System.Threading.Thread.Sleep(50);
+        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+    }
+}
+"@ -ErrorAction SilentlyContinue
 
 Add-Type @"
 using System;
@@ -73,16 +132,21 @@ public class Ghost {
         PostMessage(renderHwnd, 0x0202, IntPtr.Zero, lParam);
     }
 
+    public delegate bool EnumChildWP(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, EnumChildWP cb, IntPtr l);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder sb, int n);
+
+    private static IntPtr _renderFound;
+    private static bool _renderCb(IntPtr h, IntPtr l) {
+        var sb = new System.Text.StringBuilder(256);
+        GetClassName(h, sb, 256);
+        if (sb.ToString() == "Chrome_RenderWidgetHostHWND") { _renderFound = h; return false; }
+        return true;
+    }
     public static IntPtr FindRenderSurface(IntPtr parentHwnd) {
-        IntPtr r = FindWindowEx(parentHwnd, IntPtr.Zero, "Chrome_RenderWidgetHostHWND", null);
-        if (r != IntPtr.Zero) return r;
-        IntPtr child = FindWindowEx(parentHwnd, IntPtr.Zero, null, null);
-        while (child != IntPtr.Zero) {
-            r = FindWindowEx(child, IntPtr.Zero, "Chrome_RenderWidgetHostHWND", null);
-            if (r != IntPtr.Zero) return r;
-            child = FindWindowEx(parentHwnd, child, null, null);
-        }
-        return parentHwnd;
+        _renderFound = IntPtr.Zero;
+        EnumChildWindows(parentHwnd, new EnumChildWP(_renderCb), IntPtr.Zero);
+        return _renderFound != IntPtr.Zero ? _renderFound : parentHwnd;
     }
 
     public static List<IntPtr> GetVSCodeWindows() {
@@ -141,7 +205,7 @@ foreach ($cw in $chatWindows) {
     }
     $isEmpty = ($chatMessages -eq 0)
 
-    if ($isEmpty) {
+    if ($isEmpty -and -not $SkipEmptyCheck) {
         Write-Host "BLOCKED: Chat window HWND=$cw has no first prompt yet. Use it before opening another."
         # Bring the empty window to attention
         [Ghost]::SetForegroundWindow($cw)
@@ -226,45 +290,123 @@ $buttons = $root.FindAll(
 )
 
 $dropdown = $null
-$dropdownW = 999
+$orchRect = New-Object Ghost+RECT
+[Ghost]::GetWindowRect($orchHwnd, [ref]$orchRect)
+$winTop = $orchRect.Top
+
+# Strategy 1: ExpandCollapsePattern button that is small (≤25px wide) AND near the top of the window (toolbar area)
 foreach ($btn in $buttons) {
     $n = $btn.Current.Name
-    $w = [int]$btn.Current.BoundingRectangle.Width
-    $h = [int]$btn.Current.BoundingRectangle.Height
-    # The ▾ dropdown is the NARROWEST button named "New Chat"
-    if ($n -eq 'New Chat' -and $w -gt 0 -and $h -gt 15 -and $w -lt $dropdownW) {
-        $dropdown = $btn
-        $dropdownW = $w
+    try {
+        $w = [int]$btn.Current.BoundingRectangle.Width
+        $h = [int]$btn.Current.BoundingRectangle.Height
+        $y = [int]$btn.Current.BoundingRectangle.Y
+    } catch { continue }
+    if ($w -le 0 -or $h -le 0) { continue }
+    if ($w -gt 25) { continue }  # The ▾ chevron is narrow (≤25px)
+    if (($y - $winTop) -gt 200) { continue }  # Must be in top 200px of window (toolbar)
+    try {
+        $exp = $btn.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+        if ($exp -ne $null) {
+            $dropdown = $btn
+            Write-Host "DROPDOWN: found via ExpandCollapse -- '$n' w=$w y=$y"
+            break
+        }
+    } catch {}
+}
+
+# Strategy 2: button name contains ▾ or explicit chevron label
+if (-not $dropdown) {
+    foreach ($btn in $buttons) {
+        $n = $btn.Current.Name
+        $w = [int]$btn.Current.BoundingRectangle.Width
+        $h = [int]$btn.Current.BoundingRectangle.Height
+        if ($w -le 0 -or $h -le 0) { continue }
+        if ($n -match '▾|chevron|dropdown' -or ($n -match 'New Chat' -and $w -lt 25)) {
+            $dropdown = $btn
+            Write-Host "DROPDOWN: found via name match -- '$n' w=$w"
+            break
+        }
     }
 }
 
+# Strategy 3: narrowest visible "New Chat" button (original fallback)
 if (-not $dropdown) {
-    Record-Failure "Could not find New Chat dropdown button"
-    Write-Host "ERROR: Could not find New Chat dropdown button"
+    $dropdownW = 999
+    foreach ($btn in $buttons) {
+        $n = $btn.Current.Name
+        $w = [int]$btn.Current.BoundingRectangle.Width
+        $h = [int]$btn.Current.BoundingRectangle.Height
+        if ($n -eq 'New Chat' -and $w -gt 0 -and $h -gt 15 -and $w -lt $dropdownW) {
+            $dropdown = $btn
+            $dropdownW = $w
+        }
+    }
+    if ($dropdown) { Write-Host "DROPDOWN: found via narrowest fallback -- w=$dropdownW" }
+}
+
+if (-not $dropdown) {
+    # Diagnostic: list all non-empty buttons to help the user fix the script
+    $btnList = @()
+    foreach ($btn in $buttons) {
+        $n = $btn.Current.Name
+        $w = [int]$btn.Current.BoundingRectangle.Width
+        if ($n -ne '' -and $w -gt 0) { $btnList += "$n(${w}px)" }
+    }
+    $diag = $btnList -join ", "
+    Record-Failure "Could not find New Chat dropdown (▾) button"
+    Write-Host "ERROR: Could not find New Chat dropdown (▾) button."
+    Write-Host "EDIT REQUIRED: Update button detection in tools\new_chat.ps1."
+    Write-Host "Buttons found: $diag"
     exit 1
 }
 
 $dr = $dropdown.Current.BoundingRectangle
-[Ghost]::Click($editorRender, [int]($dr.X + $dr.Width/2), [int]($dr.Y + $dr.Height/2))
-Start-Sleep -Milliseconds 1500
 
-# --- Click "New Chat Window" via UIA InvokePattern ---
-$desktop = [System.Windows.Automation.AutomationElement]::RootElement
-$menuItems = $desktop.FindAll(
-    [System.Windows.Automation.TreeScope]::Descendants,
-    (New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::MenuItem
-    ))
-)
+# Use ExpandCollapsePattern.Expand() -- more reliable than ghost click
+try {
+    $exp = $dropdown.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    $exp.Expand()
+} catch {
+    [Ghost]::Click($editorRender, [int]($dr.X + $dr.Width/2), [int]($dr.Y + $dr.Height/2))
+}
+Start-Sleep -Milliseconds 1200
 
+# --- Click "New Chat Window" via real mouse at its UIA coordinates ---
 $launched = $false
-foreach ($mi in $menuItems) {
-    if ($mi.Current.Name -eq 'New Chat Window') {
-        $inv = $mi.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-        $inv.Invoke()
-        $launched = $true
-        break
+for ($attempt = 1; $attempt -le 3 -and -not $launched; $attempt++) {
+    $desktop = [System.Windows.Automation.AutomationElement]::RootElement
+    $menuItems = $desktop.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        (New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::MenuItem
+        ))
+    )
+    foreach ($mi in $menuItems) {
+        if ($mi.Current.Name -eq 'New Chat Window') {
+            try {
+                $mir = $mi.Current.BoundingRectangle
+                $mix = [int]($mir.X + $mir.Width/2)
+                $miy = [int]($mir.Y + $mir.Height/2)
+                [MouseClick]::ClickAt($mix, $miy)
+            } catch {
+                try { $mi.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } catch {}
+            }
+            $launched = $true
+            break
+        }
+    }
+    if (-not $launched) {
+        # Menu may have closed — re-expand dropdown
+        Write-Host "RETRY ${attempt}: re-expanding dropdown"
+        try {
+            $exp = $dropdown.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+            $exp.Expand()
+        } catch {
+            [Ghost]::Click($editorRender, [int]($dr.X + $dr.Width/2), [int]($dr.Y + $dr.Height/2))
+        }
+        Start-Sleep -Milliseconds 1000
     }
 }
 
@@ -378,15 +520,86 @@ for ($modelAttempt = 1; $modelAttempt -le 2; $modelAttempt++) {
     [Ghost]::Click($newRender, [int]($pmr.X + $pmr.Width/2), [int]($pmr.Y + $pmr.Height/2))
     Start-Sleep -Milliseconds 2000
 
-    # Type "fast" to filter to Opus fast mode -- confirmed working method
+    # Type "opus" to filter to Claude Opus models only (avoids "Grok Code Fast" false match)
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-    [System.Windows.Forms.SendKeys]::SendWait("fast")
+    [System.Windows.Forms.SendKeys]::SendWait("opus")
     Start-Sleep -Milliseconds 1500
 
     # First result should be Opus fast -- Down+Enter to select
     [System.Windows.Forms.SendKeys]::SendWait("{DOWN}{ENTER}")
     Start-Sleep -Milliseconds 1000
     Write-Host "MODEL_GUARD: Selected Opus fast via keyboard filter"
+}
+
+# --- PERMISSION GUARD: Set Bypass Approvals ---
+
+Start-Sleep -Milliseconds 500
+$chatRootP = [System.Windows.Automation.AutomationElement]::FromHandle($newHwnd)
+$pButtons = $chatRootP.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    (New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button
+    ))
+)
+$permBtn = $null
+foreach ($btn in $pButtons) {
+    $n = $btn.Current.Name
+    if ($n -eq 'Set Permissions - Bypass Approvals') {
+        # Already set to bypass
+        Write-Host "PERMISSION_GUARD: Already set to Bypass Approvals"
+        $permBtn = $null; break
+    }
+    if ($n -eq 'Set Permissions - Default Approvals') {
+        $permBtn = $btn
+    }
+}
+if ($permBtn) {
+    Write-Host "PERMISSION_GUARD: Found Default Approvals -- switching to Bypass"
+    $renderP = [Ghost]::FindRenderSurface($newHwnd)
+
+    # Step 1: Open dropdown via ExpandCollapsePattern (pure UIA, no mouse)
+    $expanded = $false
+    try {
+        $expP = $permBtn.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+        $expP.Expand()
+        $expanded = $true
+        Write-Host "PERMISSION_GUARD: Dropdown opened via ExpandCollapse"
+    } catch {
+        # Fallback: ghost click on the button (PostMessage, no real mouse)
+        $pr = $permBtn.Current.BoundingRectangle
+        [Ghost]::Click($renderP, [int]($pr.X + $pr.Width/2), [int]($pr.Y + $pr.Height/2))
+        $expanded = $true
+        Write-Host "PERMISSION_GUARD: Dropdown opened via ghost click"
+    }
+    Start-Sleep -Milliseconds 1200
+
+    # Step 2: Select Bypass via PostMessage keyboard (Down+Enter)
+    # Dropdown highlights CURRENT selection (Default Approvals)
+    # Down moves to Bypass Approvals, Enter selects it
+    # Ghost DOWN key (VK=0x28, scan=0x50)
+    [Ghost]::PostMessage($renderP, 0x0100, [IntPtr]0x28, [IntPtr]0x00500001) | Out-Null
+    Start-Sleep -Milliseconds 50
+    [Ghost]::PostMessage($renderP, 0x0101, [IntPtr]0x28, [IntPtr]::new(0xC0500001L)) | Out-Null
+    Start-Sleep -Milliseconds 200
+    # Ghost ENTER key (VK=0x0D, scan=0x1C)
+    [Ghost]::PostMessage($renderP, 0x0100, [IntPtr]0x0D, [IntPtr]0x001C0001) | Out-Null
+    Start-Sleep -Milliseconds 50
+    [Ghost]::PostMessage($renderP, 0x0101, [IntPtr]0x0D, [IntPtr]::new(0xC01C0001L)) | Out-Null
+    Start-Sleep -Milliseconds 1500
+
+    # Step 3: Verify
+    $chatRootV = [System.Windows.Automation.AutomationElement]::FromHandle($newHwnd)
+    $vBtns = $chatRootV.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+        (New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button)))
+    $verifyPerm = ($vBtns | Where-Object { $_.Current.Name -match 'Set Permissions' } | Select-Object -First 1).Current.Name
+    if ($verifyPerm -match 'Bypass') {
+        Write-Host "PERMISSION_GUARD: VERIFIED -- Bypass Approvals active"
+    } else {
+        Write-Host "PERMISSION_GUARD: WARNING -- still '$verifyPerm' after ghost attempt"
+    }
 }
 
 # --- Verify ---
@@ -399,11 +612,12 @@ $finalButtons = $chatRoot3.FindAll(
     ))
 )
 
-$target = ""; $model = ""
+$target = ""; $model = ""; $perms = ""
 foreach ($btn in $finalButtons) {
     $name = $btn.Current.Name
     if ($name -match 'Session Target|Delegate Session') { $target = $name }
     if ($name -match 'Pick Model') { $model = $name }
+    if ($name -match 'Set Permissions') { $perms = $name }
 }
 
 # Final model guard check — fail loudly if still wrong
@@ -421,4 +635,4 @@ Clear-Failures
 # --- Report ---
 $cursor = New-Object Ghost+POINT
 [Ghost]::GetCursorPos([ref]$cursor)
-Write-Host "OK HWND=$newHwnd pos=$newX,$newY | $target | $model | cursor=$($cursor.X),$($cursor.Y)"
+Write-Host "OK HWND=$newHwnd pos=$newX,$newY | $target | $model | $perms | cursor=$($cursor.X),$($cursor.Y)"

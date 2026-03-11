@@ -33,7 +33,7 @@ from uuid import uuid4
 logger = logging.getLogger(__name__)
 
 # Paths
-DATA_DIR = Path(r"D:\Prospects\ScreenMemory\data")
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DB_PATH = DATA_DIR / "god_console.db"
 QUEUE_PATH = DATA_DIR / "agent_queues" / "god_queue.json"
 

@@ -2,6 +2,7 @@
 engine_metrics.py -- Collect status/health from all ScreenMemory engines.
 Called by GOD Console /engines endpoint.
 """
+import json
 import sys
 import time
 from pathlib import Path
@@ -121,7 +122,83 @@ def collect_engine_metrics() -> dict:
     return result
 
 
+def collect_learner_health() -> dict:
+    """Truthful learner daemon health telemetry.
+
+    Reports: daemon alive/dead, episode count, last learning timestamp,
+    verifier pass rate. All values from real data files -- never fabricated.
+    """
+    import subprocess
+    data_dir = ROOT / "data"
+    health: dict = {
+        "daemon_alive": False,
+        "episode_count": 0,
+        "total_learnings": 0,
+        "total_broadcasts": 0,
+        "last_learning_ts": None,
+        "verifier_pass_rate": None,
+        "learner_state_file": str(data_dir / "learner_state.json"),
+    }
+
+    # Check daemon alive via process list
+    try:
+        result = subprocess.run(
+            ["powershell", "-Command",
+             "Get-Process python* -ErrorAction SilentlyContinue | "
+             "Select-Object -ExpandProperty CommandLine -ErrorAction SilentlyContinue"],
+            capture_output=True, text=True, timeout=5
+        )
+        health["daemon_alive"] = "skynet_learner" in (result.stdout or "")
+    except Exception:
+        pass
+
+    # Read learner state
+    state_file = data_dir / "learner_state.json"
+    if state_file.exists():
+        try:
+            state = json.loads(state_file.read_text())
+            health["episode_count"] = state.get("total_processed", 0)
+            health["total_learnings"] = state.get("total_learnings", 0)
+            health["total_broadcasts"] = state.get("total_broadcasts", 0)
+            health["last_learning_ts"] = state.get("last_run")
+        except Exception:
+            pass
+
+    # Read learning episodes if present
+    episodes_file = data_dir / "learning_episodes.json"
+    if episodes_file.exists():
+        try:
+            episodes = json.loads(episodes_file.read_text())
+            if isinstance(episodes, list):
+                health["episode_count"] = max(health["episode_count"], len(episodes))
+        except Exception:
+            pass
+
+    # Verifier pass rate from learning.db if available
+    db_file = data_dir / "learning.db"
+    if db_file.exists():
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(db_file), timeout=2)
+            cur = conn.cursor()
+            tables = [r[0] for r in cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+            if "verifications" in tables:
+                total = cur.execute("SELECT COUNT(*) FROM verifications").fetchone()[0]
+                passed = cur.execute(
+                    "SELECT COUNT(*) FROM verifications WHERE result='pass'").fetchone()[0]
+                health["verifier_pass_rate"] = round(passed / total, 3) if total else None
+                health["verifier_total"] = total
+                health["verifier_passed"] = passed
+            conn.close()
+        except Exception:
+            pass
+
+    return health
+
+
 if __name__ == "__main__":
     import json
     m = collect_engine_metrics()
+    m["learner_health"] = collect_learner_health()
     print(json.dumps(m, indent=2, default=str))

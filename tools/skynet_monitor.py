@@ -486,12 +486,18 @@ def _check_stuck_workers(workers: list):
 
 
 REALTIME_FILE = DATA_DIR / "realtime.json"
+REALTIME_PID_FILE = DATA_DIR / "realtime.pid"
 REALTIME_STALE_THRESHOLD = 5  # seconds
 MONITOR_HEALTH_FILE = DATA_DIR / "monitor_health.json"
 TODOS_FILE = DATA_DIR / "todos.json"
 TASK_QUEUE_FILE = DATA_DIR / "task_queue.json"
 SSE_DAEMON_SCRIPT = ROOT / "tools" / "skynet_sse_daemon.py"
 REALTIME_DAEMON_SCRIPT = ROOT / "tools" / "skynet_realtime.py"
+BACKGROUND_SPAWN_FLAGS = (
+    subprocess.CREATE_NEW_PROCESS_GROUP
+    | subprocess.DETACHED_PROCESS
+    | subprocess.CREATE_NO_WINDOW
+)
 
 # ─── Daemon restart cooldown tracking (prevents cascading duplicates) ────────
 RESTART_COOLDOWN_SECONDS = 60  # refuse to restart same daemon within this window
@@ -648,7 +654,8 @@ def _auto_restart_stale_daemons():
     Guards against cascading duplicates:
     - 60s cooldown per daemon after any restart
     - Double-check PID file after 2s sleep before spawning
-    - Only restarts SSE and realtime daemons (god_console/bus_relay are orchestrator-managed)
+    - Only restarts managed daemons with real PID files
+      (god_console/bus_relay are orchestrator-managed)
     """
     global _restart_cooldowns
     now = time.time()
@@ -675,15 +682,14 @@ def _auto_restart_stale_daemons():
 
     # ── Realtime daemon ──
     rt_status = _check_realtime_daemon()
-    if not rt_status["alive"]:
+    if REALTIME_PID_FILE.exists() and not rt_status["alive"]:
         if _is_on_cooldown("realtime"):
             pass  # skip
         else:
             # Double-check: sleep 2s then re-check PID (daemon may be starting)
             import time as _t
             _t.sleep(2)
-            rt_pid_file = DATA_DIR / "realtime.pid"
-            if _pid_file_is_alive(rt_pid_file):
+            if _pid_file_is_alive(REALTIME_PID_FILE):
                 log("Realtime daemon PID appeared after 2s wait -- NOT restarting", "WARN")
             else:
                 # Re-verify freshness one more time
@@ -697,7 +703,7 @@ def _auto_restart_stale_daemons():
                         sp.Popen(
                             [_REAL_PYTHON, str(REALTIME_DAEMON_SCRIPT)],
                             env=_DAEMON_ENV,
-                            creationflags=sp.CREATE_NEW_PROCESS_GROUP | sp.DETACHED_PROCESS,
+                            creationflags=BACKGROUND_SPAWN_FLAGS,
                             stdout=sp.DEVNULL, stderr=sp.DEVNULL,
                         )
                         _restart_cooldowns["realtime"] = time.time()
@@ -712,8 +718,11 @@ def _auto_restart_stale_daemons():
     # ── SSE daemon ──
     sse_pid_file = DATA_DIR / "sse_daemon.pid"
     sse_alive = _pid_file_is_alive(sse_pid_file)
+    sse_state = _check_realtime_daemon()
 
-    if not sse_alive and SSE_DAEMON_SCRIPT.exists():
+    if not sse_alive and sse_state.get("alive"):
+        log("SSE state file is fresh -- NOT restarting despite missing/stale PID", "WARN")
+    elif not sse_alive and SSE_DAEMON_SCRIPT.exists():
         if _is_on_cooldown("sse"):
             pass  # skip
         else:
@@ -722,6 +731,8 @@ def _auto_restart_stale_daemons():
             _t.sleep(2)
             if _pid_file_is_alive(sse_pid_file):
                 log("SSE daemon PID appeared after 2s wait -- NOT restarting", "WARN")
+            elif _check_realtime_daemon().get("alive"):
+                log("SSE state file became fresh during double-check -- NOT restarting", "WARN")
             else:
                 log("SSE daemon confirmed dead after double-check -- restarting", "FIX")
                 try:
@@ -729,7 +740,7 @@ def _auto_restart_stale_daemons():
                     sp.Popen(
                         [_REAL_PYTHON, str(SSE_DAEMON_SCRIPT)],
                         env=_DAEMON_ENV,
-                        creationflags=sp.CREATE_NEW_PROCESS_GROUP | sp.DETACHED_PROCESS,
+                        creationflags=BACKGROUND_SPAWN_FLAGS,
                         stdout=sp.DEVNULL, stderr=sp.DEVNULL,
                     )
                     _restart_cooldowns["sse"] = time.time()
@@ -794,33 +805,65 @@ def _record_health_trend(health: dict, productivity: dict, pending_work: int):
         log(f"Failed to write monitor_health.json: {e}", "WARN")
 
 
+def _read_state_timestamp_age(path: Path, *keys: str) -> tuple[object | None, float | None]:
+    """Read a JSON timestamp field and return (raw_value, age_seconds)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None, None
+
+    raw_value = None
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            raw_value = value
+            break
+
+    if raw_value in (None, ""):
+        return None, None
+
+    try:
+        from datetime import timezone
+        if isinstance(raw_value, str):
+            dt = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+            if dt.tzinfo:
+                age = (datetime.now(timezone.utc) - dt).total_seconds()
+            else:
+                age = (datetime.now() - dt).total_seconds()
+        else:
+            age = time.time() - float(raw_value)
+        return raw_value, max(age, 0.0)
+    except Exception:
+        return raw_value, None
+
+
 def _check_realtime_daemon() -> dict:
-    """Check if skynet_realtime.py daemon is alive by reading data/realtime.json freshness."""
+    """Check freshness of data/realtime.json.
+
+    This reflects live realtime state. A managed realtime process only exists when
+    data/realtime.pid is present; otherwise the SSE daemon is the active writer.
+    """
     try:
         if not REALTIME_FILE.exists():
-            return {"alive": False, "last_update": None, "latency_ms": None}
-        data = json.loads(REALTIME_FILE.read_text())
-        last_update = data.get("timestamp") or data.get("last_update")
-        if not last_update:
-            return {"alive": False, "last_update": None, "latency_ms": None}
-        # Parse ISO timestamp
-        from datetime import timezone
-        if isinstance(last_update, str):
-            lu = datetime.fromisoformat(last_update.replace("Z", "+00:00"))
-            if lu.tzinfo:
-                age = (datetime.now(timezone.utc) - lu).total_seconds()
-            else:
-                age = (datetime.now() - lu).total_seconds()
-        else:
-            age = time.time() - float(last_update)
+            return {"alive": False, "last_update": None, "latency_ms": None, "managed_process": REALTIME_PID_FILE.exists()}
+        last_update, age = _read_state_timestamp_age(REALTIME_FILE, "timestamp", "last_update")
+        if last_update is None or age is None:
+            return {"alive": False, "last_update": last_update, "latency_ms": None, "managed_process": REALTIME_PID_FILE.exists()}
         alive = age < REALTIME_STALE_THRESHOLD
         return {
             "alive": alive,
             "last_update": str(last_update),
             "latency_ms": round(age * 1000, 1),
+            "managed_process": REALTIME_PID_FILE.exists(),
         }
     except Exception as e:
-        return {"alive": False, "last_update": None, "latency_ms": None, "error": str(e)[:80]}
+        return {
+            "alive": False,
+            "last_update": None,
+            "latency_ms": None,
+            "managed_process": REALTIME_PID_FILE.exists(),
+            "error": str(e)[:80],
+        }
 
 
 def main():
@@ -953,9 +996,12 @@ def _run_monitor(args):
                     rt_status = _check_realtime_daemon()
                     health["realtime_daemon"] = rt_status
                     if not rt_status["alive"]:
+                        content = "REALTIME STATE STALE -- data/realtime.json stale or missing"
+                        if rt_status.get("managed_process"):
+                            content = "REALTIME DAEMON DOWN -- data/realtime.json stale or missing"
                         skynet_post("/bus/publish", {
                             "sender": "monitor", "topic": "orchestrator", "type": "alert",
-                            "content": "REALTIME DAEMON DOWN -- data/realtime.json stale or missing"
+                            "content": content
                         })
 
                     write_health(health)

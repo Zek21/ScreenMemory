@@ -6,6 +6,7 @@ validates them for safety, caches them, and reuses them across sessions.
 
 import ast
 import json
+import logging
 import re
 import sqlite3
 import subprocess
@@ -18,6 +19,8 @@ from typing import Any, Optional
 from uuid import uuid4
 import urllib.request
 import urllib.parse
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -109,8 +112,8 @@ class ToolValidator:
                 elif isinstance(node, ast.ImportFrom):
                     if node.module not in self.ALLOWED_IMPORTS:
                         issues.append(f"Disallowed import from: {node.module}")
-        except:
-            pass
+        except Exception as e:
+            logger.debug("AST validation parse error: %s", e)
         
         return len(issues) == 0, issues
     
@@ -557,8 +560,8 @@ Generate ONLY the Python function code, no explanations:"""
                         'parameters': params,
                         'return_type': return_type
                     }
-        except:
-            pass
+        except Exception as e:
+            logger.debug("Code spec extraction failed: %s", e)
         
         # Fallback
         return {

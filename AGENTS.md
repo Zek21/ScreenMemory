@@ -19,6 +19,30 @@ This applies to ALL system surfaces:
 
 This rule supersedes all other rules. No rule may authorize fabrication.
 
+## SESSION BOOT PROTOCOL — Rule #0.05 (Mandatory, Pre-Operational)
+
+**On EVERY new session start, OR when the user says "skynet-start" / "orchestrator-start" / "CC-Start", execute this boot protocol BEFORE any other work. The orchestrator cannot function without Skynet context.**
+
+### Boot Sequence (5 steps, in order):
+
+1. **Self-Identify** — Detect current VS Code HWND → read and update `data/orchestrator.json` → confirm identity as Skynet orchestrator
+2. **Health Check** — `Invoke-RestMethod http://localhost:8420/status` → determine if Skynet is already running
+3. **Bootstrap (if needed)** — `python tools/skynet_start.py` → 8-phase boot: memory preload, backend (port 8420), GOD Console (port 8421), worker windows (2×2 grid), registration, engine connections, state save, daemons. Use `--reconnect` for existing workers, `--workers N` to limit count
+4. **Knowledge Acquisition** — After Skynet is confirmed alive, absorb ALL context:
+   - Poll bus: `Invoke-RestMethod http://localhost:8420/bus/messages?limit=30` (pending results, alerts, self-directives)
+   - Worker states: `Invoke-RestMethod http://localhost:8420/status` (who is IDLE/PROCESSING/DEAD)
+   - Agent profiles: `data/agent_profiles.json` (roles, specializations, mission history)
+   - Brain config: `data/brain_config.json` (dispatch modes, learning, compliance state)
+   - Pending TODOs: `data/todos.json` (active/pending work items)
+   - Worker registry: `data/workers.json` (HWNDs, grid positions, engines)
+5. **Report Ready** — Tell the user: Skynet version, worker count + states, engine count, pending alerts, pending TODOs, any boot warnings
+
+### Post-Boot Operating Mode
+- **Every turn:** Poll bus → check worker states → act on pending work → dispatch → synthesize
+- **Orchestrator = CEO:** decompose, dispatch, monitor, collect, synthesize — NEVER do implementation work directly
+- **Workers are intelligent:** dispatch high-level goals, not line-by-line code templates
+- **No workers?** If boot failed to open windows, orchestrator may fall back to direct execution with a warning
+
 ## PROCESS PROTECTION — Rule #0.1 (Inviolable, Emergency-Grade)
 
 **NO WORKER may execute `Stop-Process`, `taskkill`, `kill()`, `terminate()`, or ANY process termination command. EVER.**
@@ -143,7 +167,7 @@ The pull loop is implemented by `tools/skynet_worker_poll.py` (`poll_for_work()`
 - The system is NEVER quiet -- it is always improving itself
 - `find_idle_with_work()` returns workers that have pending items across all 5 sources
 
-### Boot Sequence (orchestrator-start)
+### Boot Sequence (orchestrator-start / CC-Start)
 1. `skynet_start.py` boots backend, workers, engines
 2. Self-prompt daemon launches automatically (Phase 8)
 3. Boot prompt fires: reads TODOs, bus, profiles, sends brief to orchestrator

@@ -93,6 +93,23 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 
+def _hidden_subprocess_kwargs(**kwargs):
+    merged = dict(kwargs)
+    if sys.platform == "win32":
+        merged["creationflags"] = merged.get("creationflags", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startupinfo = merged.get("startupinfo")
+        if startupinfo is None and hasattr(subprocess, "STARTUPINFO"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            merged["startupinfo"] = startupinfo
+    return merged
+
+
+def _hidden_check_output(args, **kwargs):
+    return subprocess.check_output(args, **_hidden_subprocess_kwargs(**kwargs))
+
+
 def log(msg, level="INFO"):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] [SELF-PROMPT] [{level}] {msg}", flush=True)
@@ -183,13 +200,26 @@ def _get_last_action_age():
 
 def _get_pending_todos(worker=None):
     """Count pending/active TODOs."""
+    return len(_get_pending_todo_items(worker))
+
+
+def _get_pending_todo_items(worker=None, limit=None):
+    """Return pending/active TODO items sorted by priority then creation time."""
     data = _load_json(TODOS_FILE)
     if not data:
-        return 0
-    items = data.get("todos", [])
+        return []
+    items = [t for t in data.get("todos", []) if t.get("status") in ("pending", "active")]
     if worker:
         items = [t for t in items if t.get("worker") == worker]
-    return sum(1 for t in items if t.get("status") in ("pending", "active"))
+    priority_rank = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+    items.sort(key=lambda t: (
+        priority_rank.get(str(t.get("priority", "normal")).lower(), 9),
+        str(t.get("created_at", "")),
+        str(t.get("id", "")),
+    ))
+    if limit is not None:
+        return items[:limit]
+    return items
 
 
 TASK_FILE = DATA_DIR / "task_queue.json"
@@ -1064,6 +1094,7 @@ class SelfPromptDaemon:
         new_alerts = self._filter_undelivered(alerts, "alert")
         pending_todos = perception["pending_todos"]
         pending_tasks = perception["pending_tasks"]
+        orch_todos = _get_pending_todo_items("orchestrator", limit=3)
 
         # Daemon health from heartbeat files + alert messages
         daemon_issues = []
@@ -1103,6 +1134,8 @@ class SelfPromptDaemon:
             status_parts.append(f"{len(new_alerts)} alert: {alert_preview}")
         if pending_todos > 0:
             status_parts.append(f"{pending_todos} TODOs")
+        if orch_todos:
+            status_parts.append(f"OrchTODOs: {len(orch_todos)}")
         status_parts.append(f"Daemons: {daemon_status}")
 
         status_line = " | ".join(status_parts)
@@ -1114,6 +1147,18 @@ class SelfPromptDaemon:
         if self.cot.has_conclusions():
             for c in self.cot.critical_conclusions()[:1]:
                 actions.append((100, f"CRITICAL: {c.strip()} Run: python tools/orch_realtime.py status"))
+
+        # Explicit orchestrator TODOs should outrank generic status summaries.
+        if orch_todos:
+            top_todo = orch_todos[0]
+            pri = str(top_todo.get("priority", "normal")).upper()
+            task = str(top_todo.get("task", "pending orchestrator task"))[:160]
+            actions.append((97, f"EXECUTE ORCH TODO [{pri}]: {task}"))
+            if len(orch_todos) > 1:
+                next_todo = orch_todos[1]
+                next_pri = str(next_todo.get("priority", "normal")).upper()
+                next_task = str(next_todo.get("task", "next orchestrator task"))[:120]
+                actions.append((96, f"NEXT TODO [{next_pri}]: {next_task}"))
 
         # Anomalies
         if patterns["stall_pattern"]:
@@ -1130,8 +1175,7 @@ class SelfPromptDaemon:
         # Idle workers + pending TODOs
         idle_workers = [n for n, i in perception["workers"].items() if i["state"] == "IDLE"]
         if idle_workers and pending_todos > 0:
-            todos_data = _load_json(TODOS_FILE) or {}
-            todo_list = [t for t in todos_data.get("todos", []) if t.get("status") in ("pending", "active")]
+            todo_list = _get_pending_todo_items(limit=10)
             if todo_list:
                 top_todo = todo_list[0].get("task", "next task")[:50]
                 worker = idle_workers[0]
@@ -1415,10 +1459,15 @@ class SelfPromptDaemon:
                 content = entry.get("content", "")
                 msg_id = entry.get("msg_id", "")
                 sender = entry.get("sender", "?")
+                priority = str(entry.get("priority", "normal")).upper()
                 if not content:
                     continue
 
-                prompt = f"Skynet Messenger: QUEUED DIRECTIVE from {sender}: {content}"
+                prompt = (
+                    f"SKYNET {priority} DIRECTIVE from {sender}. "
+                    f"Act now. Use workers for implementation, not hands-on orchestrator edits. "
+                    f"Directive: {content}"
+                )
                 log(f"Delivering queued directive from {sender}: {content[:60]}...")
 
                 ok = _send_self_prompt(orch_hwnd, prompt)
@@ -1442,7 +1491,7 @@ class SelfPromptDaemon:
             log(f"Queued directive delivery error: {e}", "ERROR")
             return 0
 
-    def check_and_prompt(self):
+    def check_and_prompt(self, deliver_queue_first=True):
         """Single check cycle with priority scoring and anti-spam. Returns True if prompt was sent."""
         self.cycles += 1
         now = time.time()
@@ -1451,10 +1500,11 @@ class SelfPromptDaemon:
         self._report_health()
 
         # First: deliver any queued directives (these take priority)
-        queued_delivered = self._deliver_queued_directives()
-        if queued_delivered > 0:
-            log(f"Delivered {queued_delivered} queued directive(s)")
-            return True
+        if deliver_queue_first:
+            queued_delivered = self._deliver_queued_directives()
+            if queued_delivered > 0:
+                log(f"Delivered {queued_delivered} queued directive(s)")
+                return True
 
         # Rate limit
         if now - self.last_prompt_time < MIN_PROMPT_GAP:
@@ -1588,9 +1638,13 @@ class SelfPromptDaemon:
         try:
             while True:
                 try:
-                    # STATUS-BASED: only prompt when ALL workers are IDLE
-                    if self._all_workers_idle():
-                        self.check_and_prompt()
+                    # Always deliver queued directives, even mid-wave.
+                    queued_delivered = self._deliver_queued_directives()
+                    if queued_delivered > 0:
+                        log(f"Delivered {queued_delivered} queued directive(s)")
+                    # STATUS-BASED: only synthesize generic prompts when ALL workers are IDLE
+                    elif self._all_workers_idle():
+                        self.check_and_prompt(deliver_queue_first=False)
                 except Exception as e:
                     log(f"Check failed: {e}", "ERROR")
                 time.sleep(POLL_INTERVAL)
@@ -1610,7 +1664,7 @@ def _check_existing():
     if PID_FILE.exists():
         try:
             old_pid = int(PID_FILE.read_text().strip())
-            out = subprocess.check_output(
+            out = _hidden_check_output(
                 ["tasklist", "/fi", f"pid eq {old_pid}", "/fo", "csv", "/nh"],
                 text=True, timeout=5, stderr=subprocess.DEVNULL
             )

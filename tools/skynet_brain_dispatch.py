@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -348,6 +349,9 @@ def smart_dispatch(goal: str, wait_timeout: int = 120) -> dict:
 
     # Step 4: Dispatch
     from skynet_dispatch import dispatch_to_worker, dispatch_parallel
+
+    # Wire cognitive strategy into dispatch context for learner correlation
+    os.environ["SKYNET_STRATEGY"] = cog_strategy
 
     dispatch_results = {}
     if len(subtasks) == 1:

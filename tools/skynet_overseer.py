@@ -47,6 +47,49 @@ ORCH_FILE = DATA_DIR / "orchestrator.json"
 BUS_URL = "http://localhost:8420"
 GOD_URL = "http://localhost:8421"
 
+
+def _resolve_real_python():
+    """Return (real_python_path, env_dict) bypassing the Windows venv trampoline."""
+    venv_dir = ROOT.parent / "env"
+    cfg = venv_dir / "pyvenv.cfg"
+    base_python = None
+    if cfg.exists():
+        for line in cfg.read_text().splitlines():
+            if line.strip().startswith("executable"):
+                _, _, val = line.partition("=")
+                candidate = val.strip()
+                if Path(candidate).exists():
+                    base_python = candidate
+                    break
+    if not base_python:
+        base_python = str(Path(sys.executable))
+    env = os.environ.copy()
+    site_packages = str(venv_dir / "Lib" / "site-packages")
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{site_packages};{existing}" if existing else site_packages
+    env["VIRTUAL_ENV"] = str(venv_dir)
+    return base_python, env
+
+
+def _hidden_subprocess_kwargs(**kwargs):
+    merged = dict(kwargs)
+    if sys.platform == "win32":
+        merged["creationflags"] = merged.get("creationflags", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startupinfo = merged.get("startupinfo")
+        if startupinfo is None and hasattr(subprocess, "STARTUPINFO"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            merged["startupinfo"] = startupinfo
+    return merged
+
+
+def _hidden_check_output(args, **kwargs):
+    return subprocess.check_output(args, **_hidden_subprocess_kwargs(**kwargs))
+
+
+PYTHON, _DAEMON_ENV = _resolve_real_python()
+
 # Thresholds
 IDLE_STALL_S = 600       # IDLE >10min with pending TODOs = STALLED (was 120, caused spam)
 PROCESSING_STUCK_S = 300 # PROCESSING >5min = POTENTIALLY_STUCK
@@ -394,7 +437,7 @@ class OverseerDaemon:
             try:
                 wpid = int(watchdog_pid_file.read_text().strip())
                 # Check if PID is alive via tasklist
-                out = subprocess.check_output(
+                out = _hidden_check_output(
                     ["tasklist", "/fi", f"pid eq {wpid}", "/fo", "csv", "/nh"],
                     text=True, timeout=5, stderr=subprocess.DEVNULL
                 )
@@ -603,7 +646,7 @@ def _check_existing():
     if PID_FILE.exists():
         try:
             old_pid = int(PID_FILE.read_text().strip())
-            out = subprocess.check_output(
+            out = _hidden_check_output(
                 ["tasklist", "/fi", f"pid eq {old_pid}", "/fo", "csv", "/nh"],
                 text=True, timeout=5, stderr=subprocess.DEVNULL
             )
@@ -661,13 +704,14 @@ def main():
 
             time.sleep(backoff)
             log(f"Starting overseer (backoff={backoff}s)")
-            start_args = [sys.executable, __file__, "start"]
+            start_args = [PYTHON, __file__, "start"]
             if args.prod:
                 start_args.append("--prod")
             proc = subprocess.Popen(
                 start_args,
+                env=_DAEMON_ENV,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=0x00000008  # DETACHED_PROCESS
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
             )
             log(f"Overseer started as PID {proc.pid}")
             backoff = min(backoff * 2, max_backoff)

@@ -46,6 +46,23 @@ BUS_URL = "http://localhost:8420/bus/publish"
 user32 = ctypes.windll.user32
 
 
+def _hidden_subprocess_kwargs(**kwargs):
+    merged = dict(kwargs)
+    if sys.platform == "win32":
+        merged["creationflags"] = merged.get("creationflags", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startupinfo = merged.get("startupinfo")
+        if startupinfo is None and hasattr(subprocess, "STARTUPINFO"):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+            merged["startupinfo"] = startupinfo
+    return merged
+
+
+def _hidden_check_output(args, **kwargs):
+    return subprocess.check_output(args, **_hidden_subprocess_kwargs(**kwargs))
+
+
 def _hwnd_to_pid(hwnd):
     """Get the process ID that owns a window handle."""
     pid = ctypes.wintypes.DWORD()
@@ -62,7 +79,7 @@ def _find_python_processes(script_name):
             "Get-CimInstance Win32_Process -Filter \"Name like '%python%'\" "
             "| ForEach-Object { $_.ProcessId.ToString() + '|' + $_.CommandLine } "
         )
-        out = subprocess.check_output(
+        out = _hidden_check_output(
             ["powershell", "-NoProfile", "-Command", ps_cmd],
             text=True, timeout=15, stderr=subprocess.DEVNULL
         )
@@ -82,7 +99,7 @@ def _find_python_processes(script_name):
         pass
     # Fallback: wmic (legacy)
     try:
-        out = subprocess.check_output(
+        out = _hidden_check_output(
             ["wmic", "process", "where",
              "Name like '%python%'",
              "get", "ProcessId,CommandLine", "/format:csv"],
@@ -110,7 +127,7 @@ def _find_process_by_name(exe_name):
     """Find PIDs of processes with a given executable name."""
     pids = []
     try:
-        out = subprocess.check_output(
+        out = _hidden_check_output(
             ["tasklist", "/fi", f"imagename eq {exe_name}", "/fo", "csv", "/nh"],
             text=True, timeout=10, stderr=subprocess.DEVNULL
         )
@@ -153,7 +170,7 @@ def refresh_registry():
         try:
             wpid = int(pid_file.read_text().strip())
             # Verify it's actually running
-            out = subprocess.check_output(
+            out = _hidden_check_output(
                 ["tasklist", "/fi", f"pid eq {wpid}", "/fo", "csv", "/nh"],
                 text=True, timeout=5, stderr=subprocess.DEVNULL
             )

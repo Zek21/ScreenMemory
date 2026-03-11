@@ -295,6 +295,22 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .task-desc{flex:1;color:var(--text);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .task-empty{color:var(--dim);font-style:italic;font-size:10px;padding:6px 0;}
 
+/* Consultant presence */
+.consultant-item{padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.03);}
+.consultant-item:last-child{border-bottom:none;}
+.consultant-head{display:flex;align-items:center;gap:6px;margin-bottom:4px;}
+.consultant-name{font-size:10px;font-weight:700;color:var(--cyan);letter-spacing:0.4px;}
+.consultant-status{
+  margin-left:auto;padding:1px 6px;border-radius:3px;font-size:8px;font-weight:700;
+  letter-spacing:0.6px;text-transform:uppercase;border:1px solid rgba(255,255,255,0.08);
+}
+.consultant-status.live{color:var(--green);background:var(--green-dim);border-color:rgba(0,230,118,0.18);}
+.consultant-status.stale{color:var(--amber);background:var(--amber-dim);border-color:rgba(255,179,0,0.18);}
+.consultant-status.offline{color:var(--red);background:var(--red-dim);border-color:rgba(255,32,64,0.18);}
+.consultant-status.declared{color:var(--text2);background:rgba(100,116,139,0.08);border-color:rgba(100,116,139,0.18);}
+.consultant-meta{font-size:9px;color:var(--text2);line-height:1.5;}
+.consultant-note{margin-top:4px;font-size:9px;color:var(--text);line-height:1.5;}
+
 /* Bus health metrics */
 .bus-health-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;}
 .bh-metric{display:flex;flex-direction:column;gap:1px;padding:5px 8px;
@@ -388,6 +404,7 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .bus-line .bus-sender.delta{color:var(--delta);}
 .bus-line .bus-sender.system{color:var(--amber);}
 .bus-line .bus-sender.orchestrator{color:var(--orch);}
+.bus-line .bus-sender.consultant{color:var(--cyan);}
 .bus-line .bus-type{
   font-size:7px;font-weight:700;letter-spacing:0.5px;padding:1px 5px;border-radius:3px;
   flex-shrink:0;text-transform:uppercase;
@@ -788,6 +805,17 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <div id="conveneList" style="margin-top:4px;"></div>
       </div>
     </div>
+    <!-- CONSULTANT -->
+    <div class="ops-card">
+      <div class="ops-head">
+        <span style="font-size:11px;">◇</span>
+        <span class="ops-title" style="color:var(--cyan);">Consultant</span>
+        <span class="ops-badge" id="consultantBadge">--</span>
+      </div>
+      <div class="ops-body" id="consultantBody">
+        <div class="task-empty">Waiting for CC-Start consultant bridge...</div>
+      </div>
+    </div>
     <!-- WORKER TODOS -->
     <div class="ops-card">
       <div class="ops-head">
@@ -943,6 +971,7 @@ const AGENTS={
   gamma:{name:'GAMMA',color:'#ff80ab',angle:Math.PI*0.5},
   delta:{name:'DELTA',color:'#ff5252',angle:Math.PI},
 };
+const CONSULTANT_COLOR='#00f0ff';
 const DEFAULT_ROLES={alpha:'Worker Core 0',beta:'Worker Core 1',gamma:'Worker Core 2',delta:'Worker Core 3'};
 const startTime=Date.now();
 let seenLogIds=new Set(),seenOrchIds=new Set(),totalTasks=0;
@@ -1099,6 +1128,44 @@ function updateGod(items){
   }
 }
 
+function renderConsultants(consultants){
+  const body=document.getElementById('consultantBody');
+  const badge=document.getElementById('consultantBadge');
+  if(!body)return;
+  const entries=consultants&&typeof consultants==='object'&&!Array.isArray(consultants)
+    ? Object.values(consultants).filter(v=>v&&typeof v==='object'&&!v.error)
+    : [];
+  if(badge)badge.textContent=entries.length?entries.filter(c=>c.live).length+'/'+entries.length:'0';
+  if(!entries.length){
+    body.innerHTML='<div class="task-empty">No consultant identity exposed yet</div>';
+    return;
+  }
+  body.innerHTML='';
+  for(const c of entries.slice(0,3)){
+    const st=String(c.status||'DECLARED').toUpperCase();
+    const stCls=st==='LIVE'?'live':st==='STALE'?'stale':st==='OFFLINE'?'offline':'declared';
+    let hb='--';
+    if(c.heartbeat_age_s!=null){
+      hb=c.heartbeat_age_s<60?Number(c.heartbeat_age_s).toFixed(1)+'s':Math.floor(Number(c.heartbeat_age_s)/60)+'m';
+    }
+    const msg=c.last_bus_message&&c.last_bus_message.content
+      ? String(c.last_bus_message.content).slice(0,88)
+      : 'No consultant bus activity yet';
+    const backend=c.backend_connected?'backend linked':'backend unknown';
+    const div=document.createElement('div');
+    div.className='consultant-item';
+    div.innerHTML=
+      '<div class="consultant-head">'+
+        '<span class="consultant-name">'+esc(c.display_name||c.id||'Consultant')+'</span>'+
+        '<span class="consultant-status '+stCls+'">'+esc(st)+'</span>'+
+      '</div>'+
+      '<div class="consultant-meta">'+esc(c.model||'unknown model')+' | advisory | non-routable</div>'+
+      '<div class="consultant-meta">Heartbeat '+esc(hb)+' | '+esc(backend)+'</div>'+
+      '<div class="consultant-note">'+esc(msg)+'</div>';
+    body.appendChild(div);
+  }
+}
+
 /* ═══ POLLING ═══ */
 let connFails=0;
 function showConnBanner(show){
@@ -1133,6 +1200,7 @@ function _applyStatus(d){
       if(!seenOrchIds.has(th.id)){seenOrchIds.add(th.id);addOrchLine(th.text,th.type||'info');}
     }
   }
+  renderConsultants(d.consultants||{});
   updateGod(d.god_queue||[]);
   let tt=0;for(const s of Object.values(d.agents||{}))tt+=(s.tasks_completed||0);
   document.getElementById('sb-tasks').textContent=tt;
@@ -1490,7 +1558,7 @@ async function pollBus(){
       const sender=m.sender||'?';
       const type=m.type||'msg';
       const content=String(m.content||'').slice(0,80);
-      const sClass=['alpha','beta','gamma','delta','system','orchestrator'].includes(sender)?sender:'system';
+      const sClass=['alpha','beta','gamma','delta','system','orchestrator','consultant'].includes(sender)?sender:'system';
       const tClass=['result','alert','request','directive'].includes(type)?type:'other';
       const div=document.createElement('div');div.className='bus-line';
       div.innerHTML='<span class="bus-sender '+sClass+'">'+esc(sender)+'</span>'+
