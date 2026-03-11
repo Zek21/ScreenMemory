@@ -1019,6 +1019,7 @@ def phase_3_workers(num_workers=4, orch_hwnd=None, fresh=False, boot_memories=No
         log(f"Opening worker {worker_name.upper()}...", "SYS")
 
         new_hwnd = None
+        opened_fresh = False
 
         # Try restoring from SESSIONS panel first (skip if --fresh)
         if not fresh:
@@ -1029,6 +1030,7 @@ def phase_3_workers(num_workers=4, orch_hwnd=None, fresh=False, boot_memories=No
                 log(f"Session restore failed for {worker_name}, opening fresh window...", "WARN")
 
             new_hwnd = open_chat_window(orch_hwnd)
+            opened_fresh = True
 
             if not new_hwnd:
                 log(f"Could not open window for {worker_name}", "ERR")
@@ -1041,11 +1043,14 @@ def phase_3_workers(num_workers=4, orch_hwnd=None, fresh=False, boot_memories=No
         # Success — reset failure counter
         consecutive_failures = 0
 
-        # Guard model + target on the window (restored or fresh)
-        guard_model(new_hwnd, orch_hwnd)
-        time.sleep(0.5)
-        guard_permissions(new_hwnd, orch_hwnd)
-        time.sleep(1)
+        # Guard model + permissions ONLY for restored sessions.
+        # Fresh windows from new_chat.ps1 already have model guard + permission
+        # guard built in — calling them again can revert the state.
+        if not opened_fresh:
+            guard_model(new_hwnd, orch_hwnd)
+            time.sleep(0.5)
+            guard_permissions(new_hwnd, orch_hwnd)
+            time.sleep(1)
 
         # Prompt the worker
         log(f"Prompting {worker_name.upper()}...", "SYS")
