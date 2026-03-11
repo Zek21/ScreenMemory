@@ -173,6 +173,27 @@ The pull loop is implemented by `tools/skynet_worker_poll.py` (`poll_for_work()`
 - The system is NEVER quiet -- it is always improving itself
 - `find_idle_with_work()` returns workers that have pending items across all 5 sources
 
+### Continuous Monitoring Protocol (Orchestrator — MANDATORY)
+
+The orchestrator is a continuous operations loop, not a request-response system. On EVERY turn:
+
+1. **Poll bus** — read ALL pending results, alerts, proposals, consultant messages
+2. **Check worker states** — identify IDLE, PROCESSING, DEAD workers
+3. **Synthesize results** — extract deliverables from worker DONE reports, post synthesis to bus
+4. **Update TODO list** — mark completed items `done`, add new items from results/proposals. `data/todos.json` is the single source of truth. If it is empty when work remains, generate new improvement items.
+5. **Dispatch next work** — if ANY worker is IDLE and ANY TODO is `pending`, dispatch IMMEDIATELY
+6. **Check consultant proposals** — Codex/Gemini post proposals on bus (`topic=planning type=proposal`). Review and act on them or file as TODOs.
+7. **Report status** — post to bus when waves complete or significant state changes occur
+
+**Failure condition:** If a consultant has been more productive than the orchestrator, the orchestrator is failing. Fix by increasing dispatch velocity and generating more work items.
+
+**TODO List Hygiene:**
+- `data/todos.json` is the persistent store. Read it EVERY turn.
+- When worker reports DONE → update TODO to `done` immediately
+- When new work discovered → add TODO items immediately
+- Items have: `id`, `title`, `status` (pending/active/done/cancelled), `assignee`, `priority`, `wave`
+- NEVER rely on memory for TODO tracking — always read/write the file
+
 ### Boot Sequence (orchestrator-start / CC-Start)
 1. `skynet_start.py` boots backend, workers, engines
 2. Self-prompt daemon launches automatically (Phase 8)

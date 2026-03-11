@@ -587,7 +587,7 @@ class ConveneGate:
                 "no": no_count, "needed": self.MAJORITY_THRESHOLD}
 
     def _elevate(self, gate_id: str, proposal: dict) -> dict:
-        """Majority reached -- elevate report to orchestrator."""
+        """Majority reached -- elevate report to orchestrator via direct-prompt."""
         proposal["status"] = "elevated"
         proposal["elevated_at"] = time.time()
         self._state["elevated"].append({
@@ -601,19 +601,32 @@ class ConveneGate:
         self._state["stats"]["total_elevated"] = self._state["stats"].get("total_elevated", 0) + 1
         self._save()
 
-        # Post consensus result to orchestrator
+        # Post consensus result to orchestrator via bus (durable record)
         voters = [w for w, v in proposal["votes"].items() if v == "YES"]
+        consensus_content = (
+            f"[CONSENSUS {len(voters)}/{len(proposal['votes'])}] "
+            f"Proposed by {proposal['proposer']}, endorsed by {', '.join(voters)}: "
+            f"{proposal['report'][:300]}"
+        )
         try:
             requests.post(BUS_PUBLISH, json={
                 "sender": "convene-gate",
                 "topic": "orchestrator",
                 "type": "result",
-                "content": f"[CONSENSUS {len(voters)}/{len(proposal['votes'])}] "
-                           f"Proposed by {proposal['proposer']}, endorsed by {', '.join(voters)}: "
-                           f"{proposal['report'][:300]}",
+                "content": consensus_content,
             }, timeout=3)
         except Exception:
             pass
+
+        # Direct-prompt delivery to orchestrator (low-latency notification)
+        try:
+            from skynet_delivery import deliver_elevated_report
+            deliver_elevated_report(
+                gate_id, proposal["proposer"],
+                consensus_content, voters,
+            )
+        except Exception:
+            pass  # Bus post above is the durable fallback
 
         return {"action": "elevated", "gate_id": gate_id,
                 "voters": voters, "delivered": True}

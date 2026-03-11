@@ -305,6 +305,34 @@ def _announce_presence() -> None:
         },
     }, timeout=2.0)
 
+    # Also direct-prompt the orchestrator for immediate visibility
+    try:
+        from skynet_delivery import deliver_to_orchestrator
+        deliver_to_orchestrator(
+            f"[CONSULTANT LIVE] {DISPLAY_NAME} ({MODEL_NAME}) -- advisory peer online via {SOURCE_NAME}",
+            sender=CONSULTANT_ID,
+            also_bus=False,  # Bus post above is the durable record
+        )
+    except Exception:
+        pass  # Non-critical, bus post above is sufficient
+
+
+def relay_consultant_result(content: str, consultant_id: str = None) -> dict:
+    """Relay a consultant bus result to the orchestrator via direct-prompt.
+
+    Call this from bus watchers or relay daemons when a consultant posts a
+    result with topic=orchestrator. This bridges the advisory-only bus post
+    into an immediate UIA ghost-type notification.
+
+    Returns dict with delivery status.
+    """
+    cid = consultant_id or CONSULTANT_ID
+    try:
+        from skynet_delivery import deliver_consultant_result
+        return deliver_consultant_result(cid, content)
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 
 def _write_offline_snapshot() -> None:
     if not STATE_FILE.exists():
