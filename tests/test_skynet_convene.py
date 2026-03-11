@@ -140,69 +140,65 @@ class TestDiscoverSessions:
 class TestJoinSession:
     """Tests for join_session()."""
 
-    @patch("tools.skynet_convene.requests.post")
+    @patch("tools.skynet_convene.guarded_publish")
     @patch("tools.skynet_convene.requests.patch")
-    def test_join_posts_patch_and_publish(self, mock_patch, mock_post):
+    def test_join_posts_patch_and_publish(self, mock_patch, mock_gp):
         mock_patch.return_value = _ok_response()
-        mock_post.return_value = _ok_response()
+        mock_gp.return_value = {"allowed": True}
         result = sc.join_session("beta", "sess_123")
         assert result is True
         mock_patch.assert_called_once()
         patch_body = mock_patch.call_args[1]["json"]
         assert patch_body["session_id"] == "sess_123"
         assert patch_body["worker"] == "beta"
-        # signed: delta
+        # signed: gamma
 
-    @patch("tools.skynet_convene.requests.post")
+    @patch("tools.skynet_convene.guarded_publish")
     @patch("tools.skynet_convene.requests.patch")
-    def test_join_network_error(self, mock_patch, mock_post):
+    def test_join_network_error(self, mock_patch, mock_gp):
         import requests as req
         mock_patch.side_effect = req.RequestException("fail")
         assert sc.join_session("beta", "s1") is False
-        # signed: delta
+        # signed: gamma
 
 
 class TestPostUpdate:
     """Tests for post_update()."""
 
-    @patch("tools.skynet_convene.requests.post")
-    def test_posts_update_message(self, mock_post):
-        mock_post.return_value = _ok_response()
+    @patch("tools.skynet_convene.guarded_publish")
+    def test_posts_update_message(self, mock_gp):
+        mock_gp.return_value = {"allowed": True}
         result = sc.post_update("gamma", "sess_1", "my findings")
         assert result is True
-        body = mock_post.call_args[1]["json"]
+        body = mock_gp.call_args[0][0]  # signed: gamma
         assert body["sender"] == "gamma"
         assert body["type"] == "update"
         payload = json.loads(body["content"])
         assert payload["session_id"] == "sess_1"
         assert payload["content"] == "my findings"
-        # signed: delta
 
-    @patch("tools.skynet_convene.requests.post")
-    def test_network_error_returns_false(self, mock_post):
-        import requests as req
-        mock_post.side_effect = req.RequestException("err")
+    @patch("tools.skynet_convene.guarded_publish")
+    def test_network_error_returns_false(self, mock_gp):
+        mock_gp.return_value = {"allowed": False}  # signed: gamma
         assert sc.post_update("gamma", "s1", "x") is False
-        # signed: delta
 
 
 class TestResolveSession:
     """Tests for resolve_session()."""
 
-    @patch("tools.skynet_convene.requests.post")
+    @patch("tools.skynet_convene.guarded_publish")
     @patch("tools.skynet_convene.requests.delete")
-    def test_resolve_deletes_and_publishes(self, mock_del, mock_post):
+    def test_resolve_deletes_and_publishes(self, mock_del, mock_gp):
         mock_del.return_value = _ok_response()
-        mock_post.return_value = _ok_response()
+        mock_gp.return_value = {"allowed": True}
         result = sc.resolve_session("alpha", "sess_1", "all done")
         assert result is True
         mock_del.assert_called_once()
         assert "sess_1" in mock_del.call_args[0][0]
-        body = mock_post.call_args[1]["json"]
+        body = mock_gp.call_args[0][0]  # signed: gamma
         assert body["type"] == "resolve"
         payload = json.loads(body["content"])
         assert payload["summary"] == "all done"
-        # signed: delta
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -436,9 +432,9 @@ class TestConveneGate:
         assert pending[gid]["votes"]["alpha"] == "YES"
         # signed: delta
 
-    @patch("tools.skynet_convene.requests.post")
-    def test_propose_urgent_bypasses_gate(self, mock_post, clean_sessions):
-        mock_post.return_value = _ok_response()
+    @patch("tools.skynet_convene.guarded_publish")
+    def test_propose_urgent_bypasses_gate(self, mock_gp, clean_sessions):
+        mock_gp.return_value = {"allowed": True}
         gate = sc.ConveneGate()
         result = gate.propose("alpha", "CRITICAL: system down", urgent=True)
         assert result["action"] == "bypassed"
@@ -446,10 +442,9 @@ class TestConveneGate:
         assert gate.get_pending() == {}
         assert gate.get_stats()["total_bypassed"] == 1
         # verify bus message was posted with [URGENT BYPASS]
-        body = mock_post.call_args[1]["json"]
+        body = mock_gp.call_args[0][0]  # signed: gamma
         assert body["type"] == "urgent"
         assert "[URGENT BYPASS]" in body["content"]
-        # signed: delta
 
     @patch("tools.skynet_convene.requests.post")
     def test_vote_gate_approve_elevates(self, mock_post, clean_sessions):
@@ -903,15 +898,14 @@ class TestVoting:
 class TestDispatchConveneTasks:
     """Tests for _dispatch_convene_tasks()."""
 
-    @patch("tools.skynet_convene.requests.post")
-    def test_dispatches_to_all_workers(self, mock_post):
-        mock_post.return_value = _ok_response()
+    @patch("tools.skynet_convene.guarded_publish")
+    def test_dispatches_to_all_workers(self, mock_gp):
+        mock_gp.return_value = {"allowed": True}
         sc._dispatch_convene_tasks(["alpha", "beta"], "sess_1", "do the thing")
-        assert mock_post.call_count == 2
-        bodies = [c[1]["json"] for c in mock_post.call_args_list]
+        assert mock_gp.call_count == 2
+        bodies = [c[0][0] for c in mock_gp.call_args_list]  # signed: gamma
         workers_dispatched = [json.loads(b["content"])["worker"] for b in bodies]
         assert set(workers_dispatched) == {"alpha", "beta"}
-        # signed: delta
 
     @patch("tools.skynet_convene.requests.post")
     def test_handles_dispatch_failure(self, mock_post):

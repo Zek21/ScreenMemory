@@ -63,15 +63,15 @@ def _fetch_json(url, timeout=5):
 
 def _post_bus(topic, msg_type, content):
     try:
-        import requests
-        requests.post(f"{BUS_URL}/bus/publish", json={
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish({
             "sender": "self-improve",
             "topic": topic,
             "type": msg_type,
             "content": content,
-        }, timeout=5)
+        })
     except Exception:
-        pass
+        pass  # signed: alpha
 
 
 def _load_json(path):

@@ -48,7 +48,7 @@ class TestBuildPreamble(unittest.TestCase):
 
     def test_preamble_contains_bus_instructions(self):
         p = self.build_preamble("delta")
-        self.assertIn("http://localhost:8420/bus/publish", p)
+        self.assertIn("guarded_publish", p)  # signed: gamma
         self.assertIn("topic", p)
         self.assertIn("orchestrator", p)
 

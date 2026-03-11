@@ -67,15 +67,15 @@ def log(msg, level="INFO"):
 
 
 def bus_post(sender, topic, msg_type, content):
-    """Post to Skynet bus."""
+    """Post to Skynet bus via SpamGuard."""
     try:
-        import requests
-        requests.post(f"{SKYNET_URL}/bus/publish", json={
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish({
             "sender": sender, "topic": topic,
             "type": msg_type, "content": content,
-        }, timeout=3)
+        })
     except Exception:
-        pass
+        pass  # signed: alpha
 
 
 def _get_orch_hwnd():

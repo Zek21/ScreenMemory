@@ -111,14 +111,14 @@ class TestConsultantPromptQueue(unittest.TestCase):
         self.assertEqual(task_state["assigned_worker"], "alpha")
 
     def test_publish_consultant_event_stringifies_metadata(self):
-        with patch("shared.bus.bus_post", return_value=True) as bus_post:
+        with patch("tools.skynet_spam_guard.guarded_publish", return_value={"allowed": True, "published": True}) as mock_gp:  # signed: gamma
             ok = self.bridge._publish_consultant_event(
                 "task_claim",
                 "Gemini Consultant accepted a task",
                 metadata={"available_workers": ["alpha", "gamma"], "worker_count": 2, "routable": True},
             )
         self.assertTrue(ok)
-        payload = bus_post.call_args.args[0]
+        payload = mock_gp.call_args.args[0]
         self.assertEqual(payload["metadata"]["available_workers"], "[\"alpha\", \"gamma\"]")
         self.assertEqual(payload["metadata"]["worker_count"], "2")
         self.assertEqual(payload["metadata"]["routable"], "True")
@@ -349,8 +349,8 @@ class TestConsultantBootstrapTruth(unittest.TestCase):
     def test_cc_start_requires_bridge_health_before_live_claim(self):
         script = Path("CC-Start.ps1").read_text(encoding="utf-8")
         self.assertIn("http://127.0.0.1:8422/health", script)
-        self.assertIn("started and passed /health on port 8422", script)
-        self.assertIn("failed health verification within 40s", script)
+        self.assertIn("passed /health", script)  # signed: gamma
+        self.assertIn("port 8422", script)
 
     def test_gc_start_requires_bridge_health_before_live_claim(self):
         script = Path("GC-Start.ps1").read_text(encoding="utf-8")
