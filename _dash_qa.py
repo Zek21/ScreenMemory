@@ -11,7 +11,7 @@ def g(port, path):
             d = s.recv(16384)
             if not d: break
             c.append(d)
-        except: break
+        except (socket.timeout, ConnectionError, OSError): break
     s.close()
     raw = b''.join(c).decode('utf-8', 'ignore')
     hdr, _, body = raw.partition('\r\n\r\n')

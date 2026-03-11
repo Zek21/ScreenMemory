@@ -375,6 +375,39 @@ class ProcessGuardian:
             logger.info("Guardian watchdog stopped")
 
 
+def _dispatch_guardian_command(guardian, args):
+    """Dispatch a guardian CLI command."""
+    if args.command == "status":
+        print(guardian.status())
+
+    elif args.command == "kill-all":
+        print("EMERGENCY KILL-ALL")
+        actions = guardian.kill_all() + guardian.kill_orphans()
+        for a in actions:
+            print(f"  {a}")
+        if not actions:
+            print("  No processes to kill.")
+
+    elif args.command == "cleanup":
+        actions = guardian.enforce() + guardian.kill_orphans()
+        for a in actions:
+            print(f"  {a}")
+        if not actions:
+            print("  Nothing to clean up.")
+
+    elif args.command == "orphans":
+        orphans = guardian.find_orphans()
+        if orphans:
+            print(f"Found {len(orphans)} orphan Python processes:")
+            for o in orphans:
+                print(f"  PID {o['pid']} -- {o['command'][:80]}")
+        else:
+            print("No orphans found.")
+
+    elif args.command == "watch":
+        guardian.watch(interval=args.interval)
+
+
 def main():
     parser = argparse.ArgumentParser(description="ScreenMemory Process Guardian")
     parser.add_argument("command", choices=["status", "kill-all", "cleanup", "watch", "orphans"],
@@ -388,46 +421,7 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    guardian = ProcessGuardian()
-
-    if args.command == "status":
-        print(guardian.status())
-
-    elif args.command == "kill-all":
-        print("EMERGENCY KILL-ALL")
-        # Kill tracked
-        actions = guardian.kill_all()
-        for a in actions:
-            print(f"  {a}")
-        # Kill orphans
-        orphan_actions = guardian.kill_orphans()
-        for a in orphan_actions:
-            print(f"  {a}")
-        if not actions and not orphan_actions:
-            print("  No processes to kill.")
-
-    elif args.command == "cleanup":
-        # Enforce rules + kill orphans
-        actions = guardian.enforce()
-        orphan_actions = guardian.kill_orphans()
-        all_actions = actions + orphan_actions
-        if all_actions:
-            for a in all_actions:
-                print(f"  {a}")
-        else:
-            print("  Nothing to clean up.")
-
-    elif args.command == "orphans":
-        orphans = guardian.find_orphans()
-        if orphans:
-            print(f"Found {len(orphans)} orphan Python processes:")
-            for o in orphans:
-                print(f"  PID {o['pid']} — {o['command'][:80]}")
-        else:
-            print("No orphans found.")
-
-    elif args.command == "watch":
-        guardian.watch(interval=args.interval)
+    _dispatch_guardian_command(ProcessGuardian(), args)
 
 
 if __name__ == "__main__":

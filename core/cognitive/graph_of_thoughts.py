@@ -463,59 +463,36 @@ class GoTReasoner:
 
     def reason(self, problem: str, perspectives: List[str] = None,
                max_depth: int = 5) -> Tuple[str, GraphOfThoughts]:
-        """
-        Solve a problem using graph-based reasoning.
-
-        Args:
-            problem: The problem statement
-            perspectives: Different angles to explore (creates parallel branches)
-            max_depth: Maximum reasoning depth
-
-        Returns:
-            (resolution_string, graph_object)
-        """
+        """Solve a problem using graph-based reasoning."""
         got = GraphOfThoughts(max_depth=max_depth)
         root = got.add_thought(problem, score=0.3)
 
-        # Create parallel exploration branches
         if perspectives:
-            branches = []
-            for p in perspectives:
-                branch = got.generate(root.id, p, score=0.5)
-                branches.append(branch)
+            self._explore_perspectives(got, root, perspectives)
 
-            # If we have VLM, try to evaluate and refine branches
-            if self.vlm and self.vlm.is_available:
-                for branch in branches:
-                    refined = got.refine(
-                        branch.id,
-                        f"[VLM-refined] {branch.content}",
-                        score_delta=0.15,
-                    )
-
-            # Aggregate best branches
-            active_branches = [b.id for b in branches if b.score >= 0.3]
-            if len(active_branches) >= 2:
-                synthesis = f"Synthesis of {len(active_branches)} perspectives on: {problem[:60]}"
-                got.aggregate(active_branches, synthesis, score=0.8)
-
-        # Score and prune
         got.score_all()
         got.prune()
-
-        # Resolve
         resolution = got.resolve()
 
-        # Store in memory if available
         if self.memory:
             self.memory.store_episodic(
                 f"GoT reasoning: {problem[:60]} -> {got.stats['total_thoughts']} thoughts",
-                tags=["reasoning", "got"],
-                source_action="got_reason",
-                importance=0.7,
+                tags=["reasoning", "got"], source_action="got_reason", importance=0.7,
             )
-
         return resolution, got
+
+    def _explore_perspectives(self, got: GraphOfThoughts, root, perspectives: List[str]):
+        """Create parallel branches, refine via VLM if available, then aggregate."""
+        branches = [got.generate(root.id, p, score=0.5) for p in perspectives]
+
+        if self.vlm and self.vlm.is_available:
+            for branch in branches:
+                got.refine(branch.id, f"[VLM-refined] {branch.content}", score_delta=0.15)
+
+        active = [b.id for b in branches if b.score >= 0.3]
+        if len(active) >= 2:
+            synthesis = f"Synthesis of {len(active)} perspectives on: {root.content[:60]}"
+            got.aggregate(active, synthesis, score=0.8)
 
 
 if __name__ == "__main__":

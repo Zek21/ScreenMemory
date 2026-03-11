@@ -117,7 +117,8 @@ async def check_fb_page(page, slug, expected_city):
     except:
         return None, None
 
-async def main():
+def _load_businesses_scored():
+    """Load businesses from CSV, compute score, sort by value."""
     businesses = []
     with open(INPUT_CSV, 'r', encoding='utf-8') as f:
         for row in csv.DictReader(f):
@@ -128,19 +129,62 @@ async def main():
             except:
                 row['_score'] = 0
             businesses.append(row)
-
     businesses.sort(key=lambda x: -x['_score'])
     print(f"Loaded {len(businesses)} businesses (sorted by value)")
+    return businesses
 
+
+def _load_resume_state():
+    """Load completed set and existing results for resume support."""
     completed = set()
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, 'r') as f:
             completed = set(json.load(f).get('completed', []))
-
     results = []
     if os.path.exists(OUTPUT_CSV):
         with open(OUTPUT_CSV, 'r', encoding='utf-8') as f:
             results = list(csv.DictReader(f))
+    return completed, results
+
+
+def _save_checkpoint(completed, results):
+    """Save progress and results to disk."""
+    with open(PROGRESS_FILE, 'w') as f:
+        json.dump({'completed': list(completed)}, f)
+    if results:
+        fnames = list(results[0].keys())
+        with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=fnames)
+            w.writeheader()
+            w.writerows(results)
+
+
+async def _search_fb_for_business(page, biz, i, total, results, stats):
+    """Search Facebook for a single business. Updates results and stats in place."""
+    name, city = biz['name'], biz['city']
+    for slug in slugify(name):
+        page_name, emails = await check_fb_page(page, slug, city)
+        if page_name and emails:
+            stats['fb_found'] += 1
+            biz_copy = {k: v for k, v in biz.items() if k != '_score'}
+            biz_copy['email'] = '; '.join(emails)
+            biz_copy['facebook'] = f"https://www.facebook.com/{slug}"
+            biz_copy['fb_name'] = page_name
+            results.append(biz_copy)
+            stats['found'] += 1
+            print(f"  [{i+1}/{total}] \u2713 {name} ({city}) -> {biz_copy['email']}")
+            return True
+        elif page_name:
+            stats['fb_found'] += 1
+            print(f"  [{i+1}/{total}] FB no email: {name} ({city}) -> {page_name}")
+            return False
+        await page.wait_for_timeout(random.uniform(500, 1500))
+    return False
+
+
+async def main():
+    businesses = _load_businesses_scored()
+    completed, results = _load_resume_state()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -157,69 +201,24 @@ async def main():
         await stealth.apply_stealth_async(context)
         page = await context.new_page()
 
-        found_count = len(results)
-        checked = 0
-        fb_found = 0
+        stats = {'found': len(results), 'fb_found': 0, 'checked': 0}
 
         for i, biz in enumerate(businesses):
             key = f"{biz['name']}|{biz['city']}"
             if key in completed:
                 continue
 
-            name = biz['name']
-            city = biz['city']
-            slugs = slugify(name)
-
-            found_email = False
-            for slug in slugs:
-                page_name, emails = await check_fb_page(page, slug, city)
-                
-                if page_name and emails:
-                    fb_found += 1
-                    biz_copy = {k: v for k, v in biz.items() if k != '_score'}
-                    biz_copy['email'] = '; '.join(emails)
-                    biz_copy['facebook'] = f"https://www.facebook.com/{slug}"
-                    biz_copy['fb_name'] = page_name
-                    results.append(biz_copy)
-                    found_count += 1
-                    print(f"  [{i+1}/{len(businesses)}] \u2713 {name} ({city}) -> {biz_copy['email']}")
-                    found_email = True
-                    break
-                elif page_name:
-                    fb_found += 1
-                    print(f"  [{i+1}/{len(businesses)}] FB no email: {name} ({city}) -> {page_name}")
-                    break
-                
-                await page.wait_for_timeout(random.uniform(500, 1500))
-
-            if not found_email and not any(True for s in slugs if s):
-                print(f"  [{i+1}/{len(businesses)}] \u2717 {name} ({city})")
-
+            await _search_fb_for_business(page, biz, i, len(businesses), results, stats)
             completed.add(key)
-            checked += 1
+            stats['checked'] += 1
             await page.wait_for_timeout(random.uniform(1000, 2500))
 
-            if checked % 10 == 0:
-                with open(PROGRESS_FILE, 'w') as f:
-                    json.dump({'completed': list(completed)}, f)
-                if results:
-                    fnames = list(results[0].keys())
-                    with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
-                        w = csv.DictWriter(f, fieldnames=fnames)
-                        w.writeheader()
-                        w.writerows(results)
-                print(f"  >> {checked} checked, {fb_found} FB pages, {found_count} emails")
+            if stats['checked'] % 10 == 0:
+                _save_checkpoint(completed, results)
+                print(f"  >> {stats['checked']} checked, {stats['fb_found']} FB pages, {stats['found']} emails")
 
-        # Final save
-        with open(PROGRESS_FILE, 'w') as f:
-            json.dump({'completed': list(completed)}, f)
-        if results:
-            fnames = list(results[0].keys())
-            with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
-                w = csv.DictWriter(f, fieldnames=fnames)
-                w.writeheader()
-                w.writerows(results)
-        print(f"\nDONE! {found_count} emails from {fb_found} FB pages ({checked} checked)")
+        _save_checkpoint(completed, results)
+        print(f"\nDONE! {stats['found']} emails from {stats['fb_found']} FB pages ({stats['checked']} checked)")
         await browser.close()
 
 if __name__ == '__main__':

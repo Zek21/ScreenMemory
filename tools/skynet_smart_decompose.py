@@ -305,6 +305,71 @@ class SmartDecomposer:
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
+def _test_classify(d, check):
+    """Test task classification."""
+    print("\n--- classify_task ---")
+    check("code: 'write a new handler'", d.classify_task("write a new handler") == "code")
+    check("audit: 'scan for security issues'", d.classify_task("scan for security issues") == "audit")
+    check("test: 'run pytest on core/'", d.classify_task("run pytest on core/") == "test")
+    check("research: 'list all files'", d.classify_task("list all files") == "research")
+    check("infra: 'restart the server'", d.classify_task("restart the server") == "infra")
+    check("code: 'implement feature'", d.classify_task("implement the new feature module") == "code")
+    check("audit: 'review dead code'", d.classify_task("review dead code in utils") == "audit")
+    check("default: unknown text", d.classify_task("do the thing") == "research")
+
+
+def _test_complexity(d, check):
+    """Test complexity estimation."""
+    print("\n--- estimate_complexity ---")
+    c1 = d.estimate_complexity("list files")
+    c2 = d.estimate_complexity("refactor the entire authentication system with new middleware")
+    c3 = d.estimate_complexity("check status")
+    check(f"simple task <= 4 (got {c1})", c1 <= 4)
+    check(f"complex task >= 6 (got {c2})", c2 >= 6)
+    check(f"trivial task <= 3 (got {c3})", c3 <= 3)
+    check("complexity range 1-10", 1 <= c1 <= 10 and 1 <= c2 <= 10)
+
+
+def _test_decompose(d, check):
+    """Test prompt decomposition."""
+    print("\n--- decompose: single ---")
+    r = d.decompose("check the Python version")
+    check("single task returns 1 item", len(r) == 1)
+    check("has all required keys", all(k in r[0] for k in ["worker", "task", "priority", "estimated_seconds", "type", "complexity"]))
+    check("type is research/infra/audit", r[0]["type"] in ("research", "infra", "audit"))
+
+    print("\n--- decompose: compound ---")
+    r = d.decompose("audit all endpoints and write tests for core/database.py")
+    check(f"compound splits into >= 2 tasks (got {len(r)})", len(r) >= 2)
+    types = {t["type"] for t in r}
+    check(f"different task types detected: {types}", len(types) >= 1)
+
+    print("\n--- decompose: explicit routing ---")
+    r = d.decompose("alpha: fix the bug, beta: write tests, gamma: deploy")
+    check(f"explicit routing returns 3 tasks (got {len(r)})", len(r) == 3)
+    workers = [t["worker"] for t in r]
+    check("explicit workers: alpha, beta, gamma", workers == ["alpha", "beta", "gamma"])
+
+    print("\n--- decompose: priority ---")
+    r = d.decompose("URGENT: fix the crash in production")
+    check(f"urgent priority = 1 (got {r[0]['priority']})", r[0]["priority"] == 1)
+    r = d.decompose("cleanup old log files when possible")
+    check(f"low priority = 5 (got {r[0]['priority']})", r[0]["priority"] == 5)
+
+    print("\n--- decompose: numbered list ---")
+    r = d.decompose("1. Review core/database.py\n2. Add tests for search.py\n3. Fix the CI pipeline")
+    check(f"numbered list splits into 3 tasks (got {len(r)})", len(r) == 3)
+
+    print("\n--- estimated_seconds ---")
+    for t in r:
+        check(f"  {t['type']} estimate > 0 (got {t['estimated_seconds']}s)", t["estimated_seconds"] > 0)
+
+    print("\n--- load balancing ---")
+    r = d.decompose("1. task one\n2. task two\n3. task three\n4. task four")
+    assigned = [t["worker"] for t in r]
+    check(f"4 tasks spread across workers: {assigned}", len(set(assigned)) >= 2)
+
+
 def _run_tests():
     """Run built-in tests for the SmartDecomposer."""
     d = SmartDecomposer()
@@ -328,70 +393,9 @@ def _run_tests():
     print("SmartDecomposer Tests")
     print("=" * 60)
 
-    # --- classify_task ---
-    print("\n--- classify_task ---")
-    check("code: 'write a new handler'", d.classify_task("write a new handler") == "code")
-    check("audit: 'scan for security issues'", d.classify_task("scan for security issues") == "audit")
-    check("test: 'run pytest on core/'", d.classify_task("run pytest on core/") == "test")
-    check("research: 'list all files'", d.classify_task("list all files") == "research")
-    check("infra: 'restart the server'", d.classify_task("restart the server") == "infra")
-    check("code: 'implement feature'", d.classify_task("implement the new feature module") == "code")
-    check("audit: 'review dead code'", d.classify_task("review dead code in utils") == "audit")
-    check("default: unknown text", d.classify_task("do the thing") == "research")
-
-    # --- estimate_complexity ---
-    print("\n--- estimate_complexity ---")
-    c1 = d.estimate_complexity("list files")
-    c2 = d.estimate_complexity("refactor the entire authentication system with new middleware")
-    c3 = d.estimate_complexity("check status")
-    check(f"simple task <= 4 (got {c1})", c1 <= 4)
-    check(f"complex task >= 6 (got {c2})", c2 >= 6)
-    check(f"trivial task <= 3 (got {c3})", c3 <= 3)
-    check("complexity range 1-10", 1 <= c1 <= 10 and 1 <= c2 <= 10)
-
-    # --- decompose: single task ---
-    print("\n--- decompose: single ---")
-    r = d.decompose("check the Python version")
-    check("single task returns 1 item", len(r) == 1)
-    check("has all required keys", all(k in r[0] for k in ["worker", "task", "priority", "estimated_seconds", "type", "complexity"]))
-    check("type is research/infra/audit", r[0]["type"] in ("research", "infra", "audit"))
-
-    # --- decompose: compound ---
-    print("\n--- decompose: compound ---")
-    r = d.decompose("audit all endpoints and write tests for core/database.py")
-    check(f"compound splits into >= 2 tasks (got {len(r)})", len(r) >= 2)
-    types = {t["type"] for t in r}
-    check(f"different task types detected: {types}", len(types) >= 1)
-
-    # --- decompose: explicit routing ---
-    print("\n--- decompose: explicit routing ---")
-    r = d.decompose("alpha: fix the bug, beta: write tests, gamma: deploy")
-    check(f"explicit routing returns 3 tasks (got {len(r)})", len(r) == 3)
-    workers = [t["worker"] for t in r]
-    check("explicit workers: alpha, beta, gamma", workers == ["alpha", "beta", "gamma"])
-
-    # --- decompose: priority detection ---
-    print("\n--- decompose: priority ---")
-    r = d.decompose("URGENT: fix the crash in production")
-    check(f"urgent priority = 1 (got {r[0]['priority']})", r[0]["priority"] == 1)
-    r = d.decompose("cleanup old log files when possible")
-    check(f"low priority = 5 (got {r[0]['priority']})", r[0]["priority"] == 5)
-
-    # --- decompose: numbered list ---
-    print("\n--- decompose: numbered list ---")
-    r = d.decompose("1. Review core/database.py\n2. Add tests for search.py\n3. Fix the CI pipeline")
-    check(f"numbered list splits into 3 tasks (got {len(r)})", len(r) == 3)
-
-    # --- estimated_seconds ---
-    print("\n--- estimated_seconds ---")
-    for t in r:
-        check(f"  {t['type']} estimate > 0 (got {t['estimated_seconds']}s)", t["estimated_seconds"] > 0)
-
-    # --- worker load balancing ---
-    print("\n--- load balancing ---")
-    r = d.decompose("1. task one\n2. task two\n3. task three\n4. task four")
-    assigned = [t["worker"] for t in r]
-    check(f"4 tasks spread across workers: {assigned}", len(set(assigned)) >= 2)
+    _test_classify(d, check)
+    _test_complexity(d, check)
+    _test_decompose(d, check)
 
     print(f"\n{'=' * 60}")
     print(f"Results: {passed} passed, {failed} failed")

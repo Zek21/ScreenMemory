@@ -244,55 +244,46 @@ class Win32Scanner:
 
         def callback(hwnd, _):
             hwnd_val = hwnd if isinstance(hwnd, int) else ctypes.cast(hwnd, ctypes.c_void_p).value
-            if not self.user32.IsWindowVisible(hwnd_val):
-                return True
-
-            # Get title
-            length = self.user32.GetWindowTextLengthW(hwnd_val)
-            if length == 0:
-                return True
-            buf = ctypes.create_unicode_buffer(length + 1)
-            self.user32.GetWindowTextW(hwnd_val, buf, length + 1)
-            title = buf.value
-
-            # Get class
-            cls_buf = ctypes.create_unicode_buffer(256)
-            self.user32.GetClassNameW(hwnd_val, cls_buf, 256)
-            cls_name = cls_buf.value
-
-            # Skip non-interactive windows
-            if cls_name in ('Progman', 'WorkerW', 'Shell_TrayWnd',
-                            'Shell_SecondaryTrayWnd', 'NotifyIconOverflowWindow'):
-                return True
-
-            # Get rect
-            rect = ctypes.wintypes.RECT()
-            self.user32.GetWindowRect(hwnd_val, ctypes.byref(rect))
-
-            w = rect.right - rect.left
-            h = rect.bottom - rect.top
-            if w < 10 or h < 10:
-                return True
-
-            # Get process ID
-            pid = ctypes.wintypes.DWORD()
-            self.user32.GetWindowThreadProcessId(hwnd_val, ctypes.byref(pid))
-
-            node = SpatialNode(
-                source='win32', name=title, role='window',
-                x=rect.left, y=rect.top, w=w, h=h, z=z_index[0],
-                actionable=True,
-                actions=['focus', 'move', 'resize', 'close', 'minimize', 'maximize'],
-                hwnd=hwnd_val, class_name=cls_name, pid=pid.value,
-            )
-            windows.append(node)
-            z_index[0] += 1
+            node = self._build_window_node(hwnd_val, z_index[0], ctypes)
+            if node:
+                windows.append(node)
+                z_index[0] += 1
             return True
 
-        # EnumWindows enumerates in z-order (topmost first)
         cb = self._WNDENUMPROC(callback)
         self.user32.EnumWindows(cb, 0)
         return windows
+
+    _SKIP_CLASSES = frozenset(('Progman', 'WorkerW', 'Shell_TrayWnd',
+                               'Shell_SecondaryTrayWnd', 'NotifyIconOverflowWindow'))
+
+    def _build_window_node(self, hwnd_val, z, ctypes) -> 'SpatialNode':
+        """Build a SpatialNode for a single window, or None if it should be skipped."""
+        if not self.user32.IsWindowVisible(hwnd_val):
+            return None
+        length = self.user32.GetWindowTextLengthW(hwnd_val)
+        if length == 0:
+            return None
+        buf = ctypes.create_unicode_buffer(length + 1)
+        self.user32.GetWindowTextW(hwnd_val, buf, length + 1)
+        cls_buf = ctypes.create_unicode_buffer(256)
+        self.user32.GetClassNameW(hwnd_val, cls_buf, 256)
+        if cls_buf.value in self._SKIP_CLASSES:
+            return None
+        rect = ctypes.wintypes.RECT()
+        self.user32.GetWindowRect(hwnd_val, ctypes.byref(rect))
+        w, h = rect.right - rect.left, rect.bottom - rect.top
+        if w < 10 or h < 10:
+            return None
+        pid = ctypes.wintypes.DWORD()
+        self.user32.GetWindowThreadProcessId(hwnd_val, ctypes.byref(pid))
+        return SpatialNode(
+            source='win32', name=buf.value, role='window',
+            x=rect.left, y=rect.top, w=w, h=h, z=z,
+            actionable=True,
+            actions=['focus', 'move', 'resize', 'close', 'minimize', 'maximize'],
+            hwnd=hwnd_val, class_name=cls_buf.value, pid=pid.value,
+        )
 
     def send_message(self, hwnd, msg, wparam=0, lparam=0):
         """Send message to window without stealing focus."""
@@ -453,50 +444,45 @@ class CDPPerception:
 
     # ─── Perception (read-only, no side effects) ─────────
 
-    def get_dom_tree(self, tab_id: str, selector='body', depth=4) -> List[SpatialNode]:
-        """Get DOM elements as spatial nodes with bounding boxes.
-        Uses CDP DOM + CSS domains — zero mouse."""
-        js = f"""
-        (function() {{
-            var root = document.querySelector({json.dumps(selector)});
-            if (!root) return '[]';
-            var elements = [];
-            function walk(el, depth) {{
-                if (depth <= 0) return;
-                var rect = el.getBoundingClientRect();
-                if (rect.width < 1 && rect.height < 1) return;
-                var tag = el.tagName ? el.tagName.toLowerCase() : '';
-                var role = el.getAttribute('role') || el.tagName || '';
-                var name = el.getAttribute('aria-label') ||
-                           el.getAttribute('title') ||
-                           el.getAttribute('alt') ||
-                           el.getAttribute('placeholder') ||
-                           (el.innerText || '').substring(0, 50).trim();
-                var isActionable = ['A','BUTTON','INPUT','SELECT','TEXTAREA'].includes(el.tagName) ||
-                                   el.getAttribute('onclick') || el.getAttribute('role') === 'button';
-                elements.push({{
-                    tag: tag,
-                    role: role.toLowerCase(),
-                    name: name,
-                    x: Math.round(rect.x),
-                    y: Math.round(rect.y),
-                    w: Math.round(rect.width),
-                    h: Math.round(rect.height),
-                    actionable: !!isActionable,
-                    id: el.id || '',
-                    cls: (el.className || '').toString().substring(0, 60),
-                    href: el.href || '',
-                    type: el.type || '',
-                    value: (el.value || '').substring(0, 100),
-                }});
-                for (var i = 0; i < el.children.length; i++) {{
-                    walk(el.children[i], depth - 1);
-                }}
+    _DOM_WALK_JS = '''
+    (function() {{
+        var root = document.querySelector({selector});
+        if (!root) return '[]';
+        var elements = [];
+        function walk(el, depth) {{
+            if (depth <= 0) return;
+            var rect = el.getBoundingClientRect();
+            if (rect.width < 1 && rect.height < 1) return;
+            var tag = el.tagName ? el.tagName.toLowerCase() : '';
+            var role = el.getAttribute('role') || el.tagName || '';
+            var name = el.getAttribute('aria-label') ||
+                       el.getAttribute('title') ||
+                       el.getAttribute('alt') ||
+                       el.getAttribute('placeholder') ||
+                       (el.innerText || '').substring(0, 50).trim();
+            var isActionable = ['A','BUTTON','INPUT','SELECT','TEXTAREA'].includes(el.tagName) ||
+                               el.getAttribute('onclick') || el.getAttribute('role') === 'button';
+            elements.push({{
+                tag: tag, role: role.toLowerCase(), name: name,
+                x: Math.round(rect.x), y: Math.round(rect.y),
+                w: Math.round(rect.width), h: Math.round(rect.height),
+                actionable: !!isActionable, id: el.id || '',
+                cls: (el.className || '').toString().substring(0, 60),
+                href: el.href || '', type: el.type || '',
+                value: (el.value || '').substring(0, 100),
+            }});
+            for (var i = 0; i < el.children.length; i++) {{
+                walk(el.children[i], depth - 1);
             }}
-            walk(root, {depth});
-            return JSON.stringify(elements);
-        }})()
-        """
+        }}
+        walk(root, {depth});
+        return JSON.stringify(elements);
+    }})()
+    '''
+
+    def get_dom_tree(self, tab_id: str, selector='body', depth=4) -> List[SpatialNode]:
+        """Get DOM elements as spatial nodes with bounding boxes."""
+        js = self._DOM_WALK_JS.format(selector=json.dumps(selector), depth=depth)
         raw = self.cdp.eval(tab_id, js)
         if not raw or raw == '[]':
             return []
@@ -504,30 +490,27 @@ class CDPPerception:
             items = json.loads(raw) if isinstance(raw, str) else raw
         except (json.JSONDecodeError, TypeError):
             return []
+        return [self._dom_item_to_node(d) for d in items]
 
-        nodes = []
-        for d in items:
-            actions = []
-            if d.get('actionable'):
-                actions = ['click']
-                if d.get('tag') in ('input', 'textarea', 'select'):
-                    actions.append('type')
-            node = SpatialNode(
-                source='cdp',
-                name=d.get('name', '') or d.get('id', '') or d.get('tag', ''),
-                role=d.get('role', d.get('tag', 'element')),
-                x=d.get('x', 0), y=d.get('y', 0),
-                w=d.get('w', 0), h=d.get('h', 0),
-                actionable=d.get('actionable', False),
-                actions=actions,
-                value=d.get('value', ''),
-                tag=d.get('tag', ''),
-                element_id=d.get('id', ''),
-                css_class=d.get('cls', ''),
-                href=d.get('href', ''),
-            )
-            nodes.append(node)
-        return nodes
+    @staticmethod
+    def _dom_item_to_node(d: dict) -> SpatialNode:
+        """Convert a raw DOM item dict to a SpatialNode."""
+        actions = []
+        if d.get('actionable'):
+            actions = ['click']
+            if d.get('tag') in ('input', 'textarea', 'select'):
+                actions.append('type')
+        return SpatialNode(
+            source='cdp',
+            name=d.get('name', '') or d.get('id', '') or d.get('tag', ''),
+            role=d.get('role', d.get('tag', 'element')),
+            x=d.get('x', 0), y=d.get('y', 0),
+            w=d.get('w', 0), h=d.get('h', 0),
+            actionable=d.get('actionable', False), actions=actions,
+            value=d.get('value', ''), tag=d.get('tag', ''),
+            element_id=d.get('id', ''), css_class=d.get('cls', ''),
+            href=d.get('href', ''),
+        )
 
     def get_accessibility_tree(self, tab_id: str) -> List[SpatialNode]:
         """Get Chrome's accessibility tree as spatial nodes."""
@@ -671,61 +654,71 @@ class PerceptionEngine:
     # ─── Full Environment Scan ───────────────────────────
 
     def scan_world(self, include_chrome_dom=True, depth=3) -> Dict:
-        """Build complete spatial model of the digital environment.
-        Returns summary stats. All data stored in self.grid."""
+        """Build complete spatial model of the digital environment."""
         t0 = time.time()
         self.grid.clear()
 
-        # Layer 1: Win32 windows (always available, fast)
-        windows = self.win32.enum_windows()
-        for w in windows:
-            self.grid.insert(w)
-
-        # Layer 2: UIA elements (native accessibility)
-        uia_nodes = []
-        if self.uia.available():
-            try:
-                uia_nodes = self.uia.scan(depth=depth)
-                for n in uia_nodes:
-                    self.grid.insert(n)
-            except Exception:
-                pass
-
-        # Layer 3: Chrome DOM (if connected)
-        chrome_nodes = []
-        if include_chrome_dom and self.chrome.connected:
-            try:
-                for tab in self.chrome.tabs():
-                    tab_id = tab['id']
-                    url = tab.get('url', '')
-                    if url.startswith('chrome://') or url.startswith('devtools://'):
-                        continue
-                    fp = self.chrome.get_page_fingerprint(tab_id)
-                    cached = self.memory.recall(f'dom:{tab_id}', fp)
-                    if cached:
-                        for n in cached:
-                            self.grid.insert(n)
-                        chrome_nodes.extend(cached)
-                    else:
-                        dom_nodes = self.chrome.get_dom_tree(tab_id, depth=depth)
-                        for n in dom_nodes:
-                            self.grid.insert(n)
-                        chrome_nodes.extend(dom_nodes)
-                        self.memory.remember(f'dom:{tab_id}', dom_nodes, fp)
-            except Exception:
-                pass
+        windows = self._scan_win32_layer()
+        uia_nodes = self._scan_uia_layer(depth)
+        chrome_nodes = self._scan_chrome_layer(depth) if include_chrome_dom else []
 
         self._scan_count += 1
         self._last_scan_time = time.time() - t0
-
         return {
-            'windows': len(windows),
-            'uia_elements': len(uia_nodes),
+            'windows': len(windows), 'uia_elements': len(uia_nodes),
             'chrome_elements': len(chrome_nodes),
             'total_nodes': len(self.grid.all_nodes),
             'scan_time_ms': round(self._last_scan_time * 1000, 1),
             'cached_layouts': len(self.memory.known_layouts),
         }
+
+    def _scan_win32_layer(self):
+        """Layer 1: Win32 windows."""
+        windows = self.win32.enum_windows()
+        for w in windows:
+            self.grid.insert(w)
+        return windows
+
+    def _scan_uia_layer(self, depth):
+        """Layer 2: UIA accessibility elements."""
+        if not self.uia.available():
+            return []
+        try:
+            nodes = self.uia.scan(depth=depth)
+            for n in nodes:
+                self.grid.insert(n)
+            return nodes
+        except Exception:
+            return []
+
+    def _scan_chrome_layer(self, depth):
+        """Layer 3: Chrome DOM elements with caching."""
+        if not self.chrome.connected:
+            return []
+        chrome_nodes = []
+        try:
+            for tab in self.chrome.tabs():
+                url = tab.get('url', '')
+                if url.startswith('chrome://') or url.startswith('devtools://'):
+                    continue
+                nodes = self._scan_chrome_tab(tab['id'], depth)
+                chrome_nodes.extend(nodes)
+        except Exception:
+            pass
+        return chrome_nodes
+
+    def _scan_chrome_tab(self, tab_id, depth):
+        """Scan a single Chrome tab, using cache if available."""
+        fp = self.chrome.get_page_fingerprint(tab_id)
+        cached = self.memory.recall(f'dom:{tab_id}', fp)
+        if cached:
+            nodes = cached
+        else:
+            nodes = self.chrome.get_dom_tree(tab_id, depth=depth)
+            self.memory.remember(f'dom:{tab_id}', nodes, fp)
+        for n in nodes:
+            self.grid.insert(n)
+        return nodes
 
     # ─── Spatial Queries ─────────────────────────────────
 
@@ -924,10 +917,75 @@ class PerceptionEngine:
 # CLI INTERFACE
 # ═══════════════════════════════════════════════════════════════
 
+def _cmd_find(engine, args):
+    if not args.args:
+        print('Usage: perception find <name>'); return
+    engine.scan_world(depth=args.depth)
+    for n in engine.find(' '.join(args.args))[:20]:
+        print(n)
+
+
+def _cmd_at(engine, args):
+    if len(args.args) < 2:
+        print('Usage: perception at <x> <y>'); return
+    engine.scan_world(depth=args.depth)
+    print(json.dumps(engine.what_is_at(int(args.args[0]), int(args.args[1])), indent=2))
+
+
+def _cmd_tabs(engine, args):
+    for t in engine.chrome_tabs():
+        print(f"  [{t['id'][:8]}] {t.get('title', '?')[:60]}")
+        print(f"             {t.get('url', '?')[:80]}")
+
+
+def _cmd_click(engine, args):
+    if not args.args:
+        print('Usage: perception click <selector_or_text>'); return
+    ok = engine.chrome_click(engine.chrome.active_tab(), ' '.join(args.args))
+    print('clicked' if ok else 'not found')
+
+
+def _cmd_type(engine, args):
+    if not args.args:
+        print('Usage: perception type <text>'); return
+    engine.chrome_type(engine.chrome.active_tab(), ' '.join(args.args))
+    print('typed')
+
+
+def _cmd_navigate(engine, args):
+    if not args.args:
+        print('Usage: perception navigate <url>'); return
+    engine.chrome_navigate(engine.chrome.active_tab(), args.args[0])
+    print(f'navigated to {args.args[0]}')
+
+
+def _cmd_screenshot(engine, args):
+    png = engine.chrome_screenshot(engine.chrome.active_tab())
+    out = args.args[0] if args.args else os.path.join('screenshots', 'perception-screenshot.png')
+    if not args.args:
+        os.makedirs('screenshots', exist_ok=True)
+    with open(out, 'wb') as f:
+        f.write(png)
+    print(f'Saved: {out} ({len(png)} bytes)')
+
+
+def _cmd_windows(engine, args):
+    engine.scan_world(include_chrome_dom=False)
+    for n in engine.grid.all_nodes:
+        if n.source == 'win32':
+            print(f"  z={n.z:2d} hwnd={n.meta.get('hwnd', '?')} [{n.x},{n.y} {n.w}x{n.h}] {n.name[:50]}")
+
+
+def _cmd_path(engine, args):
+    if not args.args:
+        print('Usage: perception path <element_name>'); return
+    engine.scan_world(depth=args.depth)
+    print(json.dumps(engine.path_to(' '.join(args.args)), indent=2, default=str))
+
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser(
-        description='Perception Engine — Deterministic Structural Perception')
+    parser = argparse.ArgumentParser(description='Perception Engine')
     parser.add_argument('command', nargs='?', default='scan',
                         choices=['scan', 'find', 'at', 'tabs', 'click', 'type',
                                  'navigate', 'screenshot', 'windows', 'stacking',
@@ -937,104 +995,25 @@ def main():
     parser.add_argument('--port', type=int, default=9222, help='CDP port')
     parser.add_argument('--json', action='store_true', help='JSON output')
     parser.add_argument('--depth', type=int, default=3, help='Scan depth')
-
     args = parser.parse_args()
     engine = PerceptionEngine(cdp_port=args.port)
 
-    if args.command == 'scan':
-        stats = engine.scan_world(depth=args.depth)
-        print(json.dumps(stats, indent=2))
-
-    elif args.command == 'find':
-        if not args.args:
-            print('Usage: perception find <name>')
-            return
-        engine.scan_world(depth=args.depth)
-        results = engine.find(' '.join(args.args))
-        for n in results[:20]:
-            print(n)
-
-    elif args.command == 'at':
-        if len(args.args) < 2:
-            print('Usage: perception at <x> <y>')
-            return
-        engine.scan_world(depth=args.depth)
-        x, y = int(args.args[0]), int(args.args[1])
-        hits = engine.what_is_at(x, y)
-        print(json.dumps(hits, indent=2))
-
-    elif args.command == 'tabs':
-        tabs = engine.chrome_tabs()
-        for t in tabs:
-            print(f"  [{t['id'][:8]}] {t.get('title', '?')[:60]}")
-            print(f"             {t.get('url', '?')[:80]}")
-
-    elif args.command == 'click':
-        if not args.args:
-            print('Usage: perception click <selector_or_text>')
-            return
-        tab = engine.chrome.active_tab()
-        target = ' '.join(args.args)
-        ok = engine.chrome_click(tab, target)
-        print('clicked' if ok else 'not found')
-
-    elif args.command == 'type':
-        if not args.args:
-            print('Usage: perception type <text>')
-            return
-        tab = engine.chrome.active_tab()
-        engine.chrome_type(tab, ' '.join(args.args))
-        print('typed')
-
-    elif args.command == 'navigate':
-        if not args.args:
-            print('Usage: perception navigate <url>')
-            return
-        tab = engine.chrome.active_tab()
-        engine.chrome_navigate(tab, args.args[0])
-        print(f'navigated to {args.args[0]}')
-
-    elif args.command == 'screenshot':
-        tab = engine.chrome.active_tab()
-        png = engine.chrome_screenshot(tab)
-        if args.args:
-            out = args.args[0]
-        else:
-            out = os.path.join('screenshots', 'perception-screenshot.png')
-            os.makedirs('screenshots', exist_ok=True)
-        with open(out, 'wb') as f:
-            f.write(png)
-        print(f'Saved: {out} ({len(png)} bytes)')
-
-    elif args.command == 'windows':
-        engine.scan_world(include_chrome_dom=False)
-        for n in engine.grid.all_nodes:
-            if n.source == 'win32':
-                hwnd = n.meta.get('hwnd', '?')
-                print(f"  z={n.z:2d} hwnd={hwnd} [{n.x},{n.y} {n.w}x{n.h}] {n.name[:50]}")
-
-    elif args.command == 'stacking':
-        engine.scan_world(include_chrome_dom=False)
-        stack = engine.stacking_order()
-        for s in stack:
-            print(f"  z={s['z']:2d} [{s['bounds'][0]},{s['bounds'][1]}->{s['bounds'][2]},{s['bounds'][3]}] {s['name'][:50]}")
-
-    elif args.command == 'monitors':
-        monitors = engine.win32.get_monitors()
-        for i, m in enumerate(monitors):
-            print(f"  Monitor {i}: {m['x']},{m['y']} {m['w']}x{m['h']}")
-
-    elif args.command == 'path':
-        if not args.args:
-            print('Usage: perception path <element_name>')
-            return
-        engine.scan_world(depth=args.depth)
-        result = engine.path_to(' '.join(args.args))
-        print(json.dumps(result, indent=2, default=str))
-
-    elif args.command == 'summary':
-        engine.scan_world(depth=args.depth)
-        print(json.dumps(engine.summary(), indent=2))
+    handlers = {
+        'scan':       lambda: print(json.dumps(engine.scan_world(depth=args.depth), indent=2)),
+        'find':       lambda: _cmd_find(engine, args),
+        'at':         lambda: _cmd_at(engine, args),
+        'tabs':       lambda: _cmd_tabs(engine, args),
+        'click':      lambda: _cmd_click(engine, args),
+        'type':       lambda: _cmd_type(engine, args),
+        'navigate':   lambda: _cmd_navigate(engine, args),
+        'screenshot': lambda: _cmd_screenshot(engine, args),
+        'windows':    lambda: _cmd_windows(engine, args),
+        'stacking':   lambda: (engine.scan_world(include_chrome_dom=False), [print(f"  z={s['z']:2d} [{s['bounds'][0]},{s['bounds'][1]}->{s['bounds'][2]},{s['bounds'][3]}] {s['name'][:50]}") for s in engine.stacking_order()]),
+        'monitors':   lambda: [print(f"  Monitor {i}: {m['x']},{m['y']} {m['w']}x{m['h']}") for i, m in enumerate(engine.win32.get_monitors())],
+        'path':       lambda: _cmd_path(engine, args),
+        'summary':    lambda: (engine.scan_world(depth=args.depth), print(json.dumps(engine.summary(), indent=2))),
+    }
+    handlers[args.command]()
 
 
 if __name__ == '__main__':

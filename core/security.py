@@ -80,8 +80,8 @@ class DPAPIKeyManager:
             None,   # optional entropy
             None,   # reserved
             None,   # prompt struct
-            0x01,   # CRYPTPROTECT_LOCAL_MACHINE
-        )
+            0x04,   # CRYPTPROTECT_LOCAL_MACHINE (0x04 per wincrypt.h — must match protect flag)
+        )  # signed: gamma
         return decrypted
 
     def store_key(self, key: bytes) -> bool:

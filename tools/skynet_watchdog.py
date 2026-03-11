@@ -106,6 +106,80 @@ _WD_CFG = _load_watchdog_config()
 WATCHDOG_INTERVAL = _WD_CFG["watchdog_interval"]
 GOD_CHECK_INTERVAL = _WD_CFG["god_check_interval"]
 SKYNET_CHECK_INTERVAL = _WD_CFG["skynet_check_interval"]
+AWARENESS_INTERVAL = 60
+WINDOW_SCAN_INTERVAL = 30
+STUCK_CHECK_INTERVAL = 30
+GUARD_REFRESH_INTERVAL = 60
+SSE_CHECK_INTERVAL = 30
+HWND_CHECK_INTERVAL = 30
+LEARNER_CHECK_INTERVAL = 60
+CONSULTANT_CHECK_INTERVAL = 30
+
+# ── Restart backoff tracking ─────────────────────────────────────────────────
+# Prevents restart storms when a service is persistently broken.
+# After MAX_RESTART_ATTEMPTS consecutive failures, enters cooldown.
+MAX_RESTART_ATTEMPTS = 3
+RESTART_COOLDOWN_S = 600  # 10 minutes before retrying after max attempts
+
+_restart_state: dict[str, dict] = {}  # service → {attempts, last_failure, cooldown_until}
+
+
+def _should_attempt_restart(service_name: str) -> bool:
+    """Check if a restart should be attempted (respects backoff limits).
+
+    Returns True if restart is allowed, False if in cooldown.
+    Resets attempt counter when cooldown expires.
+    """
+    state = _restart_state.get(service_name)
+    if not state:
+        return True
+    now = time.time()
+    # Cooldown expired — reset
+    if now >= state.get("cooldown_until", 0):
+        if state.get("attempts", 0) >= MAX_RESTART_ATTEMPTS:
+            _restart_state[service_name] = {"attempts": 0, "last_failure": 0, "cooldown_until": 0}
+        return True
+    # Still in cooldown
+    remaining = int(state["cooldown_until"] - now)
+    log(f"{service_name}: restart cooldown active ({remaining}s remaining, {state['attempts']} consecutive failures)")
+    return False
+
+
+def _record_restart_result(service_name: str, success: bool):
+    """Record whether a restart succeeded or failed for backoff tracking."""
+    if service_name not in _restart_state:
+        _restart_state[service_name] = {"attempts": 0, "last_failure": 0, "cooldown_until": 0}
+    state = _restart_state[service_name]
+    if success:
+        state["attempts"] = 0
+        state["cooldown_until"] = 0
+    else:
+        state["attempts"] = state.get("attempts", 0) + 1
+        state["last_failure"] = time.time()
+        if state["attempts"] >= MAX_RESTART_ATTEMPTS:
+            state["cooldown_until"] = time.time() + RESTART_COOLDOWN_S
+            log(f"RESTART BACKOFF: {service_name} failed {state['attempts']} times -- "
+                f"cooling down for {RESTART_COOLDOWN_S}s. Manual intervention may be required.")
+            _post_bus_alert_safe(
+                f"RESTART_BACKOFF: {service_name} failed {state['attempts']} consecutive restarts. "
+                f"Cooling down {RESTART_COOLDOWN_S}s. Manual intervention may be required."
+            )
+
+
+def _post_bus_alert_safe(content: str):
+    """Best-effort bus alert (used during restart tracking)."""
+    try:
+        data = json.dumps({
+            "sender": "watchdog", "topic": "orchestrator",
+            "type": "alert", "content": content
+        }).encode()
+        req = urllib.request.Request(
+            "http://localhost:8420/bus/publish", data=data,
+            headers={"Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass
 
 
 def _hidden_subprocess_kwargs(**kwargs):
@@ -224,6 +298,28 @@ def _read_pid_file(pid_file: Path) -> int:
         return 0
 
 
+def _pid_alive_and_correct(pid: int, expected_script: str) -> bool:  # signed: beta
+    """Check if PID is alive AND running the expected Python script.
+
+    Prevents PID reuse attacks where OS reassigns a dead daemon's PID
+    to an unrelated process (e.g. svchost.exe). Without this check,
+    the watchdog would skip restart, leaving the real daemon dead.
+    """
+    if pid <= 0:
+        return False
+    if psutil is not None:
+        try:
+            proc = psutil.Process(pid)
+            if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+                return False
+            cmdline = " ".join(proc.cmdline()).lower()
+            return expected_script.lower() in cmdline
+        except Exception:
+            return False
+    # Fallback: can only check alive, not script name
+    return _pid_alive(pid)  # signed: beta
+
+
 def _consultant_endpoint_payload(api_port: int, timeout: float = 3.0):
     try:
         with urllib.request.urlopen(f"http://localhost:{api_port}/consultants", timeout=timeout) as resp:
@@ -249,7 +345,9 @@ def _consultant_bridge_is_healthy(config: dict) -> bool:
 
 
 def restart_god_console():
-    """Restart god_console.py as a hidden background process."""
+    """Restart god_console.py as a hidden background process (with backoff)."""
+    if not _should_attempt_restart("god_console"):
+        return False
     log("GOD Console DOWN -- attempting restart")
     old_pid = _get_service_pid("god_console")
     try:
@@ -268,17 +366,22 @@ def restart_god_console():
             _post_restart_alert("god_console.py", old_pid, new_pid)
             _refresh_protected_registry()
             _log_incident("god_console_restart", old_pid, new_pid)
+            _record_restart_result("god_console", True)
             return True
         else:
             log("GOD Console restart FAILED -- still not responding")
+            _record_restart_result("god_console", False)
             return False
     except Exception as e:
         log(f"GOD Console restart error: {e}")
+        _record_restart_result("god_console", False)
         return False
 
 
 def restart_skynet():
-    """Restart skynet.exe as a hidden background process."""
+    """Restart skynet.exe as a hidden background process (with backoff)."""
+    if not _should_attempt_restart("skynet"):
+        return False
     log("Skynet backend DOWN -- attempting restart")
     old_pid = _get_service_pid("skynet")
     try:
@@ -296,28 +399,34 @@ def restart_skynet():
             _post_restart_alert("skynet.exe", old_pid, new_pid)
             _refresh_protected_registry()
             _log_incident("skynet_restart", old_pid, new_pid)
+            _record_restart_result("skynet", True)
             return True
         else:
             log("Skynet backend restart FAILED -- still not responding")
+            _record_restart_result("skynet", False)
             return False
     except Exception as e:
         log(f"Skynet backend restart error: {e}")
+        _record_restart_result("skynet", False)
         return False
 
 
 def restart_sse_daemon():
-    """Restart skynet_sse_daemon.py as a hidden background process."""
+    """Restart skynet_sse_daemon.py as a hidden background process (with backoff)."""
     # ── PID guard: check if SSE daemon is already running via its PID file ──
     sse_pid_file = DATA_DIR / "sse_daemon.pid"
     if sse_pid_file.exists():
         try:
             old_pid_val = int(sse_pid_file.read_text().strip())
-            import os
-            os.kill(old_pid_val, 0)  # check if alive (signal 0 = no-op)
-            log(f"SSE daemon already running (PID {old_pid_val}) -- skipping restart")
-            return True
+            if _pid_alive_and_correct(old_pid_val, "skynet_sse_daemon"):  # signed: beta
+                log(f"SSE daemon already running (PID {old_pid_val}) -- skipping restart")
+                _record_restart_result("sse_daemon", True)
+                return True
         except (OSError, ValueError):
             pass  # Stale PID file -- proceed with restart
+
+    if not _should_attempt_restart("sse_daemon"):
+        return False
 
     log("SSE daemon DOWN -- attempting restart")
     old_pid = _get_service_pid("sse_daemon")
@@ -342,28 +451,34 @@ def restart_sse_daemon():
                     _post_restart_alert("skynet_sse_daemon.py", old_pid, new_pid)
                     _refresh_protected_registry()
                     _log_incident("sse_daemon_restart", old_pid, new_pid)
+                    _record_restart_result("sse_daemon", True)
                     return True
             except Exception:
                 pass
         log("SSE daemon restart -- cannot verify (may be starting)")
+        _record_restart_result("sse_daemon", True)  # optimistic
         return True  # optimistic; next check cycle will verify
     except Exception as e:
         log(f"SSE daemon restart error: {e}")
+        _record_restart_result("sse_daemon", False)
         return False
 
 
 def restart_learner():
-    """Restart skynet_learner.py as a hidden background daemon."""
+    """Restart skynet_learner.py as a hidden background daemon (with backoff)."""
     learner_pid_file = DATA_DIR / "learner.pid"
     if learner_pid_file.exists():
         try:
             old_pid_val = int(learner_pid_file.read_text().strip())
-            import os
-            os.kill(old_pid_val, 0)
-            log(f"Learner daemon already running (PID {old_pid_val}) -- skipping restart")
-            return True
+            if _pid_alive_and_correct(old_pid_val, "skynet_learner"):  # signed: beta
+                log(f"Learner daemon already running (PID {old_pid_val}) -- skipping restart")
+                _record_restart_result("learner", True)
+                return True
         except (OSError, ValueError):
             pass  # Stale PID file -- proceed with restart
+
+    if not _should_attempt_restart("learner"):
+        return False
 
     log("Learner daemon DOWN -- attempting restart")
     old_pid = _get_service_pid("learner")
@@ -386,24 +501,32 @@ def restart_learner():
                 _post_restart_alert("skynet_learner.py", old_pid, new_pid_val)
                 _refresh_protected_registry()
                 _log_incident("learner_restart", old_pid, new_pid_val)
+                _record_restart_result("learner", True)
                 return True
             except (OSError, ValueError):
                 pass
         log("Learner daemon restart -- cannot verify (may be starting)")
+        _record_restart_result("learner", True)  # optimistic
         return True
     except Exception as e:
         log(f"Learner daemon restart error: {e}")
+        _record_restart_result("learner", False)
         return False
 
 
 def restart_consultant_bridge(config: dict):
-    """Restart a consultant bridge and verify its live /consultants surface."""
+    """Restart a consultant bridge and verify its live /consultants surface (with backoff)."""
+    svc_name = config["service_name"]
     pid_file = config["pid_file"]
     old_pid = _read_pid_file(pid_file) if pid_file.exists() else 0
     if old_pid and _pid_alive(old_pid):
         if _consultant_bridge_is_healthy(config):
             log(f"{config['label']} already running (PID {old_pid}) -- skipping restart")
+            _record_restart_result(svc_name, True)
             return True
+
+    if not _should_attempt_restart(svc_name):
+        return False
 
     log(f"{config['label']} DOWN -- attempting restart")
     try:
@@ -420,14 +543,17 @@ def restart_consultant_bridge(config: dict):
         if _consultant_bridge_is_healthy(config):
             new_pid = _read_pid_file(pid_file) if pid_file.exists() else _port_to_pid(config["api_port"])
             log(f"{config['label']} restarted (old={old_pid}, new={new_pid})")
-            _post_restart_alert(f"{config['service_name']}.py", old_pid, new_pid)
+            _post_restart_alert(f"{svc_name}.py", old_pid, new_pid)
             _refresh_protected_registry()
-            _log_incident(f"{config['service_name']}_restart", old_pid, new_pid)
+            _log_incident(f"{svc_name}_restart", old_pid, new_pid)
+            _record_restart_result(svc_name, True)
             return True
         log(f"{config['label']} restart FAILED -- bridge still not live")
+        _record_restart_result(svc_name, False)
         return False
     except Exception as e:
         log(f"{config['label']} restart error: {e}")
+        _record_restart_result(svc_name, False)
         return False
 
 
@@ -549,23 +675,28 @@ def _log_incident(incident_id, old_pid, new_pid):
         log(f"Incident logging failed: {e}")
     # Also append to data/incidents.json directly as backup
     try:
+        try:
+            from tools.skynet_atomic import atomic_update_json
+        except ModuleNotFoundError:
+            from skynet_atomic import atomic_update_json
         incidents_file = DATA_DIR / "incidents.json"
-        incidents = []
-        if incidents_file.exists():
-            incidents = json.loads(incidents_file.read_text(encoding="utf-8"))
-        incidents.append({
-            "id": incident_id,
-            "timestamp": datetime.now().isoformat(),
-            "old_pid": old_pid,
-            "new_pid": new_pid,
-            "type": "auto_restart",
-        })
-        incidents_file.write_text(json.dumps(incidents[-100:], indent=2), encoding="utf-8")
+        def _append_incident(incidents):
+            if not isinstance(incidents, list):
+                incidents = []
+            incidents.append({
+                "id": incident_id,
+                "timestamp": datetime.now().isoformat(),
+                "old_pid": old_pid,
+                "new_pid": new_pid,
+                "type": "auto_restart",
+            })
+            return incidents[-100:]
+        atomic_update_json(incidents_file, _append_incident, default=[])
     except Exception:
         pass
 
 
-def _check_worker_hwnds():
+def _check_worker_hwnds_internal():
     """Check if worker window HWNDs are still valid using Win32 IsWindow().
 
     Returns list of dead workers (name, hwnd).
@@ -597,8 +728,12 @@ HEARTBEAT_TIMEOUT = 60  # seconds before a service is considered dead
 _heartbeat_cache = {}  # in-memory cache to avoid constant file reads
 
 def _update_heartbeat(service_name, is_alive):
-    """Update the heartbeat timestamp for a service."""
+    """Update the heartbeat timestamp for a service (atomic write)."""
     try:
+        try:
+            from tools.skynet_atomic import atomic_write_json
+        except ModuleNotFoundError:
+            from skynet_atomic import atomic_write_json
         if is_alive:
             _heartbeat_cache[service_name] = {
                 "last_seen": time.time(),
@@ -609,7 +744,7 @@ def _update_heartbeat(service_name, is_alive):
             entry = _heartbeat_cache.get(service_name, {})
             entry["status"] = "dead"
             _heartbeat_cache[service_name] = entry
-        HEARTBEAT_FILE.write_text(json.dumps(_heartbeat_cache, indent=2), encoding="utf-8")
+        atomic_write_json(HEARTBEAT_FILE, _heartbeat_cache)
     except Exception:
         pass
 
@@ -627,9 +762,276 @@ def _is_service_stale(service_name):
 
 
 def write_status(status: dict):
+    try:
+        from tools.skynet_atomic import atomic_write_json
+    except ModuleNotFoundError:
+        from skynet_atomic import atomic_write_json
     DATA_DIR.mkdir(exist_ok=True)
     status["updated"] = datetime.now().isoformat()
-    STATUS_FILE.write_text(json.dumps(status, indent=2))
+    atomic_write_json(STATUS_FILE, status)
+
+
+def _check_god_console(now, last_check, status):
+    """Check GOD Console health and auto-restart if down."""
+    if now - last_check < GOD_CHECK_INTERVAL:
+        return last_check
+    god_ok = check_url(f"{GOD_CONSOLE_URL}/health")
+    _update_heartbeat("god_console", god_ok)
+    if god_ok:
+        status["god_console"] = "ok"
+    else:
+        restarted = restart_god_console()
+        status["god_console"] = "restarted" if restarted else "down"
+    status["god_last_check"] = datetime.now().isoformat()
+    return now
+
+
+def _check_skynet_backend(now, last_check, status):
+    """Check Skynet backend health and auto-restart if down."""
+    if now - last_check < SKYNET_CHECK_INTERVAL:
+        return last_check
+    skynet_ok = check_url(f"{SKYNET_URL}/status")
+    _update_heartbeat("skynet", skynet_ok)
+    if skynet_ok:
+        status["skynet"] = "ok"
+    else:
+        restarted = restart_skynet()
+        status["skynet"] = "restarted" if restarted else "down"
+        if not restarted:
+            log("Skynet backend restart FAILED -- manual intervention required")
+    status["skynet_last_check"] = datetime.now().isoformat()
+    return now
+
+
+def _check_sse_daemon(now, last_check, status):
+    """Check SSE daemon health via PID file and realtime.json freshness."""
+    if now - last_check < SSE_CHECK_INTERVAL:
+        return last_check
+    sse_ok = False
+    sse_pid_file = DATA_DIR / "sse_daemon.pid"
+    if sse_pid_file.exists():
+        try:
+            sse_pid_val = int(sse_pid_file.read_text().strip())
+            import os
+            os.kill(sse_pid_val, 0)
+            sse_ok = True
+        except (OSError, ValueError):
+            pass
+    if not sse_ok:
+        rt_file = DATA_DIR / "realtime.json"
+        if rt_file.exists():
+            try:
+                _, age = _read_state_timestamp_age(rt_file, "last_update", "timestamp")
+                sse_ok = age is not None and age < 15
+            except Exception:
+                pass
+    _update_heartbeat("sse_daemon", sse_ok)
+    if sse_ok:
+        status["sse_daemon"] = "ok"
+    else:
+        restarted = restart_sse_daemon()
+        status["sse_daemon"] = "restarted" if restarted else "down"
+    status["sse_last_check"] = datetime.now().isoformat()
+    return now
+
+
+def _check_learner_daemon(now, last_check, status):
+    """Check learner daemon health via PID file."""
+    if now - last_check < LEARNER_CHECK_INTERVAL:
+        return last_check
+    learner_ok = False
+    learner_pid_file = DATA_DIR / "learner.pid"
+    if learner_pid_file.exists():
+        try:
+            learner_pid_val = int(learner_pid_file.read_text().strip())
+            import os
+            os.kill(learner_pid_val, 0)
+            learner_ok = True
+        except (OSError, ValueError):
+            pass
+    _update_heartbeat("learner", learner_ok)
+    if learner_ok:
+        status["learner"] = "ok"
+    else:
+        restarted = restart_learner()
+        status["learner"] = "restarted" if restarted else "down"
+    status["learner_last_check"] = datetime.now().isoformat()
+    return now
+
+
+def _check_consultant_bridges(now, last_check, status):
+    """Check all consultant bridge health endpoints."""
+    if now - last_check < CONSULTANT_CHECK_INTERVAL:
+        return last_check
+    for config in CONSULTANT_BRIDGES:
+        bridge_ok = _consultant_bridge_is_healthy(config)
+        _update_heartbeat(config["service_name"], bridge_ok)
+        if bridge_ok:
+            status[config["service_name"]] = "ok"
+        else:
+            restarted = restart_consultant_bridge(config)
+            status[config["service_name"]] = "restarted" if restarted else "down"
+    status["consultant_last_check"] = datetime.now().isoformat()
+    return now
+
+
+def _check_worker_hwnds(now, last_check, status):
+    """Check worker window HWNDs are still valid."""
+    if now - last_check < HWND_CHECK_INTERVAL:
+        return last_check
+    try:
+        dead_workers = _check_worker_hwnds_internal()
+        status["dead_worker_windows"] = len(dead_workers)
+        status["hwnd_last_check"] = datetime.now().isoformat()
+        if dead_workers:
+            names = [d["name"] for d in dead_workers]
+            log(f"CRITICAL: Worker window(s) GONE: {names}")
+            try:
+                alert = json.dumps({
+                    "sender": "watchdog",
+                    "topic": "orchestrator",
+                    "type": "alert",
+                    "content": f"WORKER_WINDOW_DEAD: {', '.join(names)} -- HWNDs invalid"
+                }).encode()
+                req = urllib.request.Request(
+                    "http://localhost:8420/bus/publish", data=alert,
+                    headers={"Content-Type": "application/json"}
+                )
+                urllib.request.urlopen(req, timeout=3)
+            except Exception:
+                pass
+    except Exception as e:
+        log(f"Worker HWND check failed: {e}")
+    return now
+
+
+def _run_window_scan(now, last_check, status):
+    """Periodic window scan for dead windows."""
+    if now - last_check < WINDOW_SCAN_INTERVAL:
+        return last_check
+    try:
+        from tools.skynet_windows import scan_windows, save_registry
+        registry = scan_windows()
+        save_registry(registry)
+        s = registry["summary"]
+        status["windows"] = s["total_windows"]
+        status["dead_windows"] = s["dead_windows"]
+        status["window_scan"] = datetime.now().isoformat()
+        if s["dead_windows"] > 0:
+            log(f"WINDOW ALERT: {s['dead_windows']} dead window(s) detected")
+    except Exception as e:
+        log(f"Window scan failed: {e}")
+    return now
+
+
+def _run_stuck_detection(now, last_check, status, stuck_detector):
+    """Periodic stuck worker detection."""
+    if now - last_check < STUCK_CHECK_INTERVAL:
+        return last_check, stuck_detector
+    try:
+        from tools.skynet_stuck_detector import StuckDetector
+        if stuck_detector is None:
+            stuck_detector = StuckDetector()
+        issues = stuck_detector.check_all()
+        stuck_detector.save_history()
+        status["stuck_issues"] = len(issues)
+        status["stuck_check"] = datetime.now().isoformat()
+        if issues:
+            names = [i["worker"] for i in issues]
+            log(f"STUCK DETECTOR: {len(issues)} issue(s) -- {names}")
+    except Exception as e:
+        log(f"Stuck detection failed: {e}")
+    return now, stuck_detector
+
+
+def _run_awareness_broadcast(now, last_check, status, skynet_self_cached):
+    """Periodic self-awareness broadcast with IQ scoring."""
+    if now - last_check < AWARENESS_INTERVAL:
+        return last_check, skynet_self_cached
+    try:
+        from tools.skynet_self import SkynetSelf
+        if skynet_self_cached is None:
+            skynet_self_cached = SkynetSelf()
+        pulse = skynet_self_cached.broadcast_awareness()
+        status["last_awareness"] = datetime.now().isoformat()
+        status["iq"] = pulse.get("iq", 0)
+        log(f"Awareness broadcast OK (IQ={pulse.get('iq', 0):.3f})")
+    except Exception as e:
+        log(f"Awareness broadcast failed: {e} (ROOT={ROOT}, sys.path[0]={sys.path[0]})")
+    return now, skynet_self_cached
+
+
+def _run_guard_refresh(now, last_check, status):
+    """Periodic process guard registry refresh and duplicate detection."""
+    if now - last_check < GUARD_REFRESH_INTERVAL:
+        return last_check
+    try:
+        from tools.skynet_process_guard import refresh_registry
+        reg = refresh_registry()
+        status["protected_processes"] = reg.get("process_count", 0)
+        status["guard_refresh"] = datetime.now().isoformat()
+        from collections import Counter
+        role_counts = Counter(p["role"] for p in reg.get("processes", [])
+                              if p["role"] not in ("worker", "orchestrator"))
+        dups = {r: c for r, c in role_counts.items() if c > 1}
+        if dups:
+            dup_str = ", ".join(f"{r}={c}" for r, c in dups.items())
+            log(f"DUPLICATE ALERT: {dup_str}")
+            status["duplicate_services"] = dups
+            _post_bus_alert(f"DUPLICATE_SERVICES: {dup_str} -- orchestrator should clean up")
+    except Exception as e:
+        log(f"Process guard refresh failed: {e}")
+    return now
+
+
+def _check_dispatch_timeouts(now, last_check, status):
+    """Check for dispatches that never received a result."""
+    if now - last_check < SKYNET_CHECK_INTERVAL:
+        return last_check
+    try:
+        dispatch_log = DATA_DIR / "dispatch_log.json"
+        if dispatch_log.exists():
+            all_entries = json.loads(dispatch_log.read_text(encoding="utf-8"))
+            entries = all_entries[-100:] if len(all_entries) > 100 else all_entries
+            if len(all_entries) > 500:
+                try:
+                    dispatch_log.write_text(json.dumps(all_entries[-200:], indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+            del all_entries
+            stale = []
+            for e in entries:
+                if e.get("success") and not e.get("result_received"):
+                    ts = datetime.fromisoformat(e["timestamp"])
+                    age_s = (datetime.now() - ts).total_seconds()
+                    if age_s > 300:
+                        stale.append({"worker": e["worker"], "task": e["task_summary"][:60], "age_min": round(age_s / 60, 1)})
+            if stale:
+                status["stale_dispatches"] = len(stale)
+                summary = ", ".join(f"{s['worker']}({s['age_min']}m)" for s in stale[:5])
+                log(f"TIMEOUT ALERT: {len(stale)} dispatch(es) without result >5min: {summary}")
+                _post_bus_alert(f"DISPATCH_TIMEOUT: {len(stale)} workers silent >5min: {summary}")
+            else:
+                status.pop("stale_dispatches", None)
+    except Exception as e:
+        log(f"Dispatch timeout check failed: {e}")
+    return now
+
+
+def _post_bus_alert(content: str):
+    """Post an alert message to the Skynet bus."""
+    try:
+        data = json.dumps({
+            "sender": "watchdog", "topic": "orchestrator",
+            "type": "alert", "content": content
+        }).encode()
+        req = urllib.request.Request(
+            "http://localhost:8420/bus/publish", data=data,
+            headers={"Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=3)
+    except Exception:
+        pass
 
 
 def run_daemon(args=None):
@@ -669,16 +1071,9 @@ def run_daemon(args=None):
     last_hwnd_check = 0.0
     last_learner_check = 0.0
     last_consultant_check = 0.0
-    AWARENESS_INTERVAL = 60
-    WINDOW_SCAN_INTERVAL = 30
-    STUCK_CHECK_INTERVAL = 30
-    GUARD_REFRESH_INTERVAL = 60
-    SSE_CHECK_INTERVAL = 30
-    HWND_CHECK_INTERVAL = 30
-    LEARNER_CHECK_INTERVAL = 60
-    CONSULTANT_CHECK_INTERVAL = 30
+    last_dispatch_check = 0.0
     stuck_detector = None
-    skynet_self_cached = None  # reuse to avoid re-loading large files each cycle
+    skynet_self_cached = None
     status = {
         "god_console": "unknown",
         "skynet": "unknown",
@@ -693,251 +1088,21 @@ def run_daemon(args=None):
             now = time.time()
             cycle += 1
 
-            # Max runtime guard
             if max_runtime and (now - start_time) >= max_runtime:
                 log(f"Max runtime {max_runtime}s reached -- shutting down gracefully")
                 break
 
-            # ── GOD Console check + auto-restart ──
-            if now - last_god_check >= GOD_CHECK_INTERVAL:
-                god_ok = check_url(f"{GOD_CONSOLE_URL}/health")
-                _update_heartbeat("god_console", god_ok)
-                if god_ok:
-                    status["god_console"] = "ok"
-                else:
-                    restarted = restart_god_console()
-                    status["god_console"] = "restarted" if restarted else "down"
-                status["god_last_check"] = datetime.now().isoformat()
-                last_god_check = now
-
-            # ── Skynet backend check + auto-restart ──
-            if now - last_skynet_check >= SKYNET_CHECK_INTERVAL:
-                skynet_ok = check_url(f"{SKYNET_URL}/status")
-                _update_heartbeat("skynet", skynet_ok)
-                if skynet_ok:
-                    status["skynet"] = "ok"
-                else:
-                    restarted = restart_skynet()
-                    status["skynet"] = "restarted" if restarted else "down"
-                    if not restarted:
-                        log("Skynet backend restart FAILED -- manual intervention required")
-                status["skynet_last_check"] = datetime.now().isoformat()
-                last_skynet_check = now
-
-            # ── SSE daemon check + auto-restart ──
-            if now - last_sse_check >= SSE_CHECK_INTERVAL:
-                sse_ok = False
-                # Check 1: PID file alive (process exists even if reconnecting)
-                sse_pid_file = DATA_DIR / "sse_daemon.pid"
-                if sse_pid_file.exists():
-                    try:
-                        sse_pid_val = int(sse_pid_file.read_text().strip())
-                        import os
-                        os.kill(sse_pid_val, 0)
-                        sse_ok = True  # process alive, might be in reconnect backoff
-                    except (OSError, ValueError):
-                        pass  # stale PID
-
-                # Check 2: realtime.json freshness (confirms active streaming)
-                if not sse_ok:
-                    rt_file = DATA_DIR / "realtime.json"
-                    if rt_file.exists():
-                        try:
-                            _, age = _read_state_timestamp_age(rt_file, "last_update", "timestamp")
-                            sse_ok = age is not None and age < 15
-                        except Exception:
-                            pass
-
-                _update_heartbeat("sse_daemon", sse_ok)
-                if sse_ok:
-                    status["sse_daemon"] = "ok"
-                else:
-                    restarted = restart_sse_daemon()
-                    status["sse_daemon"] = "restarted" if restarted else "down"
-                status["sse_last_check"] = datetime.now().isoformat()
-                last_sse_check = now
-
-            # ── Learner daemon check + auto-restart ──
-            if now - last_learner_check >= LEARNER_CHECK_INTERVAL:
-                learner_ok = False
-                learner_pid_file = DATA_DIR / "learner.pid"
-                if learner_pid_file.exists():
-                    try:
-                        learner_pid_val = int(learner_pid_file.read_text().strip())
-                        import os
-                        os.kill(learner_pid_val, 0)
-                        learner_ok = True
-                    except (OSError, ValueError):
-                        pass
-                _update_heartbeat("learner", learner_ok)
-                if learner_ok:
-                    status["learner"] = "ok"
-                else:
-                    restarted = restart_learner()
-                    status["learner"] = "restarted" if restarted else "down"
-                status["learner_last_check"] = datetime.now().isoformat()
-                last_learner_check = now
-
-            # ── Consultant bridge checks + auto-restart ──
-            if now - last_consultant_check >= CONSULTANT_CHECK_INTERVAL:
-                for config in CONSULTANT_BRIDGES:
-                    bridge_ok = _consultant_bridge_is_healthy(config)
-                    _update_heartbeat(config["service_name"], bridge_ok)
-                    if bridge_ok:
-                        status[config["service_name"]] = "ok"
-                    else:
-                        restarted = restart_consultant_bridge(config)
-                        status[config["service_name"]] = "restarted" if restarted else "down"
-                status["consultant_last_check"] = datetime.now().isoformat()
-                last_consultant_check = now
-
-            # ── Worker HWND health check ──
-            if now - last_hwnd_check >= HWND_CHECK_INTERVAL:
-                try:
-                    dead_workers = _check_worker_hwnds()
-                    status["dead_worker_windows"] = len(dead_workers)
-                    status["hwnd_last_check"] = datetime.now().isoformat()
-                    if dead_workers:
-                        names = [d["name"] for d in dead_workers]
-                        log(f"CRITICAL: Worker window(s) GONE: {names}")
-                        try:
-                            alert = json.dumps({
-                                "sender": "watchdog",
-                                "topic": "orchestrator",
-                                "type": "alert",
-                                "content": f"WORKER_WINDOW_DEAD: {', '.join(names)} -- HWNDs invalid"
-                            }).encode()
-                            req = urllib.request.Request(
-                                "http://localhost:8420/bus/publish", data=alert,
-                                headers={"Content-Type": "application/json"}
-                            )
-                            urllib.request.urlopen(req, timeout=3)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    log(f"Worker HWND check failed: {e}")
-                last_hwnd_check = now
-
-            # Periodic window scan
-            if now - last_window_scan >= WINDOW_SCAN_INTERVAL:
-                try:
-                    from tools.skynet_windows import scan_windows, save_registry
-                    registry = scan_windows()
-                    save_registry(registry)
-                    s = registry["summary"]
-                    status["windows"] = s["total_windows"]
-                    status["dead_windows"] = s["dead_windows"]
-                    status["window_scan"] = datetime.now().isoformat()
-                    if s["dead_windows"] > 0:
-                        log(f"WINDOW ALERT: {s['dead_windows']} dead window(s) detected")
-                except Exception as e:
-                    log(f"Window scan failed: {e}")
-                last_window_scan = now
-
-            # Periodic stuck worker detection
-            if now - last_stuck_check >= STUCK_CHECK_INTERVAL:
-                try:
-                    from tools.skynet_stuck_detector import StuckDetector
-                    if stuck_detector is None:
-                        stuck_detector = StuckDetector()
-                    issues = stuck_detector.check_all()
-                    stuck_detector.save_history()
-                    status["stuck_issues"] = len(issues)
-                    status["stuck_check"] = datetime.now().isoformat()
-                    if issues:
-                        names = [i["worker"] for i in issues]
-                        log(f"STUCK DETECTOR: {len(issues)} issue(s) -- {names}")
-                except Exception as e:
-                    log(f"Stuck detection failed: {e}")
-                last_stuck_check = now
-
-            # Periodic self-awareness broadcast
-            if now - last_awareness >= AWARENESS_INTERVAL:
-                try:
-                    from tools.skynet_self import SkynetSelf
-                    if skynet_self_cached is None:
-                        skynet_self_cached = SkynetSelf()
-                    pulse = skynet_self_cached.broadcast_awareness()
-                    status["last_awareness"] = datetime.now().isoformat()
-                    status["iq"] = pulse.get("iq", 0)
-                    log(f"Awareness broadcast OK (IQ={pulse.get('iq', 0):.3f})")
-                except Exception as e:
-                    log(f"Awareness broadcast failed: {e} (ROOT={ROOT}, sys.path[0]={sys.path[0]})")
-                last_awareness = now
-
-            # Periodic process guard registry refresh + dedup detection
-            if now - last_guard_refresh >= GUARD_REFRESH_INTERVAL:
-                try:
-                    from tools.skynet_process_guard import refresh_registry
-                    reg = refresh_registry()
-                    status["protected_processes"] = reg.get("process_count", 0)
-                    status["guard_refresh"] = datetime.now().isoformat()
-                    # Detect duplicate services
-                    from collections import Counter
-                    role_counts = Counter(p["role"] for p in reg.get("processes", [])
-                                         if p["role"] not in ("worker", "orchestrator"))
-                    dups = {r: c for r, c in role_counts.items() if c > 1}
-                    if dups:
-                        dup_str = ", ".join(f"{r}={c}" for r, c in dups.items())
-                        log(f"DUPLICATE ALERT: {dup_str}")
-                        status["duplicate_services"] = dups
-                        try:
-                            alert = json.dumps({
-                                "sender": "watchdog", "topic": "orchestrator",
-                                "type": "alert",
-                                "content": f"DUPLICATE_SERVICES: {dup_str} -- orchestrator should clean up"
-                            }).encode()
-                            req = urllib.request.Request(
-                                "http://localhost:8420/bus/publish", data=alert,
-                                headers={"Content-Type": "application/json"}
-                            )
-                            urllib.request.urlopen(req, timeout=3)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    log(f"Process guard refresh failed: {e}")
-                last_guard_refresh = now
-
-            # Dispatch timeout check (every 60s)
-            if now - last_skynet_check >= SKYNET_CHECK_INTERVAL:
-                try:
-                    dispatch_log = DATA_DIR / "dispatch_log.json"
-                    if dispatch_log.exists():
-                        all_entries = json.loads(dispatch_log.read_text(encoding="utf-8"))
-                        # Only scan last 100 entries to cap memory
-                        entries = all_entries[-100:] if len(all_entries) > 100 else all_entries
-                        # Trim file on disk if bloated (>500 entries)
-                        if len(all_entries) > 500:
-                            try:
-                                dispatch_log.write_text(json.dumps(all_entries[-200:], indent=2), encoding="utf-8")
-                            except Exception:
-                                pass
-                        del all_entries  # free full list immediately
-                        stale = []
-                        for e in entries:
-                            if e.get("success") and not e.get("result_received"):
-                                ts = datetime.fromisoformat(e["timestamp"])
-                                age_s = (datetime.now() - ts).total_seconds()
-                                if age_s > 300:  # 5 minutes
-                                    stale.append({"worker": e["worker"], "task": e["task_summary"][:60], "age_min": round(age_s / 60, 1)})
-                        if stale:
-                            status["stale_dispatches"] = len(stale)
-                            log(f"TIMEOUT ALERT: {len(stale)} dispatch(es) without result >5min: " +
-                                ", ".join(f"{s['worker']}({s['age_min']}m)" for s in stale[:5]))
-                            # Post alert to bus
-                            try:
-                                data = json.dumps({"sender": "watchdog", "topic": "orchestrator", "type": "alert",
-                                                   "content": f"DISPATCH_TIMEOUT: {len(stale)} workers silent >5min: " +
-                                                              ", ".join(f"{s['worker']}({s['age_min']}m)" for s in stale[:5])}).encode()
-                                req = urllib.request.Request("http://localhost:8420/bus/publish", data=data,
-                                                            headers={"Content-Type": "application/json"})
-                                urllib.request.urlopen(req, timeout=3)
-                            except Exception:
-                                pass
-                        else:
-                            status.pop("stale_dispatches", None)
-                except Exception as e:
-                    log(f"Dispatch timeout check failed: {e}")
+            last_god_check = _check_god_console(now, last_god_check, status)
+            last_skynet_check = _check_skynet_backend(now, last_skynet_check, status)
+            last_sse_check = _check_sse_daemon(now, last_sse_check, status)
+            last_learner_check = _check_learner_daemon(now, last_learner_check, status)
+            last_consultant_check = _check_consultant_bridges(now, last_consultant_check, status)
+            last_hwnd_check = _check_worker_hwnds(now, last_hwnd_check, status)
+            last_window_scan = _run_window_scan(now, last_window_scan, status)
+            last_stuck_check, stuck_detector = _run_stuck_detection(now, last_stuck_check, status, stuck_detector)
+            last_awareness, skynet_self_cached = _run_awareness_broadcast(now, last_awareness, status, skynet_self_cached)
+            last_guard_refresh = _run_guard_refresh(now, last_guard_refresh, status)
+            last_dispatch_check = _check_dispatch_timeouts(now, last_dispatch_check, status)
 
             write_status(status)
             time.sleep(WATCHDOG_INTERVAL)

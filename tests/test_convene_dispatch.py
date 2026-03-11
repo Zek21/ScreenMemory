@@ -17,6 +17,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 
+ARCH_BACKED_ENGINE_REPORT = (
+    "tools/engine_metrics.py _probe() instantiates analyzer, embedder, ocr, and capture during "
+    "collect_engine_metrics() on the /engines path, so constructor cost dominates the metrics probe. "
+    "Use import_only in _PROBES for those engines instead of instantiating them on every probe."
+)
+
+
 class TestBuildPreamble(unittest.TestCase):
     """Validate dispatch preamble construction and identity fingerprinting."""
 
@@ -50,6 +57,16 @@ class TestBuildPreamble(unittest.TestCase):
         self.assertIn("orch_realtime.py status", p)
         self.assertIn("skynet_dispatch.py --idle", p)
         self.assertIn("skynet_brain_dispatch.py", p)
+
+    def test_preamble_contains_architecture_review_rule(self):
+        p = self.build_preamble("alpha")
+        self.assertIn("ARCHITECTURE REVIEW RULE", p)
+        self.assertIn("realistic fix", p)
+
+    def test_preamble_contains_consolidated_digest_rule(self):
+        p = self.build_preamble("alpha")
+        self.assertIn("elevated_digest", p)
+        self.assertIn("30 minutes", p)
 
     def test_each_worker_gets_unique_preamble(self):
         """Each worker's preamble must reference only that worker's name in key positions."""
@@ -105,9 +122,13 @@ class TestConveneGate(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.gate_file = Path(self.tmpdir) / "convene_gate.json"
+        self.todos_file = Path(self.tmpdir) / "todos.json"
+        self.todos_file.write_text(json.dumps({"todos": [], "version": 1}), encoding="utf-8")
         # Patch GATE_FILE and BUS_PUBLISH to avoid real I/O
         self._patches = [
             patch("skynet_convene.GATE_FILE", self.gate_file),
+            patch("skynet_convene.TODOS_FILE", self.todos_file),
+            patch("tools.skynet_todos.TODOS_FILE", self.todos_file),
             patch("skynet_convene.requests.post", return_value=MagicMock(ok=True)),
         ]
         for p in self._patches:
@@ -123,7 +144,7 @@ class TestConveneGate(unittest.TestCase):
 
     def test_propose_creates_pending(self):
         gate = self.ConveneGate()
-        r = gate.propose("alpha", "found a bug")
+        r = gate.propose("alpha", ARCH_BACKED_ENGINE_REPORT)
         self.assertEqual(r["action"], "proposed")
         self.assertIn("gate_id", r)
         self.assertEqual(r["votes"], 1)  # proposer auto-votes YES
@@ -136,7 +157,7 @@ class TestConveneGate(unittest.TestCase):
 
     def test_two_yes_votes_elevate(self):
         gate = self.ConveneGate()
-        r1 = gate.propose("alpha", "important finding")
+        r1 = gate.propose("alpha", ARCH_BACKED_ENGINE_REPORT)
         gate_id = r1["gate_id"]
         # Second worker votes YES -> should elevate (threshold=2, proposer auto-voted)
         r2 = gate.vote_gate(gate_id, "beta", approve=True)
@@ -146,7 +167,7 @@ class TestConveneGate(unittest.TestCase):
 
     def test_two_no_votes_reject(self):
         gate = self.ConveneGate()
-        r1 = gate.propose("alpha", "trivial rename suggestion")
+        r1 = gate.propose("alpha", "Trivial rename suggestion in docs only, with no production value.")
         gate_id = r1["gate_id"]
         # Two workers vote NO -> should reject
         r2 = gate.vote_gate(gate_id, "beta", approve=False)
@@ -162,7 +183,7 @@ class TestConveneGate(unittest.TestCase):
 
     def test_expire_stale_proposals(self):
         gate = self.ConveneGate()
-        r = gate.propose("alpha", "old proposal")
+        r = gate.propose("alpha", ARCH_BACKED_ENGINE_REPORT)
         gate_id = r["gate_id"]
         # Manually backdate the created_at timestamp
         gate._state["pending"][gate_id]["created_at"] = time.time() - 600
@@ -173,8 +194,8 @@ class TestConveneGate(unittest.TestCase):
 
     def test_stats_tracking(self):
         gate = self.ConveneGate()
-        gate.propose("alpha", "proposal 1")
-        gate.propose("beta", "urgent", urgent=True)
+        gate.propose("alpha", ARCH_BACKED_ENGINE_REPORT)
+        gate.propose("beta", "CRITICAL worker crash", urgent=True)
         stats = gate.get_stats()
         self.assertEqual(stats["total_proposed"], 2)
         self.assertEqual(stats["total_bypassed"], 1)
@@ -182,7 +203,7 @@ class TestConveneGate(unittest.TestCase):
     def test_proposer_cannot_double_vote(self):
         """Proposer's auto-YES should not be overridable by re-voting."""
         gate = self.ConveneGate()
-        r = gate.propose("alpha", "test report")
+        r = gate.propose("alpha", ARCH_BACKED_ENGINE_REPORT)
         gate_id = r["gate_id"]
         # Alpha tries to vote again -- their vote should just stay YES
         r2 = gate.vote_gate(gate_id, "alpha", approve=True)

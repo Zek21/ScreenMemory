@@ -108,6 +108,182 @@ def log_command(command, target, success, latency_ms=None):
     })
 
 
+async def _handle_agent_register(ws, msg):
+    """Process agent registration/reconnection. Returns profile_id."""
+    profile_id = msg.get("profileId", "unknown")
+    is_new = profile_id not in agents
+    was_reconnect = not is_new and agents[profile_id]["ws"] != ws
+    agents[profile_id] = {"ws": ws, "info": msg, "connected_at": time.time()}
+    if is_new:
+        metrics["total_agents_seen"] += 1
+    if was_reconnect:
+        metrics["agent_reconnects"] += 1
+    version = msg.get("version", "1.x")
+    status = "reconnected" if was_reconnect else "registered"
+    print(f"[+] Agent {status}: {profile_id[:16]}... "
+          f"(v{version}, {len(msg.get('tabs', []))} tabs)")
+    await broadcast_agents()
+    return profile_id
+
+
+async def _handle_agent_event(msg):
+    """Forward agent event to all subscribed clients."""
+    event_type = msg.get("event", "")
+    for client_ws, subscribed in list(client_events.items()):
+        if event_type in subscribed or "*" in subscribed:
+            try:
+                await client_ws.send(json.dumps(msg))
+            except Exception:
+                client_events.pop(client_ws, None)
+
+
+async def _handle_hub_command(ws, msg):
+    """Handle hub meta-commands (metrics, log, health). Returns True if handled."""
+    cmd = msg.get("command", "")
+    msg_id = msg.get("id", 0)
+
+    if cmd == "bridge.hub.metrics":
+        await ws.send(json.dumps({"id": msg_id, "result": {
+            **metrics,
+            "uptime": time.time() - metrics["started_at"],
+            "active_agents": len(agents),
+            "active_clients": len(clients),
+            "pending_commands": len(pending),
+        }}))
+        return True
+
+    if cmd == "bridge.hub.log":
+        limit = msg.get("params", {}).get("limit", 50)
+        await ws.send(json.dumps({"id": msg_id, "result": list(command_log)[-limit:]}))
+        return True
+
+    if cmd == "bridge.hub.health":
+        agent_health = {
+            pid[:16]: {
+                "connected": time.time() - a["connected_at"],
+                "tabs": len(a["info"].get("tabs", [])),
+                "version": a["info"].get("version", "?"),
+            }
+            for pid, a in agents.items()
+        }
+        await ws.send(json.dumps({"id": msg_id, "result": {
+            "status": "healthy",
+            "uptime": time.time() - metrics["started_at"],
+            "agents": agent_health, "clients": len(clients),
+            "pending": len(pending), "commands_total": metrics["commands_routed"],
+            "avg_latency": metrics["avg_latency_ms"],
+            "peak_latency": metrics["peak_latency_ms"],
+        }}))
+        return True
+
+    return False
+
+
+async def _handle_event_subscription(ws, msg):
+    """Handle event subscribe/unsubscribe. Returns True if handled."""
+    cmd = msg.get("command", "")
+    if cmd not in ("bridge.events.subscribe", "bridge.events.unsubscribe"):
+        return False
+    types = msg.get("params", {}).get("events", [])
+    if isinstance(types, str):
+        types = [types]
+    if cmd == "bridge.events.subscribe":
+        client_events[ws].update(types)
+    else:
+        client_events[ws].difference_update(types)
+    await ws.send(json.dumps({
+        "id": msg.get("id", 0),
+        "result": {"ok": True, "subscriptions": list(client_events[ws])}
+    }))
+    return True
+
+
+async def _route_command_to_agent(ws, msg):
+    """Route a client command (single or batch) to the target agent."""
+    is_batch = msg.get("type") == "batch"
+    target = msg.get("target")
+    cmd_id = msg.get("id", next_id()) if not is_batch else msg.get("id", 0)
+    agent = find_agent(target)
+
+    if not agent:
+        await ws.send(json.dumps({
+            "id": cmd_id,
+            "error": "No agent connected" + (f" matching '{target}'" if target else "")
+        }))
+        return
+
+    hub_id = next_id()
+    pending[hub_id] = {
+        "client_ws": ws, "client_id": cmd_id,
+        "sent_at": time.time(),
+        "command": "batch" if is_batch else msg["command"],
+        "target": target,
+    }
+    if is_batch:
+        pending[hub_id]["is_batch"] = True
+        metrics["batches_routed"] += 1
+        forward = {"type": "batch", "id": hub_id, "commands": msg.get("commands", [])}
+    else:
+        forward = {"id": hub_id, "command": msg["command"], "params": msg.get("params", {})}
+
+    try:
+        await agent["ws"].send(json.dumps(forward))
+        if not is_batch:
+            metrics["commands_routed"] += 1
+    except Exception:
+        del pending[hub_id]
+        metrics["commands_failed"] += 1
+        log_command(pending.get(hub_id, {}).get("command", msg.get("command", "batch")), target, False)
+        await ws.send(json.dumps({"id": cmd_id, "error": "Agent disconnected"}))
+
+
+async def _handle_agent_response(msg):
+    """Route an agent's response back to the originating client."""
+    hub_id = msg["id"]
+    if hub_id not in pending:
+        return
+    p = pending.pop(hub_id)
+    elapsed_ms = (time.time() - p["sent_at"]) * 1000
+    record_latency(elapsed_ms)
+
+    response = {"id": p["client_id"]}
+    if "error" in msg:
+        response["error"] = msg["error"]
+        metrics["commands_failed"] += 1
+        log_command(p.get("command", "unknown"), p.get("target"), False, elapsed_ms)
+    elif p.get("is_batch"):
+        response["type"] = "batchResult"
+        response["results"] = msg.get("results", [])
+        log_command("batch", p.get("target"), True, elapsed_ms)
+    else:
+        response["result"] = msg["result"]
+        log_command(p.get("command", "unknown"), p.get("target"), True, elapsed_ms)
+
+    if msg.get("_ms"):
+        response["_ms"] = msg["_ms"]
+    response["_hub_ms"] = round(elapsed_ms, 1)
+
+    try:
+        await p["client_ws"].send(json.dumps(response))
+    except Exception:
+        pass
+
+
+async def _cleanup_connection(ws, conn_type, profile_id):
+    """Clean up state when a connection is closed."""
+    if conn_type == "agent" and profile_id:
+        if profile_id in agents and agents[profile_id]["ws"] == ws:
+            del agents[profile_id]
+            print(f"[-] Agent disconnected: {profile_id[:16]}...")
+            await broadcast_agents()
+    elif conn_type == "client":
+        clients.discard(ws)
+        client_events.pop(ws, None)
+        print(f"[-] Client disconnected (total: {len(clients)})")
+        for k in [k for k, v in pending.items() if v["client_ws"] == ws]:
+            del pending[k]
+
+
 async def handle_connection(ws):
     """Handle incoming WebSocket connection (could be agent or client)."""
     conn_type = None
@@ -120,234 +296,44 @@ async def handle_connection(ws):
             except json.JSONDecodeError:
                 continue
 
-            # ── Heartbeat ping/pong ──
             if msg.get("type") == "ping":
                 await ws.send(json.dumps({"type": "pong", "timestamp": msg.get("timestamp")}))
                 continue
 
-            # ── Agent registration ──
             if msg.get("type") == "register":
                 conn_type = "agent"
-                profile_id = msg.get("profileId", "unknown")
-                is_new = profile_id not in agents
-                was_reconnect = not is_new and agents[profile_id]["ws"] != ws
-                agents[profile_id] = {
-                    "ws": ws,
-                    "info": msg,
-                    "connected_at": time.time()
-                }
-                if is_new:
-                    metrics["total_agents_seen"] += 1
-                if was_reconnect:
-                    metrics["agent_reconnects"] += 1
-                version = msg.get("version", "1.x")
-                status = "reconnected" if was_reconnect else "registered"
-                print(f"[+] Agent {status}: {profile_id[:16]}... "
-                      f"(v{version}, {len(msg.get('tabs', []))} tabs)")
-                await broadcast_agents()
+                profile_id = await _handle_agent_register(ws, msg)
                 continue
 
-            # ── Agent tab update ──
             if conn_type == "agent" and "tabs" in msg:
                 if profile_id and profile_id in agents:
                     agents[profile_id]["info"] = msg
                     await broadcast_agents()
                 continue
 
-            # ── Agent event → forward to subscribed clients ──
             if conn_type == "agent" and msg.get("type") == "event":
-                event_type = msg.get("event", "")
-                for client_ws, subscribed in list(client_events.items()):
-                    if event_type in subscribed or "*" in subscribed:
-                        try:
-                            await client_ws.send(json.dumps(msg))
-                        except Exception:
-                            client_events.pop(client_ws, None)
+                await _handle_agent_event(msg)
                 continue
 
-            # ── Client identification ──
             if msg.get("type") == "client":
                 conn_type = "client"
                 clients.add(ws)
                 metrics["total_clients_seen"] += 1
                 print(f"[+] Client connected (total: {len(clients)})")
-                await ws.send(json.dumps({
-                    "type": "agents",
-                    "agents": get_agents_info()
-                }))
+                await ws.send(json.dumps({"type": "agents", "agents": get_agents_info()}))
                 continue
 
-            # ── Client metrics request ──
-            if conn_type == "client" and msg.get("command") == "bridge.hub.metrics":
-                await ws.send(json.dumps({
-                    "id": msg.get("id", 0),
-                    "result": {
-                        **metrics,
-                        "uptime": time.time() - metrics["started_at"],
-                        "active_agents": len(agents),
-                        "active_clients": len(clients),
-                        "pending_commands": len(pending),
-                    }
-                }))
-                continue
-
-            # ── Hub command log ──
-            if conn_type == "client" and msg.get("command") == "bridge.hub.log":
-                limit = msg.get("params", {}).get("limit", 50)
-                await ws.send(json.dumps({
-                    "id": msg.get("id", 0),
-                    "result": list(command_log)[-limit:]
-                }))
-                continue
-
-            # ── Hub health check ──
-            if conn_type == "client" and msg.get("command") == "bridge.hub.health":
-                agent_health = {}
-                for pid, a in agents.items():
-                    agent_health[pid[:16]] = {
-                        "connected": time.time() - a["connected_at"],
-                        "tabs": len(a["info"].get("tabs", [])),
-                        "version": a["info"].get("version", "?"),
-                    }
-                await ws.send(json.dumps({
-                    "id": msg.get("id", 0),
-                    "result": {
-                        "status": "healthy",
-                        "uptime": time.time() - metrics["started_at"],
-                        "agents": agent_health,
-                        "clients": len(clients),
-                        "pending": len(pending),
-                        "commands_total": metrics["commands_routed"],
-                        "avg_latency": metrics["avg_latency_ms"],
-                        "peak_latency": metrics["peak_latency_ms"],
-                    }
-                }))
-                continue
-
-            # ── Client event subscription ──
-            if conn_type == "client" and msg.get("command") == "bridge.events.subscribe":
-                types = msg.get("params", {}).get("events", [])
-                if isinstance(types, str):
-                    types = [types]
-                client_events[ws].update(types)
-                await ws.send(json.dumps({
-                    "id": msg.get("id", 0),
-                    "result": {"ok": True, "subscriptions": list(client_events[ws])}
-                }))
-                continue
-
-            if conn_type == "client" and msg.get("command") == "bridge.events.unsubscribe":
-                types = msg.get("params", {}).get("events", [])
-                if isinstance(types, str):
-                    types = [types]
-                client_events[ws].difference_update(types)
-                await ws.send(json.dumps({
-                    "id": msg.get("id", 0),
-                    "result": {"ok": True, "subscriptions": list(client_events[ws])}
-                }))
-                continue
-
-            # ── Client batch command ──
-            if conn_type == "client" and msg.get("type") == "batch":
-                target = msg.get("target")
-                agent = find_agent(target)
-                if not agent:
-                    await ws.send(json.dumps({
-                        "id": msg.get("id", 0),
-                        "error": "No agent connected" + (f" matching '{target}'" if target else "")
-                    }))
+            if conn_type == "client":
+                if await _handle_hub_command(ws, msg):
+                    continue
+                if await _handle_event_subscription(ws, msg):
+                    continue
+                if msg.get("type") == "batch" or "command" in msg:
+                    await _route_command_to_agent(ws, msg)
                     continue
 
-                hub_id = next_id()
-                pending[hub_id] = {
-                    "client_ws": ws,
-                    "client_id": msg.get("id", 0),
-                    "sent_at": time.time(),
-                    "is_batch": True,
-                    "command": "batch",
-                    "target": target,
-                }
-                metrics["batches_routed"] += 1
-
-                try:
-                    await agent["ws"].send(json.dumps({
-                        "type": "batch", "id": hub_id,
-                        "commands": msg.get("commands", [])
-                    }))
-                except Exception:
-                    del pending[hub_id]
-                    metrics["commands_failed"] += 1
-                    log_command("batch", target, False)
-                    await ws.send(json.dumps({"id": msg.get("id", 0), "error": "Agent disconnected"}))
-                continue
-
-            # ── Client command → route to agent ──
-            if conn_type == "client" and "command" in msg:
-                target = msg.get("target")
-                cmd_id = msg.get("id", next_id())
-                agent = find_agent(target)
-
-                if not agent:
-                    await ws.send(json.dumps({
-                        "id": cmd_id,
-                        "error": "No agent connected" + (f" matching '{target}'" if target else "")
-                    }))
-                    continue
-
-                hub_id = next_id()
-                forward = {
-                    "id": hub_id,
-                    "command": msg["command"],
-                    "params": msg.get("params", {})
-                }
-
-                pending[hub_id] = {
-                    "client_ws": ws,
-                    "client_id": cmd_id,
-                    "sent_at": time.time(),
-                    "command": msg["command"],
-                    "target": target,
-                }
-
-                try:
-                    await agent["ws"].send(json.dumps(forward))
-                    metrics["commands_routed"] += 1
-                except Exception:
-                    del pending[hub_id]
-                    metrics["commands_failed"] += 1
-                    log_command(msg["command"], target, False)
-                    await ws.send(json.dumps({"id": cmd_id, "error": "Agent disconnected"}))
-                continue
-
-            # ── Agent response → route to client ──
             if conn_type == "agent" and "id" in msg and ("result" in msg or "error" in msg or "results" in msg):
-                hub_id = msg["id"]
-                if hub_id in pending:
-                    p = pending.pop(hub_id)
-                    elapsed_ms = (time.time() - p["sent_at"]) * 1000
-                    record_latency(elapsed_ms)
-
-                    response = {"id": p["client_id"]}
-                    if "error" in msg:
-                        response["error"] = msg["error"]
-                        metrics["commands_failed"] += 1
-                        log_command(p.get("command", "unknown"), p.get("target"), False, elapsed_ms)
-                    elif p.get("is_batch"):
-                        response["type"] = "batchResult"
-                        response["results"] = msg.get("results", [])
-                        log_command("batch", p.get("target"), True, elapsed_ms)
-                    else:
-                        response["result"] = msg["result"]
-                        log_command(p.get("command", "unknown"), p.get("target"), True, elapsed_ms)
-
-                    if msg.get("_ms"):
-                        response["_ms"] = msg["_ms"]
-                    response["_hub_ms"] = round(elapsed_ms, 1)
-
-                    try:
-                        await p["client_ws"].send(json.dumps(response))
-                    except Exception:
-                        pass
+                await _handle_agent_response(msg)
                 continue
 
     except websockets.ConnectionClosed:
@@ -356,18 +342,7 @@ async def handle_connection(ws):
         print(f"[!] Error: {e}")
         traceback.print_exc()
     finally:
-        if conn_type == "agent" and profile_id:
-            if profile_id in agents and agents[profile_id]["ws"] == ws:
-                del agents[profile_id]
-                print(f"[-] Agent disconnected: {profile_id[:16]}...")
-                await broadcast_agents()
-        elif conn_type == "client":
-            clients.discard(ws)
-            client_events.pop(ws, None)
-            print(f"[-] Client disconnected (total: {len(clients)})")
-            to_remove = [k for k, v in pending.items() if v["client_ws"] == ws]
-            for k in to_remove:
-                del pending[k]
+        await _cleanup_connection(ws, conn_type, profile_id)
 
 
 def find_agent(target):

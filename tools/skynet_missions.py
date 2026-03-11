@@ -417,7 +417,8 @@ class MissionControl:
         return gantt
 
 
-def main() -> int:
+def _build_missions_parser():
+    """Build the missions CLI parser."""
     parser = argparse.ArgumentParser(description="Skynet Mission Control")
     sub = parser.add_subparsers(dest="command")
 
@@ -448,21 +449,21 @@ def main() -> int:
     p_event.add_argument("--event", required=True)
     p_event.add_argument("--actor", default="cli")
 
-    args = parser.parse_args()
-    mc = MissionControl()
+    return parser
 
+
+def _dispatch_missions_command(args, mc: "MissionControl") -> int:
+    """Dispatch parsed CLI command to the appropriate handler."""
     if args.command == "list":
         for m in mc.list_missions(status=args.status, limit=args.limit):
             print(f"[{m.status}] P{m.priority} {m.mission_id}: {m.title}")
         return 0
-
     if args.command == "create":
         tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else []
         m = mc.create(title=args.title, owner=args.owner, priority=args.priority,
                       description=args.description, tags=tags)
         print(json.dumps(m.to_dict(), indent=2))
         return 0
-
     if args.command == "status":
         m = mc.get(args.mission_id)
         if not m:
@@ -470,7 +471,6 @@ def main() -> int:
             return 1
         print(json.dumps(m.to_dict(), indent=2))
         return 0
-
     if args.command == "timeline":
         tl = mc.get_timeline(args.mission_id)
         if tl is None:
@@ -479,7 +479,6 @@ def main() -> int:
         for e in tl:
             print(f"  [{e['timestamp']}] {e['actor']}: {e['event']}")
         return 0
-
     if args.command == "update":
         m = mc.update_status(args.mission_id, args.status, actor=args.actor)
         if not m:
@@ -487,7 +486,6 @@ def main() -> int:
             return 1
         print(f"Updated to {m.status}")
         return 0
-
     if args.command == "add-event":
         entry = mc.add_event(args.mission_id, args.event, actor=args.actor)
         if not entry:
@@ -495,9 +493,18 @@ def main() -> int:
             return 1
         print(json.dumps(entry, indent=2))
         return 0
+    return -1
 
-    parser.print_help()
-    return 0
+
+def main() -> int:
+    parser = _build_missions_parser()
+    args = parser.parse_args()
+    mc = MissionControl()
+    result = _dispatch_missions_command(args, mc)
+    if result == -1:
+        parser.print_help()
+        return 0
+    return result
 
 
 if __name__ == "__main__":

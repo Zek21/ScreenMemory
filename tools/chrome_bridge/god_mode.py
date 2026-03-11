@@ -97,13 +97,42 @@ class AccessibilityTreeParser:
     def __init__(self, cdp: CDP):
         self.cdp = cdp
 
+    def _parse_node(self, node: Dict) -> Optional[Dict]:
+        """Parse a single accessibility tree node. Returns None if noise."""
+        role = self._extract_value(node.get('role', {}))
+        name = self._extract_value(node.get('name', {}))
+        desc = self._extract_value(node.get('description', {}))
+
+        if role in self.SKIP_ROLES:
+            return None
+        if not role and not name:
+            return None
+        if role == 'generic' and not name:
+            return None
+
+        states = {}
+        for prop in node.get('properties', []):
+            prop_name = prop.get('name', '')
+            prop_val = self._extract_value(prop.get('value', {}))
+            if prop_val is not None and prop_val != '':
+                states[prop_name] = prop_val
+
+        return {
+            'ax_id': node.get('nodeId', ''),
+            'backend_node_id': node.get('backendDOMNodeId'),
+            'role': role,
+            'name': name,
+            'description': desc,
+            'states': states,
+            'actionable': role in self.ACTIONABLE_ROLES,
+            'children_ids': node.get('childIds', []),
+            'parent_id': node.get('parentId'),
+        }
+
     def parse(self, tab_id: str) -> List[Dict]:
         """
         Extract the full accessibility tree and return a clean,
         hierarchical list of meaningful nodes.
-
-        Returns list of dicts with: role, name, description, states,
-        level (depth), children_count, actionable flag.
         """
         if isinstance(tab_id, dict):
             tab_id = tab_id['id']
@@ -119,42 +148,9 @@ class AccessibilityTreeParser:
 
         parsed = []
         for node in raw_nodes:
-            role = self._extract_value(node.get('role', {}))
-            name = self._extract_value(node.get('name', {}))
-            desc = self._extract_value(node.get('description', {}))
-
-            # Skip noise
-            if role in self.SKIP_ROLES:
-                continue
-            if not role and not name:
-                continue
-            # Skip unnamed generic containers
-            if role == 'generic' and not name:
-                continue
-
-            # Extract states
-            states = {}
-            for prop in node.get('properties', []):
-                prop_name = prop.get('name', '')
-                prop_val = self._extract_value(prop.get('value', {}))
-                if prop_val is not None and prop_val != '':
-                    states[prop_name] = prop_val
-
-            # Determine if actionable
-            actionable = role in self.ACTIONABLE_ROLES
-
-            parsed.append({
-                'ax_id': node.get('nodeId', ''),
-                'backend_node_id': node.get('backendDOMNodeId'),
-                'role': role,
-                'name': name,
-                'description': desc,
-                'states': states,
-                'actionable': actionable,
-                'children_ids': node.get('childIds', []),
-                'parent_id': node.get('parentId'),
-            })
-
+            entry = self._parse_node(node)
+            if entry is not None:
+                parsed.append(entry)
         return parsed
 
     def parse_compact(self, tab_id: str) -> str:
@@ -356,27 +352,37 @@ class SemanticGeometryEngine:
 
         return data
 
+    @staticmethod
+    def _compress_element(i: int, el: Dict) -> Dict:
+        """Compress a single element into a compact LLM-friendly dict."""
+        entry = {
+            'ref': i,
+            'role': el['role'],
+            'name': el['name'][:60] if el['name'] else '',
+            'box': [el['nx'], el['ny'], el['nw'], el['nh']],
+            'z': el['z'],
+        }
+        if el.get('value'):
+            entry['val'] = el['value'][:50]
+        if el.get('checked'):
+            entry['checked'] = True
+        if el.get('disabled'):
+            entry['disabled'] = True
+        if el.get('prominence', 0) > 0.3:
+            entry['primary'] = True
+        return entry
+
     def extract_grounded_action_space(self, tab_id: str,
                                        region: str = None,
                                        role_filter: List[str] = None,
                                        min_prominence: float = 0.0) -> str:
         """
-        Generate the "grounded action space" — a compact JSON representation
-        optimized for LLM consumption.
-
-        This is the key innovation: ~1,400 tokens instead of ~100,000.
-
-        Args:
-            region: 'top', 'bottom', 'left', 'right', 'center', or None for all
-            role_filter: list of roles to include, e.g. ['button', 'input']
-            min_prominence: minimum prominence score (0.0-1.0)
-
-        Returns compact JSON string ready for LLM prompt injection.
+        Generate the "grounded action space" -- a compact JSON representation
+        optimized for LLM consumption (~1,400 tokens instead of ~100,000).
         """
         data = self.extract(tab_id)
         elements = data.get('elements', [])
 
-        # Apply filters
         if region:
             elements = self._filter_by_region(elements, region, data['viewport'])
         if role_filter:
@@ -384,25 +390,7 @@ class SemanticGeometryEngine:
         if min_prominence > 0:
             elements = [e for e in elements if e.get('prominence', 0) >= min_prominence]
 
-        # Build compact representation
-        compact = []
-        for i, el in enumerate(elements):
-            entry = {
-                'ref': i,
-                'role': el['role'],
-                'name': el['name'][:60] if el['name'] else '',
-                'box': [el['nx'], el['ny'], el['nw'], el['nh']],
-                'z': el['z'],
-            }
-            if el.get('value'):
-                entry['val'] = el['value'][:50]
-            if el.get('checked'):
-                entry['checked'] = True
-            if el.get('disabled'):
-                entry['disabled'] = True
-            if el.get('prominence', 0) > 0.3:
-                entry['primary'] = True
-            compact.append(entry)
+        compact = [self._compress_element(i, el) for i, el in enumerate(elements)]
 
         return json.dumps({
             'viewport': [data['viewport']['w'], data['viewport']['h']],
@@ -707,53 +695,54 @@ class OcclusionResolver:
         return [e for e in result.get('elements', [])
                 if e.get('interactable', False)]
 
+    _OVERLAY_DETECT_JS = """
+    (function() {
+        var overlays = [];
+        var all = document.querySelectorAll('*');
+        for (var i = 0; i < all.length; i++) {
+            var el = all[i];
+            var style = window.getComputedStyle(el);
+            var role = el.getAttribute('role') || '';
+            var isOverlay = false;
+            var reason = '';
+
+            if (role === 'dialog' || role === 'alertdialog' || el.tagName === 'DIALOG') {
+                isOverlay = true; reason = 'dialog';
+            } else if (style.position === 'fixed' || style.position === 'sticky') {
+                var rect = el.getBoundingClientRect();
+                var area = rect.width * rect.height;
+                var viewArea = window.innerWidth * window.innerHeight;
+                if (area > viewArea * 0.3) {
+                    isOverlay = true; reason = 'large-fixed';
+                }
+                if (parseInt(style.zIndex) > 1000 && area > viewArea * 0.1) {
+                    isOverlay = true; reason = 'high-z-fixed';
+                }
+            }
+
+            if (isOverlay) {
+                var rect = el.getBoundingClientRect();
+                overlays.push({
+                    tag: el.tagName.toLowerCase(),
+                    role: role,
+                    reason: reason,
+                    box: [Math.round(rect.left), Math.round(rect.top),
+                          Math.round(rect.width), Math.round(rect.height)],
+                    z: parseInt(style.zIndex) || 0,
+                    text: (el.innerText || '').substring(0, 100),
+                });
+            }
+        }
+        return JSON.stringify(overlays);
+    })()
+    """
+
     def detect_overlays(self, tab_id: str) -> List[Dict]:
         """Detect modal dialogs, cookie banners, popups, etc."""
         if isinstance(tab_id, dict):
             tab_id = tab_id['id']
 
-        js = """
-        (function() {
-            var overlays = [];
-            var all = document.querySelectorAll('*');
-            for (var i = 0; i < all.length; i++) {
-                var el = all[i];
-                var style = window.getComputedStyle(el);
-                var role = el.getAttribute('role') || '';
-                var isOverlay = false;
-                var reason = '';
-
-                if (role === 'dialog' || role === 'alertdialog' || el.tagName === 'DIALOG') {
-                    isOverlay = true; reason = 'dialog';
-                } else if (style.position === 'fixed' || style.position === 'sticky') {
-                    var rect = el.getBoundingClientRect();
-                    var area = rect.width * rect.height;
-                    var viewArea = window.innerWidth * window.innerHeight;
-                    if (area > viewArea * 0.3) {
-                        isOverlay = true; reason = 'large-fixed';
-                    }
-                    if (parseInt(style.zIndex) > 1000 && area > viewArea * 0.1) {
-                        isOverlay = true; reason = 'high-z-fixed';
-                    }
-                }
-
-                if (isOverlay) {
-                    var rect = el.getBoundingClientRect();
-                    overlays.push({
-                        tag: el.tagName.toLowerCase(),
-                        role: role,
-                        reason: reason,
-                        box: [Math.round(rect.left), Math.round(rect.top),
-                              Math.round(rect.width), Math.round(rect.height)],
-                        z: parseInt(style.zIndex) || 0,
-                        text: (el.innerText || '').substring(0, 100),
-                    });
-                }
-            }
-            return JSON.stringify(overlays);
-        })()
-        """
-        raw = self.cdp.eval(tab_id, js)
+        raw = self.cdp.eval(tab_id, self._OVERLAY_DETECT_JS)
         try:
             return json.loads(raw) if isinstance(raw, str) else (raw or [])
         except (json.JSONDecodeError, TypeError):
@@ -1309,6 +1298,36 @@ class ActionSpaceOptimizer:
         self.occlusion = OcclusionResolver(cdp)
         self.embeddings = ElementEmbedding()
 
+    @staticmethod
+    def _compress_scene_element(i: int, el: Dict,
+                                 include_embeddings: bool,
+                                 embeddings: 'ElementEmbedding') -> Dict:
+        """Compress a single element for the optimized scene."""
+        entry = {
+            'ref': i,
+            'role': el.get('role', ''),
+            'name': (el.get('name', '') or '')[:60],
+            'box': [el.get('nx', 0), el.get('ny', 0),
+                    el.get('nw', 0), el.get('nh', 0)],
+        }
+        if el.get('z', 0) > 0:
+            entry['z'] = el['z']
+        if el.get('value'):
+            entry['val'] = el['value'][:40]
+        if el.get('disabled'):
+            entry['disabled'] = True
+        if el.get('prominence', 0) > 0.4:
+            entry['primary'] = True
+        if el.get('type'):
+            entry['type'] = el['type']
+        if el.get('href'):
+            entry['href'] = el['href'][:80]
+        if include_embeddings:
+            concept = embeddings.identify_concept(el)
+            if concept:
+                entry['concept'] = concept
+        return entry
+
     def optimize(self, tab_id: str,
                  max_elements: int = 50,
                  include_embeddings: bool = False,
@@ -1316,61 +1335,30 @@ class ActionSpaceOptimizer:
         """
         Generate the fully optimized action space for a page.
 
-        Returns a dict ready for LLM prompt injection with:
-        - page_type: classified page type
-        - viewport: [width, height]
-        - scene: list of compact element descriptors
-        - token_estimate: approximate token count
+        Returns a dict with: page_type, viewport, scene (compact element
+        descriptors), token_estimate.
         """
         if isinstance(tab_id, dict):
             tab_id = tab_id['id']
 
-        # Step 1+2: Extract geometry
         geo_data = self.geometry.extract(tab_id)
         elements = geo_data.get('elements', [])
 
-        # Step 3: Filter occluded elements
+        # Filter by occlusion
         truly_interactable = self.occlusion.get_truly_interactable(tab_id)
-        interactable_ids = set(e.get('id', '') for e in truly_interactable if e.get('id'))
-
-        # Merge: keep geometry data but filter by occlusion
+        interactable_ids = set(
+            e.get('id', '') for e in truly_interactable if e.get('id'))
         if interactable_ids:
             elements = [e for e in elements
                         if e.get('id') in interactable_ids or not e.get('id')]
 
-        # Step 4: Sort by prominence
+        # Sort by prominence and limit
         elements.sort(key=lambda e: e.get('prominence', 0), reverse=True)
         elements = elements[:max_elements]
 
-        # Step 5: Compress
-        scene = []
-        for i, el in enumerate(elements):
-            entry = {
-                'ref': i,
-                'role': el.get('role', ''),
-                'name': (el.get('name', '') or '')[:60],
-                'box': [el.get('nx', 0), el.get('ny', 0),
-                        el.get('nw', 0), el.get('nh', 0)],
-            }
-            if el.get('z', 0) > 0:
-                entry['z'] = el['z']
-            if el.get('value'):
-                entry['val'] = el['value'][:40]
-            if el.get('disabled'):
-                entry['disabled'] = True
-            if el.get('prominence', 0) > 0.4:
-                entry['primary'] = True
-            if el.get('type'):
-                entry['type'] = el['type']
-            if el.get('href'):
-                entry['href'] = el['href'][:80]
-
-            if include_embeddings:
-                concept = self.embeddings.identify_concept(el)
-                if concept:
-                    entry['concept'] = concept
-
-            scene.append(entry)
+        scene = [self._compress_scene_element(i, el, include_embeddings,
+                                               self.embeddings)
+                 for i, el in enumerate(elements)]
 
         result = {
             'viewport': [geo_data['viewport']['w'], geo_data['viewport']['h']],
@@ -1378,14 +1366,11 @@ class ActionSpaceOptimizer:
             'actionable_count': len(scene),
             'scene': scene,
         }
-
         if include_page_type:
             result['page_type'] = self.embeddings.classify_page_type(elements)
 
-        # Estimate tokens
         json_str = json.dumps(result, separators=(',', ':'))
-        result['token_estimate'] = len(json_str) // 4  # rough estimate
-
+        result['token_estimate'] = len(json_str) // 4
         return result
 
     def generate_prompt_context(self, tab_id: str,
@@ -1731,6 +1716,67 @@ class GodMode:
     # HIGH-LEVEL PERCEPTION
     # ═══════════════════════════════════════════════════════════
 
+    def _see_minimal(self, tab_id: str, result: Dict, t0: float) -> Dict:
+        """Layer 1: Accessibility tree only."""
+        result['accessibility_tree'] = self.a11y.parse_compact(tab_id)
+        result['actionable_elements'] = self.a11y.find_actionable(tab_id)
+        result['perception_time_ms'] = round((time.time() - t0) * 1000)
+        return result
+
+    def _see_standard(self, tab_id: str, result: Dict, t0: float) -> Dict:
+        """Layers 2-3: Geometry + occlusion."""
+        geo = self.geometry.extract(tab_id)
+        result['viewport'] = geo.get('viewport', {})
+        result['elements'] = geo.get('elements', [])
+        result['dom_element_count'] = geo.get('totalElements', 0)
+
+        occ = self.occlusion.resolve(tab_id)
+        result['occlusion'] = {
+            'visible': occ.get('visible', 0),
+            'occluded': occ.get('occluded', 0),
+            'has_modal': occ.get('has_modal', False),
+        }
+        result['perception_time_ms'] = round((time.time() - t0) * 1000)
+        return result
+
+    def _see_deep(self, tab_id: str, result: Dict, t0: float) -> Dict:
+        """Layer 4: Graph topology."""
+        if result['elements']:
+            self.graph.build(result['elements'])
+            result['topology'] = self.graph.to_compact()
+        result['perception_time_ms'] = round((time.time() - t0) * 1000)
+        return result
+
+    def _see_god(self, tab_id: str, result: Dict, t0: float) -> Dict:
+        """Layer 5: Full GOD mode -- embeddings, spatial, forms, nav, CTA."""
+        if not result['elements']:
+            result['perception_time_ms'] = round((time.time() - t0) * 1000)
+            return result
+
+        elements = result['elements']
+        result['page_type'] = self.embeddings.classify_page_type(elements)
+        result['layout'] = self.spatial.detect_layout_regions(
+            elements, result['viewport'])
+        result['grid_analysis'] = self.spatial.detect_rows_and_columns(elements)
+        result['form_groups'] = self.graph.find_form_groups()
+        result['nav_bars'] = self.graph.find_navigation_bars()
+
+        cta = self.geometry.find_primary_cta(tab_id)
+        if cta:
+            result['primary_cta'] = {
+                'name': cta.get('name', ''),
+                'role': cta.get('role', ''),
+                'box': [cta.get('x', 0), cta.get('y', 0),
+                        cta.get('w', 0), cta.get('h', 0)],
+            }
+
+        overlays = self.occlusion.detect_overlays(tab_id)
+        if overlays:
+            result['overlays'] = overlays
+
+        result['perception_time_ms'] = round((time.time() - t0) * 1000)
+        return result
+
     def see(self, tab_id: str = None, depth: str = 'standard') -> Dict:
         """
         SEE the current page. The primary perception method.
@@ -1740,8 +1786,6 @@ class GodMode:
         - 'standard': AOM + geometry + occlusion (~200ms)
         - 'deep': All modules including graph topology (~500ms)
         - 'god': Everything + embeddings + spatial reasoning (~800ms)
-
-        Returns a comprehensive perception object.
         """
         self._ensure_modules()
         tab_id = tab_id or self._get_active_tab()
@@ -1751,79 +1795,23 @@ class GodMode:
         t0 = time.time()
         result = {'tab_id': tab_id, 'timestamp': time.time()}
 
-        # Layer 1: Accessibility Tree (always)
-        a11y_compact = self.a11y.parse_compact(tab_id)
-        result['accessibility_tree'] = a11y_compact
-        result['actionable_elements'] = self.a11y.find_actionable(tab_id)
-
+        # Layer 1 always runs
+        self._see_minimal(tab_id, result, t0)
         if depth == 'minimal':
-            result['perception_time_ms'] = round((time.time() - t0) * 1000)
             return result
 
-        # Layer 2: Semantic Geometry
-        geo = self.geometry.extract(tab_id)
-        result['viewport'] = geo.get('viewport', {})
-        result['elements'] = geo.get('elements', [])
-        result['dom_element_count'] = geo.get('totalElements', 0)
-
-        # Layer 3: Occlusion
-        occ = self.occlusion.resolve(tab_id)
-        result['occlusion'] = {
-            'visible': occ.get('visible', 0),
-            'occluded': occ.get('occluded', 0),
-            'has_modal': occ.get('has_modal', False),
-        }
-
+        # Layer 2-3
+        self._see_standard(tab_id, result, t0)
         if depth == 'standard':
-            result['perception_time_ms'] = round((time.time() - t0) * 1000)
             return result
 
-        # Layer 4: Graph Topology
-        if result['elements']:
-            self.graph.build(result['elements'])
-            result['topology'] = self.graph.to_compact()
-
+        # Layer 4
+        self._see_deep(tab_id, result, t0)
         if depth == 'deep':
-            result['perception_time_ms'] = round((time.time() - t0) * 1000)
             return result
 
-        # Layer 5: Full GOD mode
-        if result['elements']:
-            # Page classification
-            result['page_type'] = self.embeddings.classify_page_type(
-                result['elements'])
-
-            # Layout regions
-            result['layout'] = self.spatial.detect_layout_regions(
-                result['elements'], result['viewport'])
-
-            # Rows and columns
-            result['grid_analysis'] = self.spatial.detect_rows_and_columns(
-                result['elements'])
-
-            # Form groups
-            result['form_groups'] = self.graph.find_form_groups()
-
-            # Navigation bars
-            result['nav_bars'] = self.graph.find_navigation_bars()
-
-            # Primary CTA
-            cta = self.geometry.find_primary_cta(tab_id)
-            if cta:
-                result['primary_cta'] = {
-                    'name': cta.get('name', ''),
-                    'role': cta.get('role', ''),
-                    'box': [cta.get('x', 0), cta.get('y', 0),
-                            cta.get('w', 0), cta.get('h', 0)],
-                }
-
-            # Overlays
-            overlays = self.occlusion.detect_overlays(tab_id)
-            if overlays:
-                result['overlays'] = overlays
-
-        result['perception_time_ms'] = round((time.time() - t0) * 1000)
-        return result
+        # Layer 5 (god)
+        return self._see_god(tab_id, result, t0)
 
     def scene(self, tab_id: str = None, max_elements: int = 40) -> str:
         """
@@ -2223,10 +2211,86 @@ class GodMode:
 # CLI INTERFACE
 # ═══════════════════════════════════════════════════════════════════════
 
+def _cmd_see(god, args):
+    result = god.see(depth=args.depth)
+    if args.json:
+        for key in ['elements', 'actionable_elements']:
+            if key in result:
+                result[key] = f'[{len(result[key])} items]'
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        print(result.get('accessibility_tree', 'No data'))
+
+
+def _cmd_find(god, args):
+    if not args.args:
+        print('Usage: god_mode find <concept>')
+        return
+    for r in god.find(' '.join(args.args))[:10]:
+        sim = r.get('similarity', 0)
+        print(f"  [{sim:.2f}] {r.get('role','')} \"{r.get('name','')}\" "
+              f"@({r.get('x',0)},{r.get('y',0)})")
+
+
+def _cmd_click(god, args):
+    if not args.args:
+        print('Usage: god_mode click <concept>')
+        return
+    print('clicked' if god.click(' '.join(args.args)) else 'not found')
+
+
+def _cmd_overlays(god, _args):
+    god._ensure_modules()
+    overlays = god.occlusion.detect_overlays(god._get_active_tab())
+    if overlays:
+        for ov in overlays:
+            print(f"  {ov['tag']} z={ov['z']} ({ov['reason']}) "
+                  f"\"{ov.get('text','')[:50]}\"")
+    else:
+        print('No overlays detected')
+
+
+def _cmd_graph(god, _args):
+    god._ensure_modules()
+    tab = god._get_active_tab()
+    geo = god.geometry.extract(tab)
+    god.graph.build(geo.get('elements', []))
+    print(json.dumps(god.graph.to_compact(), indent=2))
+
+
+def _cmd_tabs(god, _args):
+    for t in god.tabs():
+        print(f"  [{t['id'][:8]}] {t.get('title','?')[:50]}")
+        print(f"             {t.get('url','?')[:80]}")
+
+
+def _cmd_windows(god, _args):
+    god.scan_world()
+    for w in god.windows():
+        print(f"  z={w['z']:2d} {w['name'][:50]}")
+
+
+def _cmd_monitors(god, _args):
+    for i, m in enumerate(god.monitors()):
+        print(f"  Monitor {i}: {m['x']},{m['y']} {m['w']}x{m['h']}")
+
+
+def _cmd_page_type(god, _args):
+    god._ensure_modules()
+    tab = god._get_active_tab()
+    geo = god.geometry.extract(tab)
+    print(f"Page type: {god.embeddings.classify_page_type(geo.get('elements', []))}")
+
+
+def _cmd_a11y(god, _args):
+    god._ensure_modules()
+    print(god.a11y.parse_compact(god._get_active_tab()))
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description='GOD MODE — Structural Perception Engine')
+        description='GOD MODE -- Structural Perception Engine')
     parser.add_argument('command', nargs='?', default='status',
                         choices=['status', 'see', 'scene', 'find', 'click',
                                  'describe', 'overlays', 'graph', 'tabs',
@@ -2242,90 +2306,26 @@ def main():
     args = parser.parse_args()
     god = GodMode(cdp_port=args.port)
 
-    if args.command == 'status':
-        print(json.dumps(god.status(), indent=2))
+    dispatch = {
+        'status': lambda: print(json.dumps(god.status(), indent=2)),
+        'see': lambda: _cmd_see(god, args),
+        'scene': lambda: print(god.scene()),
+        'find': lambda: _cmd_find(god, args),
+        'click': lambda: _cmd_click(god, args),
+        'describe': lambda: print(god.describe()),
+        'overlays': lambda: _cmd_overlays(god, args),
+        'graph': lambda: _cmd_graph(god, args),
+        'tabs': lambda: _cmd_tabs(god, args),
+        'windows': lambda: _cmd_windows(god, args),
+        'monitors': lambda: _cmd_monitors(god, args),
+        'action-space': lambda: print(god.action_space()),
+        'page-type': lambda: _cmd_page_type(god, args),
+        'a11y': lambda: _cmd_a11y(god, args),
+    }
 
-    elif args.command == 'see':
-        result = god.see(depth=args.depth)
-        if args.json:
-            # Remove large lists for readability
-            for key in ['elements', 'actionable_elements']:
-                if key in result:
-                    result[key] = f'[{len(result[key])} items]'
-            print(json.dumps(result, indent=2, default=str))
-        else:
-            print(result.get('accessibility_tree', 'No data'))
-
-    elif args.command == 'scene':
-        print(god.scene())
-
-    elif args.command == 'find':
-        if not args.args:
-            print('Usage: god_mode find <concept>')
-            return
-        results = god.find(' '.join(args.args))
-        for r in results[:10]:
-            sim = r.get('similarity', 0)
-            print(f"  [{sim:.2f}] {r.get('role','')} \"{r.get('name','')}\" "
-                  f"@({r.get('x',0)},{r.get('y',0)})")
-
-    elif args.command == 'click':
-        if not args.args:
-            print('Usage: god_mode click <concept>')
-            return
-        ok = god.click(' '.join(args.args))
-        print('clicked' if ok else 'not found')
-
-    elif args.command == 'describe':
-        print(god.describe())
-
-    elif args.command == 'overlays':
-        god._ensure_modules()
-        tab = god._get_active_tab()
-        overlays = god.occlusion.detect_overlays(tab)
-        if overlays:
-            for ov in overlays:
-                print(f"  {ov['tag']} z={ov['z']} ({ov['reason']}) "
-                      f"\"{ov.get('text','')[:50]}\"")
-        else:
-            print('No overlays detected')
-
-    elif args.command == 'graph':
-        god._ensure_modules()
-        tab = god._get_active_tab()
-        geo = god.geometry.extract(tab)
-        elements = geo.get('elements', [])
-        god.graph.build(elements)
-        print(json.dumps(god.graph.to_compact(), indent=2))
-
-    elif args.command == 'tabs':
-        for t in god.tabs():
-            print(f"  [{t['id'][:8]}] {t.get('title','?')[:50]}")
-            print(f"             {t.get('url','?')[:80]}")
-
-    elif args.command == 'windows':
-        god.scan_world()
-        for w in god.windows():
-            print(f"  z={w['z']:2d} {w['name'][:50]}")
-
-    elif args.command == 'monitors':
-        for i, m in enumerate(god.monitors()):
-            print(f"  Monitor {i}: {m['x']},{m['y']} {m['w']}x{m['h']}")
-
-    elif args.command == 'action-space':
-        print(god.action_space())
-
-    elif args.command == 'page-type':
-        god._ensure_modules()
-        tab = god._get_active_tab()
-        geo = god.geometry.extract(tab)
-        page_type = god.embeddings.classify_page_type(geo.get('elements', []))
-        print(f"Page type: {page_type}")
-
-    elif args.command == 'a11y':
-        god._ensure_modules()
-        tab = god._get_active_tab()
-        print(god.a11y.parse_compact(tab))
+    handler = dispatch.get(args.command)
+    if handler:
+        handler()
 
 
 if __name__ == '__main__':

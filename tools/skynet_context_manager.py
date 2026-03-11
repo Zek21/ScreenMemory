@@ -177,30 +177,12 @@ def save_worker_state(name, hwnd, pending_task=None, context_summary=None):
     return state
 
 
-def refresh_worker(name, hwnd):
-    """Refresh a worker's context by opening a fresh chat window.
-
-    Steps:
-    1. Save current state
-    2. Open fresh chat via new_chat.ps1
-    3. Re-inject identity from agent_profiles.json
-    4. Re-dispatch any pending work
-    """
-    log(f"Starting context refresh for {name.upper()} (HWND={hwnd})", "SYS")
-
-    # Step 1: Save state
-    state = save_worker_state(name, hwnd)
-
-    # Step 2: Alert bus
-    bus_post("context_manager", "orchestrator", "alert",
-             f"CONTEXT_REFRESH: {name.upper()} starting context refresh -- conversation too long")
-
-    # Step 3: Open fresh chat window
+def _open_fresh_chat() -> bool:
+    """Open a fresh chat window via new_chat.ps1. Returns True on success."""
     new_chat_script = ROOT / "tools" / "new_chat.ps1"
     if not new_chat_script.exists():
         log(f"new_chat.ps1 not found at {new_chat_script}", "ERR")
         return False
-
     try:
         result = subprocess.run(
             ["pwsh", "-ExecutionPolicy", "Bypass", "-File", str(new_chat_script)],
@@ -210,73 +192,90 @@ def refresh_worker(name, hwnd):
             log(f"new_chat.ps1 failed: {result.stderr[:200]}", "ERR")
             return False
         log("Fresh chat window opened", "OK")
+        return True
     except Exception as e:
         log(f"Failed to open fresh chat: {e}", "ERR")
         return False
 
-    # Step 4: Find new HWND — reload workers.json (new_chat.ps1 updates it)
+
+def _find_new_hwnd(name: str, old_hwnd: int) -> int | None:
+    """Find the new HWND for a worker after refresh. Returns None if not found."""
     time.sleep(2)
-    workers = load_workers()
-    new_worker = None
-    for w in workers:
+    for w in load_workers():
         if w.get("name") == name:
             new_hwnd = w.get("hwnd", 0)
-            if new_hwnd != hwnd:
-                new_worker = w
-                break
+            if new_hwnd != old_hwnd:
+                return new_hwnd
+    return None
 
-    if not new_worker:
+
+def _reinject_identity(name: str, new_hwnd: int, state: dict):
+    """Re-inject worker identity from agent_profiles.json into new window."""
+    profiles_file = DATA_DIR / "agent_profiles.json"
+    if not profiles_file.exists():
+        return
+    try:
+        profiles = json.loads(profiles_file.read_text(encoding="utf-8"))
+        profile = profiles.get(name, {})
+        role = profile.get("role", "worker")
+        specs = ", ".join(profile.get("specializations", [])) or "general"
+        prev_ctx = state.get("last_result", "none available")[:300]
+        identity = (
+            f"You are {name.upper()} -- {role} in the Skynet multi-agent network. "
+            f"Your HWND is {new_hwnd}. Claude Opus 4.6 fast, Copilot CLI mode. "
+            f"Connected to Skynet on port {SKYNET_PORT}. "
+            f"Your specializations: {specs}. "
+            f"CONTEXT WAS REFRESHED -- you are in a fresh conversation window. "
+            f"Previous context summary: {prev_ctx}"
+        )
+        subprocess.run(
+            [PYTHON, str(ROOT / "tools" / "skynet_dispatch.py"),
+             "--worker", name, "--task", identity],
+            cwd=str(ROOT), timeout=30, capture_output=True, text=True,
+        )
+        log(f"Identity re-injected for {name.upper()}", "OK")
+    except Exception as e:
+        log(f"Identity re-injection failed: {e}", "WARN")
+
+
+def _redispatch_pending(name: str, state: dict):
+    """Re-dispatch pending task to refreshed worker, if any."""
+    pending = state.get("pending_task") or state.get("last_directive")
+    if not pending:
+        return
+    time.sleep(3)
+    try:
+        subprocess.run(
+            [PYTHON, str(ROOT / "tools" / "skynet_dispatch.py"),
+             "--worker", name, "--task", f"RESUMED TASK (after context refresh): {pending}"],
+            cwd=str(ROOT), timeout=30, capture_output=True, text=True,
+        )
+        log(f"Pending task re-dispatched to {name.upper()}", "OK")
+    except Exception as e:
+        log(f"Failed to re-dispatch pending task: {e}", "WARN")
+
+
+def refresh_worker(name, hwnd):
+    """Refresh a worker's context by opening a fresh chat window."""
+    log(f"Starting context refresh for {name.upper()} (HWND={hwnd})", "SYS")
+    state = save_worker_state(name, hwnd)
+    bus_post("context_manager", "orchestrator", "alert",
+             f"CONTEXT_REFRESH: {name.upper()} starting context refresh -- conversation too long")
+
+    if not _open_fresh_chat():
+        return False
+
+    new_hwnd = _find_new_hwnd(name, hwnd)
+    if new_hwnd is None:
         log(f"Could not find new HWND for {name.upper()} after refresh", "WARN")
-        # The orchestrator will handle re-mapping via reconnect
         bus_post("context_manager", "orchestrator", "alert",
                  f"CONTEXT_REFRESH_PARTIAL: {name.upper()} new window opened but HWND not updated. "
                  f"Run skynet_start.py --reconnect to re-map.")
         return True
 
-    new_hwnd = new_worker["hwnd"]
     log(f"New HWND for {name.upper()}: {new_hwnd} (was {hwnd})", "OK")
-
-    # Step 5: Re-inject identity
-    profiles_file = DATA_DIR / "agent_profiles.json"
-    if profiles_file.exists():
-        try:
-            profiles = json.loads(profiles_file.read_text(encoding="utf-8"))
-            profile = profiles.get(name, {})
-            role = profile.get("role", "worker")
-            specs = profile.get("specializations", [])
-            specs_str = ", ".join(specs) if specs else "general"
-
-            identity = (
-                f"You are {name.upper()} -- {role} in the Skynet multi-agent network. "
-                f"Your HWND is {new_hwnd}. Claude Opus 4.6 fast, Copilot CLI mode. "
-                f"Connected to Skynet on port {SKYNET_PORT}. "
-                f"Your specializations: {specs_str}. "
-                f"CONTEXT WAS REFRESHED -- you are in a fresh conversation window. "
-                f"Previous context summary: {state.get('last_result', 'none available')[:300]}"
-            )
-
-            subprocess.run(
-                [PYTHON, str(ROOT / "tools" / "skynet_dispatch.py"),
-                 "--worker", name, "--task", identity],
-                cwd=str(ROOT), timeout=30, capture_output=True, text=True,
-            )
-            log(f"Identity re-injected for {name.upper()}", "OK")
-        except Exception as e:
-            log(f"Identity re-injection failed: {e}", "WARN")
-
-    # Step 6: Re-dispatch pending task if any
-    pending = state.get("pending_task") or state.get("last_directive")
-    if pending:
-        time.sleep(3)  # Clipboard cooldown
-        try:
-            subprocess.run(
-                [PYTHON, str(ROOT / "tools" / "skynet_dispatch.py"),
-                 "--worker", name, "--task", f"RESUMED TASK (after context refresh): {pending}"],
-                cwd=str(ROOT), timeout=30, capture_output=True, text=True,
-            )
-            log(f"Pending task re-dispatched to {name.upper()}", "OK")
-        except Exception as e:
-            log(f"Failed to re-dispatch pending task: {e}", "WARN")
+    _reinject_identity(name, new_hwnd, state)
+    _redispatch_pending(name, state)
 
     bus_post("context_manager", "orchestrator", "alert",
              f"CONTEXT_REFRESH_COMPLETE: {name.upper()} refreshed. "

@@ -38,6 +38,17 @@ HEALTH_FILE = DATA_DIR / "worker_health.json"
 PID_FILE = DATA_DIR / "monitor.pid"
 SKYNET_URL = "http://localhost:8420"
 
+
+def _guarded_bus_publish(msg: dict) -> dict | None:
+    """Route bus publishes through SpamGuard. Falls back to skynet_post on import failure."""
+    try:
+        from tools.skynet_spam_guard import guarded_publish
+        return guarded_publish(msg)
+    except Exception:
+        return skynet_post("/bus/publish", msg)
+    # signed: beta
+
+
 # Resolve real Python interpreter to avoid venv trampoline double-process.
 def _resolve_real_python():
     """Return (real_python_path, env_dict) bypassing the venv trampoline."""
@@ -213,45 +224,120 @@ def write_health(health: dict):
     except Exception as e: log(f"Failed to record worker health metrics: {e}", "WARN")
 
 
+def _check_orchestrator_drift(orch_hwnd: int, health: dict):
+    """Check orchestrator model+agent for drift and auto-correct if needed."""
+    model_str, agent_str = get_model_and_agent_uia(orch_hwnd)
+    orch_ok = is_model_correct(model_str) and is_agent_cli(agent_str)
+    health["orchestrator"] = {
+        "hwnd": orch_hwnd, "model": model_str, "agent": agent_str,
+        "ok": orch_ok, "checked_at": datetime.now().isoformat()
+    }
+    if orch_ok:
+        log(f"ORCHESTRATOR: OK (model=Opus fast, agent=CLI)", "OK")
+        try: metrics().record_model_guard("orchestrator", model_str, agent_str, orch_ok)
+        except Exception as e: log(f"Failed to record orchestrator model guard metrics: {e}", "WARN")
+        return
+
+    issues = []
+    if not is_model_correct(model_str):
+        issues.append(f"model='{model_str}' (expected Opus 4.6 fast)")
+    if not is_agent_cli(agent_str):
+        issues.append(f"agent='{agent_str}' (expected Copilot CLI)")
+    issue_text = "; ".join(issues)
+    log(f"ORCHESTRATOR DRIFT: {issue_text} -- auto-correcting", "CRIT")
+    _guarded_bus_publish({"sender": "monitor", "topic": "workers", "type": "alert",
+        "content": f"SECURITY: Orchestrator drift detected: {issue_text}. Workers: verify and report."})
+
+    if not is_model_correct(model_str):
+        fixed = fix_model_via_uia(orch_hwnd, 0)
+        if fixed:
+            time.sleep(1)
+            model_str2, _ = get_model_and_agent_uia(orch_hwnd)
+            log(f"Orchestrator model after fix: '{model_str2}'", "OK" if is_model_correct(model_str2) else "WARN")
+            health["orchestrator"]["model"] = model_str2
+            health["orchestrator"]["ok"] = is_model_correct(model_str2) and is_agent_cli(agent_str)
+            _guarded_bus_publish({"sender": "monitor", "topic": "workers", "type": "report",
+                "content": f"Orchestrator model fixed: '{model_str2}'"})
+
+
+def _check_worker_dead(name: str, hwnd: int, alive: bool, visible: bool, h: dict, health: dict) -> bool:
+    """Handle a dead/invisible worker. Returns True if worker is confirmed dead."""
+    if _is_dispatch_active():
+        log(f"{name.upper()}: visibility check failed but dispatch active -- suppressed", "WARN")
+        _dead_consecutive[name] = 0
+        h.update({"model": "CHECKING", "status": "DISPATCH_ACTIVE"})
+        health[name] = h
+        return True  # skip further processing
+
+    _dead_consecutive[name] = _dead_consecutive.get(name, 0) + 1
+    consecutive = _dead_consecutive[name]
+
+    if consecutive < DEAD_DEBOUNCE_THRESHOLD:
+        log(f"{name.upper()}: visibility check failed ({consecutive}/{DEAD_DEBOUNCE_THRESHOLD}) -- debouncing", "WARN")
+        h.update({"model": "CHECKING", "status": f"DEBOUNCE_{consecutive}"})
+        health[name] = h
+        return True
+
+    h.update({"model": "UNKNOWN", "status": "DEAD"})
+    log(f"{name.upper()}: DEAD (hwnd={hwnd} alive={alive} visible={visible}, consecutive={consecutive})", "CRIT")
+    skynet_post(f"/worker/{name}/heartbeat", {"hwnd_alive": False, "visible": False, "model": ""})
+
+    now_ts = time.time()
+    last_ts = _last_alert.get(name, 0)
+    if (now_ts - last_ts) >= ALERT_DEDUP_WINDOW:
+        _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
+            "content": f"WORKER {name.upper()} DEAD -- hwnd={hwnd} alive={alive} visible={visible} (confirmed {consecutive}x)"})
+        _last_alert[name] = now_ts
+    else:
+        log(f"{name.upper()}: DEAD alert suppressed (dedup window {ALERT_DEDUP_WINDOW}s)", "WARN")
+    health[name] = h
+    return True
+
+
+def _check_worker_model(name: str, hwnd: int, h: dict, check_model: bool) -> bool:
+    """Check model/agent for a live worker. Returns True if model is correct."""
+    if not check_model:
+        h["model"] = "unchecked"
+        h["agent"] = "unchecked"
+        return True
+
+    model_name, agent_name = get_model_and_agent_uia(hwnd)
+    model_ok = is_model_correct(model_name) and is_agent_cli(agent_name)
+    h["model"] = model_name
+    h["agent"] = agent_name
+
+    if not model_ok:
+        issues = []
+        if not is_model_correct(model_name): issues.append(f"model='{model_name}'")
+        if not is_agent_cli(agent_name): issues.append(f"agent='{agent_name}'")
+        log(f"{name.upper()}: DRIFT detected {'; '.join(issues)} -- auto-correcting", "FIX")
+        _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
+            "content": f"WORKER {name.upper()} drift: {'; '.join(issues)} -- auto-correcting to Opus fast"})
+        fixed = fix_model_via_uia(hwnd, 0)
+        if fixed:
+            time.sleep(1)
+            model_name, agent_name = get_model_and_agent_uia(hwnd)
+            model_ok = is_model_correct(model_name)
+            log(f"{name.upper()}: after fix model='{model_name}' agent='{agent_name}'", "OK" if model_ok else "WARN")
+            h["model"] = model_name
+            h["agent"] = agent_name
+            _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "report",
+                "content": f"WORKER {name.upper()} fixed: model='{model_name}' agent='{agent_name}'"})
+        try: metrics().record_model_guard(name, model_name, agent_name, model_ok, fixed=bool(not model_ok and fixed))
+        except Exception as e: log(f"Failed to record model guard metrics for {name}: {e}", "WARN")
+    else:
+        try: metrics().record_model_guard(name, model_name, agent_name, model_ok)
+        except Exception as e: log(f"Failed to record model guard metrics for {name}: {e}", "WARN")
+
+    return model_ok
+
+
 def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_orch: bool = False) -> dict:
     health = {}
     any_bad = False
 
-    # ── Check orchestrator model+agent (security-critical) ──────────────────
     if check_orch and orch_hwnd:
-        model_str, agent_str = get_model_and_agent_uia(orch_hwnd)
-        orch_ok = is_model_correct(model_str) and is_agent_cli(agent_str)
-        health["orchestrator"] = {
-            "hwnd": orch_hwnd, "model": model_str, "agent": agent_str,
-            "ok": orch_ok, "checked_at": datetime.now().isoformat()
-        }
-        if not orch_ok:
-            issues = []
-            if not is_model_correct(model_str):
-                issues.append(f"model='{model_str}' (expected Opus 4.6 fast)")
-            if not is_agent_cli(agent_str):
-                issues.append(f"agent='{agent_str}' (expected Copilot CLI)")
-            issue_text = "; ".join(issues)
-            log(f"ORCHESTRATOR DRIFT: {issue_text} -- auto-correcting", "CRIT")
-            skynet_post("/bus/publish", {"sender": "monitor", "topic": "workers", "type": "alert",
-                "content": f"SECURITY: Orchestrator drift detected: {issue_text}. Workers: verify and report."})
-            # Auto-fix model
-            if not is_model_correct(model_str):
-                fixed = fix_model_via_uia(orch_hwnd, 0)
-                if fixed:
-                    time.sleep(1)
-                    model_str2, _ = get_model_and_agent_uia(orch_hwnd)
-                    log(f"Orchestrator model after fix: '{model_str2}'", "OK" if is_model_correct(model_str2) else "WARN")
-                    health["orchestrator"]["model"] = model_str2
-                    health["orchestrator"]["ok"] = is_model_correct(model_str2) and is_agent_cli(agent_str)
-                    skynet_post("/bus/publish", {"sender": "monitor", "topic": "workers", "type": "report",
-                        "content": f"Orchestrator model fixed: '{model_str2}'"})
-        else:
-            log(f"ORCHESTRATOR: OK (model=Opus fast, agent=CLI)", "OK")
-            try: metrics().record_model_guard("orchestrator", model_str, agent_str, orch_ok)
-            except Exception as e: log(f"Failed to record orchestrator model guard metrics: {e}", "WARN")
-
-    # ── Check workers ───────────────────────────────────────────────────────
+        _check_orchestrator_drift(orch_hwnd, health)
 
     for w in workers:
         name = w["name"]
@@ -260,9 +346,9 @@ def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_or
 
         if hwnd == 0:
             h.update({"alive": False, "visible": False, "model": "N/A", "status": "NO_HWND"})
-            log(f"{name.upper()}: no HWND — needs new-chat", "CRIT")
+            log(f"{name.upper()}: no HWND -- needs new-chat", "CRIT")
             skynet_post(f"/worker/{name}/heartbeat", {"hwnd_alive": False, "visible": False, "model": ""})
-            skynet_post("/bus/publish", {"sender": "monitor", "topic": "orchestrator", "type": "alert",
+            _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
                 "content": f"WORKER {name.upper()} has no HWND -- needs new-chat spawn"})
             health[name] = h
             any_bad = True
@@ -273,103 +359,33 @@ def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_or
         h["visible"] = visible
 
         if not alive or not visible:
-            # Debounce: suppress during active dispatch and require 3 consecutive failures
-            if _is_dispatch_active():
-                log(f"{name.upper()}: visibility check failed but dispatch active -- suppressed", "WARN")
-                _dead_consecutive[name] = 0  # reset counter during dispatch
-                h.update({"model": "CHECKING", "status": "DISPATCH_ACTIVE"})
-                health[name] = h
+            if _check_worker_dead(name, hwnd, alive, visible, h, health):
+                any_bad = True
                 continue
 
-            _dead_consecutive[name] = _dead_consecutive.get(name, 0) + 1
-            consecutive = _dead_consecutive[name]
-
-            if consecutive < DEAD_DEBOUNCE_THRESHOLD:
-                log(f"{name.upper()}: visibility check failed ({consecutive}/{DEAD_DEBOUNCE_THRESHOLD}) -- debouncing", "WARN")
-                h.update({"model": "CHECKING", "status": f"DEBOUNCE_{consecutive}"})
-                health[name] = h
-                continue
-
-            # Confirmed DEAD after 3 consecutive failures
-            h.update({"model": "UNKNOWN", "status": "DEAD"})
-            log(f"{name.upper()}: DEAD (hwnd={hwnd} alive={alive} visible={visible}, consecutive={consecutive})", "CRIT")
-            skynet_post(f"/worker/{name}/heartbeat", {"hwnd_alive": False, "visible": False, "model": ""})
-            # Alert dedup: only post bus alert once per ALERT_DEDUP_WINDOW
-            now_ts = time.time()
-            last_ts = _last_alert.get(name, 0)
-            if (now_ts - last_ts) >= ALERT_DEDUP_WINDOW:
-                skynet_post("/bus/publish", {"sender": "monitor", "topic": "orchestrator", "type": "alert",
-                    "content": f"WORKER {name.upper()} DEAD -- hwnd={hwnd} alive={alive} visible={visible} (confirmed {consecutive}x)"})
-                _last_alert[name] = now_ts
-            else:
-                log(f"{name.upper()}: DEAD alert suppressed (dedup window {ALERT_DEDUP_WINDOW}s)", "WARN")
-            health[name] = h
-            any_bad = True
-            continue
-
-        # Window is alive -- reset debounce counter
         _dead_consecutive[name] = 0
-        model_name = ""
-        model_ok = True
-
-        if check_model:
-            model_name, agent_name = get_model_and_agent_uia(hwnd)
-            model_ok = is_model_correct(model_name) and is_agent_cli(agent_name)
-            h["model"] = model_name
-            h["agent"] = agent_name
-
-
-            if not model_ok:
-                issues = []
-                if not is_model_correct(model_name): issues.append(f"model='{model_name}'")
-                if not is_agent_cli(agent_name): issues.append(f"agent='{agent_name}'")
-                log(f"{name.upper()}: DRIFT detected {'; '.join(issues)} -- auto-correcting", "FIX")
-                skynet_post("/bus/publish", {"sender": "monitor", "topic": "orchestrator", "type": "alert",
-                    "content": f"WORKER {name.upper()} drift: {'; '.join(issues)} -- auto-correcting to Opus fast"})
-                fixed = fix_model_via_uia(hwnd, 0)
-                if fixed:
-                    # Re-read
-                    time.sleep(1)
-                    model_name, agent_name = get_model_and_agent_uia(hwnd)
-                    model_ok = is_model_correct(model_name)
-                    log(f"{name.upper()}: after fix model='{model_name}' agent='{agent_name}'", "OK" if model_ok else "WARN")
-                    h["model"] = model_name
-                    h["agent"] = agent_name
-                    skynet_post("/bus/publish", {"sender": "monitor", "topic": "orchestrator", "type": "report",
-                        "content": f"WORKER {name.upper()} fixed: model='{model_name}' agent='{agent_name}'"})
-        else:
-            h["model"] = "unchecked"
-            h["agent"] = "unchecked"
+        model_ok = _check_worker_model(name, hwnd, h, check_model)
 
         h["status"] = "OK" if model_ok else "MODEL_WRONG"
-        
         try:
             from tools.uia_engine import get_engine
             true_state = get_engine().get_state(hwnd)
             if true_state in ("IDLE", "PROCESSING", "STEERING", "TYPING"):
                 h["status"] = true_state
-            else:
-                log(f"DEBUG: {name} truestate was {true_state}", "DEBUG")
         except Exception as e:
             log(f"Exception in get_state: {e}", "WARN")
+
         if model_ok:
             log(f"{name.upper()}: OK (hwnd={hwnd} model={'checked' if check_model else 'skip'})", "OK")
         else:
             any_bad = True
 
-        if check_model:
-            try: metrics().record_model_guard(name, model_name, agent_name, model_ok, fixed=bool(not model_ok and locals().get('fixed')))
-            except Exception as e: log(f"Failed to record model guard metrics for {name}: {e}", "WARN")
-
-        # POST heartbeat to Skynet — this keeps workers_alive accurate
         skynet_post(f"/worker/{name}/heartbeat", {
             "hwnd_alive": True, "visible": True,
-            "model": model_name or "Claude Opus 4.6 (fast mode)", "grid_slot": w.get("grid", "")
+            "model": h.get("model", "") or "Claude Opus 4.6 (fast mode)", "grid_slot": w.get("grid", "")
         })
-
         health[name] = h
 
-    # Restore orchestrator focus after UIA work
     if check_model and orch_hwnd:
         restore_orchestrator_focus(orch_hwnd)
 
@@ -426,15 +442,35 @@ def _cancel_generation(hwnd: int) -> bool:
         return False
 
 
-def _check_stuck_workers(workers: list):
-    """Detect workers stuck in PROCESSING > threshold and attempt auto-recovery.
+def _try_recover_stuck_worker(name: str, hwnd: int, duration_s: int, now: float):
+    """Attempt auto-recovery for a stuck worker via cancel_generation."""
+    log(f"{name.upper()}: PROCESSING for {duration_s}s (>{STUCK_PROCESSING_THRESHOLD}s) -- attempting auto-recovery", "WARN")
+    cancelled = _cancel_generation(hwnd)
+    if cancelled:
+        time.sleep(3)
+        if _get_worker_state(hwnd) == "IDLE":
+            _processing_since.pop(name, None)
+            _stuck_alert_last[name] = now
+            log(f"{name.upper()}: AUTO_RECOVERED -- was stuck PROCESSING for {duration_s}s, now IDLE", "OK")
+            _guarded_bus_publish({
+                "sender": "monitor", "topic": "orchestrator", "type": "alert",
+                "content": f"AUTO_RECOVERED: {name.upper()} was stuck PROCESSING for {duration_s}s, "
+                           f"cancelled generation. Worker is now IDLE."
+            })
+            return
 
-    Logic:
-      1. If PROCESSING > 180s: cancel generation, wait 3s, verify IDLE.
-         On success: post AUTO_RECOVERED alert.
-         On failure: post POTENTIALLY_STUCK alert (existing behavior).
-      2. UNRESPONSIVE (dead window) detection is handled in run_check() -- untouched.
-    """
+    _stuck_alert_last[name] = now
+    log(f"{name.upper()}: POTENTIALLY_STUCK -- cancel {'succeeded' if cancelled else 'failed'} but worker still not IDLE", "CRIT")
+    _guarded_bus_publish({
+        "sender": "monitor", "topic": "orchestrator", "type": "alert",
+        "content": f"POTENTIALLY_STUCK: {name.upper()} has been PROCESSING for {duration_s}s. "
+                   f"Auto-recovery {'attempted but worker not IDLE' if cancelled else 'failed (cancel_generation error)'}. "
+                   f"Manual intervention may be needed."
+    })
+
+
+def _check_stuck_workers(workers: list):
+    """Detect workers stuck in PROCESSING > threshold and attempt auto-recovery."""
     now = time.time()
     for w in workers:
         name = w["name"]
@@ -444,8 +480,6 @@ def _check_stuck_workers(workers: list):
             continue
 
         state = _get_worker_state(hwnd)
-
-        # Track PROCESSING start time
         if state == "PROCESSING":
             if name not in _processing_since:
                 _processing_since[name] = now
@@ -453,7 +487,6 @@ def _check_stuck_workers(workers: list):
             _processing_since.pop(name, None)
             continue
 
-        # Check if over threshold
         proc_start = _processing_since.get(name)
         if proc_start is None:
             continue
@@ -461,40 +494,10 @@ def _check_stuck_workers(workers: list):
         if duration < STUCK_PROCESSING_THRESHOLD:
             continue
 
-        # Dedup: skip if already alerted within window
-        last_alert = _stuck_alert_last.get(name, 0)
-        if now - last_alert < STUCK_DEDUP_WINDOW:
+        if now - _stuck_alert_last.get(name, 0) < STUCK_DEDUP_WINDOW:
             continue
 
-        duration_s = int(duration)
-        log(f"{name.upper()}: PROCESSING for {duration_s}s (>{STUCK_PROCESSING_THRESHOLD}s) -- attempting auto-recovery", "WARN")
-
-        # Attempt cancel_generation
-        cancelled = _cancel_generation(hwnd)
-        if cancelled:
-            time.sleep(3)
-            new_state = _get_worker_state(hwnd)
-            if new_state == "IDLE":
-                # Success -- worker recovered
-                _processing_since.pop(name, None)
-                _stuck_alert_last[name] = now
-                log(f"{name.upper()}: AUTO_RECOVERED -- was stuck PROCESSING for {duration_s}s, now IDLE", "OK")
-                skynet_post("/bus/publish", {
-                    "sender": "monitor", "topic": "orchestrator", "type": "alert",
-                    "content": f"AUTO_RECOVERED: {name.upper()} was stuck PROCESSING for {duration_s}s, "
-                               f"cancelled generation. Worker is now IDLE."
-                })
-                continue
-
-        # Cancel failed or worker still not IDLE -- fall back to existing alert
-        _stuck_alert_last[name] = now
-        log(f"{name.upper()}: POTENTIALLY_STUCK -- cancel {'succeeded' if cancelled else 'failed'} but worker still not IDLE", "CRIT")
-        skynet_post("/bus/publish", {
-            "sender": "monitor", "topic": "orchestrator", "type": "alert",
-            "content": f"POTENTIALLY_STUCK: {name.upper()} has been PROCESSING for {duration_s}s. "
-                       f"Auto-recovery {'attempted but worker not IDLE' if cancelled else 'failed (cancel_generation error)'}. "
-                       f"Manual intervention may be needed."
-        })
+        _try_recover_stuck_worker(name, hwnd, int(duration), now)
 
 
 REALTIME_FILE = DATA_DIR / "realtime.json"
@@ -579,6 +582,72 @@ def _get_pending_work_count() -> int:
     return count
 
 
+def _init_productivity_entry(name: str, now: float):
+    """Initialize productivity tracking for a worker if not already tracked."""
+    if name not in _worker_productivity:
+        _worker_productivity[name] = {
+            "tasks_completed": 0, "first_seen": now, "last_result_time": now,
+            "results_this_hour": 0, "hour_start": now,
+        }
+
+
+def _check_idle_unproductive(name: str, hwnd: int, alive: bool, pending_work: int, now: float):
+    """Track idle streaks and alert if worker is idle with pending work."""
+    state = "UNKNOWN"
+    if alive and hwnd:
+        try:
+            state = _get_worker_state(hwnd)
+        except Exception:
+            pass
+
+    if state == "IDLE":
+        if name not in _idle_since:
+            _idle_since[name] = now
+        else:
+            idle_duration = now - _idle_since[name]
+            if idle_duration > _IDLE_UNPRODUCTIVE_THRESHOLD and pending_work > 0:
+                log(f"{name.upper()}: IDLE for {int(idle_duration)}s with {pending_work} pending work items -- UNPRODUCTIVE", "WARN")
+                _guarded_bus_publish({
+                    "sender": "monitor", "topic": "orchestrator", "type": "alert",
+                    "content": f"IDLE_UNPRODUCTIVE: {name.upper()} idle {int(idle_duration)}s with {pending_work} pending tasks. Dispatch work!"
+                })
+                _idle_since[name] = now  # reset to avoid spamming
+    else:
+        _idle_since.pop(name, None)
+
+
+def _update_result_counts(now: float):
+    """Poll bus for recent worker results and update productivity counters."""
+    try:
+        req = urllib.request.Request(f"{SKYNET_URL}/bus/messages?topic=orchestrator&limit=20")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            msgs = json.loads(r.read())
+            if not isinstance(msgs, list):
+                return
+            for m in msgs:
+                if m.get("type") != "result":
+                    continue
+                sender = m.get("sender", "")
+                if sender not in _worker_productivity:
+                    continue
+                ts = m.get("timestamp", "")
+                try:
+                    from datetime import timezone
+                    msg_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if msg_time.tzinfo:
+                        age = (datetime.now(timezone.utc) - msg_time).total_seconds()
+                    else:
+                        age = (datetime.now() - msg_time).total_seconds()
+                    if age < 30:
+                        _worker_productivity[sender]["tasks_completed"] += 1
+                        _worker_productivity[sender]["results_this_hour"] += 1
+                        _worker_productivity[sender]["last_result_time"] = now
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _track_productivity(workers: list, health: dict):
     """Track worker productivity: tasks completed per hour, idle-but-unproductive detection."""
     global _worker_productivity, _idle_since
@@ -588,77 +657,17 @@ def _track_productivity(workers: list, health: dict):
     for w in workers:
         name = w["name"]
         h = health.get(name, {})
-        status = h.get("status", "UNKNOWN")
-        alive = h.get("alive", False)
 
-        # Initialize productivity tracking
-        if name not in _worker_productivity:
-            _worker_productivity[name] = {
-                "tasks_completed": 0,
-                "first_seen": now,
-                "last_result_time": now,
-                "results_this_hour": 0,
-                "hour_start": now,
-            }
+        _init_productivity_entry(name, now)
 
         prod = _worker_productivity[name]
-
-        # Reset hourly counter if hour rolled over
         if now - prod["hour_start"] >= 3600:
             prod["results_this_hour"] = 0
             prod["hour_start"] = now
 
-        # Track idle streaks
-        state = "UNKNOWN"
-        if alive and w.get("hwnd", 0):
-            try:
-                state = _get_worker_state(w["hwnd"])
-            except Exception:
-                pass
+        _check_idle_unproductive(name, w.get("hwnd", 0), h.get("alive", False), pending_work, now)
 
-        if state == "IDLE":
-            if name not in _idle_since:
-                _idle_since[name] = now
-            else:
-                idle_duration = now - _idle_since[name]
-                if idle_duration > _IDLE_UNPRODUCTIVE_THRESHOLD and pending_work > 0:
-                    log(f"{name.upper()}: IDLE for {int(idle_duration)}s with {pending_work} pending work items -- UNPRODUCTIVE", "WARN")
-                    skynet_post("/bus/publish", {
-                        "sender": "monitor", "topic": "orchestrator", "type": "alert",
-                        "content": f"IDLE_UNPRODUCTIVE: {name.upper()} idle {int(idle_duration)}s with {pending_work} pending tasks. Dispatch work!"
-                    })
-                    # Reset to avoid spamming (re-alert after another threshold period)
-                    _idle_since[name] = now
-        else:
-            _idle_since.pop(name, None)
-
-    # Check bus for recent results to update productivity counters
-    try:
-        req = urllib.request.Request(f"{SKYNET_URL}/bus/messages?topic=orchestrator&limit=20")
-        with urllib.request.urlopen(req, timeout=5) as r:
-            msgs = json.loads(r.read())
-            if isinstance(msgs, list):
-                for m in msgs:
-                    if m.get("type") == "result":
-                        sender = m.get("sender", "")
-                        if sender in _worker_productivity:
-                            # Simple dedup: only count if timestamp is fresh (last 30s)
-                            ts = m.get("timestamp", "")
-                            try:
-                                from datetime import timezone
-                                msg_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                                if msg_time.tzinfo:
-                                    age = (datetime.now(timezone.utc) - msg_time).total_seconds()
-                                else:
-                                    age = (datetime.now() - msg_time).total_seconds()
-                                if age < 30:
-                                    _worker_productivity[sender]["tasks_completed"] += 1
-                                    _worker_productivity[sender]["results_this_hour"] += 1
-                                    _worker_productivity[sender]["last_result_time"] = now
-                            except Exception:
-                                pass
-    except Exception:
-        pass
+    _update_result_counts(now)
 
 
 def _get_productivity_summary() -> dict:
@@ -677,31 +686,20 @@ def _get_productivity_summary() -> dict:
     return summary
 
 
-def _auto_restart_stale_daemons():
-    """Check if realtime and SSE daemons are alive; restart if dead.
+def _try_restart_daemon(daemon_name: str, pid_file: Path, script_path: Path, now: float) -> bool:
+    """Attempt to restart a stale daemon with cooldown and double-check guards.
 
-    Guards against cascading duplicates:
-    - 60s cooldown per daemon after any restart
-    - Double-check PID file after 2s sleep before spawning
-    - Only restarts managed daemons with real PID files
-      (god_console/bus_relay are orchestrator-managed)
+    Returns True if restart was initiated or skipped (already alive).
     """
-    global _restart_cooldowns
-    now = time.time()
-
-    def _is_on_cooldown(daemon_name: str) -> bool:
-        last = _restart_cooldowns.get(daemon_name, 0)
-        elapsed = now - last
-        if elapsed < RESTART_COOLDOWN_SECONDS:
-            log(f"COOLDOWN: {daemon_name} restarted {int(elapsed)}s ago (need {RESTART_COOLDOWN_SECONDS}s) -- skipping", "WARN")
-            return True
+    last = _restart_cooldowns.get(daemon_name, 0)
+    if (now - last) < RESTART_COOLDOWN_SECONDS:
+        log(f"COOLDOWN: {daemon_name} restarted {int(now - last)}s ago (need {RESTART_COOLDOWN_SECONDS}s) -- skipping", "WARN")
         return False
 
-    def _pid_file_is_alive(pid_file) -> bool:
-        """Check if a PID file exists and its process is running."""
+    def _pid_file_is_alive(pf: Path) -> bool:
         try:
-            if pid_file.exists():
-                pid = int(pid_file.read_text().strip())
+            if pf.exists():
+                pid = int(pf.read_text().strip())
                 import os
                 os.kill(pid, 0)
                 return True
@@ -709,80 +707,70 @@ def _auto_restart_stale_daemons():
             pass
         return False
 
+    # Double-check: sleep 2s then re-check PID (daemon may be starting)
+    import time as _t
+    _t.sleep(2)
+    if _pid_file_is_alive(pid_file):
+        log(f"{daemon_name} PID appeared after 2s wait -- NOT restarting", "WARN")
+        return False
+
+    rt_status = _check_realtime_daemon()
+    if rt_status.get("alive"):
+        log(f"{daemon_name} state file became fresh during double-check -- NOT restarting", "WARN")
+        return False
+
+    log(f"{daemon_name} confirmed dead after double-check -- restarting", "FIX")
+    try:
+        import subprocess as sp
+        sp.Popen(
+            [_REAL_PYTHON, str(script_path)],
+            env=_DAEMON_ENV,
+            creationflags=BACKGROUND_SPAWN_FLAGS,
+            stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+        )
+        _restart_cooldowns[daemon_name] = time.time()
+        log(f"{daemon_name} restart initiated (cooldown set)", "OK")
+        _guarded_bus_publish({
+            "sender": "monitor", "topic": "orchestrator", "type": "report",
+            "content": f"AUTO_RESTART: {daemon_name} was dead, restarted automatically (60s cooldown active)"
+        })
+        return True
+    except Exception as e:
+        log(f"{daemon_name} restart failed: {e}", "ERR")
+        return False
+
+
+def _auto_restart_stale_daemons():
+    """Check if realtime and SSE daemons are alive; restart if dead."""
+    global _restart_cooldowns
+    now = time.time()
+
     # ── Realtime daemon ──
     rt_status = _check_realtime_daemon()
     if REALTIME_PID_FILE.exists() and not rt_status["alive"]:
-        if _is_on_cooldown("realtime"):
-            pass  # skip
-        else:
-            # Double-check: sleep 2s then re-check PID (daemon may be starting)
-            import time as _t
-            _t.sleep(2)
-            if _pid_file_is_alive(REALTIME_PID_FILE):
-                log("Realtime daemon PID appeared after 2s wait -- NOT restarting", "WARN")
-            else:
-                # Re-verify freshness one more time
-                rt_status2 = _check_realtime_daemon()
-                if rt_status2["alive"]:
-                    log("Realtime daemon became alive during double-check -- NOT restarting", "WARN")
-                else:
-                    log("Realtime daemon confirmed dead after double-check -- restarting", "FIX")
-                    try:
-                        import subprocess as sp
-                        sp.Popen(
-                            [_REAL_PYTHON, str(REALTIME_DAEMON_SCRIPT)],
-                            env=_DAEMON_ENV,
-                            creationflags=BACKGROUND_SPAWN_FLAGS,
-                            stdout=sp.DEVNULL, stderr=sp.DEVNULL,
-                        )
-                        _restart_cooldowns["realtime"] = time.time()
-                        log("Realtime daemon restart initiated (cooldown set)", "OK")
-                        skynet_post("/bus/publish", {
-                            "sender": "monitor", "topic": "orchestrator", "type": "report",
-                            "content": "AUTO_RESTART: Realtime daemon was dead, restarted automatically (60s cooldown active)"
-                        })
-                    except Exception as e:
-                        log(f"Realtime daemon restart failed: {e}", "ERR")
+        _try_restart_daemon("realtime", REALTIME_PID_FILE, REALTIME_DAEMON_SCRIPT, now)
 
     # ── SSE daemon ──
     sse_pid_file = DATA_DIR / "sse_daemon.pid"
-    sse_alive = _pid_file_is_alive(sse_pid_file)
-    sse_state = _check_realtime_daemon()
 
-    if not sse_alive and sse_state.get("alive"):
+    def _sse_pid_alive():
+        try:
+            if sse_pid_file.exists():
+                pid = int(sse_pid_file.read_text().strip())
+                import os
+                os.kill(pid, 0)
+                return True
+        except (OSError, ValueError):
+            pass
+        return False
+
+    sse_alive = _sse_pid_alive()
+    if not sse_alive and _check_realtime_daemon().get("alive"):
         log("SSE state file is fresh -- NOT restarting despite missing/stale PID", "WARN")
     elif not sse_alive and SSE_DAEMON_SCRIPT.exists():
-        if _is_on_cooldown("sse"):
-            pass  # skip
-        else:
-            # Double-check: sleep 2s then re-check PID
-            import time as _t
-            _t.sleep(2)
-            if _pid_file_is_alive(sse_pid_file):
-                log("SSE daemon PID appeared after 2s wait -- NOT restarting", "WARN")
-            elif _check_realtime_daemon().get("alive"):
-                log("SSE state file became fresh during double-check -- NOT restarting", "WARN")
-            else:
-                log("SSE daemon confirmed dead after double-check -- restarting", "FIX")
-                try:
-                    import subprocess as sp
-                    sp.Popen(
-                        [_REAL_PYTHON, str(SSE_DAEMON_SCRIPT)],
-                        env=_DAEMON_ENV,
-                        creationflags=BACKGROUND_SPAWN_FLAGS,
-                        stdout=sp.DEVNULL, stderr=sp.DEVNULL,
-                    )
-                    _restart_cooldowns["sse"] = time.time()
-                    log("SSE daemon restart initiated (cooldown set)", "OK")
-                    skynet_post("/bus/publish", {
-                        "sender": "monitor", "topic": "orchestrator", "type": "report",
-                        "content": "AUTO_RESTART: SSE daemon was dead, restarted automatically (60s cooldown active)"
-                    })
-                except Exception as e:
-                    log(f"SSE daemon restart failed: {e}", "ERR")
+        _try_restart_daemon("sse", sse_pid_file, SSE_DAEMON_SCRIPT, now)
 
     # NOTE: god_console.py and skynet_bus_relay.py are NOT auto-restarted here.
-    # Those are managed exclusively by the orchestrator.
 
 
 def _record_health_trend(health: dict, productivity: dict, pending_work: int):
@@ -931,20 +919,75 @@ def main():
             pass
 
 
+def _run_monitor_cycle(workers, orch_hwnd, args, cycle, now, last_model_check, last_orch_check) -> tuple:
+    """Execute one monitor cycle. Returns (health, do_model, do_orch)."""
+    if cycle % 10 == 0:
+        _cleanup_stale_workers()
+
+    new_workers, new_orch, changed = _reload_workers_if_changed()
+    if changed and new_workers is not None:
+        workers[:] = new_workers
+        orch_hwnd = new_orch
+        log(f"Workers reloaded: {len(workers)} workers, orch_hwnd={orch_hwnd}", "OK")
+
+    do_model = (now - last_model_check) >= args.model_interval
+    do_orch = (now - last_orch_check) >= ORCH_MODEL_CHECK_INTERVAL
+
+    health = run_check(workers, orch_hwnd, check_model=do_model, check_orch=do_orch)
+    write_health(health)
+
+    _check_stuck_workers(workers)
+
+    _track_productivity(workers, health)
+    productivity = _get_productivity_summary()
+    pending_work = _get_pending_work_count()
+    _record_health_trend(health, productivity, pending_work)
+
+    return health, do_model, do_orch, orch_hwnd, productivity, pending_work
+
+
+def _handle_periodic_tasks(cycle, health, workers, productivity, pending_work, now,
+                           last_daemon_restart_check, DAEMON_CHECK_INTERVAL):
+    """Handle periodic bus heartbeats, intelligence metrics, and daemon restarts."""
+    if cycle % 6 == 0:
+        alive_count = sum(1 for h in health.values() if isinstance(h, dict) and h.get("alive"))
+        prod_summary = "; ".join(f"{n}={p.get('tasks_per_hour', 0):.1f}t/h" for n, p in productivity.items())
+        _guarded_bus_publish({
+            "sender": "monitor", "topic": "orchestrator", "type": "heartbeat",
+            "content": f"Monitor cycle {cycle}: {alive_count}/{len(workers)} alive, pending={pending_work}. Productivity: {prod_summary}",
+            "metadata": {k: (v.get("status", "?") if isinstance(v, dict) else str(v)) for k, v in health.items()}
+        })
+
+        intel = _collect_intelligence_metrics()
+        health["intelligence"] = intel
+
+        rt_status = _check_realtime_daemon()
+        health["realtime_daemon"] = rt_status
+        if not rt_status["alive"]:
+            content = "REALTIME STATE STALE -- data/realtime.json stale or missing"
+            if rt_status.get("managed_process"):
+                content = "REALTIME DAEMON DOWN -- data/realtime.json stale or missing"
+            _guarded_bus_publish({
+                "sender": "monitor", "topic": "orchestrator", "type": "alert",
+                "content": content
+            })
+
+        write_health(health)
+
+    if (now - last_daemon_restart_check) >= DAEMON_CHECK_INTERVAL:
+        _auto_restart_stale_daemons()
+        return now  # new last_daemon_restart_check
+    return last_daemon_restart_check
+
+
 def _run_monitor(args):
-    """Inner monitor loop, called from main() after PID guard.
-    
-    Level 4 upgrade: auto-reloads workers.json on change, tracks productivity,
-    detects idle-but-unproductive workers, auto-restarts stale daemons,
-    logs health trends to data/monitor_health.json.
-    """
+    """Inner monitor loop, called from main() after PID guard."""
     global _workers_mtime
 
     workers, orch_hwnd = load_workers()
     _workers_mtime = WORKERS_FILE.stat().st_mtime if WORKERS_FILE.exists() else 0
     log(f"Skynet Monitor starting -- watching {len(workers)} workers", "INFO")
     log(f"HWND check every {args.hwnd_interval}s | Model check every {args.model_interval}s", "INFO")
-    log(f"L4 features: auto-reload, productivity tracking, daemon auto-restart, health trends", "INFO")
 
     if args.once:
         health = run_check(workers, orch_hwnd, check_model=True)
@@ -958,40 +1001,25 @@ def _run_monitor(args):
     last_orch_check = 0.0
     last_daemon_restart_check = 0.0
     cycle = 0
-    consecutive_idle = 0       # tracks consecutive all-IDLE scans for adaptive interval
-    current_interval = args.hwnd_interval  # adaptive: starts at base, may increase
-    DAEMON_CHECK_INTERVAL = 120  # check daemon health every 2 minutes
+    consecutive_idle = 0
+    current_interval = args.hwnd_interval
+    DAEMON_CHECK_INTERVAL = 120
 
     try:
         while True:
-            # Max runtime guard
             if max_runtime and (time.time() - start_time) >= max_runtime:
                 log(f"Max runtime {max_runtime}s reached -- shutting down gracefully", "INFO")
-                skynet_post("/bus/publish", {"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",
+                _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",
                     "content": f"Monitor shutdown: max_runtime={max_runtime}s reached after {cycle} cycles"})
                 break
             try:
                 cycle += 1
                 now = time.time()
 
-                # ── Cleanup stale tracking entries every 10 cycles ──────
-                if cycle % 10 == 0:
-                    _cleanup_stale_workers()
+                health, do_model, do_orch, orch_hwnd, productivity, pending_work = \
+                    _run_monitor_cycle(workers, orch_hwnd, args, cycle, now, last_model_check, last_orch_check)
 
-                # ── AUTO-RELOAD workers.json if changed ────────────────────
-                new_workers, new_orch, changed = _reload_workers_if_changed()
-                if changed and new_workers is not None:
-                    workers = new_workers
-                    orch_hwnd = new_orch
-                    log(f"Workers reloaded: {len(workers)} workers, orch_hwnd={orch_hwnd}", "OK")
-
-                do_model = (now - last_model_check) >= args.model_interval
-                do_orch = (now - last_orch_check) >= ORCH_MODEL_CHECK_INTERVAL
-
-                health = run_check(workers, orch_hwnd, check_model=do_model, check_orch=do_orch)
-                write_health(health)
-
-                # ── Adaptive interval: slow down when all workers IDLE ───
+                # Adaptive interval: slow down when all workers IDLE
                 all_idle = all(
                     w.get("state", "").upper() == "IDLE"
                     for w in health.get("workers", {}).values()
@@ -1008,58 +1036,14 @@ def _run_monitor(args):
                     consecutive_idle = 0
                     current_interval = args.hwnd_interval
 
-                # ── Stuck worker detection with auto-recovery ───────────────
-                _check_stuck_workers(workers)
-
-                # ── Productivity tracking (every cycle) ─────────────────────
-                _track_productivity(workers, health)
-                productivity = _get_productivity_summary()
-                pending_work = _get_pending_work_count()
-
-                # ── Health trend logging (every cycle) ──────────────────────
-                _record_health_trend(health, productivity, pending_work)
-
                 if do_model:
                     last_model_check = now
                 if do_orch:
                     last_orch_check = now
 
-                # Post periodic bus heartbeat from monitor (with productivity data)
-                if cycle % 6 == 0:  # every ~60s
-                    alive_count = sum(1 for h in health.values() if isinstance(h, dict) and h.get("alive"))
-                    prod_summary = "; ".join(
-                        f"{n}={p.get('tasks_per_hour', 0):.1f}t/h"
-                        for n, p in productivity.items()
-                    )
-                    skynet_post("/bus/publish", {
-                        "sender": "monitor", "topic": "orchestrator", "type": "heartbeat",
-                        "content": f"Monitor cycle {cycle}: {alive_count}/{len(workers)} alive, pending={pending_work}. Productivity: {prod_summary}",
-                        "metadata": {k: (v.get("status", "?") if isinstance(v, dict) else str(v)) for k, v in health.items()}
-                    })
-
-                # Collect intelligence metrics (knowledge flow + convene sessions)
-                if cycle % 6 == 0:
-                    intel = _collect_intelligence_metrics()
-                    health["intelligence"] = intel
-
-                    # Check realtime daemon liveness
-                    rt_status = _check_realtime_daemon()
-                    health["realtime_daemon"] = rt_status
-                    if not rt_status["alive"]:
-                        content = "REALTIME STATE STALE -- data/realtime.json stale or missing"
-                        if rt_status.get("managed_process"):
-                            content = "REALTIME DAEMON DOWN -- data/realtime.json stale or missing"
-                        skynet_post("/bus/publish", {
-                            "sender": "monitor", "topic": "orchestrator", "type": "alert",
-                            "content": content
-                        })
-
-                    write_health(health)
-
-                # ── Auto-restart stale daemons (every 2 minutes) ────────────
-                if (now - last_daemon_restart_check) >= DAEMON_CHECK_INTERVAL:
-                    last_daemon_restart_check = now
-                    _auto_restart_stale_daemons()
+                last_daemon_restart_check = _handle_periodic_tasks(
+                    cycle, health, workers, productivity, pending_work, now,
+                    last_daemon_restart_check, DAEMON_CHECK_INTERVAL)
 
             except Exception as e:
                 log(f"Monitor cycle error: {e}", "ERR")
@@ -1067,7 +1051,7 @@ def _run_monitor(args):
             time.sleep(current_interval)
     except KeyboardInterrupt:
         log("Monitor shutting down (Ctrl+C)", "INFO")
-        skynet_post("/bus/publish", {"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",
+        _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",
             "content": f"Monitor shutdown: KeyboardInterrupt after {cycle} cycles"})
 
 

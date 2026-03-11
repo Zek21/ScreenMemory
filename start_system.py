@@ -100,43 +100,23 @@ def verify_pid(pid):
         return False
 
 
-def main():
-    print("=" * 60)
-    print("  ScreenMemory System Starter")
-    print("=" * 60)
-
-    # Step 1: Kill existing processes
-    print("\n[1/5] Killing existing processes...")
-    kill_existing()
-
-    # Step 2: Wait for port 8420 to be free
-    print(f"\n[2/5] Waiting for port {PORT} to be free...")
-    if wait_for_port_free(PORT):
-        print(f"  Port {PORT} is free")
-    else:
-        print(f"  WARNING: Port {PORT} still in use after timeout")
-        sys.exit(1)
-
-    # Step 3: Start all 6 processes
-    print("\n[3/5] Starting processes...")
+def _start_all_processes():
+    """Start all system processes and return (pids_dict, launchers_list)."""
     pids = {}
     launchers = []
 
-    # Dashboard server
     pid, launcher = start_process("dashboard_server.py")
     pids["dashboard_server"] = pid
     if launcher:
         launchers.append(launcher)
     print(f"  dashboard_server.py  -> PID {pid}")
 
-    # Auto orchestrator
     pid, launcher = start_process("auto_orchestrator.py")
     pids["auto_orchestrator"] = pid
     if launcher:
         launchers.append(launcher)
     print(f"  auto_orchestrator.py -> PID {pid}")
 
-    # 4 pool workers (generic — replaces role-based agent workers)
     for wid in range(4):
         pid, launcher = start_process("worker_pool.py", ["--id", str(wid)])
         pids[f"worker_pool_{wid}"] = pid
@@ -144,20 +124,11 @@ def main():
             launchers.append(launcher)
         print(f"  worker_pool.py  {wid}     -> PID {pid}")
 
-    # Step 4: Write PID file
-    print(f"\n[4/5] Writing PID file to {PID_FILE}...")
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    pids["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    if launchers:
-        pids["_launchers"] = launchers
-    with open(PID_FILE, "w") as f:
-        json.dump(pids, f, indent=2)
-    print("  Done")
+    return pids, launchers
 
-    # Step 5: Verify processes after 2 seconds
-    print("\n[5/5] Verifying processes (waiting 2s)...")
-    time.sleep(2)
 
+def _verify_processes(pids):
+    """Verify all started processes are alive. Returns (running_count, all_ok)."""
     all_ok = True
     for name, pid in pids.items():
         if name in ("started_at", "_launchers"):
@@ -168,10 +139,42 @@ def main():
         print(f"  [{marker:4s}] {name:25s} PID {pid:6d}  {status}")
         if not alive:
             all_ok = False
-
-    # Summary
     running = sum(1 for k, v in pids.items()
                   if k not in ("started_at", "_launchers") and verify_pid(v))
+    return running, all_ok
+
+
+def main():
+    print("=" * 60)
+    print("  ScreenMemory System Starter")
+    print("=" * 60)
+
+    print("\n[1/5] Killing existing processes...")
+    kill_existing()
+
+    print(f"\n[2/5] Waiting for port {PORT} to be free...")
+    if wait_for_port_free(PORT):
+        print(f"  Port {PORT} is free")
+    else:
+        print(f"  WARNING: Port {PORT} still in use after timeout")
+        sys.exit(1)
+
+    print("\n[3/5] Starting processes...")
+    pids, launchers = _start_all_processes()
+
+    print(f"\n[4/5] Writing PID file to {PID_FILE}...")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    pids["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    if launchers:
+        pids["_launchers"] = launchers
+    with open(PID_FILE, "w") as f:
+        json.dump(pids, f, indent=2)
+    print("  Done")
+
+    print("\n[5/5] Verifying processes (waiting 2s)...")
+    time.sleep(2)
+    running, all_ok = _verify_processes(pids)
+
     print("\n" + "=" * 60)
     if all_ok:
         print(f"  All {running}/6 processes running successfully!")

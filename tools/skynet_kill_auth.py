@@ -254,14 +254,7 @@ def collect_votes(request_id, timeout=CONSENSUS_TIMEOUT):
 # ── Orchestrator Side: Full Authorization Flow ───────────────────────────
 
 def process_kill_request(request_data):
-    """Full orchestrator-side kill authorization flow.
-
-    Args:
-        request_data: dict with pid, name, reason, requester, request_id
-
-    Returns:
-        (authorized, reason, vote_record)
-    """
+    """Full orchestrator-side kill authorization flow."""
     request_id = request_data["request_id"]
     pid = request_data.get("pid")
     name = request_data.get("name", "unknown")
@@ -269,68 +262,63 @@ def process_kill_request(request_data):
     requester = request_data.get("requester", "unknown")
 
     log_entry = {
-        "request_id": request_id,
-        "pid": pid,
-        "name": name,
-        "reason": reason,
-        "requester": requester,
+        "request_id": request_id, "pid": pid, "name": name,
+        "reason": reason, "requester": requester,
         "timestamp": datetime.now().isoformat(),
     }
 
-    # Step 1: Check critical_processes.json — instant deny
     protected, protect_reason = _is_protected(pid=pid, name=name)
     if protected:
-        log_entry["decision"] = "DENIED"
-        log_entry["deny_reason"] = f"PROTECTED: {protect_reason}"
-        log_entry["votes"] = {}
-        _append_kill_log(log_entry)
-        _bus_post({
-            "sender": "orchestrator",
-            "topic": "workers",
-            "type": "kill_denied",
-            "content": json.dumps({"request_id": request_id, "reason": protect_reason}),
-        })
-        print(f"[kill-auth] DENIED (protected): {request_id} - {protect_reason}")
-        return False, protect_reason, {}
+        return _deny_protected(log_entry, request_id, protect_reason)
 
-    # Step 2: Broadcast consensus check
     _add_pending({
-        "request_id": request_id,
-        "pid": pid,
-        "name": name,
-        "reason": reason,
-        "requester": requester,
-        "status": "voting",
-        "timestamp": datetime.now().isoformat(),
+        "request_id": request_id, "pid": pid, "name": name,
+        "reason": reason, "requester": requester,
+        "status": "voting", "timestamp": datetime.now().isoformat(),
     })
     broadcast_consensus_check(request_id, pid, name, reason, requester)
 
-    # Step 3: Collect votes
     all_safe, votes = collect_votes(request_id)
     log_entry["votes"] = votes
 
-    # Step 4: Decision
     if all_safe:
-        log_entry["decision"] = "AUTHORIZED"
-        _append_kill_log(log_entry)
-        _remove_pending(request_id)
-        print(f"[kill-auth] AUTHORIZED: {request_id} (all workers voted safe)")
-        return True, "All workers voted safe", votes
-    else:
-        blockers = [f"{w}: {v['reason']}" for w, v in votes.items() if not v["safe"]]
-        deny_reason = "Blocked by: " + "; ".join(blockers)
-        log_entry["decision"] = "DENIED"
-        log_entry["deny_reason"] = deny_reason
-        _append_kill_log(log_entry)
-        _remove_pending(request_id)
-        _bus_post({
-            "sender": "orchestrator",
-            "topic": "workers",
-            "type": "kill_denied",
-            "content": json.dumps({"request_id": request_id, "reason": deny_reason}),
-        })
-        print(f"[kill-auth] DENIED: {request_id} - {deny_reason}")
-        return False, deny_reason, votes
+        return _authorize_consensus(log_entry, request_id, votes)
+    return _deny_consensus(log_entry, request_id, votes)
+
+
+def _deny_protected(log_entry, request_id, protect_reason):
+    """Deny a kill request for a protected process."""
+    log_entry["decision"] = "DENIED"
+    log_entry["deny_reason"] = f"PROTECTED: {protect_reason}"
+    log_entry["votes"] = {}
+    _append_kill_log(log_entry)
+    _bus_post({"sender": "orchestrator", "topic": "workers", "type": "kill_denied",
+               "content": json.dumps({"request_id": request_id, "reason": protect_reason})})
+    print(f"[kill-auth] DENIED (protected): {request_id} - {protect_reason}")
+    return False, protect_reason, {}
+
+
+def _authorize_consensus(log_entry, request_id, votes):
+    """Authorize a kill after all workers voted safe."""
+    log_entry["decision"] = "AUTHORIZED"
+    _append_kill_log(log_entry)
+    _remove_pending(request_id)
+    print(f"[kill-auth] AUTHORIZED: {request_id} (all workers voted safe)")
+    return True, "All workers voted safe", votes
+
+
+def _deny_consensus(log_entry, request_id, votes):
+    """Deny a kill when one or more workers voted unsafe."""
+    blockers = [f"{w}: {v['reason']}" for w, v in votes.items() if not v["safe"]]
+    deny_reason = "Blocked by: " + "; ".join(blockers)
+    log_entry["decision"] = "DENIED"
+    log_entry["deny_reason"] = deny_reason
+    _append_kill_log(log_entry)
+    _remove_pending(request_id)
+    _bus_post({"sender": "orchestrator", "topic": "workers", "type": "kill_denied",
+               "content": json.dumps({"request_id": request_id, "reason": deny_reason})})
+    print(f"[kill-auth] DENIED: {request_id} - {deny_reason}")
+    return False, deny_reason, votes
 
 
 def execute_kill(pid):
@@ -449,37 +437,34 @@ def main():
     sub.add_parser("test", help="Run simulation test")
 
     args = parser.parse_args()
+    _dispatch_cli_command(args, parser)
 
+
+def _dispatch_cli_command(args, parser):
+    """Route CLI subcommand to the appropriate handler."""
     if args.cmd == "request":
         rid = request_kill(args.pid, args.name, args.reason, args.requester)
         print(f"Request ID: {rid}")
-
     elif args.cmd == "pending":
         pending = get_pending_requests()
         if not pending:
             print("No pending kill requests.")
         for p in pending:
             print(json.dumps(p, indent=2))
-
     elif args.cmd == "log":
         for entry in get_kill_log():
             print(json.dumps(entry, indent=2))
-
     elif args.cmd == "authorize":
         ok, msg = authorize_kill_manual(args.request_id)
         print(f"{'OK' if ok else 'FAIL'}: {msg}")
-
     elif args.cmd == "deny":
         ok, msg = deny_kill_manual(args.request_id, args.reason)
         print(f"{'OK' if ok else 'FAIL'}: {msg}")
-
     elif args.cmd == "vote":
         ok = vote_kill(args.request_id, args.worker, args.safe, args.reason)
         print(f"Vote posted: {ok}")
-
     elif args.cmd == "test":
         run_test()
-
     else:
         parser.print_help()
 
@@ -489,26 +474,35 @@ def run_test():
     print("=" * 60)
     print("KILL AUTHORIZATION PROTOCOL SIMULATION")
     print("=" * 60)
+    _test_protected_process_deny()
+    _test_worker_request_posts_to_bus()
+    _test_vote_mechanism()
+    _test_pending_request_tracking()
+    _test_manual_deny()
+    _test_kill_log_persistence()
+    print("\n" + "=" * 60)
+    print("ALL TESTS PASSED")
+    print("=" * 60)
 
-    # Test 1: Protected process — instant deny
+
+def _test_protected_process_deny():
     print("\n[TEST 1] Request kill of protected process (skynet.exe)")
     result = process_kill_request({
-        "request_id": "test_protected",
-        "pid": 24072,
-        "name": "skynet.exe",
-        "reason": "test",
-        "requester": "gamma",
+        "request_id": "test_protected", "pid": 24072,
+        "name": "skynet.exe", "reason": "test", "requester": "gamma",
     })
     assert result[0] == False, "Should deny protected process"
     print("  PASS: Protected process denied immediately")
 
-    # Test 2: Worker request_kill posts to bus
+
+def _test_worker_request_posts_to_bus():
     print("\n[TEST 2] Worker posts kill request to bus")
     rid = request_kill(99999, "test_proc.exe", "consuming 100% CPU", "alpha")
     assert rid.startswith("kill_"), "Should return request_id"
     print(f"  PASS: Request posted with id={rid}")
 
-    # Test 3: Vote mechanism
+
+def _test_vote_mechanism():
     print("\n[TEST 3] Workers vote on consensus check")
     test_rid = "test_vote_" + uuid.uuid4().hex[:6]
     vote_kill(test_rid, "alpha", True, "Not my dependency")
@@ -517,34 +511,31 @@ def run_test():
     vote_kill(test_rid, "delta", True, "Not my dependency")
     print("  PASS: All 4 votes posted (gamma voted safe=false)")
 
-    # Test 4: Pending request management
+
+def _test_pending_request_tracking():
     print("\n[TEST 4] Pending request tracking")
     _add_pending({"request_id": "test_pending_1", "pid": 12345, "name": "dummy", "status": "voting"})
     pending = get_pending_requests()
-    found = any(p["request_id"] == "test_pending_1" for p in pending)
-    assert found, "Should find pending request"
+    assert any(p["request_id"] == "test_pending_1" for p in pending), "Should find pending request"
     _remove_pending("test_pending_1")
     pending2 = get_pending_requests()
-    found2 = any(p["request_id"] == "test_pending_1" for p in pending2)
-    assert not found2, "Should be removed"
+    assert not any(p["request_id"] == "test_pending_1" for p in pending2), "Should be removed"
     print("  PASS: Pending add/remove works")
 
-    # Test 5: Manual deny
+
+def _test_manual_deny():
     print("\n[TEST 5] Manual deny by orchestrator")
     _add_pending({"request_id": "test_deny_1", "pid": 55555, "name": "some_proc"})
     ok, msg = deny_kill_manual("test_deny_1", "Not authorized by GOD")
     assert ok, "Should succeed"
     print(f"  PASS: Denied with reason: {msg}")
 
-    # Test 6: Kill log
+
+def _test_kill_log_persistence():
     print("\n[TEST 6] Kill log persistence")
     logs = get_kill_log(50)
     assert len(logs) > 0, "Should have log entries from tests"
     print(f"  PASS: {len(logs)} entries in kill log")
-
-    print("\n" + "=" * 60)
-    print("ALL TESTS PASSED")
-    print("=" * 60)
 
 
 if __name__ == "__main__":

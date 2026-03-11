@@ -80,13 +80,11 @@ def print_divider(char="-", width=72):
     print(f"{DIM}{char * width}{RESET}")
 
 
-def print_roster_full(profiles, live):
-    agent_ids = ordered_agents(profiles)
-    pulse = get_pulse()
+def _print_roster_header(pulse: dict):
+    """Print the Skynet roster header with IQ, health, and engine counts."""
     iq = pulse.get("intelligence_score", "??")
     health = pulse.get("health", "UNKNOWN")
     engines = f"{pulse.get('engines_online', '?')}/{pulse.get('engines_total', '?')}"
-
     print()
     print_divider()
     print(f"  {BOLD}SKYNET v3.0 Level 3 -- Agent Roster{RESET}")
@@ -95,51 +93,52 @@ def print_roster_full(profiles, live):
     print_divider()
     print()
 
+
+def _print_agent_detail(wid: str, p: dict, live_status: str):
+    """Print details for a single agent."""
+    color = AGENT_COLORS.get(wid, "")
+    sym = AGENT_SYMBOLS.get(wid, f"[{wid[:1].upper()}]")
+    missions = p.get("missions_completed", 0)
+
+    print(f"  {color}{BOLD}{sym} {p['name'].upper()}{RESET}  {DIM}-- {p.get('role', '')}{RESET}")
+    print(f"    {DIM}Model:{RESET} {p.get('model', '?')}  {DIM}Status:{RESET} ", end="")
+    status_colors = {"WORKING": "\033[93m", "IDLE": "\033[90m"}
+    sc = status_colors.get(live_status, "")
+    print(f"{sc}{live_status}{RESET}" if sc else live_status, end="")
+    print(f"  {DIM}Missions:{RESET} {missions}")
+
+    caps = p.get("capabilities", [])
+    if caps:
+        print(f"    {DIM}Capabilities:{RESET}")
+        for c in caps[:6]:
+            print(f"      {DIM}-{RESET} {c}")
+        if len(caps) > 6:
+            print(f"      {DIM}  ...and {len(caps)-6} more{RESET}")
+
+    strengths = p.get("strengths", [])
+    weaknesses = p.get("weaknesses", [])
+    if strengths:
+        print(f"    {DIM}Strengths:{RESET} {', '.join(strengths)}")
+    if weaknesses:
+        print(f"    {DIM}Weaknesses:{RESET} {', '.join(weaknesses)}")
+
+    last = p.get("last_mission_summary", "")
+    if last:
+        print(f"    {DIM}Last mission:{RESET} {last[:100]}")
+    print()
+
+
+def print_roster_full(profiles, live):
+    agent_ids = ordered_agents(profiles)
+    _print_roster_header(get_pulse())
+
     for wid in agent_ids:
         p = profiles.get(wid)
         if not p:
             continue
-        color = AGENT_COLORS.get(wid, "")
-        sym = AGENT_SYMBOLS.get(wid, f"[{wid[:1].upper()}]")
         live_status = live.get(wid, {}).get("status", p.get("current_status", "UNKNOWN"))
-        missions = p.get("missions_completed", 0)
+        _print_agent_detail(wid, p, live_status)
 
-        # Header
-        print(f"  {color}{BOLD}{sym} {p['name'].upper()}{RESET}  {DIM}-- {p.get('role', '')}{RESET}")
-        print(f"    {DIM}Model:{RESET} {p.get('model', '?')}  {DIM}Status:{RESET} ", end="")
-        if live_status == "WORKING":
-            print(f"\033[93m{live_status}{RESET}", end="")
-        elif live_status == "IDLE":
-            print(f"\033[90m{live_status}{RESET}", end="")
-        else:
-            print(live_status, end="")
-        print(f"  {DIM}Missions:{RESET} {missions}")
-
-        # Capabilities
-        caps = p.get("capabilities", [])
-        if caps:
-            print(f"    {DIM}Capabilities:{RESET}")
-            for c in caps[:6]:
-                print(f"      {DIM}-{RESET} {c}")
-            if len(caps) > 6:
-                print(f"      {DIM}  ...and {len(caps)-6} more{RESET}")
-
-        # Strengths/Weaknesses
-        strengths = p.get("strengths", [])
-        weaknesses = p.get("weaknesses", [])
-        if strengths:
-            print(f"    {DIM}Strengths:{RESET} {', '.join(strengths)}")
-        if weaknesses:
-            print(f"    {DIM}Weaknesses:{RESET} {', '.join(weaknesses)}")
-
-        # Last mission
-        last = p.get("last_mission_summary", "")
-        if last:
-            print(f"    {DIM}Last mission:{RESET} {last[:100]}")
-
-        print()
-
-    # Summary
     total_missions = sum(profiles.get(w, {}).get("missions_completed", 0) for w in agent_ids)
     active = sum(1 for w in agent_ids if live.get(w, {}).get("status") in ("IDLE", "WORKING"))
     working = sum(1 for w in agent_ids if live.get(w, {}).get("status") == "WORKING")

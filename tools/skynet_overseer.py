@@ -91,7 +91,7 @@ def _hidden_check_output(args, **kwargs):
 PYTHON, _DAEMON_ENV = _resolve_real_python()
 
 # Thresholds
-IDLE_STALL_S = 600       # IDLE >10min with pending TODOs = STALLED (was 120, caused spam)
+IDLE_STALL_S = 180       # IDLE >3min with pending TODOs = STALLED  # signed: delta
 PROCESSING_STUCK_S = 300 # PROCESSING >5min = POTENTIALLY_STUCK
 DELIVERY_TIMEOUT_S = 180 # dispatched >3min with no result = UNDELIVERED
 BUS_SILENCE_S = 300      # 0 messages in 5min while PROCESSING = suspicious
@@ -119,22 +119,27 @@ def log(msg, level="INFO"):
 
 
 def _post_bus(topic, msg_type, content):
-    """Post a message to the Skynet bus."""
+    """Post a message to the Skynet bus via SpamGuard."""
+    msg = {"sender": "overseer", "topic": topic, "type": msg_type, "content": content}
     try:
-        payload = json.dumps({
-            "sender": "overseer",
-            "topic": topic,
-            "type": msg_type,
-            "content": content,
-        }).encode()
-        req = urllib.request.Request(
-            f"{BUS_URL}/bus/publish", payload,
-            {"Content-Type": "application/json"}
-        )
-        urllib.request.urlopen(req, timeout=5)
-        return True
+        from tools.skynet_spam_guard import guarded_publish
+        result = guarded_publish(msg)
+        return result.get("allowed", False)
+    except ImportError:
+        # Fallback: direct HTTP if SpamGuard not available
+        try:
+            payload = json.dumps(msg).encode()
+            req = urllib.request.Request(
+                f"{BUS_URL}/bus/publish", payload,
+                {"Content-Type": "application/json"}
+            )
+            urllib.request.urlopen(req, timeout=5)
+            return True
+        except Exception:
+            return False
     except Exception:
         return False
+    # signed: delta
 
 
 def _fetch_json(url, timeout=5):
@@ -202,6 +207,111 @@ class OverseerDaemon:
 
     # ── 1. Worker Monitoring ────────────────────────────────────────────
 
+    def _check_stalled(self, name, state, history, issues):
+        """Check if a worker is IDLE too long with pending TODOs."""
+        if state != "IDLE" or len(history) < 2:
+            return
+        idle_since = None
+        for h in reversed(history):
+            if h["state"] != "IDLE":
+                break
+            idle_since = h["t"]
+        if not idle_since:
+            return
+        idle_duration = time.time() - idle_since
+        last_result = self.last_bus_results.get(name, 0)
+        has_pending = self._worker_has_pending_todos(name)
+        if has_pending and idle_duration > IDLE_STALL_S and (time.time() - last_result) > IDLE_STALL_S:
+            issues.append({
+                "worker": name, "issue": "STALLED",
+                "detail": f"IDLE for {int(idle_duration)}s with pending TODOs and no bus result",
+                "severity": "warning"
+            })
+
+    def _check_stuck(self, name, state, history, issues):
+        """Check if a worker is PROCESSING too long."""
+        if state != "PROCESSING":
+            return
+        proc_since = None
+        for h in reversed(history):
+            if h["state"] != "PROCESSING":
+                break
+            proc_since = h["t"]
+        if proc_since:
+            proc_duration = time.time() - proc_since
+            if proc_duration > PROCESSING_STUCK_S:
+                issues.append({
+                    "worker": name, "issue": "POTENTIALLY_STUCK",
+                    "detail": f"PROCESSING for {int(proc_duration)}s",
+                    "severity": "critical"
+                })
+
+    def _worker_has_pending_todos(self, name):
+        """Check if a worker has pending/active TODO items (own + shared/claimable)."""
+        try:
+            todos_file = DATA_DIR / "todos.json"
+            if todos_file.exists():
+                tdata = json.loads(todos_file.read_text(encoding="utf-8"))
+                shared_assignees = ("", "all", "shared", "any", "unassigned", "backlog")
+                return any(
+                    (str(t.get("assignee", t.get("worker", "")) or "").strip().lower() == name
+                     or str(t.get("assignee", t.get("worker", "")) or "").strip().lower() in shared_assignees)
+                    and t.get("status") in ("pending", "active")
+                    for t in tdata.get("todos", [])
+                )
+        except Exception:
+            pass
+        return False
+        # signed: delta
+
+    def _check_idle_with_todos(self, name, state, issues):
+        """Zero Ticket Stop Rule: flag IDLE workers with pending TODOs (own + shared)."""
+        if state != "IDLE":
+            return
+        try:
+            todos_file = DATA_DIR / "todos.json"
+            if todos_file.exists():
+                tdata = json.loads(todos_file.read_text(encoding="utf-8"))
+                shared_assignees = ("", "all", "shared", "any", "unassigned", "backlog")
+                own_pending = 0
+                shared_pending = 0
+                for t in tdata.get("todos", []):
+                    target = str(t.get("assignee", t.get("worker", "")) or "").strip().lower()
+                    if t.get("status") not in ("pending", "active"):
+                        continue
+                    if target == name:
+                        own_pending += 1
+                    elif target in shared_assignees:
+                        shared_pending += 1
+                total = own_pending + shared_pending
+                if total > 0:
+                    detail = f"IDLE but has {own_pending} assigned + {shared_pending} claimable TODO items"
+                    issues.append({
+                        "worker": name, "issue": "IDLE_WITH_PENDING_TODOS",
+                        "detail": detail,
+                        "severity": "warning"
+                    })
+        except Exception:
+            pass
+        # signed: delta
+
+    def _post_deduped_alerts(self, issues):
+        """Post alerts for issues, deduplicating within a 5-minute window."""
+        DEDUP_WINDOW = 300
+        now_t = time.time()
+        for issue in issues:
+            dedup_key = f"{issue['worker']}:{issue['issue']}"
+            last_posted = self._last_alert_times.get(dedup_key, 0)
+            if now_t - last_posted < DEDUP_WINDOW:
+                continue
+            alert_msg = f"[{issue['worker'].upper()}] {issue['issue']}: {issue['detail']}"
+            self.alerts.append({"msg": alert_msg, "ts": datetime.now().isoformat(), "severity": issue["severity"]})
+            if len(self.alerts) > 50:
+                self.alerts = self.alerts[-50:]
+            _post_bus("orchestrator", "monitor_alert", alert_msg)
+            log(alert_msg, level=issue["severity"].upper())
+            self._last_alert_times[dedup_key] = now_t
+
     def scan_workers(self):
         """UIA scan all workers, track state history, detect issues."""
         workers = _load_workers()
@@ -217,59 +327,14 @@ class OverseerDaemon:
                 state = _get_worker_state_uia(hwnd)
 
             now_iso = datetime.now().isoformat()
-
-            # Initialize state history
             if name not in self.worker_states:
                 self.worker_states[name] = deque(maxlen=10)
             self.worker_states[name].append({"state": state, "ts": now_iso, "t": time.time()})
 
-            # Check for STALLED (IDLE too long WITH pending TODOs — idle without work is normal)
             history = list(self.worker_states[name])
-            if len(history) >= 2 and state == "IDLE":
-                idle_since = None
-                for h in reversed(history):
-                    if h["state"] != "IDLE":
-                        break
-                    idle_since = h["t"]
-                if idle_since:
-                    idle_duration = time.time() - idle_since
-                    last_result = self.last_bus_results.get(name, 0)
-                    # Only flag STALLED if worker has pending TODOs (idle without work is expected)
-                    has_pending = False
-                    try:
-                        todos_file = DATA_DIR / "todos.json"
-                        if todos_file.exists():
-                            tdata = json.loads(todos_file.read_text(encoding="utf-8"))
-                            has_pending = any(
-                                t.get("worker") == name and t.get("status") in ("pending", "active")
-                                for t in tdata.get("todos", [])
-                            )
-                    except Exception:
-                        pass
-                    if has_pending and idle_duration > IDLE_STALL_S and (time.time() - last_result) > IDLE_STALL_S:
-                        issues.append({
-                            "worker": name, "issue": "STALLED",
-                            "detail": f"IDLE for {int(idle_duration)}s with pending TODOs and no bus result",
-                            "severity": "warning"
-                        })
+            self._check_stalled(name, state, history, issues)
+            self._check_stuck(name, state, history, issues)
 
-            # Check for STUCK (PROCESSING >5min)
-            if state == "PROCESSING":
-                proc_since = None
-                for h in reversed(history):
-                    if h["state"] != "PROCESSING":
-                        break
-                    proc_since = h["t"]
-                if proc_since:
-                    proc_duration = time.time() - proc_since
-                    if proc_duration > PROCESSING_STUCK_S:
-                        issues.append({
-                            "worker": name, "issue": "POTENTIALLY_STUCK",
-                            "detail": f"PROCESSING for {int(proc_duration)}s",
-                            "severity": "critical"
-                        })
-
-            # DEAD window
             if state == "DEAD":
                 issues.append({
                     "worker": name, "issue": "WINDOW_DEAD",
@@ -277,44 +342,61 @@ class OverseerDaemon:
                     "severity": "critical"
                 })
 
-            # Zero Ticket Stop Rule: IDLE worker with pending TODOs
-            if state == "IDLE":
-                try:
-                    todos_file = DATA_DIR / "todos.json"
-                    if todos_file.exists():
-                        tdata = json.loads(todos_file.read_text(encoding="utf-8"))
-                        pending = sum(
-                            1 for t in tdata.get("todos", [])
-                            if t.get("worker") == name and t.get("status") in ("pending", "active")
-                        )
-                        if pending > 0:
-                            issues.append({
-                                "worker": name, "issue": "IDLE_WITH_PENDING_TODOS",
-                                "detail": f"IDLE but has {pending} pending/active TODO items",
-                                "severity": "warning"
-                            })
-                except Exception:
-                    pass
+            self._check_idle_with_todos(name, state, issues)
 
-        # Post alerts for issues (deduplicated: same worker+issue suppressed for 5 min)
-        DEDUP_WINDOW = 300  # 5 minutes
-        now_t = time.time()
-        for issue in issues:
-            dedup_key = f"{issue['worker']}:{issue['issue']}"
-            last_posted = self._last_alert_times.get(dedup_key, 0)
-            if now_t - last_posted < DEDUP_WINDOW:
-                continue  # suppress duplicate
-            alert_msg = f"[{issue['worker'].upper()}] {issue['issue']}: {issue['detail']}"
-            self.alerts.append({"msg": alert_msg, "ts": datetime.now().isoformat(), "severity": issue["severity"]})
-            if len(self.alerts) > 50:
-                self.alerts = self.alerts[-50:]
-            _post_bus("orchestrator", "monitor_alert", alert_msg)
-            log(alert_msg, level=issue["severity"].upper())
-            self._last_alert_times[dedup_key] = now_t
-
+        self._post_deduped_alerts(issues)
         return issues
 
     # ── 2. Task Delivery Verification ───────────────────────────────────
+
+    def _build_worker_result_times(self, bus_msgs):
+        """Build per-worker result timestamps from bus messages."""
+        worker_result_times = {}
+        for m in bus_msgs:
+            if m.get("type") == "result" and m.get("topic") == "orchestrator":
+                sender = m.get("sender", "")
+                ts_str = m.get("timestamp", "")
+                try:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    worker_result_times.setdefault(sender, []).append(ts.timestamp())
+                except Exception:
+                    worker_result_times.setdefault(sender, []).append(time.time())
+        return worker_result_times
+
+    def _process_dispatch_entry(self, entry, worker_result_times, now):
+        """Process a single dispatch log entry. Returns undelivered info or None."""
+        MAX_AGE = 600
+        if not entry.get("success") or entry.get("result_received"):
+            return None, False
+
+        ts_str = entry.get("timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_str)
+            dispatch_epoch = ts.timestamp()
+            age_s = now - dispatch_epoch
+        except Exception:
+            return None, False
+
+        if age_s > MAX_AGE:
+            entry["result_received"] = True
+            entry["received_at"] = "expired"
+            return None, True
+
+        worker = entry.get("worker", "?")
+        result_times = worker_result_times.get(worker, [])
+        if any(rt > dispatch_epoch for rt in result_times):
+            entry["result_received"] = True
+            entry["received_at"] = datetime.now().isoformat()
+            return None, True
+
+        if age_s > DELIVERY_TIMEOUT_S:
+            return {
+                "worker": worker,
+                "task": str(entry.get("task_summary", "?"))[:60],
+                "age_min": round(age_s / 60, 1),
+            }, False
+
+        return None, False
 
     def verify_deliveries(self):
         """Check dispatch_log for undelivered tasks. Fixes false positives by:
@@ -333,67 +415,20 @@ class OverseerDaemon:
         if not isinstance(entries, list):
             return []
 
-        # Get bus results to match against
         bus_msgs = self._get_bus_messages(100)
-        # Build per-worker result timestamps for proximity matching
-        worker_result_times = {}  # worker -> [timestamp_epoch, ...]
-        for m in bus_msgs:
-            if m.get("type") == "result" and m.get("topic") == "orchestrator":
-                sender = m.get("sender", "")
-                ts_str = m.get("timestamp", "")
-                try:
-                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    worker_result_times.setdefault(sender, []).append(ts.timestamp())
-                except Exception:
-                    worker_result_times.setdefault(sender, []).append(time.time())
+        worker_result_times = self._build_worker_result_times(bus_msgs)
 
         undelivered = []
         now = time.time()
         modified = False
-        MAX_AGE = 600  # 10 minutes -- older entries are stale, skip them
 
         for entry in entries[-20:]:
-            if not entry.get("success"):
-                continue
-            if entry.get("result_received"):
-                continue
-
-            ts_str = entry.get("timestamp", "")
-            try:
-                ts = datetime.fromisoformat(ts_str)
-                dispatch_epoch = ts.timestamp()
-                age_s = now - dispatch_epoch
-            except Exception:
-                continue
-
-            # Skip stale entries (>10 min old) -- auto-mark as expired
-            if age_s > MAX_AGE:
-                entry["result_received"] = True
-                entry["received_at"] = "expired"
+            info, was_modified = self._process_dispatch_entry(entry, worker_result_times, now)
+            if was_modified:
                 modified = True
-                continue
+            if info:
+                undelivered.append(info)
 
-            worker = entry.get("worker", "?")
-
-            # Check if worker posted a result AFTER this dispatch
-            result_times = worker_result_times.get(worker, [])
-            matched = any(rt > dispatch_epoch for rt in result_times)
-
-            if matched:
-                entry["result_received"] = True
-                entry["received_at"] = datetime.now().isoformat()
-                modified = True
-                continue
-
-            # Only flag if >3 min old and no matching result
-            if age_s > DELIVERY_TIMEOUT_S:
-                undelivered.append({
-                    "worker": worker,
-                    "task": str(entry.get("task_summary", "?"))[:60],
-                    "age_min": round(age_s / 60, 1),
-                })
-
-        # Persist matched entries back to dispatch_log
         if modified:
             try:
                 DISPATCH_LOG.write_text(json.dumps(entries, indent=2, default=str), encoding="utf-8")
@@ -553,71 +588,40 @@ class OverseerDaemon:
 
     # ── Main Loop ───────────────────────────────────────────────────────
 
+    def _run_timed_task(self, name, fn, last_time, interval, now):
+        """Run a task if its interval has elapsed. Returns updated last_time."""
+        if now - last_time < interval:
+            return last_time
+        try:
+            fn()
+        except Exception as e:
+            log(f"{name} failed: {e}", level="ERROR")
+        return now
+
     def run(self):
         """Main daemon loop. Never returns."""
         log("Overseer daemon starting")
         _post_bus("orchestrator", "monitor_alert", "OVERSEER_ONLINE: Autonomous monitoring daemon started")
 
-        last_worker_scan = 0.0
-        last_task_verify = 0.0
-        last_service_check = 0.0
-        last_bus_scan = 0.0
-        last_report = 0.0
-        last_heartbeat = 0.0
+        timers = {"worker": 0.0, "task": 0.0, "service": 0.0, "bus": 0.0, "report": 0.0, "heartbeat": 0.0}
         HEARTBEAT_INTERVAL = 60
 
         try:
             while True:
                 now = time.time()
+                timers["worker"] = self._run_timed_task("Worker scan", self.scan_workers, timers["worker"], WORKER_SCAN_INTERVAL, now)
+                timers["task"] = self._run_timed_task("Delivery verify", self.verify_deliveries, timers["task"], TASK_VERIFY_INTERVAL, now)
+                timers["service"] = self._run_timed_task("Service check", self.check_services, timers["service"], SERVICE_CHECK_INTERVAL, now)
+                timers["bus"] = self._run_timed_task("Bus scan", self.scan_bus_activity, timers["bus"], BUS_SCAN_INTERVAL, now)
+                timers["report"] = self._run_timed_task("Report", self.generate_report, timers["report"], REPORT_INTERVAL, now)
 
-                # Worker monitoring (30s)
-                if now - last_worker_scan >= WORKER_SCAN_INTERVAL:
-                    try:
-                        self.scan_workers()
-                    except Exception as e:
-                        log(f"Worker scan failed: {e}", level="ERROR")
-                    last_worker_scan = now
-
-                # Task delivery verification (60s)
-                if now - last_task_verify >= TASK_VERIFY_INTERVAL:
-                    try:
-                        self.verify_deliveries()
-                    except Exception as e:
-                        log(f"Delivery verify failed: {e}", level="ERROR")
-                    last_task_verify = now
-
-                # Service health (60s)
-                if now - last_service_check >= SERVICE_CHECK_INTERVAL:
-                    try:
-                        self.check_services()
-                    except Exception as e:
-                        log(f"Service check failed: {e}", level="ERROR")
-                    last_service_check = now
-
-                # Bus activity (30s)
-                if now - last_bus_scan >= BUS_SCAN_INTERVAL:
-                    try:
-                        self.scan_bus_activity()
-                    except Exception as e:
-                        log(f"Bus scan failed: {e}", level="ERROR")
-                    last_bus_scan = now
-
-                # Auto-report (5 minutes)
-                if now - last_report >= REPORT_INTERVAL:
-                    try:
-                        self.generate_report()
-                    except Exception as e:
-                        log(f"Report failed: {e}", level="ERROR")
-                    last_report = now
-
-                # Heartbeat (60s)
-                if now - last_heartbeat >= HEARTBEAT_INTERVAL:
+                if now - timers["heartbeat"] >= HEARTBEAT_INTERVAL:
                     uptime = int(now - self.start_time)
                     _post_bus("overseer", "heartbeat",
                               f"ALIVE pid={os.getpid()} uptime={uptime}s scans={self.scan_count} alerts={len(self.alerts)}")
-                    last_heartbeat = now
+                    timers["heartbeat"] = now
 
-                time.sleep(5)  # base tick
+                time.sleep(5)
 
         except KeyboardInterrupt:
             log("Overseer shutting down (Ctrl+C)")
@@ -657,6 +661,39 @@ def _check_existing():
     return None
 
 
+def _run_guardian(args):
+    """Auto-restart wrapper: runs overseer, restarts on crash with backoff."""
+    log("Guardian mode: will restart overseer on crash")
+    backoff = 5
+    max_backoff = 120
+    while True:
+        existing = _check_existing()
+        if existing:
+            log(f"Overseer running (PID {existing}), guardian watching...")
+            while _check_existing():
+                time.sleep(30)
+            log("Overseer process died! Restarting...", level="WARNING")
+            _post_bus("orchestrator", "monitor_alert",
+                      f"OVERSEER_CRASHED: Guardian restarting after {backoff}s backoff")
+
+        time.sleep(backoff)
+        log(f"Starting overseer (backoff={backoff}s)")
+        start_args = [PYTHON, __file__, "start"]
+        if args.prod:
+            start_args.append("--prod")
+        proc = subprocess.Popen(
+            start_args,
+            env=_DAEMON_ENV,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+        )
+        log(f"Overseer started as PID {proc.pid}")
+        backoff = min(backoff * 2, max_backoff)
+        time.sleep(10)
+        if _check_existing():
+            backoff = 5
+
+
 def main():
     parser = argparse.ArgumentParser(description="Skynet Overseer -- Autonomous Monitor Daemon")
     parser.add_argument("action", nargs="?", default="status",
@@ -675,8 +712,7 @@ def main():
         return
 
     if args.action == "once":
-        daemon = OverseerDaemon()
-        daemon.run_once()
+        OverseerDaemon().run_once()
         return
 
     if args.action == "stop":
@@ -688,36 +724,7 @@ def main():
         return
 
     if args.action == "guardian":
-        # Auto-restart wrapper: runs overseer, restarts on crash with backoff
-        log("Guardian mode: will restart overseer on crash")
-        backoff = 5
-        max_backoff = 120
-        while True:
-            existing = _check_existing()
-            if existing:
-                log(f"Overseer running (PID {existing}), guardian watching...")
-                while _check_existing():
-                    time.sleep(30)
-                log("Overseer process died! Restarting...", level="WARNING")
-                _post_bus("orchestrator", "monitor_alert",
-                          f"OVERSEER_CRASHED: Guardian restarting after {backoff}s backoff")
-
-            time.sleep(backoff)
-            log(f"Starting overseer (backoff={backoff}s)")
-            start_args = [PYTHON, __file__, "start"]
-            if args.prod:
-                start_args.append("--prod")
-            proc = subprocess.Popen(
-                start_args,
-                env=_DAEMON_ENV,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
-            )
-            log(f"Overseer started as PID {proc.pid}")
-            backoff = min(backoff * 2, max_backoff)
-            time.sleep(10)  # let it initialize
-            if _check_existing():
-                backoff = 5  # reset on successful start
+        _run_guardian(args)
         return
 
     if args.action == "start":
@@ -725,14 +732,10 @@ def main():
         if existing:
             print(f"Overseer already running (PID {existing}). Use 'status' to check.")
             return
-
-        # Write PID file
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         PID_FILE.write_text(str(os.getpid()))
-
         log(f"Overseer daemon PID {os.getpid()}" + (" [PROD MODE]" if args.prod else ""))
-        daemon = OverseerDaemon(prod_mode=args.prod)
-        daemon.run()
+        OverseerDaemon(prod_mode=args.prod).run()
 
 
 if __name__ == "__main__":

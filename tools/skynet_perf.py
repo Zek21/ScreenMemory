@@ -75,48 +75,21 @@ def bench_bus_throughput():
     return round(20 / elapsed, 1)
 
 
-def run_benchmarks():
-    """Run all benchmarks and return results."""
-    results = []
-
-    # 1. Skynet backend endpoints
-    endpoints = [
-        ("/health", "Skynet /health"),
-        ("/status", "Skynet /status"),
-        ("/metrics", "Skynet /metrics"),
-        ("/bus/messages?limit=5", "Skynet /bus/messages"),
-        ("/bus/tasks", "Skynet /bus/tasks"),
-        ("/bus/convene", "Skynet /bus/convene"),
+def _bench_http_endpoints(base: str, endpoints: list[tuple[str, str]],
+                          iterations: int = 3) -> list[dict]:
+    """Benchmark a list of (path, label) HTTP endpoints."""
+    return [
+        _time_fn(lambda p=path: _http_get(f"{base}{p}"), label, iterations=iterations)
+        for path, label in endpoints
     ]
-    for path, label in endpoints:
-        results.append(_time_fn(lambda p=path: _http_get(f"{SKYNET}{p}"), label, iterations=3))
 
-    # 2. GOD Console endpoints
-    god_endpoints = [
-        ("/health", "GOD /health"),
-        ("/engines", "GOD /engines"),
-        ("/skynet/self/pulse", "GOD /pulse"),
-        ("/windows", "GOD /windows"),
-        ("/skynet/status", "GOD /skynet/status"),
-    ]
-    for path, label in god_endpoints:
-        results.append(_time_fn(lambda p=path: _http_get(f"{GOD}{p}"), label, iterations=3))
 
-    # 3. Bus round-trip
-    results.append(_time_fn(bench_bus_roundtrip, "Bus round-trip (post+read)", iterations=5))
-
-    # 4. Bus throughput
-    tp_result = _time_fn(bench_bus_throughput, "Bus throughput (20 msgs)")
-    tp_result["throughput_msg_s"] = bench_bus_throughput()
-    results.append(tp_result)
-
-    # 5. Engine metrics (probe all 18)
-    results.append(_time_fn(
+def _bench_engine_probes() -> list[dict]:
+    """Benchmark engine metric probes (cached and uncached)."""
+    results = [_time_fn(
         lambda: __import__("engine_metrics").collect_engine_metrics(),
         "Engine probe (18 engines)", iterations=1
-    ))
-
-    # Force cache clear for honest re-probe
+    )]
     try:
         import engine_metrics
         engine_metrics._cache = {}
@@ -127,45 +100,56 @@ def run_benchmarks():
         ))
     except Exception:
         pass
+    return results
 
-    # 6. IQ computation
-    results.append(_time_fn(
-        lambda: __import__("skynet_self").SkynetSelf().compute_iq(),
-        "IQ computation", iterations=3
-    ))
 
-    # 7. Window scan
-    results.append(_time_fn(
-        lambda: __import__("skynet_windows").scan_windows(),
-        "Window scan", iterations=2
-    ))
-
-    # 8. JSON serialization comparison
+def _bench_serialization() -> list[dict]:
+    """Benchmark JSON serialization (stdlib vs orjson)."""
     import json as stdlib_json
     test_data = {"key": list(range(1000)), "nested": {"a": "b" * 500}}
-    results.append(_time_fn(
-        lambda: stdlib_json.dumps(test_data),
-        "json.dumps (stdlib)", iterations=100
-    ))
+    results = [_time_fn(lambda: stdlib_json.dumps(test_data), "json.dumps (stdlib)", iterations=100)]
     try:
         import orjson
-        results.append(_time_fn(
-            lambda: orjson.dumps(test_data),
-            "orjson.dumps", iterations=100
-        ))
+        results.append(_time_fn(lambda: orjson.dumps(test_data), "orjson.dumps", iterations=100))
     except ImportError:
         results.append({"label": "orjson.dumps", "status": "not_installed", "ms": 0})
+    return results
 
-    # 9. Health report
+
+def run_benchmarks():
+    """Run all benchmarks and return results."""
+    skynet_endpoints = [
+        ("/health", "Skynet /health"), ("/status", "Skynet /status"),
+        ("/metrics", "Skynet /metrics"), ("/bus/messages?limit=5", "Skynet /bus/messages"),
+        ("/bus/tasks", "Skynet /bus/tasks"), ("/bus/convene", "Skynet /bus/convene"),
+    ]
+    god_endpoints = [
+        ("/health", "GOD /health"), ("/engines", "GOD /engines"),
+        ("/skynet/self/pulse", "GOD /pulse"), ("/windows", "GOD /windows"),
+        ("/skynet/status", "GOD /skynet/status"),
+    ]
+
+    results = _bench_http_endpoints(SKYNET, skynet_endpoints, iterations=3)
+    results += _bench_http_endpoints(GOD, god_endpoints, iterations=3)
+    results.append(_time_fn(bench_bus_roundtrip, "Bus round-trip (post+read)", iterations=5))
+
+    tp_result = _time_fn(bench_bus_throughput, "Bus throughput (20 msgs)")
+    tp_result["throughput_msg_s"] = bench_bus_throughput()
+    results.append(tp_result)
+
+    results += _bench_engine_probes()
+    results.append(_time_fn(
+        lambda: __import__("skynet_self").SkynetSelf().compute_iq(),
+        "IQ computation", iterations=3))
+    results.append(_time_fn(
+        lambda: __import__("skynet_windows").scan_windows(),
+        "Window scan", iterations=2))
+    results += _bench_serialization()
     results.append(_time_fn(
         lambda: __import__("skynet_health_report").collect_report(),
-        "Health report (full)", iterations=1
-    ))
+        "Health report (full)", iterations=1))
 
-    # Sort by time descending
     results.sort(key=lambda r: r.get("ms", 0), reverse=True)
-
-    # Identify top 3 slowest
     slowest = [r for r in results if r.get("status") == "ok"][:3]
 
     return {

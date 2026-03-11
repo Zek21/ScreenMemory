@@ -40,6 +40,7 @@ import os
 import sys
 import time
 import json
+import re
 import logging
 from typing import Optional, Tuple, List
 from pathlib import Path
@@ -158,12 +159,7 @@ class WebNavigator:
     def _execute_step(self, plan: Plan) -> dict:
         """
         Execute one step of the plan using the full perception-action loop:
-        1. Capture screenshot
-        2. Ground with SoM markers
-        3. Decide action (VLM + planner)
-        4. Execute action (click/type/key)
-        5. Verify outcome
-        6. Store in memory
+        capture → ground → decide → execute → verify → record.
         """
         step_start = time.perf_counter()
         subtask = plan.subtasks[plan.current_step]
@@ -174,10 +170,7 @@ class WebNavigator:
         # 1. Capture current screen state
         pre_screenshot = self._capture_screen()
         if pre_screenshot is None:
-            subtask.status = TaskStatus.FAILED
-            subtask.error = "Screen capture failed"
-            plan.current_step += 1
-            return {"step": subtask.id, "status": "failed", "error": "capture_failed"}
+            return self._handle_capture_failure(subtask, plan)
 
         # 2. Ground with visual markers
         grounded = self.grounder.ground(pre_screenshot)
@@ -194,20 +187,33 @@ class WebNavigator:
         self._execute_action(action)
         self._action_count += 1
 
-        # 5. Brief wait for UI to respond
+        # 5. Brief wait, then capture post-action screenshot
         time.sleep(0.5)
-
-        # 6. Capture post-action screenshot
         post_screenshot = self._capture_screen()
 
-        # 7. Verify outcome
+        # 6. Verify outcome and update step status
+        success = self._verify_and_update_step(plan, subtask, pre_screenshot, post_screenshot)
+
+        # 7. Record result to memory and debug log
+        return self._record_step_result(subtask, grounded, action, step_start, success)
+
+    def _handle_capture_failure(self, subtask: Subtask, plan: Plan) -> dict:
+        """Mark a step as failed when screen capture is unavailable."""
+        subtask.status = TaskStatus.FAILED
+        subtask.error = "Screen capture failed"
+        plan.current_step += 1
+        return {"step": subtask.id, "status": "failed", "error": "capture_failed"}
+
+    def _verify_and_update_step(self, plan: Plan, subtask: Subtask,
+                                pre_screenshot: Image.Image,
+                                post_screenshot: Optional[Image.Image]) -> bool:
+        """Verify the action outcome and update subtask/plan status."""
         success = self.planner.verify_outcome(
             subtask,
             pre_screenshot=pre_screenshot,
             post_screenshot=post_screenshot,
             change_detector=self.change_detector,
         )
-
         if success:
             subtask.status = TaskStatus.SUCCESS
             subtask.completed_at = time.time()
@@ -217,8 +223,11 @@ class WebNavigator:
             if subtask.retries >= subtask.max_retries:
                 subtask.status = TaskStatus.FAILED
                 plan.current_step += 1
+        return success
 
-        # 8. Store in memory
+    def _record_step_result(self, subtask: Subtask, grounded: GroundedScreenshot,
+                            action: Action, step_start: float, success: bool) -> dict:
+        """Store step outcome in memory, save debug screenshot, and return result dict."""
         elapsed = (time.perf_counter() - step_start) * 1000
         self.memory.store_episodic(
             f"Step {subtask.id}: {subtask.description} → {subtask.status.value}",
@@ -227,7 +236,6 @@ class WebNavigator:
             importance=0.6 if success else 0.8,
         )
 
-        # Save grounded screenshot for debugging
         debug_path = Path("logs") / f"step_{subtask.id}_{subtask.status.value}.png"
         debug_path.parent.mkdir(exist_ok=True)
         grounded.marked.save(str(debug_path))
@@ -290,8 +298,6 @@ class WebNavigator:
         response = vlm_response.upper()
 
         if "CLICK" in response:
-            # Extract mark number
-            import re
             marks = re.findall(r'CLICK\s*(\d+)', response)
             if marks:
                 mark_id = int(marks[0])
@@ -305,7 +311,6 @@ class WebNavigator:
                     )
 
         if "TYPE" in response:
-            import re
             text_match = re.findall(r'TYPE\s+"([^"]+)"', response)
             if text_match:
                 return Action(
@@ -316,7 +321,6 @@ class WebNavigator:
                 )
 
         if "KEY" in response:
-            import re
             key_match = re.findall(r'KEY\s+(\S+)', response)
             if key_match:
                 return Action(
@@ -326,7 +330,10 @@ class WebNavigator:
                     expected_outcome=f"Pressed: {key_match[0]}",
                 )
 
-        # Default: click the first region
+        return self._default_action(grounded)
+
+    def _default_action(self, grounded: GroundedScreenshot) -> Action:
+        """Fallback action: click the first detected region, or wait."""
         if grounded.regions:
             r = grounded.regions[0]
             return Action(
@@ -335,7 +342,6 @@ class WebNavigator:
                 value=f"{r.center_x},{r.center_y}",
                 expected_outcome="Clicked first detected element",
             )
-
         return Action(action_type=ActionType.WAIT, target="", value="1000")
 
     def _heuristic_action(self, subtask: Subtask, grounded: GroundedScreenshot) -> Action:

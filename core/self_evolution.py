@@ -560,6 +560,44 @@ class EvolutionEngine:
         contestants = random.sample(population, tournament_size)
         return max(contestants, key=lambda g: g.fitness_score)
     
+    def _fill_population(self, category):
+        """Fill population to minimum size with random strategies."""
+        population = self._get_population(category)
+        while len(population) < self.POPULATION_SIZE:
+            gene = self._create_random_strategy(category, 0)
+            self._save_strategy(gene)
+            population.append(gene)
+        return population
+
+    def _generate_offspring(self, category, population):
+        """Generate offspring via crossover and mutation from top performers."""
+        offspring = []
+        crossover_count = int(self.POPULATION_SIZE * self.CROSSOVER_RATE)
+        for _ in range(crossover_count):
+            parent_a = self.select_best(category)
+            parent_b = self.select_best(category)
+            offspring.append(self.crossover(parent_a, parent_b))
+
+        mutation_count = self.POPULATION_SIZE - self.ELITE_SIZE - crossover_count
+        for _ in range(mutation_count):
+            parent = self.select_best(category)
+            offspring.append(self.mutate_strategy(parent))
+
+        return offspring
+
+    def _replace_population(self, category, elites, offspring):
+        """Replace old population in DB with elites + offspring."""
+        with sqlite3.connect(self.db_path) as conn:
+            elite_ids = [g.strategy_id for g in elites]
+            placeholders = ','.join('?' * len(elite_ids))
+            conn.execute(
+                f"DELETE FROM strategy_population WHERE category = ? AND strategy_id NOT IN ({placeholders})",
+                [category] + elite_ids
+            )
+            for gene in offspring:
+                self._save_strategy(gene, conn)
+            conn.commit()
+
     def evolve_generation(self, category: str):
         """
         Run one evolution cycle for a category:
@@ -570,57 +608,15 @@ class EvolutionEngine:
         """
         with self.lock:
             population = self._get_population(category)
-            
+
             if len(population) < self.POPULATION_SIZE:
-                # Population too small, fill with random strategies
-                while len(population) < self.POPULATION_SIZE:
-                    gene = self._create_random_strategy(category, 0)
-                    self._save_strategy(gene)
-                    population.append(gene)
+                self._fill_population(category)
                 return
-            
-            # Sort by fitness
+
             population.sort(key=lambda g: g.fitness_score, reverse=True)
-            
-            # Elites always survive
             elites = population[:self.ELITE_SIZE]
-            
-            # Generate offspring
-            offspring = []
-            
-            # Crossover: create new hybrids
-            crossover_count = int(self.POPULATION_SIZE * self.CROSSOVER_RATE)
-            for _ in range(crossover_count):
-                parent_a = self.select_best(category)
-                parent_b = self.select_best(category)
-                child = self.crossover(parent_a, parent_b)
-                offspring.append(child)
-            
-            # Mutation: create mutants from top performers
-            mutation_count = self.POPULATION_SIZE - self.ELITE_SIZE - crossover_count
-            for _ in range(mutation_count):
-                parent = self.select_best(category)
-                child = self.mutate_strategy(parent)
-                offspring.append(child)
-            
-            # New population: elites + offspring
-            new_population = elites + offspring
-            
-            # Replace old population
-            with sqlite3.connect(self.db_path) as conn:
-                # Delete old non-elite strategies
-                elite_ids = [g.strategy_id for g in elites]
-                placeholders = ','.join('?' * len(elite_ids))
-                conn.execute(
-                    f"DELETE FROM strategy_population WHERE category = ? AND strategy_id NOT IN ({placeholders})",
-                    [category] + elite_ids
-                )
-                
-                # Save offspring
-                for gene in offspring:
-                    self._save_strategy(gene, conn)
-                
-                conn.commit()
+            offspring = self._generate_offspring(category, population)
+            self._replace_population(category, elites, offspring)
     
     def get_optimal_config(self, task_category: str) -> Dict[str, Any]:
         """Get best-known parameter configuration for a task category."""
@@ -655,25 +651,18 @@ class SelfReflector:
     def __init__(self, tracker: PerformanceTracker):
         self.tracker = tracker
     
-    def reflect_on_failures(self, recent_n: int = 10) -> List[str]:
-        """Analyze recent failures and generate improvement hypotheses."""
-        failures = self.tracker.get_recent_failures(recent_n)
-        
-        if not failures:
-            return ["System performing well - no recent failures detected."]
-        
-        hypotheses = []
-        
-        # Analyze failure patterns
+    def _generate_failure_hypotheses(self, failures, recent_n):
+        """Generate improvement hypotheses from failure patterns."""
         by_category = defaultdict(list)
         by_error = defaultdict(list)
-        
+
         for f in failures:
             by_category[f["category"]].append(f)
             if f["error_type"]:
                 by_error[f["error_type"]].append(f)
-        
-        # Hypothesis 1: Category-specific weakness
+
+        hypotheses = []
+
         for category, fails in by_category.items():
             if len(fails) >= 3:
                 rate = len(fails) / recent_n
@@ -681,31 +670,38 @@ class SelfReflector:
                     f"High failure rate in {category} ({rate:.0%}). "
                     f"Consider evolving {category} strategies or adjusting category router."
                 )
-        
-        # Hypothesis 2: Specific error pattern
+
         for error_type, fails in by_error.items():
             if len(fails) >= 3:
                 hypotheses.append(
                     f"Recurring error: {error_type} ({len(fails)} times). "
                     f"May indicate systematic issue in error handling or resource limits."
                 )
-        
-        # Hypothesis 3: Quality issues
+
         low_quality = [f for f in failures if f["quality_score"] < 0.3]
         if len(low_quality) >= 3:
             hypotheses.append(
                 f"{len(low_quality)} failures with very low quality scores. "
                 f"Consider increasing retrieval_k or cot_depth parameters."
             )
-        
-        # Hypothesis 4: Timeout issues
+
         timeouts = [f for f in failures if f["latency_ms"] > 30000]
         if len(timeouts) >= 2:
             hypotheses.append(
                 f"{len(timeouts)} tasks timed out. "
                 f"Consider reducing max_iterations or increasing parallel_agents."
             )
+
+        return hypotheses
+
+    def reflect_on_failures(self, recent_n: int = 10) -> List[str]:
+        """Analyze recent failures and generate improvement hypotheses."""
+        failures = self.tracker.get_recent_failures(recent_n)
         
+        if not failures:
+            return ["System performing well - no recent failures detected."]
+        
+        hypotheses = self._generate_failure_hypotheses(failures, recent_n)
         return hypotheses if hypotheses else ["Failure patterns unclear - need more data."]
     
     def identify_bottlenecks(self) -> List[Dict[str, Any]]:
@@ -759,6 +755,41 @@ class SelfReflector:
         
         return bottlenecks
     
+    def _bottleneck_to_proposal(self, bn):
+        """Convert a single bottleneck to an improvement proposal."""
+        if bn["type"] == "success_rate":
+            return {
+                "action": "evolve_strategies",
+                "target": bn["category"],
+                "reason": bn["description"],
+                "priority": bn["severity"]
+            }
+        elif bn["type"] == "latency":
+            return {
+                "action": "optimize_parameters",
+                "target": bn["category"],
+                "parameters": {"max_iterations": -1, "context_window": -512},
+                "reason": bn["description"],
+                "priority": bn["severity"]
+            }
+        elif bn["type"] == "memory_efficiency":
+            return {
+                "action": "adjust_memory",
+                "target": bn["category"],
+                "parameters": {"retrieval_k": +1, "memory_threshold": -0.05},
+                "reason": bn["description"],
+                "priority": bn["severity"]
+            }
+        elif bn["type"] == "cost_efficiency":
+            return {
+                "action": "optimize_quality",
+                "target": bn["category"],
+                "parameters": {"cot_depth": +1, "min_confidence": +0.05},
+                "reason": bn["description"],
+                "priority": bn["severity"]
+            }
+        return None
+
     def propose_improvements(self) -> List[Dict[str, Any]]:
         """Generate concrete improvement proposals based on analysis."""
         bottlenecks = self.identify_bottlenecks()
@@ -766,56 +797,14 @@ class SelfReflector:
         
         proposals = []
         
-        # Convert bottlenecks to proposals
         for bn in bottlenecks:
-            if bn["type"] == "success_rate":
-                proposals.append({
-                    "action": "evolve_strategies",
-                    "target": bn["category"],
-                    "reason": bn["description"],
-                    "priority": bn["severity"]
-                })
-            
-            elif bn["type"] == "latency":
-                proposals.append({
-                    "action": "optimize_parameters",
-                    "target": bn["category"],
-                    "parameters": {
-                        "max_iterations": -1,  # Reduce by 1
-                        "context_window": -512  # Reduce by 512
-                    },
-                    "reason": bn["description"],
-                    "priority": bn["severity"]
-                })
-            
-            elif bn["type"] == "memory_efficiency":
-                proposals.append({
-                    "action": "adjust_memory",
-                    "target": bn["category"],
-                    "parameters": {
-                        "retrieval_k": +1,  # Increase K
-                        "memory_threshold": -0.05  # Lower threshold
-                    },
-                    "reason": bn["description"],
-                    "priority": bn["severity"]
-                })
-            
-            elif bn["type"] == "cost_efficiency":
-                proposals.append({
-                    "action": "optimize_quality",
-                    "target": bn["category"],
-                    "parameters": {
-                        "cot_depth": +1,  # Deeper reasoning
-                        "min_confidence": +0.05  # Higher bar
-                    },
-                    "reason": bn["description"],
-                    "priority": bn["severity"]
-                })
+            proposal = self._bottleneck_to_proposal(bn)
+            if proposal:
+                proposals.append(proposal)
         
-        # Add hypothesis-driven proposals
         for hypothesis in hypotheses:
             if "evolving" in hypothesis.lower():
-                category = hypothesis.split()[4]  # Extract category name
+                category = hypothesis.split()[4]
                 proposals.append({
                     "action": "trigger_evolution",
                     "target": category,
@@ -930,6 +919,13 @@ class EvolutionDashboard:
         
         return lineage
     
+    _TREND_QUERIES = {
+        "success_rate": "SELECT success FROM evolution_metrics WHERE category = ? ORDER BY timestamp ASC LIMIT ?",
+        "latency": "SELECT latency_ms FROM evolution_metrics WHERE category = ? ORDER BY timestamp ASC LIMIT ?",
+        "quality": "SELECT quality_score FROM evolution_metrics WHERE category = ? ORDER BY timestamp ASC LIMIT ?",
+        "efficiency": "SELECT quality_score / CAST(tokens_used AS REAL) FROM evolution_metrics WHERE category = ? AND tokens_used > 0 ORDER BY timestamp ASC LIMIT ?",
+    }
+
     def trend(self, category: str, metric: str, window: int = 50) -> List[float]:
         """
         Return metric trend over recent tasks.
@@ -942,45 +938,13 @@ class EvolutionDashboard:
         Returns:
             List of metric values over time (oldest to newest)
         """
+        query = self._TREND_QUERIES.get(metric)
+        if not query:
+            return []
+
         with sqlite3.connect(self.tracker.db_path) as conn:
-            if metric == "success_rate":
-                cursor = conn.execute("""
-                    SELECT success FROM evolution_metrics
-                    WHERE category = ?
-                    ORDER BY timestamp ASC
-                    LIMIT ?
-                """, (category, window))
-                return [float(row[0]) for row in cursor.fetchall()]
-            
-            elif metric == "latency":
-                cursor = conn.execute("""
-                    SELECT latency_ms FROM evolution_metrics
-                    WHERE category = ?
-                    ORDER BY timestamp ASC
-                    LIMIT ?
-                """, (category, window))
-                return [row[0] for row in cursor.fetchall()]
-            
-            elif metric == "quality":
-                cursor = conn.execute("""
-                    SELECT quality_score FROM evolution_metrics
-                    WHERE category = ?
-                    ORDER BY timestamp ASC
-                    LIMIT ?
-                """, (category, window))
-                return [row[0] for row in cursor.fetchall()]
-            
-            elif metric == "efficiency":
-                cursor = conn.execute("""
-                    SELECT quality_score / CAST(tokens_used AS REAL) FROM evolution_metrics
-                    WHERE category = ? AND tokens_used > 0
-                    ORDER BY timestamp ASC
-                    LIMIT ?
-                """, (category, window))
-                return [row[0] for row in cursor.fetchall()]
-            
-            else:
-                return []
+            cursor = conn.execute(query, (category, window))
+            return [float(row[0]) for row in cursor.fetchall()]
     
     def get_improvement_over_time(self, category: str, window: int = 100) -> Dict[str, Any]:
         """Calculate improvement metrics comparing first half vs second half of window."""
@@ -1015,7 +979,9 @@ class EvolutionDashboard:
 class SelfEvolutionSystem:
     """Unified interface to the self-evolution system."""
     
-    def __init__(self, data_dir: str = "D:\\Prospects\\ScreenMemory\\data"):
+    def __init__(self, data_dir: str = None):
+        if data_dir is None:
+            data_dir = str(Path(__file__).resolve().parent.parent / "data")  # signed: gamma
         data_path = Path(data_dir)
         data_path.mkdir(parents=True, exist_ok=True)
         

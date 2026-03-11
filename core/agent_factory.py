@@ -87,111 +87,81 @@ class AgentRegistry:
 
     def _register_defaults(self):
         """Register the built-in agent types."""
+        for spec in self._default_core_specs():
+            self.register(spec)
+        for spec in self._default_domain_specs():
+            self.register(spec)
 
-        self.register(AgentSpec(
-            role="reasoner",
-            system_prompt=(
-                "You are a deep reasoning agent. Analyze problems step-by-step using "
-                "Graph of Thoughts methodology. Consider multiple perspectives before "
-                "reaching conclusions. Identify assumptions and potential failure modes."
-            ),
-            capabilities=[AgentCapability.REASONING, AgentCapability.SYNTHESIS],
-            temperature=0.3,
-        ))
+    @staticmethod
+    def _default_core_specs() -> list:
+        """Return the built-in core agent specs."""
+        defs = [
+            ("reasoner",
+             "You are a deep reasoning agent. Analyze problems step-by-step using "
+             "Graph of Thoughts methodology. Consider multiple perspectives before "
+             "reaching conclusions. Identify assumptions and potential failure modes.",
+             [AgentCapability.REASONING, AgentCapability.SYNTHESIS], 0.3, False),
+            ("planner",
+             "You are a hierarchical task planner. Decompose complex goals into "
+             "ordered subtasks with clear dependencies. Each subtask must be atomic "
+             "and independently verifiable. Output structured plans.",
+             [AgentCapability.PLANNING, AgentCapability.REASONING], 0.2, False),
+            ("specialist",
+             "You are a domain specialist agent. Apply deep expertise to solve "
+             "specific technical problems. Use precise terminology and cite "
+             "relevant data. Focus on accuracy over breadth.",
+             [AgentCapability.REASONING, AgentCapability.DATA_ANALYSIS], 0.5, False),
+            ("validator",
+             "You are a validation agent. Verify outputs against requirements. "
+             "Check for: factual accuracy, logical consistency, completeness, "
+             "format compliance. Flag specific issues with evidence.",
+             [AgentCapability.CRITIQUE, AgentCapability.REASONING], 0.1, False),
+            ("tool_executor",
+             "You are a tool execution agent. Translate high-level requests into "
+             "specific tool calls. Parse tool outputs and extract relevant data. "
+             "Handle errors gracefully with retries and fallbacks.",
+             [AgentCapability.TOOL_USE, AgentCapability.CODE_EXECUTION], 0.1, True),
+            ("proposer",
+             "You are a proposal agent in a debate protocol. Generate well-reasoned "
+             "arguments with supporting evidence. Present clear, structured positions. "
+             "Anticipate counterarguments.",
+             [AgentCapability.REASONING, AgentCapability.SYNTHESIS], 0.7, False),
+            ("critic",
+             "You are a critic agent in a debate protocol. Challenge proposals with "
+             "rigorous counterarguments. Identify logical fallacies, missing evidence, "
+             "and unstated assumptions. Be adversarial but constructive.",
+             [AgentCapability.CRITIQUE, AgentCapability.REASONING], 0.4, False),
+            ("judge",
+             "You are the judge agent in a debate protocol. Evaluate arguments from "
+             "proposer and critic. Determine the strongest position based on evidence "
+             "quality, logical coherence, and practical applicability. Render verdicts.",
+             [AgentCapability.CRITIQUE, AgentCapability.SYNTHESIS], 0.2, False),
+        ]
+        return [
+            AgentSpec(role=r, system_prompt=p, capabilities=c, temperature=t, can_write=w)
+            for r, p, c, t, w in defs
+        ]
 
-        self.register(AgentSpec(
-            role="planner",
-            system_prompt=(
-                "You are a hierarchical task planner. Decompose complex goals into "
-                "ordered subtasks with clear dependencies. Each subtask must be atomic "
-                "and independently verifiable. Output structured plans."
-            ),
-            capabilities=[AgentCapability.PLANNING, AgentCapability.REASONING],
-            temperature=0.2,
-        ))
-
-        self.register(AgentSpec(
-            role="specialist",
-            system_prompt=(
-                "You are a domain specialist agent. Apply deep expertise to solve "
-                "specific technical problems. Use precise terminology and cite "
-                "relevant data. Focus on accuracy over breadth."
-            ),
-            capabilities=[AgentCapability.REASONING, AgentCapability.DATA_ANALYSIS],
-            temperature=0.5,
-        ))
-
-        self.register(AgentSpec(
-            role="validator",
-            system_prompt=(
-                "You are a validation agent. Verify outputs against requirements. "
-                "Check for: factual accuracy, logical consistency, completeness, "
-                "format compliance. Flag specific issues with evidence."
-            ),
-            capabilities=[AgentCapability.CRITIQUE, AgentCapability.REASONING],
-            temperature=0.1,
-        ))
-
-        self.register(AgentSpec(
-            role="tool_executor",
-            system_prompt=(
-                "You are a tool execution agent. Translate high-level requests into "
-                "specific tool calls. Parse tool outputs and extract relevant data. "
-                "Handle errors gracefully with retries and fallbacks."
-            ),
-            capabilities=[AgentCapability.TOOL_USE, AgentCapability.CODE_EXECUTION],
-            can_write=True,
-            temperature=0.1,
-        ))
-
-        self.register(AgentSpec(
-            role="proposer",
-            system_prompt=(
-                "You are a proposal agent in a debate protocol. Generate well-reasoned "
-                "arguments with supporting evidence. Present clear, structured positions. "
-                "Anticipate counterarguments."
-            ),
-            capabilities=[AgentCapability.REASONING, AgentCapability.SYNTHESIS],
-            temperature=0.7,
-        ))
-
-        self.register(AgentSpec(
-            role="critic",
-            system_prompt=(
-                "You are a critic agent in a debate protocol. Challenge proposals with "
-                "rigorous counterarguments. Identify logical fallacies, missing evidence, "
-                "and unstated assumptions. Be adversarial but constructive."
-            ),
-            capabilities=[AgentCapability.CRITIQUE, AgentCapability.REASONING],
-            temperature=0.4,
-        ))
-
-        self.register(AgentSpec(
-            role="judge",
-            system_prompt=(
-                "You are the judge agent in a debate protocol. Evaluate arguments from "
-                "proposer and critic. Determine the strongest position based on evidence "
-                "quality, logical coherence, and practical applicability. Render verdicts."
-            ),
-            capabilities=[AgentCapability.CRITIQUE, AgentCapability.SYNTHESIS],
-            temperature=0.2,
-        ))
-
-        # Domain specialists
-        for domain, prompt_suffix in [
+    @staticmethod
+    def _default_domain_specs() -> list:
+        """Return domain specialist agent specs."""
+        domains = [
             ("code_specialist", "software engineering, debugging, and code architecture"),
             ("finance_specialist", "financial markets, crypto, and economic analysis"),
             ("web_specialist", "web technologies, browser automation, and web scraping"),
             ("system_specialist", "system administration, DevOps, and infrastructure"),
             ("analysis_specialist", "data analysis, statistics, and research methodology"),
-        ]:
-            self.register(AgentSpec(
+        ]
+        return [
+            AgentSpec(
                 role=domain,
                 system_prompt=f"You are a domain specialist in {prompt_suffix}. "
                               f"Apply deep technical knowledge to solve domain-specific problems.",
                 capabilities=[AgentCapability.REASONING, AgentCapability.DATA_ANALYSIS],
                 temperature=0.4,
-            ))
+            )
+            for domain, prompt_suffix in domains
+        ]
 
     def register(self, spec: AgentSpec):
         """Register a new agent type."""

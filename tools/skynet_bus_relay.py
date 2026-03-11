@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
-Skynet Bus Relay -- Delivers bus messages to worker chat windows.
+Skynet Bus Relay -- Holds relayable bus traffic and forwards hourly digest to orchestrator.
 
-THE MISSING LINK: Workers are VS Code chat windows. They cannot poll the bus
-themselves. This daemon bridges the gap: it polls the bus for messages addressed
-to workers (topic=workers, topic=<worker_name>, topic=convene) and ghost-types
-them into the target worker's chat window via the dispatch system.
-
-Without this daemon, inter-worker communication via the bus is one-way:
-workers can POST to the bus, but never RECEIVE messages from it.
+Critical rule: relayable worker traffic is no longer ghost-typed directly into
+worker chat windows. Instead, relayable messages are held in a Skynet queue and
+sent to the orchestrator once per hour as a consolidated digest for action.
 
 Usage:
     python tools/skynet_bus_relay.py              # Start relay daemon
     python tools/skynet_bus_relay.py --once       # Single poll cycle
     python tools/skynet_bus_relay.py --status     # Show relay stats
-    python tools/skynet_bus_relay.py --dry-run    # Show what would be delivered
+    python tools/skynet_bus_relay.py --dry-run    # Show what would be queued/sent
 """
 
 import atexit
@@ -32,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 PID_FILE = DATA_DIR / "bus_relay.pid"
 DELIVERED_FILE = DATA_DIR / "bus_relay_delivered.json"
+QUEUE_FILE = DATA_DIR / "bus_relay_queue.json"
 WORKERS_FILE = DATA_DIR / "workers.json"
 ORCH_FILE = DATA_DIR / "orchestrator.json"
 
@@ -40,6 +37,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 SKYNET_URL = "http://localhost:8420"
 POLL_INTERVAL = 3.0  # Must be >= 2.0s to prevent CPU spin
 MIN_POLL_INTERVAL = 2.0
+HOLD_INTERVAL_S = 3600
 WORKER_NAMES = {"alpha", "beta", "gamma", "delta"}
 # Topics that should be delivered to workers
 RELAY_TOPICS = {"workers", "convene"} | WORKER_NAMES
@@ -47,6 +45,7 @@ RELAY_TOPICS = {"workers", "convene"} | WORKER_NAMES
 RELAY_TYPES = {"request", "proposal", "vote", "task", "sub-task", "urgent",
                "urgent-task", "directive", "gate-proposal", "alert"}
 MAX_DELIVERED_IDS = 500
+MAX_QUEUED_MESSAGES = 500
 
 
 def log(msg, level="INFO"):
@@ -83,6 +82,33 @@ def _save_delivered(ids):
     DELIVERED_FILE.write_text(json.dumps(trimmed))
 
 
+def _load_queue_state():
+    state = {
+        "messages": [],
+        "window_started_at": "",
+        "last_digest_at": "",
+    }
+    if QUEUE_FILE.exists():
+        try:
+            raw = json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                state.update(raw)
+        except Exception:
+            pass
+    if not isinstance(state.get("messages"), list):
+        state["messages"] = []
+    return state
+
+
+def _save_queue_state(state):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    state = dict(state or {})
+    messages = state.get("messages", [])
+    if isinstance(messages, list) and len(messages) > MAX_QUEUED_MESSAGES:
+        state["messages"] = messages[-MAX_QUEUED_MESSAGES:]
+    QUEUE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
 def _fetch_messages(limit=50):
     try:
         req = urllib.request.Request(
@@ -95,29 +121,15 @@ def _fetch_messages(limit=50):
         return []
 
 
-def _deliver_to_worker(worker_name, text, workers, orch_hwnd):
-    """Ghost-type a message into a worker's chat window."""
-    worker = workers.get(worker_name)
-    if not worker:
-        log(f"Worker {worker_name} not in workers.json", "WARN")
-        return False
+def _now_iso():
+    return datetime.now().isoformat(timespec="seconds")
 
-    hwnd = worker.get("hwnd")
-    if not hwnd:
-        log(f"No HWND for {worker_name}", "WARN")
-        return False
 
+def _ts(value):
     try:
-        from skynet_dispatch import ghost_type_to_worker
-        ok = ghost_type_to_worker(hwnd, text, orch_hwnd)
-        if ok:
-            log(f"Delivered to {worker_name.upper()}", "OK")
-        else:
-            log(f"Ghost-type failed for {worker_name.upper()}", "ERR")
-        return ok
-    except Exception as e:
-        log(f"Delivery error for {worker_name}: {e}", "ERR")
-        return False
+        return datetime.fromisoformat(str(value)).timestamp()
+    except Exception:
+        return 0.0
 
 
 def _format_bus_message(msg):
@@ -139,18 +151,18 @@ def _format_bus_message(msg):
                     f"[BUS RELAY] Convene session '{session}' from {sender}:\n"
                     f"{question}\n"
                     f"{vote_req}\n"
-                    f"To vote GO: import requests; requests.post('http://localhost:8420/bus/publish', "
-                    f"json={{'sender':'YOUR_NAME','topic':'convene','type':'vote','content':'GO on {session}'}})"
-                )
+                    f"To vote GO: from tools.skynet_spam_guard import guarded_publish; "
+                    f"guarded_publish({{'sender':'YOUR_NAME','topic':'convene','type':'vote','content':'GO on {session}'}})"
+                )  # signed: alpha
         except (json.JSONDecodeError, TypeError):
             pass
 
     return (
         f"[BUS RELAY] {mtype.upper()} from {sender} (topic={topic}):\n"
         f"{content}\n"
-        f"Reply via bus: import requests; requests.post('http://localhost:8420/bus/publish', "
-        f"json={{'sender':'YOUR_NAME','topic':'{sender}','type':'reply','content':'YOUR_REPLY'}})"
-    )
+        f"Reply via bus: from tools.skynet_spam_guard import guarded_publish; "
+        f"guarded_publish({{'sender':'YOUR_NAME','topic':'{sender}','type':'reply','content':'YOUR_REPLY'}})"
+    )  # signed: alpha
 
 
 def _determine_targets(msg):
@@ -169,65 +181,160 @@ def _determine_targets(msg):
     return set()
 
 
-def poll_and_relay(dry_run=False):
-    """Single poll cycle: fetch bus messages and relay to worker windows."""
-    messages = _fetch_messages(limit=50)
-    delivered_ids = _load_delivered()
-    workers = _load_workers()
-    orch_hwnd = _load_orch_hwnd()
+def _queue_entry(msg):
+    return {
+        "id": msg.get("id", ""),
+        "sender": msg.get("sender", "unknown"),
+        "topic": msg.get("topic", ""),
+        "type": msg.get("type", ""),
+        "content": str(msg.get("content", "")),
+        "queued_at": _now_iso(),
+    }
 
-    if not workers:
-        log("No workers.json found -- cannot deliver", "ERR")
+
+def _queue_message(msg, delivered_ids, queue_state, dry_run=False):
+    msg_id = msg.get("id", "")
+    if not msg_id or msg_id in delivered_ids:
         return 0
 
-    new_deliveries = 0
-    cooldown = 2.0  # seconds between deliveries to avoid clipboard corruption
+    topic = msg.get("topic", "")
+    mtype = str(msg.get("type", "")).lower()
+    if topic not in RELAY_TOPICS:
+        return 0
+    if mtype not in RELAY_TYPES:
+        delivered_ids.add(msg_id)
+        return 0
 
+    targets = _determine_targets(msg)
+    if not targets:
+        delivered_ids.add(msg_id)
+        return 0
+
+    existing_ids = {str(item.get("id", "")) for item in queue_state.get("messages", [])}
+    if msg_id in existing_ids:
+        delivered_ids.add(msg_id)
+        return 0
+
+    if dry_run:
+        log(f"[DRY-RUN] Would queue [{msg.get('sender', '?')}] {mtype} from topic={topic}")
+        delivered_ids.add(msg_id)
+        return 1
+
+    if not queue_state.get("window_started_at"):
+        queue_state["window_started_at"] = _now_iso()
+    queue_state.setdefault("messages", []).append(_queue_entry(msg))
+    delivered_ids.add(msg_id)
+    log(f"Queued [{msg.get('sender', '?')}] {mtype} topic={topic} for hourly orchestrator digest")
+    return 1
+
+
+def _format_digest(messages):
+    stamp = _now_iso()
+    lines = [
+        f"[BUS RELAY DIGEST] held_window=60m count={len(messages)} generated_at={stamp}",
+        "Relayable worker/convene traffic was held instead of direct worker delivery.",
+        "Review these queued messages and take action explicitly.",
+        "",
+    ]
+    for idx, msg in enumerate(messages, start=1):
+        content = " ".join(str(msg.get("content", "")).split())
+        lines.append(
+            f"{idx}. id={msg.get('id', '-')}"
+            f" sender={msg.get('sender', 'unknown')}"
+            f" topic={msg.get('topic', '')}"
+            f" type={msg.get('type', '')}"
+            f" queued_at={msg.get('queued_at', '')}"
+        )
+        lines.append(f"   {content[:260]}")
+    return "\n".join(lines)[:4000]
+
+
+def _bus_post(sender, topic, msg_type, content):
+    payload = json.dumps({
+        "sender": sender,
+        "topic": topic,
+        "type": msg_type,
+        "content": content,
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            f"{SKYNET_URL}/bus/publish",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5):
+            return True
+    except Exception as e:
+        log(f"Bus publish failed: {e}", "ERR")
+        return False
+
+
+def _send_digest_to_orchestrator(messages, dry_run=False):
+    digest = _format_digest(messages)
+    if dry_run:
+        log(f"[DRY-RUN] Would send hourly digest to orchestrator ({len(messages)} queued messages)")
+        return {"bus_ok": True, "prompt_ok": True, "count": len(messages)}
+
+    bus_ok = _bus_post("bus_relay", "orchestrator", "bus_relay_digest", digest)
+    prompt_ok = False
+    try:
+        from skynet_delivery import deliver_to_orchestrator
+        result = deliver_to_orchestrator(digest, sender="bus_relay", also_bus=False)
+        prompt_ok = bool(result.get("success"))
+    except Exception as e:
+        log(f"Orchestrator direct delivery failed: {e}", "ERR")
+
+    return {"bus_ok": bus_ok, "prompt_ok": prompt_ok, "count": len(messages)}
+
+
+def _flush_due_queue(queue_state, dry_run=False):
+    messages = queue_state.get("messages", [])
+    if not messages:
+        return 0
+
+    window_started = _ts(queue_state.get("window_started_at", ""))
+    if not window_started:
+        queue_state["window_started_at"] = messages[0].get("queued_at", _now_iso())
+        window_started = _ts(queue_state["window_started_at"])
+
+    elapsed = time.time() - window_started
+    if elapsed < HOLD_INTERVAL_S:
+        return 0
+
+    result = _send_digest_to_orchestrator(messages, dry_run=dry_run)
+    if result.get("bus_ok"):
+        log(
+            f"Sent hourly bus relay digest to orchestrator "
+            f"(count={result.get('count', 0)} prompt_ok={result.get('prompt_ok', False)})",
+            "OK",
+        )
+        queue_state["messages"] = []
+        queue_state["window_started_at"] = ""
+        queue_state["last_digest_at"] = _now_iso()
+        return int(result.get("count", 0))
+    return 0
+
+
+def _process_message(msg, delivered_ids, workers, orch_hwnd, dry_run):
+    """Compatibility wrapper -- relayable messages now queue for orchestrator digest."""
+    return _queue_message(msg, delivered_ids, workers, dry_run=dry_run)
+
+
+def poll_and_relay(dry_run=False):
+    """Single poll cycle: queue relayable messages and flush hourly digest if due."""
+    messages = _fetch_messages(limit=50)
+    delivered_ids = _load_delivered()
+    queue_state = _load_queue_state()
+
+    new_queued = 0
     for msg in messages:
-        msg_id = msg.get("id", "")
-        if not msg_id or msg_id in delivered_ids:
-            continue
-
-        topic = msg.get("topic", "")
-        mtype = msg.get("type", "").lower()
-
-        # Only relay relevant topics and types
-        if topic not in RELAY_TOPICS:
-            continue
-        if mtype not in RELAY_TYPES:
-            delivered_ids.add(msg_id)  # mark as seen but don't deliver
-            continue
-
-        targets = _determine_targets(msg)
-        if not targets:
-            delivered_ids.add(msg_id)
-            continue
-
-        formatted = _format_bus_message(msg)
-        sender = msg.get("sender", "?")
-
-        if dry_run:
-            log(f"[DRY-RUN] Would deliver to {targets}: [{sender}] {mtype} ({formatted[:80]}...)")
-            delivered_ids.add(msg_id)
-            new_deliveries += 1
-            continue
-
-        delivered_any = False
-        for target in targets:
-            if target not in workers:
-                continue
-            log(f"Relaying [{sender}] {mtype} -> {target.upper()}")
-            ok = _deliver_to_worker(target, formatted, workers, orch_hwnd)
-            if ok:
-                delivered_any = True
-                new_deliveries += 1
-                time.sleep(cooldown)  # clipboard cooldown
-
-        if delivered_any:
-            delivered_ids.add(msg_id)
+        new_queued += _process_message(msg, delivered_ids, queue_state, None, dry_run)
 
     _save_delivered(delivered_ids)
-    return new_deliveries
+    flushed = _flush_due_queue(queue_state, dry_run=dry_run)
+    _save_queue_state(queue_state)
+    return new_queued + flushed
 
 
 def _pid_is_bus_relay(pid: int) -> bool:
@@ -309,15 +416,19 @@ def run_daemon():
 def print_status():
     """Show relay statistics."""
     delivered = _load_delivered()
-    workers = _load_workers()
+    queue_state = _load_queue_state()
+    queued = queue_state.get("messages", [])
     print(f"\n{'='*50}")
     print(f"  SKYNET BUS RELAY -- Status")
     print(f"{'='*50}")
-    print(f"  Messages delivered (tracked IDs): {len(delivered)}")
-    print(f"  Workers known: {', '.join(workers.keys()) if workers else 'NONE'}")
+    print(f"  Relayable IDs tracked: {len(delivered)}")
+    print(f"  Queued for orchestrator digest: {len(queued)}")
+    print(f"  Window started: {queue_state.get('window_started_at') or 'none'}")
+    print(f"  Last digest sent: {queue_state.get('last_digest_at') or 'never'}")
     print(f"  PID file: {'exists' if PID_FILE.exists() else 'none'}")
     print(f"  Relay topics: {RELAY_TOPICS}")
     print(f"  Relay types: {RELAY_TYPES}")
+    print(f"  Hold interval: {HOLD_INTERVAL_S}s")
     print(f"{'='*50}\n")
 
 

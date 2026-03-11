@@ -24,6 +24,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 BUS_URL = "http://localhost:8420"
+WORKER_NAMES = ("alpha", "beta", "gamma", "delta")
+KNOWN_ACTORS = WORKER_NAMES + ("orchestrator", "consultant", "gemini_consultant")
+SHARED_ASSIGNEES = ("", "all", "shared", "any", "unassigned", "backlog")
 
 # How far back to look for bus messages (seconds)
 BUS_LOOKBACK_S = 300  # 5 minutes
@@ -36,6 +39,21 @@ def _load_json(path):
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+
+def _todo_target(item):
+    """Return normalized assignee/worker target for a TODO-like object."""
+    return str(item.get("assignee", item.get("worker", "")) or "").strip().lower()
+
+
+def _todo_item_view(item, target):
+    return {
+        "id": item.get("id", ""),
+        "task": item.get("task", item.get("title", ""))[:200],
+        "status": item.get("status", "").lower(),
+        "priority": item.get("priority", "normal"),
+        "target": target or "-",
+    }
 
 
 def _get_pending_tasks(worker_name):
@@ -131,16 +149,26 @@ def _get_todos(worker_name):
     todos = data.get("todos", [])
     pending = []
     for t in todos:
-        worker = t.get("worker", "").lower()
+        worker = _todo_target(t)
         status = t.get("status", "").lower()
         if worker == worker_name.lower() and status in ("pending", "active"):
-            pending.append({
-                "id": t.get("id", ""),
-                "task": t.get("task", "")[:200],
-                "status": status,
-                "priority": t.get("priority", "normal"),
-            })
+            pending.append(_todo_item_view(t, worker))
     return pending
+
+
+def _get_claimable_todos(actor_name):
+    """Return shared/unassigned TODOs this actor can proactively pull."""
+    data = _load_json(DATA / "todos.json")
+    todos = data.get("todos", [])
+    claimable = []
+    for t in todos:
+        target = _todo_target(t)
+        status = t.get("status", "").lower()
+        if status not in ("pending", "active"):
+            continue
+        if target in SHARED_ASSIGNEES:
+            claimable.append(_todo_item_view(t, target))
+    return claimable
 
 
 def _get_directives(worker_name):
@@ -173,66 +201,47 @@ def _get_directives(worker_name):
         return []
 
 
+def _build_work_summary(worker_name: str, sources: dict) -> str:
+    """Build a human-readable summary of pending work items."""
+    total = sum(len(v) for v in sources.values())
+    if not total:
+        return f"=== {worker_name.upper()} has NO pending work ==="
+
+    lines = [f"=== {worker_name.upper()} has {total} pending item(s) ==="]
+    _formatters = {
+        "pending_tasks": ("[TASK QUEUE]", lambda t: f"  - [{t['priority'].upper()}] {t['task_id']}: {t['task'][:80]}"),
+        "queued_tasks": ("[GO QUEUE]", lambda t: f"  - {t['id']}: {t['task'][:80]}"),
+        "bus_requests": ("[BUS REQUESTS]", lambda m: f"  - from {m['sender']} ({m['type']}): {m['content'][:80]}"),
+        "directives": ("[DIRECTIVES]", lambda d: f"  - from {d['sender']}: {d['content'][:80]}"),
+        "todos": ("[TODOs]", lambda t: f"  - [{t['priority'].upper()}] {t['id']}: {t['task'][:80]}"),
+        "claimable_todos": ("[CLAIMABLE TODOs]", lambda t: f"  - [{t['priority'].upper()}] {t['id']} ({t['target']}): {t['task'][:80]}"),
+    }
+    for key, (label, fmt) in _formatters.items():
+        items = sources.get(key, [])
+        if items:
+            lines.append(f"\n{label} {len(items)} item(s):")
+            lines.extend(fmt(item) for item in items)
+    return "\n".join(lines)
+
+
 def poll_for_work(worker_name):
-    """Poll all sources for pending work assigned to a worker.
-
-    Returns:
-        dict with keys:
-            pending_tasks  - from data/task_queue.json (status=pending/active)
-            queued_tasks   - from Go backend /bus/tasks (unclaimed)
-            bus_requests   - from bus topic=workers (sub-tasks, requests)
-            directives     - from bus topic=orchestrator type=directive
-            todos          - from data/todos.json (pending/active)
-            has_work       - True if any source has pending items
-            total_items    - total count of all pending items
-            summary_text   - human-readable summary
-    """
-    pending_tasks = _get_pending_tasks(worker_name)
-    queued_tasks = _get_queued_tasks(worker_name)
-    bus_requests = _get_bus_requests(worker_name)
-    directives = _get_directives(worker_name)
-    todos = _get_todos(worker_name)
-
-    total = len(pending_tasks) + len(queued_tasks) + len(bus_requests) + len(directives) + len(todos)
-    has_work = total > 0
-
-    # Build summary text
-    lines = []
-    if has_work:
-        lines.append(f"=== {worker_name.upper()} has {total} pending item(s) ===")
-        if pending_tasks:
-            lines.append(f"\n[TASK QUEUE] {len(pending_tasks)} task(s):")
-            for t in pending_tasks:
-                lines.append(f"  - [{t['priority'].upper()}] {t['task_id']}: {t['task'][:80]}")
-        if queued_tasks:
-            lines.append(f"\n[GO QUEUE] {len(queued_tasks)} unclaimed task(s):")
-            for t in queued_tasks:
-                lines.append(f"  - {t['id']}: {t['task'][:80]}")
-        if bus_requests:
-            lines.append(f"\n[BUS REQUESTS] {len(bus_requests)} message(s):")
-            for m in bus_requests:
-                lines.append(f"  - from {m['sender']} ({m['type']}): {m['content'][:80]}")
-        if directives:
-            lines.append(f"\n[DIRECTIVES] {len(directives)} directive(s):")
-            for d in directives:
-                lines.append(f"  - from {d['sender']}: {d['content'][:80]}")
-        if todos:
-            lines.append(f"\n[TODOs] {len(todos)} item(s):")
-            for t in todos:
-                lines.append(f"  - [{t['priority'].upper()}] {t['id']}: {t['task'][:80]}")
-    else:
-        lines.append(f"=== {worker_name.upper()} has NO pending work ===")
+    """Poll all sources for pending work assigned to a worker."""
+    sources = {
+        "pending_tasks": _get_pending_tasks(worker_name),
+        "queued_tasks": _get_queued_tasks(worker_name),
+        "bus_requests": _get_bus_requests(worker_name),
+        "directives": _get_directives(worker_name),
+        "todos": _get_todos(worker_name),
+        "claimable_todos": _get_claimable_todos(worker_name),
+    }
+    total = sum(len(v) for v in sources.values())
 
     return {
         "worker": worker_name,
-        "pending_tasks": pending_tasks,
-        "queued_tasks": queued_tasks,
-        "bus_requests": bus_requests,
-        "directives": directives,
-        "todos": todos,
-        "has_work": has_work,
+        **sources,
+        "has_work": total > 0,
         "total_items": total,
-        "summary_text": "\n".join(lines),
+        "summary_text": _build_work_summary(worker_name, sources),
     }
 
 
@@ -314,8 +323,8 @@ if __name__ == "__main__":
 
     else:
         worker = args[0].lower()
-        if worker not in ("alpha", "beta", "gamma", "delta", "orchestrator"):
-            print(f"Unknown worker: {worker}")
+        if worker not in KNOWN_ACTORS:
+            print(f"Unknown actor: {worker}")
             sys.exit(1)
         result = poll_for_work(worker)
         print(result["summary_text"])

@@ -99,6 +99,78 @@ def _get_test_files() -> set:
     return test_files
 
 
+def _scan_todo_comments(source: str, rel_path: str, report: HealthReport):
+    """Scan source lines for TODO/FIXME/HACK comments."""
+    for i, line in enumerate(source.splitlines(), 1):
+        match = TODO_PATTERNS.search(line)
+        if match:
+            tag = match.group(1).upper()
+            comment = line.strip()[:120]
+            report.add(Finding(
+                category="todo_comment",
+                file=rel_path,
+                line=i,
+                detail=f"{tag}: {comment}",
+                severity="low" if tag == "TODO" else "medium",
+            ))
+
+
+def _check_missing_tests(tree, py_file: Path, rel_path: str,
+                         test_modules: set, report: HealthReport):
+    """Check if a non-test module has a corresponding test file."""
+    if py_file.name.startswith("test_") or "tests" in py_file.parts:
+        return
+    module_stem = py_file.stem
+    if module_stem not in test_modules:
+        has_public_fns = any(
+            isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for n in ast.walk(tree)
+            if not (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and n.name.startswith("_"))
+        )
+        if has_public_fns:
+            report.add(Finding(
+                category="missing_test",
+                file=rel_path,
+                detail=f"No test_{{name}}.py found for {module_stem}",
+                severity="medium",
+            ))
+
+
+def _scan_ast_nodes(tree, rel_path: str, report: HealthReport):
+    """Scan AST for missing docstrings and long functions/classes."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not ast.get_docstring(node) and not node.name.startswith("_"):
+                report.add(Finding(
+                    category="missing_docstring",
+                    file=rel_path,
+                    line=node.lineno,
+                    detail=f"Function '{node.name}' has no docstring",
+                    severity="low",
+                ))
+            if hasattr(node, "end_lineno") and node.end_lineno:
+                length = node.end_lineno - node.lineno + 1
+                if length > MAX_FUNCTION_LINES:
+                    report.add(Finding(
+                        category="long_function",
+                        file=rel_path,
+                        line=node.lineno,
+                        detail=f"Function '{node.name}' is {length} lines "
+                               f"(max recommended: {MAX_FUNCTION_LINES})",
+                        severity="medium",
+                    ))
+        elif isinstance(node, ast.ClassDef):
+            if not ast.get_docstring(node):
+                report.add(Finding(
+                    category="missing_docstring",
+                    file=rel_path,
+                    line=node.lineno,
+                    detail=f"Class '{node.name}' has no docstring",
+                    severity="low",
+                ))
+
+
 def scan_codebase_health() -> HealthReport:
     """Scan codebase for improvement opportunities using AST parsing."""
     report = HealthReport()
@@ -113,19 +185,7 @@ def scan_codebase_health() -> HealthReport:
         except Exception:
             continue
 
-        # Scan for TODO/FIXME/HACK comments
-        for i, line in enumerate(source.splitlines(), 1):
-            match = TODO_PATTERNS.search(line)
-            if match:
-                tag = match.group(1).upper()
-                comment = line.strip()[:120]
-                report.add(Finding(
-                    category="todo_comment",
-                    file=rel_path,
-                    line=i,
-                    detail=f"{tag}: {comment}",
-                    severity="low" if tag == "TODO" else "medium",
-                ))
+        _scan_todo_comments(source, rel_path, report)
 
         # Parse AST
         try:
@@ -139,61 +199,9 @@ def scan_codebase_health() -> HealthReport:
             ))
             continue
 
-        # Check if file has tests (only for non-test files)
-        if not py_file.name.startswith("test_") and "tests" not in py_file.parts:
-            module_stem = py_file.stem
-            # Check common naming patterns
-            if module_stem not in test_modules:
-                has_functions = any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                                   for n in ast.walk(tree)
-                                   if not (isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                                           and n.name.startswith("_")))
-                if has_functions:
-                    report.add(Finding(
-                        category="missing_test",
-                        file=rel_path,
-                        detail=f"No test_{{name}}.py found for {module_stem}",
-                        severity="medium",
-                    ))
+        _check_missing_tests(tree, py_file, rel_path, test_modules, report)
 
-        # Scan functions/classes
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                # Missing docstring
-                if not (ast.get_docstring(node)):
-                    if not node.name.startswith("_"):
-                        report.add(Finding(
-                            category="missing_docstring",
-                            file=rel_path,
-                            line=node.lineno,
-                            detail=f"Function '{node.name}' has no docstring",
-                            severity="low",
-                        ))
-
-                # Long function
-                if hasattr(node, "end_lineno") and node.end_lineno:
-                    length = node.end_lineno - node.lineno + 1
-                    if length > MAX_FUNCTION_LINES:
-                        report.add(Finding(
-                            category="long_function",
-                            file=rel_path,
-                            line=node.lineno,
-                            detail=f"Function '{node.name}' is {length} lines "
-                                   f"(max recommended: {MAX_FUNCTION_LINES})",
-                            severity="medium",
-                        ))
-
-            elif isinstance(node, ast.ClassDef):
-                if not ast.get_docstring(node):
-                    report.add(Finding(
-                        category="missing_docstring",
-                        file=rel_path,
-                        line=node.lineno,
-                        detail=f"Class '{node.name}' has no docstring",
-                        severity="low",
-                    ))
-
-        # Detect unused imports (basic heuristic: import at top, name never used in body)
+        _scan_ast_nodes(tree, rel_path, report)
         _scan_unused_imports(tree, source, rel_path, report)
 
     return report

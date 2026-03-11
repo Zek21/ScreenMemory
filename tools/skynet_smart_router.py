@@ -143,41 +143,17 @@ def route_task(task_text: str, workers: Optional[list[str]] = None) -> str:
     return ranked[0]["worker"]
 
 
-def record_metrics(
-    worker: str,
-    duration_ms: float,
-    outcome: str,
-    task_summary: str = "",
-) -> dict:
-    """Record task performance metrics for a worker.
-
-    Args:
-        worker: Worker name (alpha/beta/gamma/delta)
-        duration_ms: Task duration in milliseconds
-        outcome: 'success' or 'failure'
-        task_summary: Brief task description
-    """
-    perf = _load_performance()
-    workers = perf.setdefault("workers", {})
-    wp = workers.setdefault(worker, {
-        "tasks_completed": 0,
-        "tasks_failed": 0,
-        "avg_duration_ms": 0,
-        "specialties": {},
-        "recent_tasks": [],
-    })
-
-    if outcome == "success":
-        wp["tasks_completed"] = wp.get("tasks_completed", 0) + 1
-    else:
-        wp["tasks_failed"] = wp.get("tasks_failed", 0) + 1
-
-    # Rolling average duration
+def _update_worker_stats(wp: dict, duration_ms: float, outcome: str):
+    """Update task counts and rolling average duration."""
+    key = "tasks_completed" if outcome == "success" else "tasks_failed"
+    wp[key] = wp.get(key, 0) + 1
     total = wp.get("tasks_completed", 0) + wp.get("tasks_failed", 0)
     old_avg = wp.get("avg_duration_ms", 0)
     wp["avg_duration_ms"] = round(((old_avg * (total - 1)) + duration_ms) / total, 1) if total > 0 else duration_ms
 
-    # Keep last 20 tasks
+
+def _append_recent_task(wp: dict, task_summary: str, duration_ms: float, outcome: str):
+    """Append to recent tasks list (capped at 20)."""
     recent = wp.setdefault("recent_tasks", [])
     recent.append({
         "task": task_summary[:120] if task_summary else "",
@@ -187,14 +163,29 @@ def record_metrics(
     })
     wp["recent_tasks"] = recent[-20:]
 
-    # Update specialty scores based on outcome and detected domains
-    domains = detect_domains(task_summary)
-    for domain in domains:
+
+def record_metrics(
+    worker: str,
+    duration_ms: float,
+    outcome: str,
+    task_summary: str = "",
+) -> dict:
+    """Record task performance metrics for a worker."""
+    perf = _load_performance()
+    wp = perf.setdefault("workers", {}).setdefault(worker, {
+        "tasks_completed": 0, "tasks_failed": 0,
+        "avg_duration_ms": 0, "specialties": {}, "recent_tasks": [],
+    })
+
+    _update_worker_stats(wp, duration_ms, outcome)
+    _append_recent_task(wp, task_summary, duration_ms, outcome)
+
+    for domain in detect_domains(task_summary):
         old_score = wp.get("specialties", {}).setdefault(domain, 0.5)
-        if outcome == "success":
-            wp["specialties"][domain] = min(1.0, round(old_score + 0.02, 4))
-        else:
-            wp["specialties"][domain] = max(0.1, round(old_score - 0.05, 4))
+        delta = 0.02 if outcome == "success" else -0.05
+        bound = min if outcome == "success" else max
+        limit = 1.0 if outcome == "success" else 0.1
+        wp["specialties"][domain] = bound(limit, round(old_score + delta, 4))
 
     _save_performance(perf)
     return {

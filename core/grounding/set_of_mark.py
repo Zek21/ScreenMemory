@@ -311,21 +311,24 @@ class SetOfMarkGrounding:
         if not regions:
             return []
 
-        # Build spatial grid for fast neighbor lookup
-        if not regions:
-            return []
-        grid_size = 80  # pixels per grid cell
+        grid_size = 80
+        grid = self._build_spatial_grid(regions, grid_size)
+        return self._merge_with_grid(regions, grid, grid_size)
+
+    @staticmethod
+    def _build_spatial_grid(regions: List[UIRegion], grid_size: int) -> dict:
+        """Build a spatial grid index for fast neighbor lookup."""
         grid = {}
         for i, r in enumerate(regions):
-            # Cells this region spans
-            cx1 = r.x // grid_size
-            cy1 = r.y // grid_size
-            cx2 = (r.x + r.width) // grid_size
-            cy2 = (r.y + r.height) // grid_size
+            cx1, cy1 = r.x // grid_size, r.y // grid_size
+            cx2, cy2 = (r.x + r.width) // grid_size, (r.y + r.height) // grid_size
             for gy in range(cy1, cy2 + 1):
                 for gx in range(cx1, cx2 + 1):
                     grid.setdefault((gx, gy), []).append(i)
+        return grid
 
+    def _merge_with_grid(self, regions: List[UIRegion], grid: dict, grid_size: int) -> List[UIRegion]:
+        """Merge overlapping region groups using grid-accelerated neighbor lookup."""
         merged = []
         used = set()
 
@@ -333,40 +336,35 @@ class SetOfMarkGrounding:
             if i in used:
                 continue
 
-            # Only check neighbors in same/adjacent grid cells
-            cx1 = r1.x // grid_size
-            cy1 = r1.y // grid_size
-            cx2 = (r1.x + r1.width) // grid_size
-            cy2 = (r1.y + r1.height) // grid_size
-
-            candidates = set()
-            for gy in range(cy1, cy2 + 1):
-                for gx in range(cx1, cx2 + 1):
-                    for j in grid.get((gx, gy), []):
-                        if j > i and j not in used:
-                            candidates.add(j)
-
+            candidates = self._grid_neighbors(r1, grid, grid_size, i, used)
             group = [r1]
             for j in candidates:
                 if self._iou(r1, regions[j]) > self.merge_threshold:
                     group.append(regions[j])
                     used.add(j)
 
-            # Merge group into single region
             x1 = min(r.x for r in group)
             y1 = min(r.y for r in group)
             x2 = max(r.x + r.width for r in group)
             y2 = max(r.y + r.height for r in group)
             avg_conf = sum(r.confidence for r in group) / len(group)
-
-            merged.append(UIRegion(
-                id=0, x=x1, y=y1,
-                width=x2 - x1, height=y2 - y1,
-                confidence=avg_conf,
-            ))
+            merged.append(UIRegion(id=0, x=x1, y=y1, width=x2 - x1, height=y2 - y1, confidence=avg_conf))
             used.add(i)
 
         return merged
+
+    @staticmethod
+    def _grid_neighbors(region: UIRegion, grid: dict, grid_size: int, idx: int, used: set) -> set:
+        """Find candidate neighbor indices from the spatial grid."""
+        cx1, cy1 = region.x // grid_size, region.y // grid_size
+        cx2, cy2 = (region.x + region.width) // grid_size, (region.y + region.height) // grid_size
+        candidates = set()
+        for gy in range(cy1, cy2 + 1):
+            for gx in range(cx1, cx2 + 1):
+                for j in grid.get((gx, gy), []):
+                    if j > idx and j not in used:
+                        candidates.add(j)
+        return candidates
 
     def _iou(self, r1: UIRegion, r2: UIRegion) -> float:
         """Compute Intersection over Union of two regions."""

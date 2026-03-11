@@ -60,9 +60,11 @@ def _hidden_run(args, **kwargs):
 
 
 def _load_workers():
-    if not WORKERS_FILE.exists():
-        return [], None
-    data = json.loads(WORKERS_FILE.read_text())
+    try:
+        from tools.skynet_atomic import safe_read_json
+    except ModuleNotFoundError:
+        from skynet_atomic import safe_read_json
+    data = safe_read_json(WORKERS_FILE, default={"workers": []})
     return data.get("workers", []), data.get("orchestrator_hwnd")
 
 
@@ -300,17 +302,26 @@ def _get_vscode_hwnds():
 
 
 def _update_worker_hwnd(worker_name, new_hwnd):
-    """Update workers.json with a new HWND for a worker."""
+    """Update workers.json with a new HWND for a worker (atomic write)."""
+    try:
+        from tools.skynet_atomic import atomic_update_json, safe_read_json
+    except ModuleNotFoundError:
+        from skynet_atomic import atomic_update_json, safe_read_json
     if not WORKERS_FILE.exists():
         return
-    data = json.loads(WORKERS_FILE.read_text())
-    for w in data.get("workers", []):
-        if w["name"] == worker_name:
-            old_hwnd = w["hwnd"]
-            w["hwnd"] = new_hwnd
-            log(f"workers.json: {worker_name} HWND {old_hwnd} → {new_hwnd}", "SYS")
-            break
-    WORKERS_FILE.write_text(json.dumps(data, indent=2))
+    def _update(data):
+        from datetime import datetime as _dt
+        now_iso = _dt.now().isoformat()
+        for w in data.get("workers", []):
+            if w["name"] == worker_name:
+                old_hwnd = w["hwnd"]
+                w["hwnd"] = new_hwnd
+                w["updated_at"] = now_iso  # signed: delta
+                w["last_seen"] = now_iso   # signed: delta
+                log(f"workers.json: {worker_name} HWND {old_hwnd} -> {new_hwnd}", "SYS")
+                break
+        return data
+    atomic_update_json(WORKERS_FILE, _update, default={"workers": []})
 
 
 # ─── Worker Scoring ─────────────────────────────────────────────────────────
@@ -325,8 +336,11 @@ def _load_scores():
 
 
 def _save_scores(scores):
-    SCORE_FILE.parent.mkdir(exist_ok=True)
-    SCORE_FILE.write_text(json.dumps(scores, indent=2))
+    try:
+        from tools.skynet_atomic import atomic_write_json
+    except ModuleNotFoundError:
+        from skynet_atomic import atomic_write_json
+    atomic_write_json(SCORE_FILE, scores)
 
 
 def record_outcome(worker_name, success, elapsed_s, task_type="general"):
@@ -412,6 +426,47 @@ class RealtimeCollector:
 
         log(f"  Baselines: {', '.join(f'{n}={c[:8]}' for n, c in self._baselines.items())}", "SYS")
 
+    def _process_scan(self, name, scan_result, prev_states, saw_processing,
+                       results, t0, elapsed_total, extract_text,
+                       task_types, recovery_attempted):
+        """Process a single worker scan result during collection."""
+        prev = prev_states.get(name, "UNKNOWN")
+        curr = scan_result.state
+
+        if curr == "PROCESSING":
+            saw_processing.add(name)
+
+        if curr == "IDLE" and name in saw_processing:
+            elapsed = time.time() - t0
+            log(f"  {name.upper()}: DONE ({prev}->IDLE {elapsed:.1f}s)", "OK")
+            text, fresh = self._extract_fresh(name) if extract_text else (None, False)
+            results[name] = {"status": "complete", "text": text, "elapsed_s": round(elapsed, 1), "fresh": fresh}
+            record_outcome(name, bool(text), elapsed, task_types.get(name, "general"))
+
+        elif curr == "IDLE" and name not in saw_processing and elapsed_total > 8:
+            _, fresh = self._check_freshness(name)
+            if fresh:
+                elapsed = time.time() - t0
+                text, _ = self._extract_fresh(name) if extract_text else (None, False)
+                log(f"  {name.upper()}: instant completion ({elapsed:.1f}s, fresh={fresh})", "OK")
+                results[name] = {"status": "complete", "text": text, "elapsed_s": round(elapsed, 1), "fresh": True}
+                record_outcome(name, bool(text), elapsed, task_types.get(name, "general"))
+            elif elapsed_total > 30:
+                log(f"  {name.upper()}: 30s IDLE, no new items -- stale", "WARN")
+                results[name] = {"status": "stale", "text": None, "elapsed_s": round(time.time() - t0, 1), "fresh": False}
+                record_outcome(name, False, time.time() - t0, task_types.get(name, "general"))
+
+        elif curr == "UNKNOWN" and self.auto_recover and name not in recovery_attempted:
+            recovery_attempted.add(name)
+            log(f"  {name.upper()}: UNKNOWN -- recovering", "WARN")
+            ok, new_hwnd = recover_worker(name, self._workers, self._orch_hwnd)
+            if ok and new_hwnd:
+                self._worker_map[name]["hwnd"] = new_hwnd
+                self._workers = [w if w["name"] != name else {**w, "hwnd": new_hwnd} for w in self._workers]
+                log(f"  {name.upper()}: recovered HWND={new_hwnd}", "OK")
+
+        prev_states[name] = curr
+
     def collect(self, expected_workers, timeout=120, extract_text=True, task_types=None):
         """Real-time result collection with fingerprinting.
 
@@ -462,45 +517,11 @@ class RealtimeCollector:
             poll_sleep = 0.5 if elapsed_total < 5.0 else self.poll_interval
 
             for name, scan_result in scans.items():
-                prev = prev_states.get(name, "UNKNOWN")
-                curr = scan_result.state
-
-                if curr == "PROCESSING":
-                    saw_processing.add(name)
-
-                # DONE: IDLE after PROCESSING
-                if curr == "IDLE" and name in saw_processing:
-                    elapsed = time.time() - t0
-                    log(f"  {name.upper()}: DONE ({prev}→IDLE {elapsed:.1f}s)", "OK")
-                    text, fresh = self._extract_fresh(name) if extract_text else (None, False)
-                    results[name] = {"status": "complete", "text": text, "elapsed_s": round(elapsed, 1), "fresh": fresh}
-                    record_outcome(name, bool(text), elapsed, task_types.get(name, "general"))
-
-                # Instant completion: IDLE but never saw PROCESSING + new ListItems exist
-                elif curr == "IDLE" and name not in saw_processing and elapsed_total > 8:
-                    _, fresh = self._check_freshness(name)
-                    if fresh:
-                        elapsed = time.time() - t0
-                        text, _ = self._extract_fresh(name) if extract_text else (None, False)
-                        log(f"  {name.upper()}: instant completion ({elapsed:.1f}s, fresh={fresh})", "OK")
-                        results[name] = {"status": "complete", "text": text, "elapsed_s": round(elapsed, 1), "fresh": True}
-                        record_outcome(name, bool(text), elapsed, task_types.get(name, "general"))
-                    elif elapsed_total > 30:
-                        log(f"  {name.upper()}: 30s IDLE, no new items — stale", "WARN")
-                        results[name] = {"status": "stale", "text": None, "elapsed_s": round(time.time() - t0, 1), "fresh": False}
-                        record_outcome(name, False, time.time() - t0, task_types.get(name, "general"))
-
-                # UNKNOWN → recovery
-                elif curr == "UNKNOWN" and self.auto_recover and name not in recovery_attempted:
-                    recovery_attempted.add(name)
-                    log(f"  {name.upper()}: UNKNOWN — recovering", "WARN")
-                    ok, new_hwnd = recover_worker(name, self._workers, self._orch_hwnd)
-                    if ok and new_hwnd:
-                        self._worker_map[name]["hwnd"] = new_hwnd
-                        self._workers = [w if w["name"] != name else {**w, "hwnd": new_hwnd} for w in self._workers]
-                        log(f"  {name.upper()}: recovered HWND={new_hwnd}", "OK")
-
-                prev_states[name] = curr
+                self._process_scan(
+                    name, scan_result, prev_states, saw_processing,
+                    results, t0, elapsed_total, extract_text,
+                    task_types, recovery_attempted,
+                )
 
             if poll_count % 10 == 0:
                 missing = [w for w in expected_workers if w not in results]

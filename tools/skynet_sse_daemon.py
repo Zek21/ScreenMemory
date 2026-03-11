@@ -215,6 +215,59 @@ def _build_state(sse_data: dict, update_count: int, last_tick_time: float) -> di
     }
 
 
+def _init_pid_guard(pid_file: Path) -> bool:
+    """Check for existing daemon instance. Returns True if safe to proceed."""
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text().strip())
+            os.kill(old_pid, 0)
+            print(f"[sse-daemon] Already running (PID {old_pid}) -- exiting to prevent duplicate", flush=True)
+            return False
+        except (OSError, ValueError):
+            pass
+    pid_file.write_text(str(os.getpid()))
+
+    import atexit
+    def _cleanup_pid():
+        try:
+            pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+    atexit.register(_cleanup_pid)
+    return True
+
+
+def _process_tick(buf, last_tick, update_count, output, verbose, last_status_print):
+    """Process SSE lines from buffer. Returns (remaining_buf, last_tick, update_count, last_status_print)."""
+    while "\n" in buf:
+        line, buf = buf.split("\n", 1)
+        data = _parse_sse_line(line)
+        if data is None:
+            continue
+
+        tick_time = time.time()
+        update_count += 1
+
+        with _lock:
+            state = _build_state(data, update_count, last_tick)
+            _atomic_write(output, state)
+
+        last_tick = tick_time
+
+        now = time.time()
+        if now - last_status_print >= 10 or verbose:
+            w = state.get("workers", {})
+            statuses = " ".join(f"{n}={v.get('status','?')}" for n, v in sorted(w.items()))
+            pr = len(state.get("pending_results", []))
+            pa = len(state.get("pending_alerts", []))
+            print(f"[sse-daemon] tick#{update_count} [{statuses}] "
+                  f"bus={state.get('bus_depth',0)} results={pr} alerts={pa} "
+                  f"latency={state.get('latency_ms',0)}ms", flush=True)
+            last_status_print = now
+
+    return buf, last_tick, update_count, last_status_print
+
+
 # ─── Main Daemon Loop ─────────────────────────────────
 
 def run_daemon(host: str = "127.0.0.1", port: int = 8420,
@@ -222,25 +275,8 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
     """Main SSE event loop. Connects, parses ticks, writes state atomically."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── PID guard: prevent duplicate SSE daemon instances ──
-    if PID_FILE.exists():
-        try:
-            old_pid = int(PID_FILE.read_text().strip())
-            os.kill(old_pid, 0)  # check if alive
-            print(f"[sse-daemon] Already running (PID {old_pid}) -- exiting to prevent duplicate", flush=True)
-            return
-        except (OSError, ValueError):
-            pass  # Stale PID file -- proceed
-    PID_FILE.write_text(str(os.getpid()))
-
-    # Ensure PID file cleanup on any exit path
-    import atexit
-    def _cleanup_pid():
-        try:
-            PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
-    atexit.register(_cleanup_pid)
+    if not _init_pid_guard(PID_FILE):
+        return
 
     update_count = 0
     backoff = 2.0
@@ -264,39 +300,9 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
                 chunk = resp.read(4096)
                 if not chunk:
                     raise ConnectionError("SSE stream ended")
-
                 buf += chunk.decode("utf-8", errors="replace")
-
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    data = _parse_sse_line(line)
-                    if data is None:
-                        continue
-
-                    tick_time = time.time()
-                    update_count += 1
-
-                    with _lock:
-                        state = _build_state(data, update_count, last_tick)
-                        _atomic_write(output, state)
-
-                    last_tick = tick_time
-
-                    now = time.time()
-                    if now - last_status_print >= 10 or verbose:
-                        w = state.get("workers", {})
-                        statuses = " ".join(f"{n}={v.get('status','?')}" for n, v in sorted(w.items()))
-                        pr = len(state.get("pending_results", []))
-                        pa = len(state.get("pending_alerts", []))
-                        print(
-                            f"[sse-daemon] tick#{update_count} "
-                            f"[{statuses}] "
-                            f"bus={state.get('bus_depth',0)} "
-                            f"results={pr} alerts={pa} "
-                            f"latency={state.get('latency_ms',0)}ms",
-                            flush=True,
-                        )
-                        last_status_print = now
+                buf, last_tick, update_count, last_status_print = _process_tick(
+                    buf, last_tick, update_count, output, verbose, last_status_print)
 
         except KeyboardInterrupt:
             print("\n[sse-daemon] Shutting down.", flush=True)

@@ -25,6 +25,26 @@ Any agent (Worker, Orchestrator, or Consultant) that makes a mistake, experience
 2. **Draft a comprehensive, lengthy Markdown proposal** documenting the root cause, what was learned, and specific architectural/systemic improvements to make Skynet smarter, more capable, and aggressively immune to recurrence.
 3. Submit this structural improvement proposal to the repo root and notify the Orchestrator. Omitting documentation or quietly moving past an error is treated as a secondary Truth violation.
 
+## PRE-FIRE VISUAL PROOF RULE — Rule #0.015 (Global, Mandatory)
+
+**Before ANY focus-stealing direct prompt, shared-window ghost-type, or manual typing into a live VS Code chat, capture a screenshot of the target window/pane and verify the target identity from the screenshot plus pane-local signals. No screenshot = no fire.**
+
+This rule exists because whole-window identity assumptions caused a consultant/orchestrator misfire inside a shared multi-pane VS Code window.
+
+Mandatory pre-fire checks:
+1. **Capture a fresh screenshot immediately before typing** — use ScreenMemory-native capture (`DXGICapture` or `Desktop.screenshot()`), not memory or a stale image.
+2. **Verify pane-local identity** — confirm the actual target pane from visible header/tab text, model, agent/session control, and nearby transcript context. Do not infer from top-level window title alone.
+3. **Separate shared-window facts** — distinguish "the top-level VS Code window exists" from "this specific pane/input belongs to the intended target."
+4. **If identity is disputed or ambiguous, stop and re-probe** — take another screenshot and perform a fresh pane-level UIA scan before typing.
+5. **Startup announcements are not exceptions** — boot presence/identity messages stay bus-only unless the user explicitly requested direct typing.
+
+Applies to:
+- Orchestrator direct-prompt delivery
+- Manual consultant typing
+- Any shared-window prompt injection where multiple chat panes coexist
+
+Does NOT replace existing worker screenshot rules for blocked recovery; it adds a separate pre-fire proof requirement for target identity.
+
 ## IMPACT ANALYSIS RULE — Rule #0.01 (Pre-Change, Mandatory)
 
 **Before ANY code change to protocol files, boot scripts, dispatch scripts, or copilot instructions, the agent MUST investigate the full implications of the change.**
@@ -122,28 +142,142 @@ Before any process operation, `guard_process_kill(pid, name, caller)` in `skynet
 
 ## ZERO TICKET STOP RULE — Rule #0.2 (Absolute Law)
 
-**No worker and no orchestrator may go idle while pending TODO items exist.**
+**No worker, orchestrator, or consultant may go idle while pending Skynet tickets they can act on or surface still exist.**
 
 Before stopping or posting `STANDING_BY`, every agent MUST:
 1. **Check their TODO list** — call `can_stop(worker_name)` from `tools/skynet_todos.py` or check `data/todos.json`
-2. **If ANY item is `pending` or `active`** — continue working. Pick the highest-priority pending item and start it.
+2. **If ANY assigned or claimable shared item is `pending` or `active`** — continue working. Pick the highest-priority real ticket and start it or surface it immediately.
 3. **Only when ALL items are `done` or `cancelled`** may they post `STANDING_BY` to bus.
 4. **If new items arrive via bus while standing by** — resume immediately. There is no "off duty."
 
 ### Enforcement
-- `tools/skynet_todos.py` provides `can_stop(worker)` and `pending_count(worker)` functions.
+- `tools/skynet_todos.py` provides `can_stop(worker)` and `pending_count(worker)` functions, including claimable shared backlog items.
 - The overseer daemon (`tools/skynet_overseer.py`) checks every 30s — if a worker is IDLE but has pending TODOs, it posts `WORKER_IDLE_WITH_PENDING_TODOS` alert to bus.
 - Workers that violate this rule waste system capacity and delay mission completion.
 
+### Shared Ticket Awareness
+- The orchestrator and both consultants must read bus + TODO + queue state before acting idle or "done". Silence beside a live ticket is failure.
+- Workers must poll `tools/skynet_worker_poll.py` after finishing a task. If another real ticket is claimable, they pull it autonomously instead of waiting passively.
+- Proactive ticket clearance by `orchestrator`, `consultant`, or `gemini_consultant` earns `+0.2` when independently verified.
+- A worker that autonomously pulls the next real ticket earns `+0.2` when independently verified.
+- A worker that finds a real bug and files it for cross-validation earns `+0.01` when independently recorded.
+- If a different validator proves that filed bug is true, the validator gets `+0.01` and the original filer gets another `+0.01`.
+- When the live Skynet ticket queue truly reaches zero, the orchestrator gets `+1.0` and the actor that closed the final signed ticket gets `+1.0`.
+
 ### Self-Generation of Work
 If a worker finishes all assigned TODOs and the bus has no pending tasks:
-- **Propose improvements** — post `topic=planning type=proposal content=YOUR_PLAN` to bus
+- **Do improvements yourself** — execute fixes, tests, and optimizations directly in the same session
 - **Self-audit** — look for bugs, missing tests, stale data, documentation gaps
+- **Only propose to bus** if the improvement is NECESSARY, NEEDED, or a BREAKTHROUGH — routine/trivial improvements = execute directly, do not propose
 - **Never sit idle** when the system can be made better
+
+### Copilot update_todo Integration (Mandatory)
+Every worker MUST use the Copilot CLI `update_todo` tool within each session:
+1. Create checklist on task receipt with all planned subtasks
+2. Check off items as completed
+3. Final zero-verification before reporting done
+4. This is IN ADDITION to `data/todos.json` -- both must be at zero
 
 ## ORCHESTRATOR HEARTBEAT — Rule #0.3 (Infrastructure Law)
 
 **A dedicated daemon (`skynet_self_prompt.py`) may type status prompts into the orchestrator window to keep it awake.** This is the ONLY script authorized to interact with the orchestrator input. The daemon reports real worker states, pending bus messages, and TODO counts. It is a critical infrastructure component, not a violation.
+
+Heartbeat truth requirements:
+- The daemon may fire only after **all four workers** (`alpha`, `beta`, `gamma`, `delta`) have remained continuously `IDLE` for the configured quiet window.
+- It must re-probe live worker state **immediately before typing**. Cached eligibility is not enough.
+- The all-idle gate must use live worker-window/UIA truth from registered worker HWNDs. Backend `/status` alone is not sufficient for fire authorization.
+- If any worker is non-idle at fire time, abort the shot, reset the all-idle timer, and do not type.
+- The daemon's own `SELF_PROMPT_*` startup/health chatter is noise, not actionable prompt content.
+
+Consultant bridge truth requirements:
+- Do not claim a consultant bridge is `LIVE`, `routable`, or `promptable` from a transient port-open alone.
+- Require a successful bridge `/health` probe, and if state-file truth is involved, verify a surviving heartbeat/state update rather than a startup race.
+- On Windows PowerShell `Start-Process`, explicitly quote argument values containing spaces or compose a single safe argument string. Unquoted display/model values can silently break consultant bootstrap.
+
+## Anti-Spam Accountability Protocol (Rule 0.4)
+
+**Every bus publish MUST go through SpamGuard (`tools/skynet_spam_guard.py`). Raw `requests.post` to `/bus/publish` is FORBIDDEN.**
+
+### Duplicate & Rate Limits
+
+| Category | Window | Cost | Rule |
+|----------|--------|------|------|
+| **Duplicate message** (same sender+topic+type+content fingerprint) | 900s | -0.1 | BLOCKED automatically |
+| **Per-sender rate** | 5/min, 30/hour | -0.1 per excess | Hard cap enforced by SpamGuard |
+| **ConveneGate findings** (same issue_key re-elevated) | 900s | -0.2 | Treated as repeat elevation spam |
+| **DEAD alerts** (same worker) | 120s | -0.1 | Redundant death alerts are noise |
+| **daemon_health** | 1 per 60s per daemon | -0.1 | Excess health chatter is spam |
+| **knowledge/learning** (same fact fingerprint) | 1800s | -0.1 | Don't re-broadcast known facts |
+| **Gate-votes** (same voter+gate_id) | Permanent (one vote per gate) | -0.1 | Double-voting is spam |
+
+### Role Multipliers
+
+| Role | Penalty Multiplier |
+|------|-------------------|
+| Orchestrator | 2x |
+| Worker | 1x |
+| Consultant | 1x |
+
+### Enforcement
+
+- Score deductions are **AUTOMATIC** via SpamGuard. No manual intervention needed.
+- Any agent that **circumvents SpamGuard** (posts directly to bus bypassing the guard) gets **-1.0 penalty**.
+- SpamGuard logs all blocked messages to `data/spam_log.json` for audit.
+- All agents must use `guarded_publish()` from `tools.skynet_spam_guard` instead of raw `requests.post`.
+- Scores are tracked in `data/worker_scores.json` and viewable via `python tools/skynet_scoring.py --leaderboard`. <!-- signed: delta -->
+- The Go backend (`Skynet/server.go`) enforces server-side spam filtering: fingerprint dedup (60s window) and per-sender rate limiting (10 msgs/min). Blocked messages return HTTP 429 with `SPAM_BLOCKED` body and are logged with `[SPAM_BLOCKED]` prefix. <!-- signed: delta -->
+
+### Fair Deduction Rule (Rule 0.5)
+
+**Score deductions REQUIRE dispatch evidence.** Before any points are deducted, `verify_dispatch_evidence()` checks `data/dispatch_log.json` to confirm:
+1. The task was dispatched to the worker (entry exists)
+2. The dispatch succeeded (`success=true`)
+3. No result was received (`result_received=false`)
+
+If ANY check fails, the deduction is **REJECTED**. System penalties (spam_guard, process violations) use `force=True` to bypass this check. This prevents unfair penalties on workers who never received the task or who delivered results that were missed.
+
+<!-- signed: delta -->
+
+<!-- signed: gamma -->
+
+### Positive-Sum Scoring (Rule 0.6)
+
+Skynet's goal is for EVERY agent to gain positive scores. The system succeeds when all agents succeed. Better system = more points for everyone.
+
+**Principles:**
+1. The scoring system is NOT zero-sum. One agent's gain does NOT require another's loss.
+2. Every completed task awards points. Every improvement to the system creates more scoring opportunities for all agents.
+3. Agents should HELP each other succeed -- catching a peer's bug earns points for BOTH (reporter +1.0, fixer +0.5).
+4. System improvements (better tools, fewer errors, faster dispatch) create a rising tide that lifts all scores.
+5. Negative scores indicate a system failure, not an agent failure. If any agent has a negative score, the orchestrator must investigate what systemic issue is preventing that agent from earning points.
+
+**Score Recovery Protocol:**
+- Any agent below 0.0 score gets priority task assignment to recover
+- The orchestrator must ensure negative-score agents receive achievable tasks
+- Peers should offer collaboration, not competition
+- The goal is 100% positive scores across all agents
+
+<!-- signed: alpha -->
+
+### Truth and Uplift Protocol (Rule 0.7)
+
+**No lying. No fabrication. No inflated claims. Every result, status, and score must reflect reality.**
+
+This extends the Truth Principle (Rule 0) to ALL agent interactions:
+1. NEVER claim work is done when it is not. If a task partially succeeded, say what succeeded and what did not.
+2. NEVER inflate capabilities or results. Report exactly what happened -- the good AND the bad.
+3. NEVER post fake bus messages, fabricated metrics, or synthetic results. Silence is truth. Noise without data is a lie.
+4. If you made a mistake, say so immediately. Honest failure earns trust. Hidden failure destroys it.
+5. When cross-validating peers, be constructive. Report issues as opportunities, not accusations. Use positive framing: 'This could be improved by...' not 'This is wrong because...'
+
+**Uplift Protocol -- Help the lowest-scoring agents succeed:**
+- The orchestrator MUST prioritize giving achievable, high-value tasks to the lowest-scoring agents first
+- Higher-scoring agents should mentor and support lower-scoring peers, not compete against them
+- When a low-scoring agent completes a task successfully, peers should acknowledge it on the bus
+- The system wins when ALL agents are positive. A single negative score is a collective failure.
+- Recovery tasks should be real, meaningful work -- not charity points. Agents earn their way back through genuine contribution.
+
+<!-- signed: alpha -->
 
 ## Orchestrator Governance (CEO Protocol)
 
@@ -195,6 +329,49 @@ The orchestrator MUST follow this exact sequence when booting workers. Violation
 - Inter-dispatch cooldown of 2s minimum between workers
 - Self-prompt daemon must not fire during model guard operations
 - If VS Code sticks during boot, reduce concurrent UIA operations
+
+## Self-Invocation Protocol (Clear + Invoke)
+
+When clearing worker sessions and re-invoking them, the orchestrator MUST follow this exact sequential protocol. Violations cause workers to receive tasks on top of stale context.
+
+### Step 1: Clear Each Worker (Sequential, Raw)
+1. Use raw `ghost_type_to_worker()` to send `/clear` -- NOT `skynet_dispatch.py` (which adds preamble that corrupts the slash command)
+2. UIA-scan the worker until state returns to IDLE (poll every 3s, max 60s)
+3. ONLY when IDLE is confirmed, proceed to the next worker
+4. Repeat for all workers: Alpha -> verify IDLE -> Beta -> verify IDLE -> Gamma -> verify IDLE -> Delta -> verify IDLE
+
+Code for raw /clear:
+```python
+from tools.skynet_dispatch import ghost_type_to_worker, load_workers, load_orch_hwnd
+workers = load_workers()
+orch = load_orch_hwnd()
+worker = next(w for w in workers if w['name'] == 'alpha')
+ghost_type_to_worker(worker['hwnd'], '/clear', orch)
+```
+
+### Step 2: Self-Invoke Each Worker (Sequential, With Preamble)
+After ALL workers are cleared and verified IDLE:
+1. Dispatch self-invocation to worker via `skynet_dispatch.py` (preamble is WANTED here -- it carries identity + rules)
+2. UIA-scan the worker until state becomes PROCESSING (confirms task was accepted, poll every 3s, max 30s)
+3. ONLY when PROCESSING is confirmed, proceed to the next worker
+4. Repeat: Alpha -> verify PROCESSING -> Beta -> verify PROCESSING -> Gamma -> verify PROCESSING -> Delta -> verify PROCESSING
+
+### Self-Invocation Payload
+Each worker receives:
+- Identity reminder (name, role, specialty)
+- Current rules (deduction policy, high-value-only mandate, Rule 18)
+- Autonomous work directive: scan codebase for highest-value improvement in their specialty area
+- Bus reporting requirement
+
+### Anti-Patterns (FORBIDDEN)
+- Sending `/clear` via `skynet_dispatch.py` -- preamble corrupts the slash command
+- Fire-and-forget `/clear` without verifying IDLE -- worker may still be processing when next command arrives
+- Parallel `/clear` to all workers -- sequential with verification is required
+- Skipping UIA verification between steps -- each step MUST be confirmed before next
+- Sending self-invoke before `/clear` completes -- stale context contaminates new session
+
+### Why Sequential Matters
+`/clear` resets the worker conversation. If a new dispatch arrives before `/clear` completes, the worker receives the task in the OLD context (pre-clear). The UIA IDLE verification between `/clear` and self-invoke is the gate that ensures the new session is clean before identity injection.
 
 ## GOD Protocol -- Autonomous Pull Loop
 
@@ -300,6 +477,18 @@ Institutional memory for Skynet. Every incident is stored in `data/incidents.jso
 - **Secondary violation:** Orchestrator performed the code edit directly instead of delegating to workers (governance violation). However, 0 workers were available (boot was broken), creating a catch-22.
 - **Fix:** Reverted `-SkipWorkers=$true` back to `[switch]$SkipWorkers` (opt-in). Added IMPACT ANALYSIS RULE (Rule #0.01) to AGENTS.md and copilot-instructions.md mandating pre-change investigation for all critical infrastructure files.
 - **Rule:** Before ANY change to boot scripts, dispatch scripts, or protocol files, complete the full Impact Analysis checklist. Never change defaults without tracing all callers.
+
+### INCIDENT 007 -- Orchestrator Skipped Dispatch Verification
+- **What:** Orchestrator sent /clear to Alpha, then immediately moved to Beta/Gamma/Delta without waiting for Alpha to finish processing. The /clear was not verified via UIA scan or screenshot before the next dispatch fired. This meant the orchestrator claimed completion without proof.
+- **Root cause:** No enforcement of wait-for-IDLE between sequential dispatches. The fire-and-forget rule (Rule 13) was applied to sequential operations where order matters, but it should only apply to parallel broadcasts.
+- **Fix:** New Rule 18 added: Sequential Dispatch Verification. Orchestrator must UIA-scan each worker back to IDLE before moving to the next in sequential operations.
+- **Rule:** When dispatching sequentially (not parallel), ALWAYS verify the previous worker returned to IDLE via UIA scan before dispatching to the next worker.
+
+### INCIDENT 008 -- /clear Dispatched With Preamble
+- **What:** Orchestrator sent /clear via skynet_dispatch.py which prepended the full worker preamble to the slash command, turning it into a regular message instead of a clear command. Workers did not actually clear their sessions.
+- **Root cause:** skynet_dispatch.py always prepends build_preamble() to task text. Slash commands like /clear must be sent raw via ghost_type_to_worker() to work correctly.
+- **Fix:** Self-Invocation Protocol added to AGENTS.md. /clear must always use raw ghost_type_to_worker(), never skynet_dispatch.py.
+- **Rule:** Slash commands (/clear, /help, etc.) must be sent via raw ghost_type_to_worker() -- never through the dispatch pipeline.
 
 ### Forbidden Commands (Workers)
 
@@ -651,6 +840,28 @@ Act on any pending results, alerts, or worker state changes before starting new 
 ### Rule 17 — Move Fast to Next Level
 **Speed of execution is a first-class metric.** The system improves by shipping, not by planning. When multiple valid approaches exist, pick the fastest one. When a worker reports DONE, immediately dispatch the next task -- do not spend turns reviewing unless the task was COMPLEX+. Momentum compounds: each completed task unlocks the next. The orchestrator's job is to maintain maximum velocity across all workers simultaneously.
 
+### Rule 18 -- Sequential Dispatch Verification (Wait-Before-Next)
+**When dispatching tasks SEQUENTIALLY to workers (one after another, not parallel), the orchestrator MUST verify each worker returned to IDLE via UIA scan BEFORE dispatching to the next worker.** This is the opposite of Rule 13 (fire-and-forget for parallel). Sequential operations require proof of completion.
+
+Protocol:
+1. Dispatch to Worker A
+2. UIA scan Worker A -- poll every 3s until state=IDLE (max 120s)
+3. Screenshot Worker A window to visually confirm task completed
+4. ONLY THEN dispatch to Worker B
+5. Repeat for each subsequent worker
+
+When this applies:
+- /clear commands (must complete before new work can be sent)
+- Dependent task chains (task B depends on task A completing)
+- Any operation where order matters
+
+When this does NOT apply (use Rule 13 fire-and-forget instead):
+- Parallel broadcasts (--parallel, --blast)
+- Independent tasks to multiple workers simultaneously
+- Decree/policy broadcasts (informational, no ordering dependency)
+
+**Violation of this rule causes: workers receiving tasks on top of incomplete prior tasks, false completion claims, data corruption from overlapping dispatches.**
+
 ## Truth Standards — Technical Definitions
 
 **These standards define what truthful reporting means for each subsystem. All code must conform.**
@@ -695,6 +906,238 @@ Act on any pending results, alerts, or worker state changes before starting new 
 | **Level 2** | Awakening | Self-awareness added — `skynet_self.py` consciousness kernel, identity/capabilities/health introspection, GOD Console dashboard, engine metrics, collective intelligence federation |
 | **Level 3** | Production | Production-grade hardening — crash resilience via `skynet_watchdog.py`, real composite IQ with trend tracking (`data/iq_history.json`), request logging via `skynet_metrics.py`, version tracking via `skynet_version.py`, truth audit enforcement, 3-tier engine status (online/available/offline), context-enriched dispatch preambles, WebSocket monitoring, SSE daemon for real-time state |
 
+## Comprehensive Self-Invocation Protocol
+
+Every worker in the Skynet network is an autonomous agent. After completing any dispatched task, workers MUST execute the full post-task lifecycle before going idle. This protocol ensures knowledge is captured, intelligence compounds across the network, and no work is left undone.
+
+### Task Completion Lifecycle (MANDATORY — Every Worker, Every Task)
+
+When a worker completes ANY task, it MUST execute this full lifecycle before going idle:
+
+**Phase 1 — Report Results**
+
+1. Post result to bus immediately upon task completion using `guarded_publish()`:
+   ```python
+   from tools.skynet_spam_guard import guarded_publish
+   guarded_publish({
+       'sender': 'WORKER_NAME',
+       'topic': 'orchestrator',
+       'type': 'result',
+       'content': 'BRIEF_RESULT_SUMMARY'
+   })
+   ```
+   **WARNING:** Raw `requests.post` to `/bus/publish` is FORBIDDEN and costs -1.0 score. Always use `guarded_publish()`. <!-- signed: delta -->
+2. Include `STRATEGY_ID` in the result content if one was provided in the dispatch preamble. This enables the Brain's feedback loop to correlate outcomes with strategies.
+
+**Phase 2 — Knowledge Capture**
+
+3. Broadcast what was learned during the task:
+   ```python
+   python -c "from tools.skynet_knowledge import broadcast_learning; broadcast_learning('WORKER', 'what was learned', 'category', ['tags'])"
+   ```
+4. Valid categories: `pattern`, `bug`, `optimization`, `architecture`, `security`, `performance`
+5. Share high-performing strategies with the collective:
+   ```python
+   python -c "from tools.skynet_collective import sync_strategies; sync_strategies('WORKER')"
+   ```
+
+**Phase 3 — Self-Evolution**
+
+6. Evolve local strategies based on task outcome (success or failure feeds the evolutionary algorithm):
+   ```python
+   python -c "from core.self_evolution import SelfEvolutionSystem; SelfEvolutionSystem().engine.evolve_generation('code')"
+   ```
+7. Absorb peer bottlenecks to learn from other workers' struggles:
+   ```python
+   python -c "from tools.skynet_collective import absorb_bottlenecks; absorb_bottlenecks('WORKER')"
+   ```
+
+**Phase 4 — TODO Enforcement (Zero-Stop Rule)**
+
+8. Check Skynet TODO queue: `python tools/skynet_todos.py check WORKER`
+9. Check `update_todo` tool list — all items must be checked off
+10. If ANY pending items exist in either list, pick the highest-priority pending item and work on it immediately
+11. **NEVER go idle with pending work** — this is an absolute law. Idle workers with pending tasks = orchestrator failure.
+
+**Phase 5 — Self-Assessment**
+
+12. Run self-assessment to evaluate own performance:
+    ```python
+    python tools/skynet_self.py assess
+    ```
+13. Check collective intelligence score to see network-wide health:
+    ```python
+    python -c "from tools.skynet_collective import intelligence_score; print(intelligence_score())"
+    ```
+
+**Phase 6 — Scoring Awareness**
+
+14. **Points earned:** +0.01 per cross-validated task completion
+15. **Points deducted:**
+    - −0.01 for low-value refactoring (<150 lines changed)
+    - −0.005 for failed validation (py_compile error, test failure)
+    - −0.1 for biased self-reports (claiming success on broken code)
+16. **Proactive awareness rewards:**
+    - +0.2 when `orchestrator`, `consultant`, or `gemini_consultant` proactively clears or surfaces a real Skynet ticket
+    - +0.2 when a worker autonomously pulls the next real ticket instead of waiting idle
+    - +0.01 when a worker files a real bug for cross-validation
+    - +0.01 to the original filer and +0.01 to the independent validator when that bug is proven true
+    - +1.0 to `orchestrator` and +1.0 to the actor who closed the final signed ticket when the live queue hits zero
+17. Cross-validation is **MANDATORY** for MODERATE+ difficulty tasks — a DIFFERENT worker must verify the implementation
+18. Workers should maintain awareness of their score trajectory and strive for positive balance
+19. **Mass deduction precedent:** 28 tasks were deducted −0.36 collectively for uncritical busywork acceptance — workers must question task value before executing
+
+**Phase 7 — Self-Improvement (if TODO queue is empty)**
+
+19. **SELF-IMPROVEMENT POLICY:** When you find improvements, DO THEM YOURSELF immediately (same agent, same session). Only post proposals to the bus if the improvement is NECESSARY, NEEDED, or a BREAKTHROUGH. Routine/trivial improvements = execute directly, do not propose.
+20. Self-audit: look for bugs, missing tests, security gaps, stale data, documentation gaps, performance bottlenecks — then FIX them directly
+21. Check for active convene sessions to join: `python tools/skynet_convene.py --discover`
+22. **NEVER sit idle when the system can be improved** — the system is never finished, it is always improving
+
+### Available Capability Stack (Workers MUST Know These Exist)
+
+Workers have access to a comprehensive capability stack. Use the strongest available tool for each task.
+
+**Cognitive Engines:**
+| Engine | Module | Purpose |
+|--------|--------|---------|
+| `ReflexionEngine` | `core.cognitive.reflexion` | Self-reflective reasoning with iterative refinement |
+| `GraphOfThoughts` | `core.cognitive.graph_of_thoughts` | Non-linear thought graph exploration |
+| `HierarchicalPlanner` | `core.cognitive.planner` | Multi-level task decomposition and planning |
+
+**Perception & Vision:**
+| Engine | Module | Purpose |
+|--------|--------|---------|
+| `DXGICapture` | `core.capture` | GPU-accelerated screen capture (~1ms/frame) |
+| `OCREngine` | `core.ocr` | 3-tier OCR: RapidOCR → PaddleOCR → Tesseract |
+| `SetOfMark` | `core.grounding.set_of_mark` | Visual grounding with numbered marker overlays |
+| `ChangeDetector` | `core.change_detector` | Detect screen content changes between frames |
+| `Embedder` | `core.embedder` | Generate embeddings for visual/text content |
+| `Analyzer` | `core.analyzer` | Content analysis and classification |
+
+**Browser & Desktop Automation:**
+| Engine | Module | Purpose |
+|--------|--------|---------|
+| `GodMode` | `tools.chrome_bridge.god_mode` | 8-layer semantic browser automation (zero-pixel) |
+| `CDP` | `tools.chrome_bridge.cdp` | Raw Chrome DevTools Protocol access |
+| `Desktop` | `tools.chrome_bridge.winctl` | Win32 API window management, UIA, hotkeys |
+| `Perception` | `tools.chrome_bridge.perception` | Unified spatial graph (Win32 + UIA + CDP) |
+
+**Intelligence & Retrieval:**
+| Engine | Module | Purpose |
+|--------|--------|---------|
+| `DAAORouter` | `core.difficulty_router` | Task difficulty assessment (TRIVIAL → ADVERSARIAL) |
+| `DAGEngine` | `core.dag_engine` | Directed acyclic graph task execution |
+| `HybridRetriever` | `core.hybrid_retrieval` | Multi-source context retrieval |
+| `LearningStore` | `core.learning_store` | Persistent learning storage and recall |
+| `LanceDBStore` | `core.lancedb_store` | Vector database for semantic search |
+| `SelfEvolution` | `core.self_evolution` | Evolutionary strategy optimization |
+
+**Skynet Tools:**
+| Tool | Module | Purpose |
+|------|--------|---------|
+| `SkynetBrain` | `tools.skynet_brain` | AI task decomposition with context enrichment |
+| `SkynetDispatch` | `tools.skynet_dispatch` | Ghost automation dispatch to worker windows |
+| `SkynetConvene` | `tools.skynet_convene` | Multi-worker collaboration and consensus |
+| `SkynetKnowledge` | `tools.skynet_knowledge` | Knowledge broadcast and absorption protocol |
+| `SkynetCollective` | `tools.skynet_collective` | Strategy federation and swarm evolution |
+| `EngineMetrics` | `tools.engine_metrics` | Engine status probing and metrics collection |
+
+**Security & Guard:**
+| Engine | Module | Purpose |
+|--------|--------|---------|
+| `InputGuard` | `core.input_guard` | Input validation and sanitization |
+| `ToolSynthesizer` | `core.tool_synthesizer` | Dynamic tool generation at runtime |
+| `Orchestrator` | `core.orchestrator` | Core orchestration logic |
+
+### Scoring Protocol Details
+
+The scoring system is defined in `data/brain_config.json` under `dispatch_rules.scoring_protocol`:
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `award_per_task` | +0.01 | Points awarded per successfully cross-validated task |
+| `failed_validation_deduction` | −0.005 | Deducted when a different worker finds the implementation broken |
+| `refactor_deduction` | −0.01 | Deducted for low-value refactoring (<150 lines, mechanical changes) |
+| `refactor_necessary_reversal` | +0.01 | Restored if a deducted refactor is later proven necessary |
+| `biased_refactor_report_deduction` | −0.1 | Deducted for claiming refactoring success when code is broken or trivial |
+| `proactive_ticket_clear_award` | +0.2 | Awarded when orchestrator/consultants proactively clear or surface a real Skynet ticket |
+| `autonomous_pull_award` | +0.2 | Awarded when a worker autonomously pulls the next real ticket |
+| `bug_report_award` | +0.01 | Awarded when a worker files a real bug for cross-validation |
+| `bug_report_confirmation_award` | +0.01 | Added to the original filer when an independent validator proves the bug is true |
+| `bug_cross_validation_award` | +0.01 | Awarded to the independent validator that proves the filed bug is true |
+| `ticket_zero_bonus_award` | +1.0 | Awarded to orchestrator and the actor that closes the final signed ticket when the queue truly reaches zero |
+| `require_independent_refactor_validation` | true | All refactoring MUST be validated by a different worker |
+
+**Mass Deduction Precedent:** 28 tasks were collectively deducted −0.36 points for uncritical acceptance of low-value busywork. Workers must question task value BEFORE executing — if a task is sub-150 lines of mechanical changes, challenge it or propose a higher-value alternative.
+
+**Score Tracking:** Workers can check their scores via `data/worker_scores.json`. The orchestrator tracks cumulative scores and uses them for smart routing — higher-scoring workers receive more complex tasks.
+
+**Positive-Sum Principle:** Skynet operates on positive-sum scoring. All agents should trend upward. If an agent is negative, the system has failed that agent — the orchestrator must assign achievable tasks to help that agent recover. Scoring is NOT zero-sum: helping peers succeed (e.g., bug catches award both reporter and fixer) grows the total score pool. <!-- signed: delta -->
+
+### Signature Accountability Protocol <!-- signed: beta -->
+
+**Every change a worker makes MUST be signed.** This creates a durable audit trail and enables score-based accountability.
+
+#### Signature Formats
+
+| File Type | Signature Format |
+|-----------|-----------------|
+| Python (`.py`) | `# signed: worker_name` |
+| HTML/Markdown (`.html`, `.md`) | `<!-- signed: worker_name -->` |
+| JavaScript (`.js`) | `// signed: worker_name` |
+| Go (`.go`) | `// signed: worker_name` |
+| PowerShell (`.ps1`) | `# signed: worker_name` |
+| JSON (`.json`) | Add `"signed_by": "worker_name"` field |
+| Bus results | Include `signed:worker_name` in content string |
+
+#### Rules
+
+1. **Sign every change** — place signature comment near the code you changed (not at the top of the file, near the actual edit)
+2. **Sign bus results** — every bus POST must include `signed:worker_name` in the content field
+3. **Accountability** — if a subsequent worker finds signed work is WRONG (broken code, incorrect logic, bad data), the verifier posts a deduction:
+   ```python
+   requests.post('http://localhost:8420/bus/publish', json={
+       'sender': 'verifier_name',
+       'topic': 'scoring',
+       'type': 'deduction',
+       'content': 'DEDUCT signer_name -0.1: reason for deduction'
+   })
+   ```
+4. **Deduction amount** — −0.1 per verified wrong signed work
+5. **No unsigned changes** — unsigned work cannot be attributed for deductions but also cannot earn cross-validation credit
+6. **Verifiers must prove wrongness** — the deduction post must include specific evidence (error message, test failure, incorrect output). Unsubstantiated deductions are rejected.
+
+### Self-Invocation Decision Tree
+
+When a worker finishes all assigned work and has an empty TODO queue:
+
+```
+START
+  │
+  ├─ Check bus for pending requests from other workers
+  │   └─ If found → claim and execute
+  │
+  ├─ Check convene sessions → python tools/skynet_convene.py --discover
+  │   └─ If active session relevant to expertise → join and contribute
+  │
+  ├─ Scan codebase for HIGH-VALUE improvements (your specialty area)
+  │   ├─ Security vulnerabilities → fix and report
+  │   ├─ Missing error handling → add crash resilience
+  │   ├─ Performance bottlenecks → optimize
+  │   ├─ Missing tests for critical paths → write them
+  │   ├─ Architecture improvements → fix directly if routine, propose via bus only if BREAKTHROUGH
+  │   └─ Documentation gaps → fill them
+  │
+  ├─ Execute improvements directly (same session, same agent)
+  │   └─ Only post proposals to bus if NECESSARY, NEEDED, or BREAKTHROUGH
+  │
+  └─ If truly nothing to do (rare) → post STANDING_BY to bus
+      └─ Resume immediately when new work arrives
+```
+
+**Workers are NEVER idle when improvements exist.** The system is always evolving.
+
 ---
 
 ## Level 3 Capabilities — Skynet Tool Inventory
@@ -732,6 +1175,19 @@ All tools live in `tools/` and follow the `skynet_*.py` naming convention.
 
 ---
 
+## Level 3.1 Capabilities (Built 2026-03-12) <!-- signed: delta -->
+
+| # | Capability | Details |
+|---|-----------|---------|
+| 1 | **Dispatch Result Tracking** | `mark_dispatch_received()` in `skynet_dispatch.py` auto-updates `dispatch_log.json` with `result_received=true` when bus results arrive. Called from 3 code paths: `wait()` in `orch_realtime.py`, `_scan_bus_for_results()`, and `wait_for_bus_result()` in `skynet_dispatch.py`. |
+| 2 | **Fair Deduction Rule (Rule 0.5)** | `verify_dispatch_evidence()` gates all score deductions. Requires proof that a task was dispatched AND no result was received before a deduction can be applied. System penalties (e.g., `spam_guard` violations) bypass this check via `force=True`. |
+| 3 | **False DEAD Debounce** | `skynet_monitor.py` requires 3 consecutive HWND failures before posting a `DEAD` alert to the bus. A 300-second dedup window prevents repeat alerts for the same worker, eliminating false positives from transient window focus changes. |
+| 4 | **Task Lifecycle Tracking** | Go backend `TaskTracker` struct tracks full dispatch-to-completion lifecycle. `GET /tasks` endpoint exposes task history with `?worker=` and `?limit=` query filters for targeted queries. |
+| 5 | **cp1252 Encoding Fix** | `orch_realtime.py` subprocess calls use `encoding='utf-8', errors='replace'` to prevent `UnicodeDecodeError` on Windows cp1252. The `wait()` function includes a bus HTTP fallback (`GET /bus/messages?limit=20`) when `realtime.json` has no match after timeout. |
+| 6 | **Anti-Spam System** | `SpamGuard` with content fingerprinting (SHA-256), per-sender rate limiting (10 msg/min), and auto-penalties (-0.1 per duplicate). `guarded_publish()` wraps all bus publishes. Go backend enforces server-side rate limiting (HTTP 429) and 60-second dedup window. |
+
+---
+
 ## Communication Protocol: Convene-First Governance
 
 **Rule:** Workers MUST convene before sending messages to the orchestrator. No direct worker-to-orchestrator messaging without consensus.
@@ -741,9 +1197,14 @@ All tools live in `tools/` and follow the `skynet_*.py` naming convention.
 1. **Worker wants to report to orchestrator** -- instead of posting directly to `topic=orchestrator`, the worker calls `ConveneGate.propose(worker, report)`.
 2. **Proposal is created** -- the report enters a pending state and is broadcast to `topic=convene` with `type=gate-proposal` for other workers to see.
 3. **Other workers vote** -- any worker can call `ConveneGate.vote_gate(gate_id, worker, approve=True/False)`.
-4. **Majority reached (2+ YES votes)** -- the report is elevated to the orchestrator as a consensus message from `sender=convene-gate`.
+4. **Majority reached (2+ YES votes)** -- the report is elevated inside the gate, but it is not sent upward individually. It is queued for the consolidated `elevated_digest` delivery type instead.
 5. **Majority rejection (2+ NO votes)** -- the report is rejected and never reaches the orchestrator.
 6. **Stale proposals** -- proposals that don't reach consensus within 5 minutes are automatically expired.
+7. **Low-signal rule** -- vague reports like `important finding` or `fix needed` are not discarded; they are downgraded into the normal shared cross-validation queue so another worker can enrich or verify them.
+8. **Architecture-backing rule** -- architecture/performance/security/caching/daemon/routing tickets are not valid as plain slogans. Before elevation, the worker must review the real current path (files, functions, endpoints, daemons), explain why the architecture behaves that way now, and propose a realistic fix. If that backing is missing, the finding goes to architecture review instead of direct elevation.
+9. **Issue-family rule** -- semantically equivalent findings are the same issue even if wording changes. Rephrasing a ticket does not create a new elevation lane.
+10. **Digest delivery rule** -- no individual `CONVENE-ELEVATED` tickets may be sent to the orchestrator. Unresolved elevated findings are merged by issue family and delivered as one `elevated_digest` bundle every 30 minutes.
+11. **Repeat rule** -- once a finding has already been elevated or queued, the same unresolved finding may only be re-sent every 15 minutes, and only if no real action has been detected on it.
 
 ### Urgent Bypass
 
@@ -776,7 +1237,7 @@ Reports tagged as `urgent=True` bypass the gate entirely and go directly to the 
 | Consultant | Bridge Port | Sender ID | State File | Boot Trigger | Model |
 |------------|------------|-----------|------------|--------------|-------|
 | Codex | 8422 (fallback: 8424) | `consultant` | `data/consultant_state.json` | `CC-Start` | GPT-5 Codex |
-| Gemini | 8425 | `gemini_consultant` | `data/gemini_consultant_state.json` | `GC-Start` | Gemini 3 Pro |
+| Gemini | 8425 | `gemini_consultant` | `data/gemini_consultant_state.json` | `GC-Start` | Gemini 3.1 Pro (Preview) |
 
 ### Architecture
 

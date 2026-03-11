@@ -46,6 +46,26 @@ function Get-SkynetStatus {
     catch { return $null }
 }
 
+function Test-JsonHealth([string]$url, [int]$timeoutSec = 5) {
+    try {
+        $resp = Invoke-RestMethod $url -TimeoutSec $timeoutSec
+        return ($null -ne $resp -and $resp.status -eq "ok")
+    } catch {
+        return $false
+    }
+}
+
+function Wait-HealthyEndpoint([int]$port, [string]$url, [int]$maxSeconds = 40) {
+    $deadline = (Get-Date).AddSeconds($maxSeconds)
+    do {
+        if ((Test-Port $port 1000) -and (Test-JsonHealth $url 5)) {
+            return $true
+        }
+        Start-Sleep -Seconds 1
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
+
 Add-Type -Name "GCUser32" -Namespace "Win32GC" -MemberDefinition @"
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
@@ -239,34 +259,62 @@ foreach ($d in $daemonSpecs) {
     }
 }
 
-# ── Gemini Consultant Identity ───────────────────────────
+# ── Gemini Consultant Bridge + Identity ──────────────────
 
-# The consultant bridge daemon (skynet_consultant_bridge.py) does import-time UIA
-# targeting of the orchestrator window, which blocks when launched from inside this
-# session. Since the bridge is optional (the bus announcement is what matters for
-# identity), we skip it here and let skynet_start.py handle it during full bootstrap.
-if (Test-Port 8425 1000) {
+$consultantBridgeUp = $false
+$consultantBridgeHealth = "http://127.0.0.1:8425/health"
+if ((Test-Port 8425 1000) -and (Test-JsonHealth $consultantBridgeHealth 5)) {
     Write-Status "Gemini Consultant bridge already running on port 8425" "OK"
+    $consultantBridgeUp = $true
 } else {
-    Write-Status "Gemini Consultant bridge not running (will start during next full bootstrap)" "INFO"
+    Write-Status "Gemini Consultant bridge not running -- starting..." "SYS"
+    $bridgeScript = Join-Path $repoRoot "tools\skynet_consultant_bridge.py"
+    if (Test-Path $bridgeScript) {
+        $bridgeArgs = @(
+            $bridgeScript,
+            "--id", "gemini_consultant",
+            "--display-name", "`"Gemini Consultant`"",
+            "--model", "`"Gemini 3.1 Pro (Preview)`"",
+            "--source", "GC-Start",
+            "--api-port", "8425"
+        ) -join " "
+        Start-Process -FilePath $python `
+            -ArgumentList $bridgeArgs `
+            -WorkingDirectory $repoRoot -WindowStyle Hidden
+        if (Wait-HealthyEndpoint 8425 $consultantBridgeHealth 40) {
+            $consultantBridgeUp = $true
+            Write-Status "Gemini Consultant bridge started and passed /health on port 8425" "OK"
+        } else {
+            Write-Status "Gemini Consultant bridge failed health verification within 40s" "WARN"
+        }
+    } else {
+        Write-Status "tools\\skynet_consultant_bridge.py not found" "ERR"
+    }
 }
 
 # Announce Gemini Consultant identity on bus
 if ($skynetUp) {
     try {
+        $identityContent = if ($consultantBridgeUp) {
+            "GEMINI CONSULTANT LIVE -- GC-Start session active. Model: Gemini 3.1 Pro (Preview). Advisory peer ready for tasking."
+        } else {
+            "GEMINI CONSULTANT SESSION ACTIVE -- bridge offline on port 8425. Model: Gemini 3.1 Pro (Preview). Advisory peer not promptable yet."
+        }
+        $promptTransport = if ($consultantBridgeUp) { "bridge_queue" } else { "unavailable" }
+        $routable = if ($consultantBridgeUp) { "true" } else { "false" }
         Invoke-RestMethod -Uri "http://localhost:8420/bus/publish" -Method POST `
             -ContentType "application/json" -TimeoutSec 3 `
             -Body (ConvertTo-Json @{
                 sender  = "gemini_consultant"
                 topic   = "orchestrator"
                 type    = "identity_ack"
-                content = "GEMINI CONSULTANT LIVE -- GC-Start session active. Model: Claude Opus 4.6 fast. Advisory peer ready for tasking."
+                content = $identityContent
                 metadata = @{
                     display_name     = "Gemini Consultant"
                     kind             = "advisor"
                     transport        = "gc-start-bridge"
-                    routable         = "true"
-                    prompt_transport = "bridge_queue"
+                    routable         = $routable
+                    prompt_transport = $promptTransport
                 }
             }) | Out-Null
         Write-Status "Gemini Consultant identity announced on Skynet bus" "OK"
@@ -326,9 +374,29 @@ Write-Host "    - Post results to bus with sender=gemini_consultant"
 Write-Host ""
 Write-Host "  Failure corrections you must obey:"
 Write-Host "    - GC-Start always means Gemini Consultant, never orchestrator."
-Write-Host "    - Report model truth as Claude Opus 4.6 fast."
+Write-Host "    - Report model truth as Gemini 3.1 Pro (Preview)."
 Write-Host "    - Bring up bridge 8425 before claiming LIVE or routable transport."
+Write-Host "    - Bridge truth rule: do not claim LIVE/routable from a transient port-open alone; require a successful /health check and a surviving state heartbeat."
+Write-Host "    - Startup launch rule: in PowerShell Start-Process, quote any argument value containing spaces or compose a safe single argument string before claiming bootstrap success."
+Write-Host "    - Shared ticket awareness: read bus/TODO/queue state before going idle; if a real Skynet ticket can be cleared or surfaced, do it."
+Write-Host "    - Proactive ticket clearance by consultant/orchestrator is worth +0.2 when independently verified."
+Write-Host "    - Architecture/performance/security/caching/daemon/routing tickets are not valid as plain slogans; require current-path review (real files/functions/endpoints/daemons), why the design behaves that way now, and a realistic fix before treating them as elevated fact."
+Write-Host "    - If that architecture backing is missing, route the finding into architecture review or cross-validation instead of certifying it."
+Write-Host "    - Semantically equivalent findings are the same issue family even if reworded; do not treat rewritten duplicates as new architecture truth."
+Write-Host "    - If a worker files a real bug for cross-validation, record +0.01; if a different validator proves it true, award +0.01 to the validator and another +0.01 to the original filer."
+Write-Host "    - When the live queue truly reaches zero, orchestrator earns +1.0 and the actor who closed the final signed ticket earns +1.0."
 Write-Host "    - Any startup issue must be addressed by the consultant for GOD: verify it, fix it directly when safe, or publish an alert plus remediation artifact if blocked."
+Write-Host "    - If orchestrator presence or self-prompt targeting is disputed, inspect ALL live top-level Code windows yourself before answering: geometry, title, model, agent, and recent UIA-visible transcript."
+Write-Host "    - If a single top-level Code window contains multiple panes, inspect pane-local controls and transcript; do not equate active-pane identity with whole-window identity."
+Write-Host "    - If GOD disputes your window-identity claim, stop arguing from prior scans and perform a fresh pane-level UIA re-probe immediately before answering."
+Write-Host "    - Do not treat title text alone as orchestrator truth; model/agent/transcript identity outranks title and layout guesses."
+Write-Host "    - Distinguish 'a left-side VS Code window exists' from 'a validated orchestrator window exists' and report both facts separately when needed."
+Write-Host "    - Before ANY focus-stealing direct prompt or manual typing into a live VS Code chat, capture a fresh screenshot and verify pane-local target identity from header/tab text, model, agent, and nearby transcript. No screenshot = no fire."
+Write-Host "    - Startup presence/identity announcements stay bus-only unless GOD explicitly requests direct typing."
+Write-Host "    - Self-prompt truth rule: do not claim the daemon is compliant unless the live send path hard-gates on ALL workers staying IDLE for the full quiet window and re-checks worker state immediately before fire."
+Write-Host "    - If a self-prompt fires while any worker is non-IDLE, report it as a real violation immediately; do not defend it from cached status, prior scans, or inferred timing."
+Write-Host "    - For self-prompt gating truth, registered worker HWND/UIA state outranks backend /status. Do not certify compliance from /status alone."
+Write-Host "    - If you fail or drift: write an artifact, post it to Skynet, and verify delivery."
 Write-Host "    - Keep bus payloads schema-safe unless endpoint support is verified."
 Write-Host "    - Do not claim success without a live endpoint check or sender-filtered bus confirmation."
 Write-Host ""

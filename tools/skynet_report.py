@@ -163,52 +163,11 @@ def save_artifact(
     return rel_path
 
 
-def post_report(
-    worker: str,
-    topic: str,
-    task: str,
-    approach: str = "",
-    changes: dict = None,
-    issues: list = None,
-    learnings: list = None,
-    recommendations: list = None,
-    verification: str = "",
-    summary: str = "",
-) -> str:
-    """Write a comprehensive report and post to bus.
-
-    Args:
-        worker: Worker name (alpha, beta, gamma, delta)
-        topic: Short slug for the task (e.g. "dispatch_fix")
-        task: Original task description
-        approach: Strategy chosen and why
-        changes: Dict of {filepath: description of changes}
-        issues: List of bugs/gaps/problems discovered
-        learnings: List of facts learned (auto-stored to LearningStore)
-        recommendations: List of next steps
-        verification: How success was confirmed
-        summary: Optional 1-line summary for bus (auto-generated if omitted)
-
-    Returns:
-        Path to the report file (relative to repo root).
-    """
-    changes = changes or {}
-    issues = issues or []
-    learnings = learnings or []
-    recommendations = recommendations or []
-
-    # Generate filename
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    slug = _slugify(topic)
-    filename = f"{ts}_{worker}_{slug}.md"
-    filepath = REPORTS_DIR / filename
-    rel_path = f"data/worker_output/reports/{filename}"
-
-    # Build markdown with YAML frontmatter
-    auto_summary = summary or topic.upper().replace("_", " ")
-    if not summary and approach:
-        auto_summary += f": {approach[:80]}"
-
+def _build_report_markdown(worker: str, topic: str, task: str, approach: str,
+                           changes: dict, issues: list, learnings: list,
+                           recommendations: list, verification: str,
+                           auto_summary: str) -> str:
+    """Build the markdown report content with YAML frontmatter."""
     lines = [
         "---",
         f"worker: {worker}",
@@ -228,44 +187,67 @@ def post_report(
         "",
     ]
 
-    if approach:
-        lines.extend(["## Approach", approach, ""])
-
-    if changes:
-        lines.append("## Changes Made")
-        for filepath_key, desc in changes.items():
-            lines.append(f"- **{filepath_key}**: {desc}")
+    _section_pairs = [
+        (approach, "## Approach", False),
+        (changes, "## Changes Made", True),
+        (issues, "## Issues Found", False),
+        (learnings, "## Learnings", False),
+        (recommendations, "## Recommendations", False),
+        (verification, "## Verification", False),
+    ]
+    for data, heading, is_dict in _section_pairs:
+        if not data:
+            continue
+        lines.append(heading)
+        if is_dict:
+            for filepath_key, desc in data.items():
+                lines.append(f"- **{filepath_key}**: {desc}")
+        elif isinstance(data, list):
+            for item in data:
+                lines.append(f"- {item}")
+        else:
+            lines.append(data)
         lines.append("")
 
-    if issues:
-        lines.append("## Issues Found")
-        for issue in issues:
-            lines.append(f"- {issue}")
-        lines.append("")
+    return "\n".join(lines)
 
-    if learnings:
-        lines.append("## Learnings")
-        for learning in learnings:
-            lines.append(f"- {learning}")
-        lines.append("")
 
-    if recommendations:
-        lines.append("## Recommendations")
-        for rec in recommendations:
-            lines.append(f"- {rec}")
-        lines.append("")
+def post_report(
+    worker: str,
+    topic: str,
+    task: str,
+    approach: str = "",
+    changes: dict = None,
+    issues: list = None,
+    learnings: list = None,
+    recommendations: list = None,
+    verification: str = "",
+    summary: str = "",
+) -> str:
+    """Write a comprehensive report and post to bus. Returns relative path."""
+    changes = changes or {}
+    issues = issues or []
+    learnings = learnings or []
+    recommendations = recommendations or []
 
-    if verification:
-        lines.extend(["## Verification", verification, ""])
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = _slugify(topic)
+    filename = f"{ts}_{worker}_{slug}.md"
+    filepath = REPORTS_DIR / filename
+    rel_path = f"data/worker_output/reports/{filename}"
 
-    # Write report
-    filepath.write_text("\n".join(lines), encoding="utf-8")
+    auto_summary = summary or topic.upper().replace("_", " ")
+    if not summary and approach:
+        auto_summary += f": {approach[:80]}"
 
-    # Post to bus with link
-    bus_content = f"REPORT:{rel_path}|SUMMARY:{auto_summary}"
-    _post_bus(worker, "orchestrator", "result", bus_content)
+    content = _build_report_markdown(
+        worker, topic, task, approach, changes, issues,
+        learnings, recommendations, verification, auto_summary)
+    filepath.write_text(content, encoding="utf-8")
 
-    # Store learnings for future intelligence injection
+    _post_bus(worker, "orchestrator", "result",
+              f"REPORT:{rel_path}|SUMMARY:{auto_summary}")
+
     if learnings:
         _store_learnings(worker, learnings, topic)
 

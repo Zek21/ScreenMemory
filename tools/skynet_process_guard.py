@@ -197,71 +197,50 @@ def _find_process_by_name(exe_name):
     return pids
 
 
-def refresh_registry():
-    """Scan all running Skynet processes and write critical_processes.json."""
+def _scan_named_processes():
+    """Scan for backend and daemon processes by name/script."""
     processes = []
-
-    # 1. skynet.exe (Go backend)
     for pid in _find_process_by_name("skynet.exe"):
-        processes.append({
-            "pid": pid, "name": "skynet.exe",
-            "role": "backend", "protected": True
-        })
+        processes.append({"pid": pid, "name": "skynet.exe", "role": "backend", "protected": True})
 
-    # 2. god_console.py
-    for pid in _find_python_processes("god_console"):
-        processes.append({
-            "pid": pid, "name": "god_console.py",
-            "role": "god_console", "protected": True
-        })
+    _SCRIPT_ROLES = [
+        ("god_console", "god_console.py", "god_console"),
+        ("skynet_sse_daemon", "skynet_sse_daemon.py", "sse_daemon"),
+        ("skynet_monitor", "skynet_monitor.py", "monitor"),
+        ("skynet_overseer", "skynet_overseer.py", "overseer"),
+    ]
+    for script, name, role in _SCRIPT_ROLES:
+        for pid in _find_python_processes(script):
+            processes.append({"pid": pid, "name": name, "role": role, "protected": True})
+    return processes
 
-    # 3. skynet_watchdog.py
+
+def _scan_watchdog_processes():
+    """Scan for watchdog via PID file and command line."""
+    processes = []
     pid_file = DATA_DIR / "watchdog.pid"
     if pid_file.exists():
         try:
             wpid = int(pid_file.read_text().strip())
-            # Verify it's actually running
             out = _hidden_check_output(
                 ["tasklist", "/fi", f"pid eq {wpid}", "/fo", "csv", "/nh"],
                 text=True, timeout=5, stderr=subprocess.DEVNULL
             )
             if str(wpid) in out:
-                processes.append({
-                    "pid": wpid, "name": "skynet_watchdog.py",
-                    "role": "watchdog", "protected": True
-                })
+                processes.append({"pid": wpid, "name": "skynet_watchdog.py",
+                                  "role": "watchdog", "protected": True})
         except Exception:
             pass
-    # Also scan by command line
     for pid in _find_python_processes("skynet_watchdog"):
         if not any(p["pid"] == pid for p in processes):
-            processes.append({
-                "pid": pid, "name": "skynet_watchdog.py",
-                "role": "watchdog", "protected": True
-            })
+            processes.append({"pid": pid, "name": "skynet_watchdog.py",
+                              "role": "watchdog", "protected": True})
+    return processes
 
-    # 4. skynet_sse_daemon.py
-    for pid in _find_python_processes("skynet_sse_daemon"):
-        processes.append({
-            "pid": pid, "name": "skynet_sse_daemon.py",
-            "role": "sse_daemon", "protected": True
-        })
 
-    # 5. skynet_monitor.py
-    for pid in _find_python_processes("skynet_monitor"):
-        processes.append({
-            "pid": pid, "name": "skynet_monitor.py",
-            "role": "monitor", "protected": True
-        })
-
-    # 6. skynet_overseer.py
-    for pid in _find_python_processes("skynet_overseer"):
-        processes.append({
-            "pid": pid, "name": "skynet_overseer.py",
-            "role": "overseer", "protected": True
-        })
-
-    # 7. Worker HWNDs → PIDs from data/workers.json
+def _scan_hwnd_processes():
+    """Scan worker HWNDs and orchestrator from JSON files."""
+    processes = []
     workers_file = DATA_DIR / "workers.json"
     if workers_file.exists():
         try:
@@ -270,31 +249,27 @@ def refresh_registry():
             if isinstance(workers, list):
                 for w in workers:
                     hwnd = w.get("hwnd", 0)
-                    name = w.get("name", "?")
                     pid = _hwnd_to_pid(hwnd) if hwnd else 0
-                    processes.append({
-                        "pid": pid, "hwnd": hwnd, "name": name,
-                        "role": "worker", "protected": True
-                    })
+                    processes.append({"pid": pid, "hwnd": hwnd, "name": w.get("name", "?"),
+                                      "role": "worker", "protected": True})
         except Exception:
             pass
 
-    # 7. Orchestrator from data/orchestrator.json
     orch_file = DATA_DIR / "orchestrator.json"
     if orch_file.exists():
         try:
             odata = json.loads(orch_file.read_text(encoding="utf-8"))
             hwnd = odata.get("orchestrator_hwnd", odata.get("hwnd", 0))
             pid = _hwnd_to_pid(hwnd) if hwnd else odata.get("pid", 0)
-            processes.append({
-                "pid": pid, "hwnd": hwnd, "name": "orchestrator",
-                "role": "orchestrator", "protected": True
-            })
+            processes.append({"pid": pid, "hwnd": hwnd, "name": "orchestrator",
+                              "role": "orchestrator", "protected": True})
         except Exception:
             pass
+    return processes
 
-    # Deduplicate by (PID, role) — same PID can appear with different roles
-    # (e.g., orchestrator and worker may share a VS Code process)
+
+def _deduplicate_processes(processes):
+    """Deduplicate by (PID, role) pair."""
     seen = set()
     deduped = []
     for p in processes:
@@ -306,6 +281,17 @@ def refresh_registry():
         if pid:
             seen.add(key)
         deduped.append(p)
+    return deduped
+
+
+def refresh_registry():
+    """Scan all running Skynet processes and write critical_processes.json."""
+    processes = []
+    processes.extend(_scan_named_processes())
+    processes.extend(_scan_watchdog_processes())
+    processes.extend(_scan_hwnd_processes())
+
+    deduped = _deduplicate_processes(processes)
 
     registry = {
         "description": "Critical Skynet processes -- NEVER kill these",

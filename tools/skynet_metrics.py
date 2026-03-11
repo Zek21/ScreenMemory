@@ -187,30 +187,56 @@ class SkynetMetrics:
 
     def generate_summary(self):
         """Read all JSONL files and generate research_summary.json with publication-quality stats."""
-        all_events = []
+        all_events = self._load_all_metric_events()
+
+        summary = {
+            "generated_at": datetime.now().isoformat(),
+            "total_events": len(all_events),
+            "system_info": self._collect_system_info(),
+            "timeline": self._compute_timeline(all_events),
+            "categories": self._count_categories(all_events),
+        }
+
+        self._add_uia_performance(summary, all_events)
+        self._add_benchmark_stats(summary, all_events)
+        self._add_speedup_comparisons(summary)
+
+        dispatches = [e for e in all_events if e.get("category") == "dispatch"]
+        self._add_dispatch_stats(summary, dispatches)
+        self._add_model_guard_stats(summary, all_events)
+        self._add_e2e_task_stats(summary, all_events)
+        self._add_worker_utilization(summary, dispatches)
+        self._add_dispatch_latency_stats(summary, all_events)
+        self._add_utilization_snapshots(summary, all_events)
+        self._add_bus_latency_stats(summary, all_events)
+
+        with open(self.summary_file, "w") as f:
+            json.dump(summary, f, indent=2)
+        return summary
+
+    def _load_all_metric_events(self):
+        events = []
         for f in METRICS_DIR.glob("session_*.jsonl"):
             for line in open(f):
                 try:
-                    all_events.append(json.loads(line))
+                    events.append(json.loads(line))
                 except Exception:
                     pass
+        return events
 
-        # --- Timeline ---
-        timestamps = [e.get("ts", "") for e in all_events if e.get("ts")]
-        timestamps.sort()
+    def _compute_timeline(self, events):
+        timestamps = sorted(e.get("ts", "") for e in events if e.get("ts"))
         first_ts = timestamps[0] if timestamps else None
         last_ts = timestamps[-1] if timestamps else None
+        duration_s = 0
         if first_ts and last_ts:
             try:
-                t0 = datetime.fromisoformat(first_ts)
-                t1 = datetime.fromisoformat(last_ts)
-                duration_s = round((t1 - t0).total_seconds(), 2)
+                duration_s = round((datetime.fromisoformat(last_ts) - datetime.fromisoformat(first_ts)).total_seconds(), 2)
             except Exception:
-                duration_s = 0
-        else:
-            duration_s = 0
+                pass
+        return {"first_event": first_ts, "last_event": last_ts, "total_duration_s": duration_s}
 
-        # --- System info ---
+    def _collect_system_info(self):
         try:
             import comtypes
             comtypes_ver = comtypes.__version__
@@ -224,57 +250,46 @@ class SkynetMetrics:
                 worker_count = len(json.loads(wf.read_text()).get("workers", []))
         except Exception:
             pass
-
-        summary = {
-            "generated_at": datetime.now().isoformat(),
-            "total_events": len(all_events),
-            "system_info": {
-                "python_version": platform.python_version(),
-                "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
-                "comtypes_version": comtypes_ver,
-                "worker_count": worker_count,
-            },
-            "timeline": {
-                "first_event": first_ts,
-                "last_event": last_ts,
-                "total_duration_s": duration_s,
-            },
-            "categories": {},
+        return {
+            "python_version": platform.python_version(),
+            "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
+            "comtypes_version": comtypes_ver,
+            "worker_count": worker_count,
         }
-        for e in all_events:
+
+    @staticmethod
+    def _count_categories(events):
+        cats = {}
+        for e in events:
             cat = e.get("category", "unknown")
-            if cat not in summary["categories"]:
-                summary["categories"][cat] = {"count": 0}
-            summary["categories"][cat]["count"] += 1
+            if cat not in cats:
+                cats[cat] = {"count": 0}
+            cats[cat]["count"] += 1
+        return cats
 
-        # --- UIA benchmarks (full descriptive stats) ---
-        uia_scans = [e for e in all_events if e.get("category") == "uia"]
-        if uia_scans:
-            seq = [e for e in uia_scans if e.get("mode") == "sequential"]
-            par = [e for e in uia_scans if e.get("mode") == "parallel"]
-            seq_times = [e["total_ms"] for e in seq if "total_ms" in e]
-            par_times = [e["total_ms"] for e in par if "total_ms" in e]
-            summary["uia_performance"] = {
-                "total_scans": len(uia_scans),
-                "sequential": self._stats(seq_times),
-                "parallel": self._stats(par_times),
-            }
+    def _add_uia_performance(self, summary, events):
+        uia_scans = [e for e in events if e.get("category") == "uia"]
+        if not uia_scans:
+            return
+        seq_times = [e["total_ms"] for e in uia_scans if e.get("mode") == "sequential" and "total_ms" in e]
+        par_times = [e["total_ms"] for e in uia_scans if e.get("mode") == "parallel" and "total_ms" in e]
+        summary["uia_performance"] = {
+            "total_scans": len(uia_scans),
+            "sequential": self._stats(seq_times),
+            "parallel": self._stats(par_times),
+        }
 
-        # --- Benchmarks (named, with full stats) ---
-        benchmarks = [e for e in all_events if e.get("category") == "benchmark"]
-        if benchmarks:
-            by_name = {}
-            for b in benchmarks:
-                name = b.get("event", "unknown")
-                times = b.get("times_ms", [])
-                if name not in by_name:
-                    by_name[name] = []
-                by_name[name].extend(times)
-            summary["benchmarks"] = {
-                name: self._stats(times) for name, times in by_name.items()
-            }
+    def _add_benchmark_stats(self, summary, events):
+        benchmarks = [e for e in events if e.get("category") == "benchmark"]
+        if not benchmarks:
+            return
+        by_name = {}
+        for b in benchmarks:
+            name = b.get("event", "unknown")
+            by_name.setdefault(name, []).extend(b.get("times_ms", []))
+        summary["benchmarks"] = {name: self._stats(times) for name, times in by_name.items()}
 
-        # --- Comparisons / speedup ratios ---
+    def _add_speedup_comparisons(self, summary):
         uia_perf = summary.get("uia_performance", {})
         seq_mean = uia_perf.get("sequential", {}).get("mean", 0)
         par_mean = uia_perf.get("parallel", {}).get("mean", 0)
@@ -293,7 +308,6 @@ class SkynetMetrics:
                 "speedup": round(seq_bench_mean / par_bench_mean, 2),
                 "reduction_pct": round((1 - par_bench_mean / seq_bench_mean) * 100, 2),
             }
-        # COM vs PowerShell: check for powershell benchmarks
         ps_bench = bench.get("powershell_scan", {})
         com_bench = bench.get("uia_single_window", {})
         if ps_bench.get("mean") and com_bench.get("mean"):
@@ -304,114 +318,93 @@ class SkynetMetrics:
         if comparisons:
             summary["comparisons"] = comparisons
 
-        # --- Dispatch stats ---
-        dispatches = [e for e in all_events if e.get("category") == "dispatch"]
-        if dispatches:
-            successes = sum(1 for d in dispatches if d.get("success"))
-            dur_times = [d.get("duration_ms", 0) for d in dispatches]
-            summary["dispatch"] = {
-                "total": len(dispatches),
-                "success": successes,
-                "failed": len(dispatches) - successes,
-                "success_rate": round(successes / len(dispatches), 4),
-                "duration": self._stats(dur_times),
-            }
+    def _add_dispatch_stats(self, summary, dispatches):
+        if not dispatches:
+            return
+        successes = sum(1 for d in dispatches if d.get("success"))
+        dur_times = [d.get("duration_ms", 0) for d in dispatches]
+        summary["dispatch"] = {
+            "total": len(dispatches), "success": successes,
+            "failed": len(dispatches) - successes,
+            "success_rate": round(successes / len(dispatches), 4),
+            "duration": self._stats(dur_times),
+        }
 
-        # --- Security / model guard ---
-        guards = [e for e in all_events if e.get("category") == "security"]
-        if guards:
-            drifts = [g for g in guards if not g.get("correct")]
-            fixes = sum(1 for g in guards if g.get("fixed"))
-            drift_timeline = [
-                {"ts": g.get("ts"), "target": g.get("target", ""),
-                 "model": g.get("model", ""), "fixed": g.get("fixed", False)}
-                for g in drifts
-            ]
-            summary["model_guard"] = {
-                "total_checks": len(guards),
-                "drifts_detected": len(drifts),
-                "auto_fixed": fixes,
-                "events": drift_timeline,
-            }
+    def _add_model_guard_stats(self, summary, events):
+        guards = [e for e in events if e.get("category") == "security"]
+        if not guards:
+            return
+        drifts = [g for g in guards if not g.get("correct")]
+        fixes = sum(1 for g in guards if g.get("fixed"))
+        summary["model_guard"] = {
+            "total_checks": len(guards), "drifts_detected": len(drifts), "auto_fixed": fixes,
+            "events": [{"ts": g.get("ts"), "target": g.get("target", ""),
+                        "model": g.get("model", ""), "fixed": g.get("fixed", False)} for g in drifts],
+        }
 
-        # --- E2E tasks ---
-        e2es = [e for e in all_events if e.get("category") == "e2e"]
-        if e2es:
-            dur_times = [e.get("total_ms", 0) for e in e2es]
-            rates = [e.get("success_rate", 0) for e in e2es]
-            worker_counts = [len(e.get("workers_used", [])) for e in e2es]
-            task_list = [
-                {"id": e.get("task_id", ""), "name": e.get("task_id", ""),
-                 "duration_ms": round(e.get("total_ms", 0), 2),
-                 "workers": len(e.get("workers_used", [])),
-                 "success_rate": round(e.get("success_rate", 0), 4)}
-                for e in e2es
-            ]
-            summary["e2e_tasks"] = task_list
-            summary["e2e_performance"] = {
-                "total": len(e2es),
-                "duration": self._stats(dur_times),
-                "avg_workers": round(statistics.mean(worker_counts), 2) if worker_counts else 0,
-                "avg_success_rate": round(statistics.mean(rates), 4) if rates else 0,
-            }
+    def _add_e2e_task_stats(self, summary, events):
+        e2es = [e for e in events if e.get("category") == "e2e"]
+        if not e2es:
+            return
+        dur_times = [e.get("total_ms", 0) for e in e2es]
+        rates = [e.get("success_rate", 0) for e in e2es]
+        worker_counts = [len(e.get("workers_used", [])) for e in e2es]
+        summary["e2e_tasks"] = [
+            {"id": e.get("task_id", ""), "name": e.get("task_id", ""),
+             "duration_ms": round(e.get("total_ms", 0), 2),
+             "workers": len(e.get("workers_used", [])),
+             "success_rate": round(e.get("success_rate", 0), 4)} for e in e2es
+        ]
+        summary["e2e_performance"] = {
+            "total": len(e2es), "duration": self._stats(dur_times),
+            "avg_workers": round(statistics.mean(worker_counts), 2) if worker_counts else 0,
+            "avg_success_rate": round(statistics.mean(rates), 4) if rates else 0,
+        }
 
-        # --- Worker utilization ---
+    @staticmethod
+    def _add_worker_utilization(summary, dispatches):
         worker_tasks = {}
         for d in dispatches:
             w = d.get("worker", "unknown")
             worker_tasks[w] = worker_tasks.get(w, 0) + 1
         if worker_tasks:
-            summary["worker_utilization"] = {
-                w: {"tasks": c} for w, c in sorted(worker_tasks.items())
-            }
+            summary["worker_utilization"] = {w: {"tasks": c} for w, c in sorted(worker_tasks.items())}
 
-        # --- Dispatch latency (timing breakdown) ---
-        dispatch_lat = [e for e in all_events if e.get("category") == "dispatch_latency"]
-        if dispatch_lat:
-            d_ms = [e.get("dispatch_ms", 0) for e in dispatch_lat]
-            r_ms = [e.get("result_ms", 0) for e in dispatch_lat]
-            t_ms = [e.get("total_ms", 0) for e in dispatch_lat]
-            successes = sum(1 for e in dispatch_lat if e.get("success"))
-            summary["dispatch_latency"] = {
-                "total": len(dispatch_lat),
-                "success": successes,
-                "success_rate": round(successes / len(dispatch_lat), 4) if dispatch_lat else 0,
-                "dispatch_ms": self._stats(d_ms),
-                "result_ms": self._stats(r_ms),
-                "total_ms": self._stats(t_ms),
-            }
+    def _add_dispatch_latency_stats(self, summary, events):
+        dispatch_lat = [e for e in events if e.get("category") == "dispatch_latency"]
+        if not dispatch_lat:
+            return
+        successes = sum(1 for e in dispatch_lat if e.get("success"))
+        summary["dispatch_latency"] = {
+            "total": len(dispatch_lat), "success": successes,
+            "success_rate": round(successes / len(dispatch_lat), 4),
+            "dispatch_ms": self._stats([e.get("dispatch_ms", 0) for e in dispatch_lat]),
+            "result_ms": self._stats([e.get("result_ms", 0) for e in dispatch_lat]),
+            "total_ms": self._stats([e.get("total_ms", 0) for e in dispatch_lat]),
+        }
 
-        # --- Worker utilization snapshots ---
-        util_snaps = [e for e in all_events if e.get("category") == "utilization"]
-        if util_snaps:
-            util_pcts = [e.get("utilization_pct", 0) for e in util_snaps]
-            idle_counts = [e.get("idle", 0) for e in util_snaps]
-            busy_counts = [e.get("busy", 0) for e in util_snaps]
-            steering_counts = [e.get("steering", 0) for e in util_snaps]
-            summary["utilization_snapshots"] = {
-                "total_snapshots": len(util_snaps),
-                "utilization_pct": self._stats(util_pcts),
-                "avg_idle": round(statistics.mean(idle_counts), 2) if idle_counts else 0,
-                "avg_busy": round(statistics.mean(busy_counts), 2) if busy_counts else 0,
-                "avg_steering": round(statistics.mean(steering_counts), 2) if steering_counts else 0,
-            }
+    def _add_utilization_snapshots(self, summary, events):
+        util_snaps = [e for e in events if e.get("category") == "utilization"]
+        if not util_snaps:
+            return
+        summary["utilization_snapshots"] = {
+            "total_snapshots": len(util_snaps),
+            "utilization_pct": self._stats([e.get("utilization_pct", 0) for e in util_snaps]),
+            "avg_idle": round(statistics.mean([e.get("idle", 0) for e in util_snaps]), 2),
+            "avg_busy": round(statistics.mean([e.get("busy", 0) for e in util_snaps]), 2),
+            "avg_steering": round(statistics.mean([e.get("steering", 0) for e in util_snaps]), 2),
+        }
 
-        # --- Bus roundtrip latency ---
-        bus_rt = [e for e in all_events if e.get("category") == "bus_latency"]
-        if bus_rt:
-            pub_ms = [e.get("publish_ms", 0) for e in bus_rt]
-            poll_ms = [e.get("poll_ms", 0) for e in bus_rt]
-            total_ms = [e.get("total_ms", 0) for e in bus_rt]
-            summary["bus_latency"] = {
-                "total_roundtrips": len(bus_rt),
-                "publish_ms": self._stats(pub_ms),
-                "poll_ms": self._stats(poll_ms),
-                "total_ms": self._stats(total_ms),
-            }
-
-        with open(self.summary_file, "w") as f:
-            json.dump(summary, f, indent=2)
-        return summary
+    def _add_bus_latency_stats(self, summary, events):
+        bus_rt = [e for e in events if e.get("category") == "bus_latency"]
+        if not bus_rt:
+            return
+        summary["bus_latency"] = {
+            "total_roundtrips": len(bus_rt),
+            "publish_ms": self._stats([e.get("publish_ms", 0) for e in bus_rt]),
+            "poll_ms": self._stats([e.get("poll_ms", 0) for e in bus_rt]),
+            "total_ms": self._stats([e.get("total_ms", 0) for e in bus_rt]),
+        }
 
 
     def collect_live_snapshot(self):
@@ -430,7 +423,20 @@ class SkynetMetrics:
 
         snapshot = {"ts": datetime.now().isoformat(), "workers": {}, "orchestrator": None, "bus": [], "skynet": None}
 
-        # Scan each worker via UIA
+        worker_states = self._scan_worker_windows(engine, workers, snapshot)
+        self._scan_orchestrator_window(engine, orch_hwnd, snapshot)
+        self.record_worker_health(worker_states)
+        self._poll_skynet_endpoints(snapshot)
+
+        self.record("utilization", "snapshot", {
+            "worker_count": len(workers), "states": worker_states,
+            "skynet_up": snapshot["skynet"] is not None and "error" not in snapshot.get("skynet", {}),
+        })
+        return snapshot
+
+    @staticmethod
+    def _scan_worker_windows(engine, workers, snapshot):
+        """Scan each worker via UIA and populate snapshot."""
         worker_states = {}
         for w in workers:
             name, hwnd = w["name"], w["hwnd"]
@@ -446,42 +452,34 @@ class SkynetMetrics:
             except Exception as e:
                 worker_states[name] = "ERROR"
                 snapshot["workers"][name] = {"hwnd": hwnd, "error": str(e)}
+        return worker_states
 
-        # Scan orchestrator
-        if orch_hwnd:
-            try:
-                r = engine.scan(orch_hwnd)
-                snapshot["orchestrator"] = {
-                    "hwnd": orch_hwnd, "model": getattr(r, "model", ""),
-                    "agent": getattr(r, "agent", ""), "state": getattr(r, "state", ""),
-                }
-            except Exception as e:
-                snapshot["orchestrator"] = {"hwnd": orch_hwnd, "error": str(e)}
+    @staticmethod
+    def _scan_orchestrator_window(engine, orch_hwnd, snapshot):
+        if not orch_hwnd:
+            return
+        try:
+            r = engine.scan(orch_hwnd)
+            snapshot["orchestrator"] = {
+                "hwnd": orch_hwnd, "model": getattr(r, "model", ""),
+                "agent": getattr(r, "agent", ""), "state": getattr(r, "state", ""),
+            }
+        except Exception as e:
+            snapshot["orchestrator"] = {"hwnd": orch_hwnd, "error": str(e)}
 
-        # Record worker health
-        self.record_worker_health(worker_states)
-
-        # Poll Skynet status + bus
+    @staticmethod
+    def _poll_skynet_endpoints(snapshot):
+        import urllib.request
         try:
             with urllib.request.urlopen("http://localhost:8420/health", timeout=3) as resp:
                 snapshot["skynet"] = json.loads(resp.read())
         except Exception:
             snapshot["skynet"] = {"error": "unreachable"}
-
         try:
             with urllib.request.urlopen("http://localhost:8420/bus/messages?limit=10", timeout=3) as resp:
                 snapshot["bus"] = json.loads(resp.read())
         except Exception:
             snapshot["bus"] = []
-
-        # Record utilization snapshot
-        self.record("utilization", "snapshot", {
-            "worker_count": len(workers),
-            "states": worker_states,
-            "skynet_up": snapshot["skynet"] is not None and "error" not in snapshot.get("skynet", {}),
-        })
-
-        return snapshot
 
 
 # ─── CSV Export ───────────────────────────────────────────────────────────────
@@ -506,6 +504,28 @@ def export_csv(output_path):
     """Export all JSONL metrics to CSV with proper per-category column mapping."""
     import csv
 
+    events = _load_all_jsonl_events()
+    if not events:
+        print("No events found")
+        return
+
+    all_cols = _build_csv_columns(events)
+    rows = _flatten_events_to_rows(events, all_cols)
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=all_cols)
+        w.writeheader()
+        w.writerows(rows)
+
+    cats = {}
+    for e in events:
+        c = e.get("category", "unknown")
+        cats[c] = cats.get(c, 0) + 1
+    breakdown = ", ".join(f"{c}={n}" for c, n in sorted(cats.items()))
+    print(f"Exported {len(events)} events to {output_path} ({breakdown})")
+
+
+def _load_all_jsonl_events():
     events = []
     for f in METRICS_DIR.glob("session_*.jsonl"):
         for line in open(f):
@@ -513,17 +533,15 @@ def export_csv(output_path):
                 events.append(json.loads(line))
             except Exception:
                 pass
+    return events
 
-    if not events:
-        print("No events found")
-        return
 
-    # Collect all columns needed, ordered: base cols first, then extras alphabetically
+def _build_csv_columns(events):
+    """Collect all columns: base cols first, then extras alphabetically."""
     all_cols = list(_BASE_COLUMNS)
     extra = set()
     for e in events:
-        cat = e.get("category", "")
-        cat_cols = _CSV_COLUMNS.get(cat, [])
+        cat_cols = _CSV_COLUMNS.get(e.get("category", ""), [])
         for c in cat_cols:
             if c not in all_cols:
                 extra.add(c)
@@ -531,8 +549,11 @@ def export_csv(output_path):
             if k not in all_cols:
                 extra.add(k)
     all_cols.extend(sorted(extra))
+    return all_cols
 
-    # Flatten complex values for CSV compatibility
+
+def _flatten_events_to_rows(events, all_cols):
+    """Flatten complex values (dict/list) for CSV compatibility."""
     rows = []
     for e in events:
         row = {}
@@ -542,19 +563,7 @@ def export_csv(output_path):
                 val = json.dumps(val, default=str)
             row[col] = val
         rows.append(row)
-
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=all_cols)
-        w.writeheader()
-        w.writerows(rows)
-
-    # Per-category breakdown
-    cats = {}
-    for e in events:
-        c = e.get("category", "unknown")
-        cats[c] = cats.get(c, 0) + 1
-    breakdown = ", ".join(f"{c}={n}" for c, n in sorted(cats.items()))
-    print(f"Exported {len(events)} events to {output_path} ({breakdown})")
+    return rows
 
 
 def run_powershell_benchmark(metrics, hwnd, iterations=20):

@@ -158,6 +158,42 @@ class TestGhostTypeBlockedOnInvalidHWND(unittest.TestCase):
         self.assertEqual(args[0][1], "blocked")
 
 
+class TestGhostTypePrefireScreenshotRule(unittest.TestCase):
+    """Test 6b: direct prompt requires a fresh pre-fire screenshot artifact."""
+
+    @patch("skynet_delivery.validate_hwnd")
+    @patch("skynet_delivery._capture_prefire_screenshot", return_value="")
+    @patch("skynet_delivery._log_delivery")
+    def test_ghost_type_blocked_when_prefire_screenshot_missing(self, mock_log, _mock_ss, mock_validate):
+        mock_validate.return_value = {
+            "valid": True,
+            "checks": {"nonzero": True, "is_window": True, "is_vscode_process": True, "has_vscode_title": True},
+            "pid": 1234,
+            "process_name": "Code - Insiders.exe",
+        }
+        ok = _ghost_type(12345, "safe payload", 0, "orchestrator")
+        self.assertFalse(ok)
+        mock_log.assert_called_once()
+        self.assertEqual(mock_log.call_args.args[1], "blocked")
+        self.assertIn("Prefire screenshot missing", mock_log.call_args.args[4])
+
+    @patch("skynet_delivery.validate_hwnd")
+    @patch("skynet_delivery._capture_prefire_screenshot", return_value="D:/tmp/prefire.png")
+    @patch("skynet_dispatch.ghost_type_to_worker", return_value=True)
+    @patch("skynet_delivery._log_delivery")
+    def test_ghost_type_logs_prefire_screenshot_before_typing(self, mock_log, _mock_gtw, _mock_ss, mock_validate):
+        mock_validate.return_value = {
+            "valid": True,
+            "checks": {"nonzero": True, "is_window": True, "is_vscode_process": True, "has_vscode_title": True},
+            "pid": 1234,
+            "process_name": "Code - Insiders.exe",
+        }
+        ok = _ghost_type(12345, "safe payload", 0, "orchestrator")
+        self.assertTrue(ok)
+        self.assertEqual(mock_log.call_count, 1)
+        self.assertEqual(mock_log.call_args.args[1], "prefire_screenshot")
+
+
 class TestDeliverRejectsStaleOrchestratorHWND(unittest.TestCase):
     """Test 7: deliver(ORCHESTRATOR) with stale HWND from tampered file."""
 
@@ -172,6 +208,204 @@ class TestDeliverRejectsStaleOrchestratorHWND(unittest.TestCase):
         result = deliver(DeliveryTarget.ORCHESTRATOR, "test")
         self.assertFalse(result["success"])
         self.assertIn("No orchestrator HWND", result["detail"])
+
+
+class TestLoadOrchestratorHwndHardening(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmpdir.name)
+        self.orch_file = self.root / "orchestrator.json"
+        self.workers_file = self.root / "workers.json"
+        self.critical_file = self.root / "critical_processes.json"
+        self.layout_file = self.root / "orch_layout.json"
+        self.workers_file.write_text(json.dumps({"workers": []}), encoding="utf-8")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    @patch("skynet_delivery._is_window", return_value=True)
+    @patch("skynet_delivery.validate_hwnd")
+    @patch("skynet_delivery._get_orchestrator_pane_signals", return_value={
+        "left_model": "",
+        "left_agent": "",
+        "left_model_ok": False,
+        "left_agent_ok": False,
+        "markers": [],
+        "reject_markers": [],
+    })
+    @patch("skynet_delivery._enum_vscode_hwnds", return_value=[])
+    def test_orchestrator_json_only_consultant_title_is_rejected(self, _mock_enum, _mock_pane, mock_validate, _mock_isw):
+        self.orch_file.write_text(json.dumps({"orchestrator_hwnd": 67568}), encoding="utf-8")
+        self.critical_file.write_text(json.dumps({"processes": []}), encoding="utf-8")
+        self.layout_file.write_text(json.dumps({}), encoding="utf-8")
+        mock_validate.return_value = {
+            "valid": True,
+            "title": "Understanding gc-start command usage - ScreenMemory - Visual Studio Code - Insiders",
+            "checks": {"nonzero": True, "is_window": True, "is_vscode_process": True, "has_vscode_title": True},
+        }
+        with patch("skynet_delivery.ORCH_FILE", self.orch_file), \
+             patch("skynet_delivery.WORKERS_FILE", self.workers_file), \
+             patch("skynet_delivery.CRITICAL_PROCS_FILE", self.critical_file), \
+             patch("skynet_delivery.ORCH_LAYOUT_FILE", self.layout_file):
+            self.assertEqual(_load_orch_hwnd(), 0)
+
+    @patch("skynet_delivery._is_window", return_value=True)
+    @patch("skynet_delivery.validate_hwnd")
+    @patch("skynet_delivery._get_window_scan_flags", return_value={
+        "agent": "Delegate Session - Copilot CLI",
+        "model": "",
+        "agent_ok": True,
+        "model_ok": False,
+    })
+    @patch("skynet_delivery._enum_vscode_hwnds", return_value=[])
+    def test_corroborated_orchestrator_start_boot_trigger_is_accepted(
+        self, _mock_enum, _mock_scan, mock_validate, _mock_isw
+    ):
+        self.orch_file.write_text(json.dumps({
+            "orchestrator_hwnd": 55555,
+            "boot_trigger": "orchestrator-start",
+        }), encoding="utf-8")
+        self.critical_file.write_text(json.dumps({
+            "processes": [{"role": "orchestrator", "hwnd": 55555}]
+        }), encoding="utf-8")
+        self.layout_file.write_text(json.dumps({}), encoding="utf-8")
+        mock_validate.return_value = {
+            "valid": True,
+            "title": "Random main window - ScreenMemory - Visual Studio Code - Insiders",
+            "checks": {"nonzero": True, "is_window": True, "is_vscode_process": True, "has_vscode_title": True},
+        }
+        with patch("skynet_delivery.ORCH_FILE", self.orch_file), \
+             patch("skynet_delivery.WORKERS_FILE", self.workers_file), \
+             patch("skynet_delivery.CRITICAL_PROCS_FILE", self.critical_file), \
+             patch("skynet_delivery.ORCH_LAYOUT_FILE", self.layout_file):
+            self.assertEqual(_load_orch_hwnd(), 55555)
+
+    @patch("skynet_delivery._is_window", return_value=True)
+    @patch("skynet_delivery.validate_hwnd")
+    @patch("skynet_delivery._get_window_scan_flags", return_value={
+        "agent": "",
+        "model": "",
+        "agent_ok": False,
+        "model_ok": False,
+    })
+    @patch("skynet_delivery._get_candidate_window_text", return_value="")
+    @patch("skynet_delivery._enum_vscode_hwnds", return_value=[77777])
+    def test_enumerated_skynet_start_title_is_accepted(
+        self, _mock_enum, _mock_text, _mock_scan, mock_validate, _mock_isw
+    ):
+        self.orch_file.write_text(json.dumps({}), encoding="utf-8")
+        self.critical_file.write_text(json.dumps({"processes": []}), encoding="utf-8")
+        self.layout_file.write_text(json.dumps({}), encoding="utf-8")
+        mock_validate.return_value = {
+            "valid": True,
+            "title": "skynet-start - ScreenMemory - Visual Studio Code - Insiders",
+            "checks": {"nonzero": True, "is_window": True, "is_vscode_process": True, "has_vscode_title": True},
+        }
+        with patch("skynet_delivery.ORCH_FILE", self.orch_file), \
+             patch("skynet_delivery.WORKERS_FILE", self.workers_file), \
+             patch("skynet_delivery.CRITICAL_PROCS_FILE", self.critical_file), \
+             patch("skynet_delivery.ORCH_LAYOUT_FILE", self.layout_file):
+            self.assertEqual(_load_orch_hwnd(), 77777)
+
+    @patch("skynet_delivery._is_window", return_value=True)
+    @patch("skynet_delivery.validate_hwnd")
+    @patch("skynet_delivery._get_window_scan_flags", return_value={
+        "agent": "Delegate Session - Copilot CLI",
+        "model": "Pick Model, Claude Opus 4.6 (fast mode)",
+        "agent_ok": True,
+        "model_ok": True,
+    })
+    @patch(
+        "skynet_delivery._get_candidate_window_text",
+        return_value="You are the SKYNET ORCHESTRATOR.\nServing GOD by managing the distributed worker network.",
+    )
+    @patch("skynet_delivery._enum_vscode_hwnds", return_value=[88888])
+    def test_enumerated_orchestrator_identity_text_is_accepted(
+        self, _mock_enum, _mock_text, _mock_scan, mock_validate, _mock_isw
+    ):
+        self.orch_file.write_text(json.dumps({}), encoding="utf-8")
+        self.critical_file.write_text(json.dumps({"processes": []}), encoding="utf-8")
+        self.layout_file.write_text(json.dumps({}), encoding="utf-8")
+        mock_validate.return_value = {
+            "valid": True,
+            "title": "Main Chat - ScreenMemory - Visual Studio Code - Insiders",
+            "checks": {"nonzero": True, "is_window": True, "is_vscode_process": True, "has_vscode_title": True},
+        }
+        with patch("skynet_delivery.ORCH_FILE", self.orch_file), \
+             patch("skynet_delivery.WORKERS_FILE", self.workers_file), \
+             patch("skynet_delivery.CRITICAL_PROCS_FILE", self.critical_file), \
+             patch("skynet_delivery.ORCH_LAYOUT_FILE", self.layout_file):
+            self.assertEqual(_load_orch_hwnd(), 88888)
+
+    @patch("skynet_delivery._is_window", return_value=True)
+    @patch("skynet_delivery.validate_hwnd")
+    @patch("skynet_delivery._get_window_scan_flags", return_value={
+        "agent": "Delegate Session - Local",
+        "model": "Pick Model, Gemini 3.1 Pro (Preview)",
+        "agent_ok": False,
+        "model_ok": False,
+    })
+    @patch("skynet_delivery._get_orchestrator_pane_signals", return_value={
+        "left_model": "Pick Model, Claude Opus 4.6 (fast mode)",
+        "left_agent": "Delegate Session - Copilot CLI",
+        "left_model_ok": True,
+        "left_agent_ok": True,
+        "markers": ["worker alpha", "all 4 workers"],
+        "reject_markers": [],
+    })
+    @patch("skynet_delivery._get_candidate_window_text", return_value="gc-start\nGemini Consultant")
+    @patch("skynet_delivery._enum_vscode_hwnds", return_value=[67568])
+    def test_shared_window_left_pane_orchestrator_is_accepted(
+        self, _mock_enum, _mock_text, _mock_pane, _mock_scan, mock_validate, _mock_isw
+    ):
+        self.orch_file.write_text(json.dumps({}), encoding="utf-8")
+        self.critical_file.write_text(json.dumps({"processes": []}), encoding="utf-8")
+        self.layout_file.write_text(json.dumps({}), encoding="utf-8")
+        mock_validate.return_value = {
+            "valid": True,
+            "title": "You are worker delta in the Sk… - ScreenMemory - Visual Studio Code - Insiders",
+            "checks": {"nonzero": True, "is_window": True, "is_vscode_process": True, "has_vscode_title": True},
+        }
+        with patch("skynet_delivery.ORCH_FILE", self.orch_file), \
+             patch("skynet_delivery.WORKERS_FILE", self.workers_file), \
+             patch("skynet_delivery.CRITICAL_PROCS_FILE", self.critical_file), \
+             patch("skynet_delivery.ORCH_LAYOUT_FILE", self.layout_file):
+            self.assertEqual(_load_orch_hwnd(), 67568)
+
+    @patch("skynet_delivery._is_window", return_value=True)
+    @patch("skynet_delivery.validate_hwnd")
+    @patch("skynet_delivery._get_window_scan_flags", return_value={
+        "agent": "Delegate Session - Local",
+        "model": "Pick Model, Gemini 3.1 Pro (Preview)",
+        "agent_ok": False,
+        "model_ok": False,
+    })
+    @patch("skynet_delivery._get_orchestrator_pane_signals", return_value={
+        "left_model": "",
+        "left_agent": "Delegate Session - Copilot CLI",
+        "left_model_ok": False,
+        "left_agent_ok": True,
+        "markers": ["all 4 workers", "dispatch"],
+        "reject_markers": [],
+    })
+    @patch("skynet_delivery._get_candidate_window_text", return_value="gc-start\nGemini Consultant")
+    @patch("skynet_delivery._enum_vscode_hwnds", return_value=[67676])
+    def test_shared_window_left_pane_override_survives_missing_model_button(
+        self, _mock_enum, _mock_text, _mock_pane, _mock_scan, mock_validate, _mock_isw
+    ):
+        self.orch_file.write_text(json.dumps({}), encoding="utf-8")
+        self.critical_file.write_text(json.dumps({"processes": []}), encoding="utf-8")
+        self.layout_file.write_text(json.dumps({}), encoding="utf-8")
+        mock_validate.return_value = {
+            "valid": True,
+            "title": "You are worker beta in the Sky… - ScreenMemory - Visual Studio Code - Insiders",
+            "checks": {"nonzero": True, "is_window": True, "is_vscode_process": True, "has_vscode_title": True},
+        }
+        with patch("skynet_delivery.ORCH_FILE", self.orch_file), \
+             patch("skynet_delivery.WORKERS_FILE", self.workers_file), \
+             patch("skynet_delivery.CRITICAL_PROCS_FILE", self.critical_file), \
+             patch("skynet_delivery.ORCH_LAYOUT_FILE", self.layout_file):
+            self.assertEqual(_load_orch_hwnd(), 67676)
 
 
 class TestTamperedWorkersJsonInjection(unittest.TestCase):

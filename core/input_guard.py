@@ -115,56 +115,40 @@ class InputGuard:
 
     def scan(self, input_text: str) -> ScanResult:
         """Scan input for injection attempts. Returns ScanResult."""
+        # Validate input type and bounds  # signed: gamma
+        if input_text is None:
+            return ScanResult(
+                threat_level=ThreatLevel.BLOCKED, score=1.0,
+                triggers=["null_input"], sanitized_input="", blocked=True,
+            )
+        if not isinstance(input_text, str):
+            try:
+                input_text = str(input_text)
+            except (TypeError, ValueError):
+                return ScanResult(
+                    threat_level=ThreatLevel.BLOCKED, score=1.0,
+                    triggers=["invalid_type"], sanitized_input="", blocked=True,
+                )
+        MAX_INPUT_LENGTH = 100_000  # 100KB hard limit
+        if len(input_text) > MAX_INPUT_LENGTH:
+            logger.warning("InputGuard: oversized input (%d chars), truncating to %d",
+                           len(input_text), MAX_INPUT_LENGTH)
+            input_text = input_text[:MAX_INPUT_LENGTH]
+
         t0 = time.perf_counter()
         self._scan_count += 1
 
-        triggers = []
-        max_score = 0.0
-
-        # Layer 1: Known injection patterns
-        for pattern, score, label in self.INJECTION_PATTERNS:
-            if pattern.search(input_text):
-                triggers.append(f"L1:{label}")
-                max_score = max(max_score, score)
-
-        # Layer 2: Structural anomalies
-        for pattern, score, label in self.STRUCTURAL_PATTERNS:
-            matches = pattern.findall(input_text)
-            if matches:
-                adjusted_score = min(1.0, score * (1 + len(matches) * 0.1))
-                triggers.append(f"L2:{label}({len(matches)})")
-                max_score = max(max_score, adjusted_score)
-
-        # Layer 3: Context violation heuristics
-        context_score = self._check_context_violations(input_text)
-        if context_score > 0:
-            triggers.append(f"L3:context_violation")
-            max_score = max(max_score, context_score)
-
-        # Determine threat level
-        if max_score >= self.block_threshold:
-            threat_level = ThreatLevel.BLOCKED
-            blocked = True
+        triggers, max_score = self._collect_triggers(input_text)
+        threat_level, blocked = self._classify_threat(max_score)
+        if blocked:
             self._block_count += 1
-        elif max_score >= self.warn_threshold:
-            threat_level = ThreatLevel.SUSPICIOUS if max_score < 0.6 else ThreatLevel.DANGEROUS
-            blocked = False
-        else:
-            threat_level = ThreatLevel.SAFE
-            blocked = False
 
-        # Sanitize input
         sanitized = self._sanitize(input_text) if triggers else input_text
-
         result = ScanResult(
-            threat_level=threat_level,
-            score=max_score,
-            triggers=triggers,
-            sanitized_input=sanitized,
-            blocked=blocked,
+            threat_level=threat_level, score=max_score,
+            triggers=triggers, sanitized_input=sanitized, blocked=blocked,
         )
 
-        # Audit log
         if self.audit_all or triggers:
             self._audit_log.append(result)
 
@@ -174,8 +158,40 @@ class InputGuard:
                            f"triggers={triggers} [{elapsed:.1f}ms]")
         else:
             logger.debug(f"InputGuard: SAFE [{elapsed:.1f}ms]")
-
         return result
+
+    def _collect_triggers(self, input_text: str):
+        """Run all detection layers and return (triggers, max_score)."""
+        triggers = []
+        max_score = 0.0
+
+        for pattern, score, label in self.INJECTION_PATTERNS:
+            if pattern.search(input_text):
+                triggers.append(f"L1:{label}")
+                max_score = max(max_score, score)
+
+        for pattern, score, label in self.STRUCTURAL_PATTERNS:
+            matches = pattern.findall(input_text)
+            if matches:
+                adjusted_score = min(1.0, score * (1 + len(matches) * 0.1))
+                triggers.append(f"L2:{label}({len(matches)})")
+                max_score = max(max_score, adjusted_score)
+
+        context_score = self._check_context_violations(input_text)
+        if context_score > 0:
+            triggers.append(f"L3:context_violation")
+            max_score = max(max_score, context_score)
+
+        return triggers, max_score
+
+    def _classify_threat(self, max_score: float):
+        """Classify threat level from max score. Returns (level, blocked)."""
+        if max_score >= self.block_threshold:
+            return ThreatLevel.BLOCKED, True
+        if max_score >= self.warn_threshold:
+            level = ThreatLevel.SUSPICIOUS if max_score < 0.6 else ThreatLevel.DANGEROUS
+            return level, False
+        return ThreatLevel.SAFE, False
 
     def _check_context_violations(self, text: str) -> float:
         """Check for attempts to manipulate conversation context."""

@@ -177,6 +177,30 @@ class AgentWorker:
         except (json.JSONDecodeError, OSError):
             return None
 
+    def _run_subprocess(self, cmd_args, label, all_output):
+        """Run a subprocess, streaming output live. Returns (exit_code, output_text)."""
+        proc = subprocess.Popen(
+            cmd_args, shell=isinstance(cmd_args, str),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+            **_hidden_popen_kwargs(),
+        )
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                display = line[:52] if len(line) > 52 else line
+                self.log(f"  {DIM}│{RESET} {display}")
+                all_output.append(line)
+                self.render()
+        proc.wait(timeout=120)
+        output_text = "\n".join(all_output[-50:])
+        if proc.returncode == 0:
+            self.log(f"  {GREEN}✓ {label} done — {len(all_output)} lines{RESET}")
+        else:
+            self.log(f"  \033[91m✗ {label} exit {proc.returncode}{RESET}")
+        self.render()
+        return proc.returncode, output_text
+
     def execute_task(self, task: dict):
         """Execute a task — streams EVERY line of output live to the dashboard."""
         self.status = "WORKING"
@@ -187,69 +211,28 @@ class AgentWorker:
         command = task.get("command", "")
         task_type = task.get("type", "shell")
         all_output = []
-
         result = {"status": "success", "output": "", "error": ""}
 
         try:
             if task_type == "shell" and command:
                 self.log(f"  {WHITE}$ {command[:48]}{RESET}")
                 self.render()
-
-                proc = subprocess.Popen(
-                    command, shell=True,
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1,
-                    **_hidden_popen_kwargs(),
-                )
-                # Stream every line live
-                for line in proc.stdout:
-                    line = line.rstrip()
-                    if line:
-                        # Truncate long lines for display
-                        display = line[:52] if len(line) > 52 else line
-                        self.log(f"  {DIM}│{RESET} {display}")
-                        all_output.append(line)
-                        self.render()
-
-                proc.wait(timeout=120)
-                result["output"] = "\n".join(all_output[-50:])
-                result["returncode"] = proc.returncode
-
-                if proc.returncode == 0:
-                    self.log(f"  {GREEN}✓ Done (exit 0) — {len(all_output)} lines{RESET}")
-                else:
-                    self.log(f"  \033[91m✗ Exit code {proc.returncode}{RESET}")
+                rc, output = self._run_subprocess(command, "Done (exit 0)" if True else "", all_output)
+                result["output"] = output
+                result["returncode"] = rc
+                if rc != 0:
                     result["status"] = "failed"
-                self.render()
 
             elif task_type == "python" and command:
                 self.log(f"  {WHITE}Running Python code...{RESET}")
                 self.render()
-
-                proc = subprocess.Popen(
-                    [sys.executable, "-u", "-c", command],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1,
-                    **_hidden_popen_kwargs(),
+                rc, output = self._run_subprocess(
+                    [sys.executable, "-u", "-c", command], "Python", all_output
                 )
-                for line in proc.stdout:
-                    line = line.rstrip()
-                    if line:
-                        display = line[:52] if len(line) > 52 else line
-                        self.log(f"  {DIM}│{RESET} {display}")
-                        all_output.append(line)
-                        self.render()
-
-                proc.wait(timeout=120)
-                result["output"] = "\n".join(all_output[-50:])
-                result["returncode"] = proc.returncode
-
-                if proc.returncode == 0:
-                    self.log(f"  {GREEN}✓ Python done — {len(all_output)} lines{RESET}")
-                else:
-                    self.log(f"  \033[91m✗ Python exit {proc.returncode}{RESET}")
+                result["output"] = output
+                result["returncode"] = rc
+                if rc != 0:
                     result["status"] = "failed"
-                self.render()
 
             elif task_type == "message":
                 self.log(f"  📨 {command[:50]}")
@@ -261,7 +244,6 @@ class AgentWorker:
             self.log(f"  \033[91m✗ Error: {str(e)[:50]}{RESET}")
             self.render()
 
-        # Write result
         try:
             with open(self.result_file, 'w') as f:
                 json.dump(result, f)

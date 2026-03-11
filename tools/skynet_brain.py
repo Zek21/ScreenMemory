@@ -15,6 +15,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass, field, asdict
@@ -90,52 +91,71 @@ def _bus_post(message: dict) -> bool:
 
 
 def _save_episode(plan, results: dict, success: bool):
-    """Persist an episode JSON file in data/episodes/ and update the index."""
+    """Persist an episode JSON file in data/episodes/ and update the index.
+
+    Uses atomic writes to prevent corruption from concurrent brain executions.
+    """  # signed: gamma
     strategy_id = getattr(plan, "strategy_id", "") or _generate_strategy_id(plan.goal)
     ts = time.time()
-    episode = {
-        "id": f"ep_{int(ts * 1000)}_{strategy_id[:8]}",
-        "strategy_id": strategy_id,
-        "goal": plan.goal[:300],
-        "difficulty": plan.difficulty,
-        "worker_count": len(plan.subtasks),
-        "workers": [st.assigned_worker if hasattr(st, "assigned_worker") else st.get("worker", "?")
-                     for st in (plan.subtasks if not hasattr(plan.subtasks[0], "assigned_worker")
-                                else plan.subtasks)]
-                   if plan.subtasks else [],
-        "outcome": "success" if success else "failure",
-        "timestamp": ts,
-        "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
-    }
-    # Normalize workers list from dataclass or dict subtasks
+
+    # Build workers list from dataclass or dict subtasks
     workers = []
     for st in plan.subtasks:
         if hasattr(st, "assigned_worker"):
             workers.append(st.assigned_worker)
         elif isinstance(st, dict):
             workers.append(st.get("worker", "?"))
-    episode["workers"] = workers
 
-    # Write individual episode file
+    episode = {
+        "id": f"ep_{int(ts * 1000)}_{strategy_id[:8]}",
+        "strategy_id": strategy_id,
+        "goal": plan.goal[:300],
+        "difficulty": plan.difficulty,
+        "worker_count": len(plan.subtasks),
+        "workers": workers,
+        "outcome": "success" if success else "failure",
+        "timestamp": ts,
+        "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
+    }
+
+    # Write individual episode file (atomic to prevent partial writes)
     EPISODES_DIR.mkdir(parents=True, exist_ok=True)
     ep_file = EPISODES_DIR / f"{episode['id']}.json"
     try:
-        ep_file.write_text(json.dumps(episode, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+        from tools.skynet_atomic import atomic_write_json
+        atomic_write_json(ep_file, episode)
+    except ImportError:
+        try:
+            ep_file.write_text(json.dumps(episode, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
-    # Update index
+    # Update index atomically (read-modify-write under lock prevents corruption
+    # when multiple brain processes or threads call _save_episode concurrently)
     try:
-        if EPISODES_INDEX.exists():
-            index = json.loads(EPISODES_INDEX.read_text(encoding="utf-8"))
-        else:
-            index = []
-        index.append(episode)
-        if len(index) > 500:
-            index = index[-500:]
-        EPISODES_INDEX.write_text(json.dumps(index, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+        from tools.skynet_atomic import atomic_update_json
+
+        def _append_episode(index):
+            if not isinstance(index, list):
+                index = []
+            index.append(episode)
+            if len(index) > 500:
+                index = index[-500:]
+            return index
+
+        atomic_update_json(EPISODES_INDEX, _append_episode, default=[])
+    except ImportError:
+        try:
+            if EPISODES_INDEX.exists():
+                index = json.loads(EPISODES_INDEX.read_text(encoding="utf-8"))
+            else:
+                index = []
+            index.append(episode)
+            if len(index) > 500:
+                index = index[-500:]
+            EPISODES_INDEX.write_text(json.dumps(index, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
 
 def query_episodes_by_strategy(strategy_id: str) -> List[dict]:
@@ -523,19 +543,8 @@ class SkynetBrain:
 
     # ─── THINK ─────────────────────────────────────────
 
-    def think(self, goal: str) -> BrainPlan:
-        """Given a goal, produce an intelligent execution plan."""
-
-        # a) ASSESS difficulty — router + text-based override
-        assessment = self.assess(goal)
-        difficulty = assessment.get("difficulty", "MODERATE")
-        operator = assessment.get("operator", "CHAIN_OF_THOUGHT")
-        domain_tags = assessment.get("domain_tags", [])
-
-        # Override: analyze goal text for multi-task signals
-        difficulty = self._adjust_difficulty(goal, difficulty)
-
-        # b) RECALL past learnings
+    def _recall_and_search(self, goal: str) -> tuple:
+        """Recall past learnings and search for relevant context. Returns (learnings, context_docs)."""
         learnings = []
         if self.learning_store:
             try:
@@ -544,7 +553,6 @@ class SkynetBrain:
             except Exception:
                 pass
 
-        # c) SEARCH for relevant context
         context_docs = []
         if self.retriever:
             try:
@@ -553,69 +561,71 @@ class SkynetBrain:
             except Exception:
                 pass
 
-        # d) COGNITIVE STRATEGY (Level 4) — apply reasoning before decomposition
-        cognitive_context = ""
-        cognitive_result = None
-        if self.cognitive:
-            try:
-                cognitive_result = self.cognitive.apply(difficulty, goal, learnings)
-                cognitive_context = self.cognitive.enrich_with_cognitive_context(cognitive_result)
-                strategy_name = cognitive_result.get("strategy", "direct")
-                if strategy_name != "direct":
-                    print(f"[brain] Cognitive strategy: {strategy_name.upper()} applied")
-            except Exception as e:
-                print(f"[brain] WARN: Cognitive strategy failed: {e}")
+        return learnings, context_docs
 
-        # e) DECOMPOSE — smart decomposition for multi-part goals
-        idle_workers = _get_idle_workers()
-        if not idle_workers:
-            idle_workers = list(WORKER_NAMES)
+    def _apply_cognitive_strategy(self, goal: str, difficulty: str, learnings: list) -> tuple:
+        """Apply cognitive strategy and return (cognitive_context, cognitive_result)."""
+        if not self.cognitive:
+            return "", None
+        try:
+            result = self.cognitive.apply(difficulty, goal, learnings)
+            context = self.cognitive.enrich_with_cognitive_context(result)
+            if result.get("strategy", "direct") != "direct":
+                print(f"[brain] Cognitive strategy: {result['strategy'].upper()} applied")
+            return context, result
+        except Exception as e:
+            print(f"[brain] WARN: Cognitive strategy failed: {e}")
+            return "", None
 
-        # Try natural decomposition first (split on "and", commas, numbered items)
+    def _append_cognitive_reasoning(self, reasoning: str, cognitive_result: dict) -> str:
+        """Append cognitive strategy info to reasoning string."""
+        if not cognitive_result or cognitive_result.get("strategy") == "direct":
+            return reasoning
+        strategy = cognitive_result["strategy"]
+        reasoning += f"\nCognitive strategy: {strategy.upper()}"
+        if strategy == "got":
+            reasoning += f" (graph: {cognitive_result.get('graph_size', 0)} nodes)"
+        elif strategy == "mcts":
+            reasoning += f" ({cognitive_result.get('iterations', 0)} iterations, best={cognitive_result.get('best_score', 0):.2f})"
+        elif strategy == "reflexion":
+            reasoning += f" ({cognitive_result.get('reflection_count', 0)} relevant reflections)"
+        return reasoning
+
+    def think(self, goal: str) -> BrainPlan:
+        """Given a goal, produce an intelligent execution plan."""
+        assessment = self.assess(goal)
+        difficulty = self._adjust_difficulty(goal, assessment.get("difficulty", "MODERATE"))
+        operator = assessment.get("operator", "CHAIN_OF_THOUGHT")
+        domain_tags = assessment.get("domain_tags", [])
+
+        learnings, context_docs = self._recall_and_search(goal)
+        cognitive_context, cognitive_result = self._apply_cognitive_strategy(goal, difficulty, learnings)
+
+        idle_workers = _get_idle_workers() or list(WORKER_NAMES)
+
         natural_parts = self._extract_natural_subtasks(goal)
         if len(natural_parts) > 1 and difficulty in ("TRIVIAL", "SIMPLE"):
-            # Goal has multiple explicit parts but router said simple — upgrade
             difficulty = "MODERATE" if len(natural_parts) <= 2 else "COMPLEX"
 
-        # Build context including cognitive insights
         base_context = self._build_context(learnings, context_docs)
-        if cognitive_context:
-            full_context = f"{base_context}\n\n{cognitive_context}" if base_context else cognitive_context
-        else:
-            full_context = base_context
+        full_context = f"{base_context}\n\n{cognitive_context}" if cognitive_context and base_context else (cognitive_context or base_context)
 
         if len(natural_parts) > 1:
             subtasks = self._decompose_natural(natural_parts, idle_workers, full_context)
         else:
             subtasks = self._decompose(goal, difficulty, idle_workers, learnings, context_docs)
-            # Inject cognitive context into existing subtasks
             if cognitive_context:
                 for st in subtasks:
-                    if st.context:
-                        st.context = f"{st.context}\n\n{cognitive_context}"
-                    else:
-                        st.context = cognitive_context
+                    st.context = f"{st.context}\n\n{cognitive_context}" if st.context else cognitive_context
 
-        # f) Build reasoning
         reasoning = self._build_reasoning(goal, difficulty, operator, subtasks,
                                           learnings, context_docs, idle_workers)
-        if cognitive_result and cognitive_result.get("strategy") != "direct":
-            reasoning += f"\nCognitive strategy: {cognitive_result['strategy'].upper()}"
-            if cognitive_result.get("strategy") == "got":
-                reasoning += f" (graph: {cognitive_result.get('graph_size', 0)} nodes)"
-            elif cognitive_result.get("strategy") == "mcts":
-                reasoning += f" ({cognitive_result.get('iterations', 0)} iterations, best={cognitive_result.get('best_score', 0):.2f})"
-            elif cognitive_result.get("strategy") == "reflexion":
-                reasoning += f" ({cognitive_result.get('reflection_count', 0)} relevant reflections)"
+        reasoning = self._append_cognitive_reasoning(reasoning, cognitive_result)
 
         return BrainPlan(
-            goal=goal,
-            difficulty=difficulty,
-            subtasks=subtasks,
-            reasoning=reasoning,
-            relevant_learnings=learnings[:5],
-            operator=operator,
-            domain_tags=domain_tags,
+            goal=goal, difficulty=difficulty, subtasks=subtasks,
+            reasoning=reasoning, relevant_learnings=learnings[:5],
+            operator=operator, domain_tags=domain_tags,
             strategy_id=_generate_strategy_id(goal),
         )
 
@@ -641,8 +651,7 @@ class SkynetBrain:
         elif verb_count >= 2:
             signals += 1
 
-        # Explicit enumerations
-        import re
+        # Explicit enumerations  # signed: gamma
         if re.search(r'\d\)', gl) or re.search(r'\d\.', gl):
             signals += 1
         # "and" joining distinct clauses
@@ -671,14 +680,20 @@ class SkynetBrain:
             return levels[min(current_idx + 1, 4)]
         return router_difficulty
 
+    _NATURAL_ACTION_VERBS = frozenset([
+        "build", "create", "implement", "fix", "audit", "review",
+        "redesign", "add", "remove", "refactor", "test", "deploy",
+        "analyze", "scan", "check", "verify", "update", "enhance",
+        "write", "design", "optimize", "integrate", "migrate",
+        "count", "list", "report", "find", "search", "delete",
+        "install", "configure", "setup", "clean", "document",
+        "debug", "profile", "benchmark", "monitor", "restart",
+        "run", "execute", "start", "stop", "upgrade", "downgrade",
+    ])
+
     @staticmethod
     def _extract_natural_subtasks(goal: str) -> List[str]:
-        """Extract natural subtask boundaries from goal text.
-
-        Splits on: numbered items (1. 2. 3.), semicolons, and compound 'and' clauses
-        that join distinct actions (not just compound nouns).
-        """
-        import re
+        """Extract natural subtask boundaries from goal text."""  # signed: gamma
 
         # Try numbered items: "1) ... 2) ..." or "1. ... 2. ..."
         numbered = re.split(r'\d+[.)]\s+', goal)
@@ -692,35 +707,20 @@ class SkynetBrain:
             if len(parts) > 1:
                 return parts
 
-        # Try splitting on ", and " or " and " between verb phrases
-        # Only split if both sides contain an action verb
-        action_verbs = {"build", "create", "implement", "fix", "audit", "review",
-                        "redesign", "add", "remove", "refactor", "test", "deploy",
-                        "analyze", "scan", "check", "verify", "update", "enhance",
-                        "write", "design", "optimize", "integrate", "migrate",
-                        "count", "list", "report", "find", "search", "delete",
-                        "install", "configure", "setup", "clean", "document",
-                        "debug", "profile", "benchmark", "monitor", "restart",
-                        "run", "execute", "start", "stop", "upgrade", "downgrade"}
+        verbs = SkynetBrain._NATURAL_ACTION_VERBS
 
-        # Try comma-separated list with final "and" (Oxford comma pattern)
-        # "do X, fix Y, optimize Z, and update W" → [X, Y, Z, W]
+        # Try comma-separated list with optional final "and" (Oxford comma pattern)
         if "," in goal:
-            # Remove trailing ", and ..." by splitting on ", and " then re-joining
-            # with a comma so we can split uniformly
             normalized = re.sub(r',\s+and\s+', ', ', goal)
-            parts = [p.strip() for p in normalized.split(",")]
-            # Clean: remove leading "and " from any part
-            parts = [re.sub(r'^and\s+', '', p).strip() for p in parts]
+            parts = [re.sub(r'^and\s+', '', p).strip() for p in normalized.split(",")]
             parts = [p for p in parts if p]
-            verb_parts = [p for p in parts if any(v in p.lower() for v in action_verbs)]
-            if len(verb_parts) >= 2:
+            if sum(1 for p in parts if any(v in p.lower() for v in verbs)) >= 2:
                 return parts
 
         # Split on " and " between independent clauses
         if " and " in goal:
             parts = [p.strip() for p in goal.split(" and ")]
-            verb_parts = [p for p in parts if any(v in p.lower() for v in action_verbs)]
+            verb_parts = [p for p in parts if any(v in p.lower() for v in verbs)]
             if len(verb_parts) >= 2 and len(parts) <= 4:
                 return parts
 
@@ -740,100 +740,47 @@ class SkynetBrain:
             ))
         return subtasks
 
+    @staticmethod
+    def _make_subtask_chain(specs: list, context_str: str) -> List[Subtask]:
+        """Build a list of Subtasks from (task_text, worker, deps_list) specs."""
+        return [
+            Subtask(task_text=text, assigned_worker=worker, context=context_str,
+                    dependencies=deps, index=i)
+            for i, (text, worker, deps) in enumerate(specs)
+        ]
+
     def _decompose(self, goal: str, difficulty: str, idle_workers: List[str],
                    learnings: List[str], context_docs: List[str]) -> List[Subtask]:
         """Decompose goal into subtasks based on difficulty level."""
         context_str = self._build_context(learnings, context_docs)
 
         if difficulty in ("TRIVIAL", "SIMPLE"):
-            return [Subtask(
-                task_text=goal,
-                assigned_worker=idle_workers[0],
-                context=context_str,
-                index=0,
-            )]
+            return [Subtask(task_text=goal, assigned_worker=idle_workers[0],
+                           context=context_str, index=0)]
+
+        w = (idle_workers * 2)[:4]
 
         if difficulty == "MODERATE":
-            w1 = idle_workers[0]
-            w2 = idle_workers[1] if len(idle_workers) > 1 else idle_workers[0]
-            return [
-                Subtask(
-                    task_text=f"Analyze and plan approach for: {goal}",
-                    assigned_worker=w1,
-                    context=context_str,
-                    index=0,
-                ),
-                Subtask(
-                    task_text=f"Implement and verify: {goal}",
-                    assigned_worker=w2,
-                    context=context_str,
-                    dependencies=["subtask_0"],
-                    index=1,
-                ),
-            ]
+            return self._make_subtask_chain([
+                (f"Analyze and plan approach for: {goal}", w[0], []),
+                (f"Implement and verify: {goal}", w[1] if len(idle_workers) > 1 else w[0], ["subtask_0"]),
+            ], context_str)
 
         if difficulty == "COMPLEX":
-            workers = (idle_workers * 2)[:4]
-            return [
-                Subtask(
-                    task_text=f"Research and analyze requirements for: {goal}",
-                    assigned_worker=workers[0],
-                    context=context_str,
-                    index=0,
-                ),
-                Subtask(
-                    task_text=f"Design solution architecture for: {goal}",
-                    assigned_worker=workers[1],
-                    context=context_str,
-                    dependencies=["subtask_0"],
-                    index=1,
-                ),
-                Subtask(
-                    task_text=f"Implement core logic for: {goal}",
-                    assigned_worker=workers[2],
-                    context=context_str,
-                    dependencies=["subtask_1"],
-                    index=2,
-                ),
-                Subtask(
-                    task_text=f"Validate and test implementation for: {goal}",
-                    assigned_worker=workers[3],
-                    context=context_str,
-                    dependencies=["subtask_2"],
-                    index=3,
-                ),
-            ]
+            return self._make_subtask_chain([
+                (f"Research and analyze requirements for: {goal}", w[0], []),
+                (f"Design solution architecture for: {goal}", w[1], ["subtask_0"]),
+                (f"Implement core logic for: {goal}", w[2], ["subtask_1"]),
+                (f"Validate and test implementation for: {goal}", w[3], ["subtask_2"]),
+            ], context_str)
 
         # ADVERSARIAL / DEBATE
-        workers = (idle_workers * 2)[:4]
-        return [
-            Subtask(
-                task_text=f"Propose solution approach A for: {goal}",
-                assigned_worker=workers[0],
-                context=context_str,
-                index=0,
-            ),
-            Subtask(
-                task_text=f"Propose alternative approach B for: {goal}",
-                assigned_worker=workers[1],
-                context=context_str,
-                index=1,
-            ),
-            Subtask(
-                task_text=f"Critique both approaches for: {goal}. Identify flaws and risks.",
-                assigned_worker=workers[2],
-                context=context_str,
-                dependencies=["subtask_0", "subtask_1"],
-                index=2,
-            ),
-            Subtask(
-                task_text=f"Synthesize final solution from debate for: {goal}",
-                assigned_worker=workers[3],
-                context=context_str,
-                dependencies=["subtask_0", "subtask_1", "subtask_2"],
-                index=3,
-            ),
-        ]
+        return self._make_subtask_chain([
+            (f"Propose solution approach A for: {goal}", w[0], []),
+            (f"Propose alternative approach B for: {goal}", w[1], []),
+            (f"Critique both approaches for: {goal}. Identify flaws and risks.", w[2], ["subtask_0", "subtask_1"]),
+            (f"Synthesize final solution from debate for: {goal}", w[3], ["subtask_0", "subtask_1", "subtask_2"]),
+        ], context_str)
 
     def _build_context(self, learnings: List[str], docs: List[str]) -> str:
         """Build context string from learnings and retrieved documents."""
@@ -871,69 +818,36 @@ class SkynetBrain:
 
     # ─── DISPATCH ──────────────────────────────────────
 
+    def _dispatch_single(self, st: Subtask, dispatch_fn, completed: dict) -> dict:
+        """Dispatch one subtask and return its result entry."""
+        if st.dependencies and not all(d in completed for d in st.dependencies):
+            return {"worker": st.assigned_worker, "dispatched": False,
+                    "error": f"Dependencies not met: {st.dependencies}"}
+
+        enriched = f"{st.task_text}\n\nCONTEXT:\n{st.context}" if st.context else st.task_text
+        try:
+            ok = dispatch_fn(st.assigned_worker, enriched)
+            if ok:
+                completed[f"subtask_{st.index}"] = True
+            return {"worker": st.assigned_worker, "dispatched": ok, "task": st.task_text[:100]}
+        except Exception as e:
+            return {"worker": st.assigned_worker, "dispatched": False, "error": str(e)}
+
     def dispatch(self, plan: BrainPlan) -> dict:
         """Execute the plan by dispatching subtasks to workers."""
-        # Lazy import to avoid circular dependency
         from tools.skynet_dispatch import dispatch_to_worker
 
+        completed = {}
         results = {}
-        completed_subtasks = {}
 
-        # Group subtasks by dependency level
         independent = [st for st in plan.subtasks if not st.dependencies]
         dependent = [st for st in plan.subtasks if st.dependencies]
 
-        # Dispatch independent subtasks in parallel
         for st in independent:
-            enriched_task = st.task_text
-            if st.context:
-                enriched_task = f"{st.task_text}\n\nCONTEXT:\n{st.context}"
-            try:
-                ok = dispatch_to_worker(st.assigned_worker, enriched_task)
-                results[f"subtask_{st.index}"] = {
-                    "worker": st.assigned_worker,
-                    "dispatched": ok,
-                    "task": st.task_text[:100],
-                }
-                if ok:
-                    completed_subtasks[f"subtask_{st.index}"] = True
-            except Exception as e:
-                results[f"subtask_{st.index}"] = {
-                    "worker": st.assigned_worker,
-                    "dispatched": False,
-                    "error": str(e),
-                }
+            results[f"subtask_{st.index}"] = self._dispatch_single(st, dispatch_to_worker, completed)
 
-        # Dispatch dependent subtasks sequentially
         for st in dependent:
-            # Check if all dependencies are met
-            deps_met = all(d in completed_subtasks for d in st.dependencies)
-            if not deps_met:
-                results[f"subtask_{st.index}"] = {
-                    "worker": st.assigned_worker,
-                    "dispatched": False,
-                    "error": f"Dependencies not met: {st.dependencies}",
-                }
-                continue
-
-            enriched_task = st.task_text
-            if st.context:
-                enriched_task = f"{st.task_text}\n\nCONTEXT:\n{st.context}"
-            try:
-                ok = dispatch_to_worker(st.assigned_worker, enriched_task)
-                results[f"subtask_{st.index}"] = {
-                    "worker": st.assigned_worker,
-                    "dispatched": ok,
-                    "task": st.task_text[:100],
-                }
-                if ok:
-                    completed_subtasks[f"subtask_{st.index}"] = True
-            except Exception as e:
-                results[f"subtask_{st.index}"] = {
-                    "worker": st.assigned_worker,
-                    "dispatched": False,
-                    "error": str(e),
-                }
+            results[f"subtask_{st.index}"] = self._dispatch_single(st, dispatch_to_worker, completed)
 
         return results
 

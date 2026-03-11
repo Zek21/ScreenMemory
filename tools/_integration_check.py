@@ -210,16 +210,16 @@ print("=" * 55)
 for k, v in results.items():
     print(f"  {k:<25s}: {v}")
 
-# Post to bus
-import requests
+# Post to bus  # signed: alpha
+from tools.skynet_spam_guard import guarded_publish
 summary = "; ".join(f"{k}={v}" for k, v in results.items())
 try:
-    requests.post("http://localhost:8420/bus/publish", json={
+    guarded_publish({
         "sender": "delta",
         "topic": "orchestrator",
         "type": "result",
         "content": f"INTEGRATION CHECK: {summary}"
-    }, timeout=5)
+    })
     print("\n  Results posted to bus.")
 except Exception as e:
     print(f"\n  Bus post failed: {e}")

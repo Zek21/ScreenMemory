@@ -276,10 +276,26 @@ class SkynetHealth:
     """Real-time health assessment across all subsystems."""
 
     def pulse(self) -> dict:
-        """Quick health check — all critical systems."""
+        """Quick health check -- all critical systems."""
         checks = {}
+        self._check_backend(checks)
+        self._check_workers(checks)
+        self._check_bus(checks)
+        self._check_sse_daemon(checks)
+        self._check_intelligence_engines(checks)
+        self._check_collective_iq(checks)
+        self._check_knowledge_base(checks)
+        self._check_windows(checks)
 
-        # Skynet backend
+        critical_up = all(
+            checks.get(k, {}).get("status", checks.get(k, {}).get("all_healthy", False))
+            in ("UP", True) for k in ["backend", "workers"]
+        )
+        return {"timestamp": datetime.now().isoformat(),
+                "overall": "HEALTHY" if critical_up else "DEGRADED", "checks": checks}
+
+    @staticmethod
+    def _check_backend(checks):
         status = _http_get("/status")
         checks["backend"] = {
             "status": "UP" if status else "DOWN",
@@ -287,99 +303,78 @@ class SkynetHealth:
             "version": status.get("version", "?") if status else "?",
         }
 
-        # Workers
+    @staticmethod
+    def _check_workers(checks):
+        status = _http_get("/status")
         if status:
             agents = status.get("agents", {})
             workers = {n: agents.get(n, {}) for n in WORKER_NAMES}
             alive = sum(1 for w in workers.values() if w.get("status") != "DEAD")
             idle = sum(1 for w in workers.values() if w.get("status") == "IDLE")
-            checks["workers"] = {
-                "total": len(WORKER_NAMES),
-                "alive": alive,
-                "idle": idle,
-                "working": alive - idle,
-                "all_healthy": alive == len(WORKER_NAMES),
-            }
+            checks["workers"] = {"total": len(WORKER_NAMES), "alive": alive, "idle": idle,
+                                 "working": alive - idle, "all_healthy": alive == len(WORKER_NAMES)}
         else:
             checks["workers"] = {"total": 0, "alive": 0, "all_healthy": False}
 
-        # Bus
+    @staticmethod
+    def _check_bus(checks):
         bus = _http_get("/bus/messages?limit=1")
         checks["bus"] = {"status": "UP" if bus is not None else "DOWN"}
 
-        # SSE daemon
+    @staticmethod
+    def _check_sse_daemon(checks):
         realtime_file = DATA / "realtime.json"
-        if realtime_file.exists():
-            try:
-                rt = json.loads(realtime_file.read_text())
-                age = time.time() - rt.get("last_update", 0)
-                checks["sse_daemon"] = {
-                    "status": "UP" if age < 5 else "STALE",
-                    "age_s": round(age, 1),
-                    "update_count": rt.get("update_count", 0),
-                }
-            except Exception:
-                checks["sse_daemon"] = {"status": "ERROR"}
-        else:
+        if not realtime_file.exists():
             checks["sse_daemon"] = {"status": "DOWN"}
+            return
+        try:
+            rt = json.loads(realtime_file.read_text())
+            age = time.time() - rt.get("last_update", 0)
+            checks["sse_daemon"] = {"status": "UP" if age < 5 else "STALE",
+                                    "age_s": round(age, 1), "update_count": rt.get("update_count", 0)}
+        except Exception:
+            checks["sse_daemon"] = {"status": "ERROR"}
 
-        # Intelligence engines (cached probe)
+    @staticmethod
+    def _check_intelligence_engines(checks):
         try:
             from tools.engine_metrics import collect_engine_metrics
             metrics = collect_engine_metrics()
             summary = metrics.get("summary", {})
             online = summary.get("online", 0)
             total = summary.get("total", 0)
-            checks["intelligence"] = {
-                "engines_online": online,
-                "engines_total": total,
-                "ratio": round(online / max(1, total), 2),
-            }
+            checks["intelligence"] = {"engines_online": online, "engines_total": total,
+                                      "ratio": round(online / max(1, total), 2)}
         except Exception:
             checks["intelligence"] = {"engines_online": 0, "engines_total": 0}
 
-        # Collective intelligence score
+    @staticmethod
+    def _check_collective_iq(checks):
         try:
             from tools.skynet_collective import intelligence_score
             score_data = intelligence_score()
-            if isinstance(score_data, dict):
-                checks["collective_iq"] = round(score_data.get("intelligence_score", 0), 3)
-            else:
-                checks["collective_iq"] = round(float(score_data), 3)
+            val = score_data.get("intelligence_score", 0) if isinstance(score_data, dict) else float(score_data)
+            checks["collective_iq"] = round(val, 3)
         except Exception:
             checks["collective_iq"] = 0.0
 
-        # Knowledge base
+    @staticmethod
+    def _check_knowledge_base(checks):
         try:
             from core.learning_store import LearningStore
             ls = LearningStore(str(DATA / "learning.db"))
             stats = ls.stats() if hasattr(ls, "stats") else {}
-            checks["knowledge"] = {
-                "facts": stats.get("total_facts", 0) if stats else 0,
-                "status": "UP",
-            }
+            checks["knowledge"] = {"facts": stats.get("total_facts", 0) if stats else 0, "status": "UP"}
         except Exception:
             checks["knowledge"] = {"facts": 0, "status": "UNAVAILABLE"}
 
-        # Overall health score
-        critical = ["backend", "workers"]
-        critical_up = all(
-            checks.get(k, {}).get("status", checks.get(k, {}).get("all_healthy", False))
-            in ("UP", True) for k in critical
-        )
-
-        # Window/process awareness
+    @staticmethod
+    def _check_windows(checks):
         try:
             from tools.skynet_windows import get_window_summary
             checks["windows"] = get_window_summary()
         except Exception:
             checks["windows"] = {"total_windows": 0, "error": "scan_failed"}
-
-        return {
-            "timestamp": datetime.now().isoformat(),
-            "overall": "HEALTHY" if critical_up else "DEGRADED",
-            "checks": checks,
-        }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -395,19 +390,48 @@ class SkynetIntrospection:
         capabilities = SkynetCapabilities().census()
         identity = SkynetIdentity().report()
 
-        observations = []
-        recommendations = []
-        strengths = []
-        weaknesses = []
-
-        # Analyze health
+        observations, recommendations, strengths, weaknesses = [], [], [], []
         checks = health.get("checks", {})
+
+        self._reflect_on_backend(checks, strengths, weaknesses, recommendations)
+        self._reflect_on_workers(checks, strengths, weaknesses, recommendations)
+
+        cap_ratio = capabilities.get("capability_ratio", 0)
+        self._reflect_on_capabilities(cap_ratio, strengths, weaknesses, observations, recommendations)
+
+        iq = checks.get("collective_iq", 0)
+        self._reflect_on_iq(iq, strengths, weaknesses, observations, recommendations)
+        self._reflect_on_sse(checks, strengths, weaknesses, recommendations)
+
+        facts = checks.get("knowledge", {}).get("facts", 0)
+        self._reflect_on_knowledge(facts, strengths, observations, recommendations)
+        self._reflect_on_evolution(weaknesses, recommendations)
+
+        workers = checks.get("workers", {})
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "overall_health": health.get("overall", "UNKNOWN"),
+            "strengths": strengths, "weaknesses": weaknesses,
+            "observations": observations, "recommendations": recommendations,
+            "metrics": {
+                "workers_alive": workers.get("alive", 0),
+                "workers_total": workers.get("total", 0),
+                "capability_ratio": cap_ratio, "collective_iq": iq,
+                "knowledge_facts": facts,
+                "uptime_s": checks.get("backend", {}).get("uptime_s", 0),
+            },
+        }
+
+    @staticmethod
+    def _reflect_on_backend(checks, strengths, weaknesses, recommendations):
         if checks.get("backend", {}).get("status") == "UP":
             strengths.append("Skynet backend is online and responsive")
         else:
             weaknesses.append("Backend is DOWN -- all operations degraded")
             recommendations.append("Restart Skynet backend: cd Skynet && skynet.exe")
 
+    @staticmethod
+    def _reflect_on_workers(checks, strengths, weaknesses, recommendations):
         workers = checks.get("workers", {})
         if workers.get("all_healthy"):
             strengths.append(f"All {workers['total']} workers alive and connected")
@@ -417,8 +441,8 @@ class SkynetIntrospection:
                 weaknesses.append(f"{dead} worker(s) are DEAD")
                 recommendations.append("Run skynet_start.py --reconnect to recover dead workers")
 
-        # Analyze capabilities
-        cap_ratio = capabilities.get("capability_ratio", 0)
+    @staticmethod
+    def _reflect_on_capabilities(cap_ratio, strengths, weaknesses, observations, recommendations):
         if cap_ratio >= 0.8:
             strengths.append(f"High capability coverage: {cap_ratio*100:.0f}% engines/tools available")
         elif cap_ratio >= 0.5:
@@ -427,8 +451,8 @@ class SkynetIntrospection:
             weaknesses.append(f"Low capability coverage: {cap_ratio*100:.0f}%")
             recommendations.append("Check engine dependencies -- some may need pip install")
 
-        # Analyze intelligence
-        iq = checks.get("collective_iq", 0)
+    @staticmethod
+    def _reflect_on_iq(iq, strengths, weaknesses, observations, recommendations):
         if iq > 0.5:
             strengths.append(f"Collective IQ is strong: {iq:.3f}")
         elif iq > 0.2:
@@ -438,7 +462,8 @@ class SkynetIntrospection:
             weaknesses.append(f"Collective IQ is low: {iq:.3f}")
             recommendations.append("Workers need to share strategies: python skynet_collective.py --sync")
 
-        # Analyze SSE
+    @staticmethod
+    def _reflect_on_sse(checks, strengths, weaknesses, recommendations):
         sse = checks.get("sse_daemon", {})
         if sse.get("status") == "UP":
             strengths.append("Real-time SSE daemon active")
@@ -446,9 +471,8 @@ class SkynetIntrospection:
             weaknesses.append(f"SSE daemon stale ({sse.get('age_s', '?')}s old)")
             recommendations.append("Restart SSE daemon: python tools/skynet_sse_daemon.py &")
 
-        # Analyze knowledge
-        kb = checks.get("knowledge", {})
-        facts = kb.get("facts", 0)
+    @staticmethod
+    def _reflect_on_knowledge(facts, strengths, observations, recommendations):
         if facts > 100:
             strengths.append(f"Rich knowledge base: {facts} facts")
         elif facts > 0:
@@ -456,36 +480,18 @@ class SkynetIntrospection:
         else:
             recommendations.append("Seed knowledge base with initial learnings")
 
-        # Self-evolution check
+    @staticmethod
+    def _reflect_on_evolution(weaknesses, recommendations):
         try:
             from core.self_evolution import SelfEvolutionSystem
             evo = SelfEvolutionSystem()
             evo_status = evo.get_status()
-            if evo_status.get("bottlenecks"):
-                for b in evo_status["bottlenecks"][:3]:
-                    weaknesses.append(f"Bottleneck: {b}")
-            if evo_status.get("hypotheses"):
-                for h in evo_status["hypotheses"][:3]:
-                    recommendations.append(f"Hypothesis: {h}")
+            for b in (evo_status.get("bottlenecks") or [])[:3]:
+                weaknesses.append(f"Bottleneck: {b}")
+            for h in (evo_status.get("hypotheses") or [])[:3]:
+                recommendations.append(f"Hypothesis: {h}")
         except Exception:
             pass
-
-        return {
-            "timestamp": datetime.now().isoformat(),
-            "overall_health": health.get("overall", "UNKNOWN"),
-            "strengths": strengths,
-            "weaknesses": weaknesses,
-            "observations": observations,
-            "recommendations": recommendations,
-            "metrics": {
-                "workers_alive": workers.get("alive", 0),
-                "workers_total": workers.get("total", 0),
-                "capability_ratio": cap_ratio,
-                "collective_iq": iq,
-                "knowledge_facts": facts,
-                "uptime_s": checks.get("backend", {}).get("uptime_s", 0),
-            },
-        }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -624,79 +630,51 @@ class SkynetSelf:
             return pulse
 
     def compute_iq(self, pulse: dict = None, agents: dict = None) -> dict:
-        """Calculate a real composite IQ score from live system metrics.
-
-        Returns dict with 'score' (float) and 'trend' ('rising'/'stable'/'falling').
-
-        Components (weighted):
-          - workers_alive:    25% — alive workers / total expected
-          - engines_online:   25% — online engines / total engines
-          - bus_healthy:      10% — bus UP = 1.0, DOWN = 0.0
-          - knowledge_facts:  15% — min(facts / 500, 1.0)
-          - uptime_hours:     10% — min(uptime_h / 24, 1.0)
-          - capability_ratio: 15% — engines importable / total
-        """
+        """Calculate a real composite IQ score from live system metrics."""
         if pulse is None:
             pulse = self._cached_health_pulse()
         checks = pulse.get("checks", {})
 
-        # Workers alive (25%)
-        w = checks.get("workers", {})
-        total_workers = max(w.get("total", len(WORKER_NAMES)), 1)
-        workers_score = w.get("alive", 0) / total_workers
-
-        # Engines online (25%)
-        intel = checks.get("intelligence", {})
-        engines_total = max(intel.get("engines_total", 1), 1)
-        engines_score = intel.get("engines_online", 0) / engines_total
-
-        # Bus healthy (10%)
-        bus_score = 1.0 if checks.get("bus", {}).get("status") == "UP" else 0.0
-
-        # Knowledge facts (15%) — normalized to 500 facts = 1.0
-        facts = checks.get("knowledge", {}).get("facts", 0)
-        knowledge_score = min(facts / 500, 1.0)
-
-        # Uptime hours (10%) — normalized to 24h = 1.0
-        uptime_s = checks.get("backend", {}).get("uptime_s", 0)
-        uptime_score = min(uptime_s / 86400, 1.0)
-
-        # Capability ratio (15%)
-        cap_ratio = intel.get("ratio", 0)
-        cap_score = min(cap_ratio, 1.0)
-
-        iq = (
-            workers_score * 0.25
-            + engines_score * 0.25
-            + bus_score * 0.10
-            + knowledge_score * 0.15
-            + uptime_score * 0.10
-            + cap_score * 0.15
-        )
-
-        # Trend: compare to last 5 readings
+        scores = self._compute_iq_components(checks)
+        iq = sum(score * weight for score, weight in scores)
         trend = self._update_iq_history(iq)
         return {"score": round(iq, 4), "trend": trend}
 
+    @staticmethod
+    def _compute_iq_components(checks):
+        """Return list of (score, weight) tuples for IQ components."""
+        w = checks.get("workers", {})
+        total_workers = max(w.get("total", len(WORKER_NAMES)), 1)
+        intel = checks.get("intelligence", {})
+        engines_total = max(intel.get("engines_total", 1), 1)
+        facts = checks.get("knowledge", {}).get("facts", 0)
+        uptime_s = checks.get("backend", {}).get("uptime_s", 0)
+
+        return [
+            (w.get("alive", 0) / total_workers, 0.25),                             # workers alive
+            (intel.get("engines_online", 0) / engines_total, 0.25),                 # engines online
+            (1.0 if checks.get("bus", {}).get("status") == "UP" else 0.0, 0.10),    # bus healthy
+            (min(facts / 500, 1.0), 0.15),                                          # knowledge facts
+            (min(uptime_s / 86400, 1.0), 0.10),                                     # uptime hours
+            (min(intel.get("ratio", 0), 1.0), 0.15),                                # capability ratio
+        ]
+
     def _update_iq_history(self, current_iq: float) -> str:
         """Append current IQ to data/iq_history.json, return trend vs last 5 readings."""
-        history_file = DATA / "iq_history.json"
-        history = []
         try:
-            if history_file.exists():
-                history = json.loads(history_file.read_text())
-        except Exception:
+            from tools.skynet_atomic import safe_read_json, atomic_write_json
+        except ModuleNotFoundError:
+            from skynet_atomic import safe_read_json, atomic_write_json
+
+        history_file = DATA / "iq_history.json"
+        history = safe_read_json(history_file, default=[])
+        if not isinstance(history, list):
             history = []
 
         history.append({"iq": round(current_iq, 4), "ts": time.time()})
-        # Keep last 100 readings
         history = history[-100:]
 
-        try:
-            DATA.mkdir(exist_ok=True)
-            history_file.write_text(json.dumps(history))
-        except Exception:
-            pass
+        atomic_write_json(history_file, history)
 
         # Determine trend from last 5 readings
         recent = [h["iq"] for h in history[-6:-1]] if len(history) > 1 else []

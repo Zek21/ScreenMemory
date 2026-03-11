@@ -95,16 +95,8 @@ async def has_website_in_detail(page):
         pass
     return False
 
-async def extract_business_info(page, category, city):
-    """Extract business details from the detail panel."""
-    info = {
-        "search_category": category,
-        "city": city,
-        "country": CITY_COUNTRY.get(city, "Austria"),
-        "has_website": "No",
-        "found_date": datetime.now().strftime("%Y-%m-%d"),
-    }
-    # Name
+async def _extract_name(page):
+    """Extract business name from the detail panel h1 elements."""
     try:
         h1s = page.locator("h1")
         count = await h1s.count()
@@ -112,22 +104,20 @@ async def extract_business_info(page, category, city):
             el = h1s.nth(i)
             box = await el.bounding_box()
             if box and box["x"] > 400:
-                info["name"] = await el.inner_text()
-                break
+                return await el.inner_text()
     except:
         pass
-    if "name" not in info:
-        return None
+    return None
 
-    # Category from Google
+
+async def _extract_detail_fields(page, info):
+    """Populate category, address, phone, rating, and reviews into info dict."""
     try:
         cat_btn = page.locator('button[jsaction*="category"]')
         if await cat_btn.count() > 0:
             info["google_category"] = await cat_btn.first.inner_text()
     except:
         pass
-
-    # Address
     try:
         addr_btn = page.locator('button[data-item-id="address"]')
         if await addr_btn.count() > 0:
@@ -135,8 +125,6 @@ async def extract_business_info(page, category, city):
             info["address"] = info["address"].replace("Address: ", "")
     except:
         pass
-
-    # Phone
     try:
         phone_btn = page.locator('button[data-item-id^="phone"]')
         if await phone_btn.count() > 0:
@@ -144,8 +132,6 @@ async def extract_business_info(page, category, city):
             info["phone"] = info["phone"].replace("Phone: ", "")
     except:
         pass
-
-    # Rating
     try:
         rating_el = page.locator('div.F7nice span[aria-hidden="true"]')
         if await rating_el.count() > 0:
@@ -159,7 +145,66 @@ async def extract_business_info(page, category, city):
     except:
         pass
 
+
+async def extract_business_info(page, category, city):
+    """Extract business details from the detail panel."""
+    name = await _extract_name(page)
+    if not name:
+        return None
+    info = {
+        "name": name,
+        "search_category": category,
+        "city": city,
+        "country": CITY_COUNTRY.get(city, "Austria"),
+        "has_website": "No",
+        "found_date": datetime.now().strftime("%Y-%m-%d"),
+    }
+    await _extract_detail_fields(page, info)
     return info
+
+async def _scroll_feed(page):
+    """Scroll the results feed to load more items."""
+    for _ in range(5):
+        await page.evaluate('''
+            const feed = document.querySelector('div[role="feed"]');
+            if (feed) feed.scrollTop = feed.scrollHeight;
+        ''')
+        await asyncio.sleep(1)
+
+
+async def _item_has_website(parent):
+    """Check if a feed item has a website indicator."""
+    try:
+        web_links = parent.locator('a[aria-label*="Visit"]')
+        if await web_links.count() > 0:
+            return True
+    except:
+        pass
+    parent_text = await parent.inner_text() if await parent.count() > 0 else ""
+    return "Website" in parent_text
+
+
+async def _process_feed_item(link, page, category, city):
+    """Process a single feed item: check for website, extract info if none."""
+    parent = link.locator("xpath=ancestor::div[contains(@class, 'Nv2PK')]")
+    if await parent.count() == 0:
+        parent = link.locator("xpath=ancestor::div[3]")
+
+    if await _item_has_website(parent):
+        return None
+
+    await link.click()
+    await asyncio.sleep(1.5)
+
+    if await has_website_in_detail(page):
+        return None
+
+    info = await extract_business_info(page, category, city)
+    if info and info.get("name"):
+        print(f"    ✅ {info['name']}")
+        return info
+    return None
+
 
 async def search_category_city(page, category, city, progress):
     """Search one category in one city."""
@@ -175,7 +220,6 @@ async def search_category_city(page, category, city, progress):
         await page.goto(url, wait_until="domcontentloaded", timeout=15000)
         await asyncio.sleep(2)
 
-        # Check if we got results
         feed = page.locator('div[role="feed"]')
         try:
             await feed.wait_for(state="attached", timeout=5000)
@@ -184,58 +228,16 @@ async def search_category_city(page, category, city, progress):
             save_progress(progress)
             return []
 
-        # Scroll to load all results
-        for _ in range(5):
-            await page.evaluate('''
-                const feed = document.querySelector('div[role="feed"]');
-                if (feed) feed.scrollTop = feed.scrollHeight;
-            ''')
-            await asyncio.sleep(1)
-
-        # Get all place links
+        await _scroll_feed(page)
         links = feed.locator('a[href*="/maps/place/"]')
         link_count = await links.count()
 
-        # Pre-filter: check each item in the feed for website indicators
         for i in range(min(link_count, 40)):
             try:
-                link = links.nth(i)
-                # Check parent container for "Website" text
-                parent = link.locator("xpath=ancestor::div[contains(@class, 'Nv2PK')]")
-                if await parent.count() == 0:
-                    parent = link.locator("xpath=ancestor::div[3]")
-
-                parent_text = await parent.inner_text() if await parent.count() > 0 else ""
-
-                # Check for website indicators in the feed item
-                has_web_indicator = False
-                try:
-                    web_links = parent.locator('a[aria-label*="Visit"]')
-                    if await web_links.count() > 0:
-                        has_web_indicator = True
-                except:
-                    pass
-
-                if not has_web_indicator and "Website" in parent_text:
-                    has_web_indicator = True
-
-                if has_web_indicator:
-                    continue
-
-                # Click to open detail
-                await link.click()
-                await asyncio.sleep(1.5)
-
-                # Verify no website in detail panel
-                if await has_website_in_detail(page):
-                    continue
-
-                info = await extract_business_info(page, category, city)
-                if info and info.get("name"):
+                info = await _process_feed_item(links.nth(i), page, category, city)
+                if info:
                     businesses.append(info)
-                    print(f"    ✅ {info['name']}")
-
-            except Exception as e:
+            except Exception:
                 continue
 
     except Exception as e:
@@ -249,6 +251,31 @@ async def search_category_city(page, category, city, progress):
         append_to_csv(businesses)
 
     return businesses
+
+async def _launch_browser(p):
+    """Launch a headless Chromium browser and return (browser, page)."""
+    browser = await p.chromium.launch(headless=True)
+    context = await browser.new_context(
+        viewport={"width": 1920, "height": 1080},
+        locale="en-US",
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    page = await context.new_page()
+    return browser, page
+
+
+async def _accept_cookies(page):
+    """Navigate to Google Maps and accept cookies if prompted."""
+    try:
+        await page.goto("https://www.google.com/maps", wait_until="domcontentloaded", timeout=10000)
+        await asyncio.sleep(2)
+        accept_btn = page.locator('button:has-text("Accept all")')
+        if await accept_btn.count() > 0:
+            await accept_btn.first.click()
+            await asyncio.sleep(1)
+    except:
+        pass
+
 
 async def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -264,24 +291,8 @@ async def main():
     print("=" * 60)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
-
-        # Accept cookies if prompted
-        try:
-            await page.goto("https://www.google.com/maps", wait_until="domcontentloaded", timeout=10000)
-            await asyncio.sleep(2)
-            accept_btn = page.locator('button:has-text("Accept all")')
-            if await accept_btn.count() > 0:
-                await accept_btn.first.click()
-                await asyncio.sleep(1)
-        except:
-            pass
+        browser, page = await _launch_browser(p)
+        await _accept_cookies(page)
 
         combo_num = done_combos
         for cat_idx, category in enumerate(categories):

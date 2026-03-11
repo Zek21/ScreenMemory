@@ -470,82 +470,97 @@ class SystemAwareness:
         """Analyze system state and return warnings."""
         warnings: List[str] = []
         try:
-            # --- Duplicate processes ---
-            proc_map = self.get_process_map()
-            from collections import Counter
-            proc_names = [k.split("_")[0] if not k.startswith("pid_") else k for k in proc_map]
-            counts = Counter(proc_names)
-            for name, count in counts.items():
-                if count > 1 and name != "_error":
-                    warnings.append(f"Duplicate processes: {count} instances of {name}")
-
-            # --- Idle agents with pending tasks ---
-            agent_status = self.get_live_agent_status()
-            now = time.time()
-            for agent, data in agent_status.get("agents", {}).items():
-                status = data.get("status", "unknown")
-                updated = data.get("last_updated") or data.get("updated_at") or data.get("timestamp")
-                pending = agent_status.get("pending_queues", {}).get(agent, {}).get("count", 0)
-                if status.upper() in ("IDLE", "WAITING") and pending > 0:
-                    idle_minutes = 0
-                    if updated:
-                        try:
-                            ts = datetime.fromisoformat(str(updated)).timestamp()
-                            idle_minutes = round((now - ts) / 60, 1)
-                        except (ValueError, TypeError, OSError):
-                            pass
-                    if idle_minutes > 5:
-                        warnings.append(
-                            f"Agent {agent} has been IDLE for >{idle_minutes:.0f} minutes with {pending} pending tasks"
-                        )
-
-            # --- Memory usage ---
-            try:
-                import psutil
-                mem = psutil.virtual_memory()
-                if mem.percent > 80:
-                    warnings.append(f"Memory usage above 80% (currently {mem.percent}%)")
-            except ImportError:
-                pass
-
-            # --- No recent results ---
-            results = agent_status.get("results", {})
-            if not results:
-                # Check if any result files exist at all
-                result_files = list(AGENT_QUEUE_DIR.glob("*_result.json")) if AGENT_QUEUE_DIR.exists() else []
-                if not result_files:
-                    task_hist = self.get_task_history(limit=1)
-                    if task_hist.get("total", 0) == 0:
-                        warnings.append("No agent results in last 10 minutes — pipeline may be stalled")
-            else:
-                any_recent = False
-                for agent, rdata in results.items():
-                    latest = rdata.get("latest") or {}
-                    ts = latest.get("timestamp") or latest.get("completed_at")
-                    if ts:
-                        try:
-                            t = datetime.fromisoformat(str(ts)).timestamp()
-                            if now - t < 600:
-                                any_recent = True
-                                break
-                        except (ValueError, TypeError):
-                            pass
-                if not any_recent:
-                    warnings.append("No agent results in last 10 minutes — pipeline may be stalled")
-
-            # --- Stale orchestrator thinking ---
-            orch_file = AGENT_QUEUE_DIR / "orch_thinking.json"
-            if orch_file.exists():
-                try:
-                    age = now - orch_file.stat().st_mtime
-                    if age > 300:
-                        warnings.append(f"Orchestrator thinking file stale (>{int(age // 60)} min old)")
-                except OSError:
-                    pass
-
+            self._check_duplicate_processes(warnings)
+            self._check_idle_agents_with_pending(warnings)
+            self._check_memory_usage(warnings)
+            self._check_stale_results(warnings)
+            self._check_stale_orchestrator(warnings)
         except Exception as exc:
             warnings.append(f"Anomaly detection error: {exc}")
         return warnings
+
+    def _check_duplicate_processes(self, warnings):
+        proc_map = self.get_process_map()
+        from collections import Counter
+        proc_names = [k.split("_")[0] if not k.startswith("pid_") else k for k in proc_map]
+        counts = Counter(proc_names)
+        for name, count in counts.items():
+            if count > 1 and name != "_error":
+                warnings.append(f"Duplicate processes: {count} instances of {name}")
+
+    def _check_idle_agents_with_pending(self, warnings):
+        agent_status = self.get_live_agent_status()
+        now = time.time()
+        for agent, data in agent_status.get("agents", {}).items():
+            status = data.get("status", "unknown")
+            updated = data.get("last_updated") or data.get("updated_at") or data.get("timestamp")
+            pending = agent_status.get("pending_queues", {}).get(agent, {}).get("count", 0)
+            if status.upper() in ("IDLE", "WAITING") and pending > 0:
+                idle_minutes = self._parse_idle_minutes(updated, now)
+                if idle_minutes > 5:
+                    warnings.append(
+                        f"Agent {agent} has been IDLE for >{idle_minutes:.0f} minutes with {pending} pending tasks"
+                    )
+
+    @staticmethod
+    def _parse_idle_minutes(updated, now):
+        if not updated:
+            return 0
+        try:
+            ts = datetime.fromisoformat(str(updated)).timestamp()
+            return round((now - ts) / 60, 1)
+        except (ValueError, TypeError, OSError):
+            return 0
+
+    @staticmethod
+    def _check_memory_usage(warnings):
+        try:
+            import psutil
+            mem = psutil.virtual_memory()
+            if mem.percent > 80:
+                warnings.append(f"Memory usage above 80% (currently {mem.percent}%)")
+        except ImportError:
+            pass
+
+    def _check_stale_results(self, warnings):
+        agent_status = self.get_live_agent_status()
+        now = time.time()
+        results = agent_status.get("results", {})
+        if not results:
+            result_files = list(AGENT_QUEUE_DIR.glob("*_result.json")) if AGENT_QUEUE_DIR.exists() else []
+            if not result_files:
+                task_hist = self.get_task_history(limit=1)
+                if task_hist.get("total", 0) == 0:
+                    warnings.append("No agent results in last 10 minutes -- pipeline may be stalled")
+        else:
+            any_recent = any(
+                self._result_is_recent(rdata, now) for rdata in results.values()
+            )
+            if not any_recent:
+                warnings.append("No agent results in last 10 minutes -- pipeline may be stalled")
+
+    @staticmethod
+    def _result_is_recent(rdata, now, window=600):
+        latest = rdata.get("latest") or {}
+        ts = latest.get("timestamp") or latest.get("completed_at")
+        if not ts:
+            return False
+        try:
+            return now - datetime.fromisoformat(str(ts)).timestamp() < window
+        except (ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def _check_stale_orchestrator(warnings):
+        orch_file = AGENT_QUEUE_DIR / "orch_thinking.json"
+        if not orch_file.exists():
+            return
+        try:
+            age = time.time() - orch_file.stat().st_mtime
+            if age > 300:
+                warnings.append(f"Orchestrator thinking file stale (>{int(age // 60)} min old)")
+        except OSError:
+            pass
 
     def format_god_briefing(self) -> str:
         """Produce a human-readable status summary for GOD."""
@@ -556,50 +571,39 @@ class SystemAwareness:
             anomalies = self.detect_anomalies()
             tasks = self.get_task_history(limit=1000)
 
-            # --- SYSTEM line ---
-            agent_count = len(agents_data.get("agents", {}))
-            pending_approvals = len(agents_data.get("god_queue", []))
-            tasks_done = tasks.get("total", 0)
-            system_line = f"SYSTEM: {agent_count} agents | {pending_approvals} pending approvals | {tasks_done} tasks completed"
-
-            # --- HEALTH line ---
-            cpu = resources.get("cpu_percent", "?")
-            mem_info = resources.get("memory", {})
-            mem_used = mem_info.get("used_gb", "?")
-            mem_total = mem_info.get("total_gb", "?")
-            disk_pct = resources.get("disk", {}).get("percent", "?")
-            health_line = f"HEALTH: CPU {cpu}% | RAM {mem_used}/{mem_total} GB | Disk {disk_pct}%"
-
-            # --- AGENTS line ---
-            agent_parts = []
-            for name, data in agents_data.get("agents", {}).items():
-                st = data.get("status", "UNKNOWN").upper()
-                agent_parts.append(f"{name}={st}")
-            agents_line = "AGENTS: " + (" ".join(agent_parts) if agent_parts else "none detected")
-
-            # --- ALERTS ---
-            if anomalies:
-                alert_lines = "\n".join(f"  ⚠ {a}" for a in anomalies)
-            else:
-                alert_lines = "  ✓ No anomalies detected"
-
-            # --- ARCHITECTURE ---
+            system_line = self._briefing_system_line(agents_data, tasks)
+            health_line = self._briefing_health_line(resources)
+            agents_line = self._briefing_agents_line(agents_data)
+            alert_lines = "\n".join(f"  warning {a}" for a in anomalies) if anomalies else "  OK No anomalies detected"
             healthy = sum(1 for v in arch.values() if v.get("exists"))
-            total = len(arch)
-            arch_line = f"ARCHITECTURE: {healthy}/{total} modules healthy"
+            arch_line = f"ARCHITECTURE: {healthy}/{len(arch)} modules healthy"
 
-            briefing = (
-                f"\n═══ GOD BRIEFING ═══\n"
-                f"{system_line}\n"
-                f"{health_line}\n"
-                f"{agents_line}\n"
-                f"ALERTS:\n{alert_lines}\n"
-                f"{arch_line}\n"
-                f"═══════════════════\n"
+            return (
+                f"\n=== GOD BRIEFING ===\n"
+                f"{system_line}\n{health_line}\n{agents_line}\n"
+                f"ALERTS:\n{alert_lines}\n{arch_line}\n"
+                f"===================\n"
             )
-            return briefing
         except Exception as exc:
-            return f"\n═══ GOD BRIEFING ═══\nError generating briefing: {exc}\n═══════════════════\n"
+            return f"\n=== GOD BRIEFING ===\nError generating briefing: {exc}\n===================\n"
+
+    @staticmethod
+    def _briefing_system_line(agents_data, tasks):
+        agent_count = len(agents_data.get("agents", {}))
+        pending = len(agents_data.get("god_queue", []))
+        done = tasks.get("total", 0)
+        return f"SYSTEM: {agent_count} agents | {pending} pending approvals | {done} tasks completed"
+
+    @staticmethod
+    def _briefing_health_line(resources):
+        cpu = resources.get("cpu_percent", "?")
+        mem_info = resources.get("memory", {})
+        return f"HEALTH: CPU {cpu}% | RAM {mem_info.get('used_gb', '?')}/{mem_info.get('total_gb', '?')} GB | Disk {resources.get('disk', {}).get('percent', '?')}%"
+
+    @staticmethod
+    def _briefing_agents_line(agents_data):
+        parts = [f"{name}={data.get('status', 'UNKNOWN').upper()}" for name, data in agents_data.get("agents", {}).items()]
+        return "AGENTS: " + (" ".join(parts) if parts else "none detected")
 
 
 # ============================================================================
@@ -637,72 +641,38 @@ class GodConsole:
     # DATABASE INIT
     # ------------------------------------------------------------------
 
+    _SCHEMA_SQL = """
+        CREATE TABLE IF NOT EXISTS approvals (
+            id TEXT PRIMARY KEY, action TEXT NOT NULL, agent_id TEXT NOT NULL,
+            risk_level TEXT NOT NULL, detail TEXT, timestamp REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', reviewed_at REAL,
+            rejection_reason TEXT, auto_expire_seconds INTEGER DEFAULT 3600
+        );
+        CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, timestamp);
+        CREATE TABLE IF NOT EXISTS directives (
+            id TEXT PRIMARY KEY, goal TEXT NOT NULL, priority INTEGER NOT NULL,
+            created_at REAL NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+            sub_tasks TEXT DEFAULT '[]', completed_at REAL, notes TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS overrides (
+            id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, action TEXT NOT NULL,
+            reason TEXT NOT NULL, timestamp REAL NOT NULL, metadata TEXT DEFAULT '{}'
+        );
+        CREATE TABLE IF NOT EXISTS system_errors (
+            id TEXT PRIMARY KEY, agent_id TEXT, error_type TEXT NOT NULL,
+            message TEXT NOT NULL, traceback TEXT, timestamp REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS task_log (
+            id TEXT PRIMARY KEY, agent_id TEXT, task_type TEXT NOT NULL,
+            description TEXT, success INTEGER NOT NULL, started_at REAL,
+            completed_at REAL NOT NULL, duration_ms REAL, error TEXT
+        );
+    """
+
     def _init_db(self):
         """Initialize all GOD console tables."""
         with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS approvals (
-                    id TEXT PRIMARY KEY,
-                    action TEXT NOT NULL,
-                    agent_id TEXT NOT NULL,
-                    risk_level TEXT NOT NULL,
-                    detail TEXT,
-                    timestamp REAL NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    reviewed_at REAL,
-                    rejection_reason TEXT,
-                    auto_expire_seconds INTEGER DEFAULT 3600
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_approvals_status
-                ON approvals(status, timestamp)
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS directives (
-                    id TEXT PRIMARY KEY,
-                    goal TEXT NOT NULL,
-                    priority INTEGER NOT NULL,
-                    created_at REAL NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active',
-                    sub_tasks TEXT DEFAULT '[]',
-                    completed_at REAL,
-                    notes TEXT DEFAULT ''
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS overrides (
-                    id TEXT PRIMARY KEY,
-                    agent_id TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    timestamp REAL NOT NULL,
-                    metadata TEXT DEFAULT '{}'
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS system_errors (
-                    id TEXT PRIMARY KEY,
-                    agent_id TEXT,
-                    error_type TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    traceback TEXT,
-                    timestamp REAL NOT NULL
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS task_log (
-                    id TEXT PRIMARY KEY,
-                    agent_id TEXT,
-                    task_type TEXT NOT NULL,
-                    description TEXT,
-                    success INTEGER NOT NULL,
-                    started_at REAL,
-                    completed_at REAL NOT NULL,
-                    duration_ms REAL,
-                    error TEXT
-                )
-            """)
+            conn.executescript(self._SCHEMA_SQL)
             conn.commit()
 
     # ------------------------------------------------------------------

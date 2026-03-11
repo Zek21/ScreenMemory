@@ -63,72 +63,24 @@ class KnowledgeDistiller:
         self._total_distilled = 0
 
     def distill(self) -> dict:
-        """
-        Run a full distillation cycle:
-        1. Find low-utility episodic entries
-        2. Cluster them by topic
-        3. Summarize each cluster
-        4. Promote summaries to semantic memory
-        5. Remove originals
-
-        Returns stats dict with counts.
-        """
+        """Run a full distillation cycle. Returns stats dict with counts."""
         if not self.memory:
             return {"error": "No memory instance"}
 
         start = time.perf_counter()
         logger.info(f"[DISTILL] scan: {len(self.memory._episodic)} episodic entries")
 
-        # Step 1: Find decayed entries
-        decayed = [
-            m for m in self.memory._episodic
-            if m.effective_utility < self.decay_threshold
-        ]
+        decayed = [m for m in self.memory._episodic if m.effective_utility < self.decay_threshold]
         logger.info(f"[DISTILL] found: {len(decayed)} below threshold {self.decay_threshold}")
 
         if len(decayed) < self.min_cluster_size:
-            return {
-                "distilled": 0,
-                "freed": 0,
-                "reason": "not_enough_entries",
-            }
+            return {"distilled": 0, "freed": 0, "reason": "not_enough_entries"}
 
-        # Step 2: Cluster by tags/keywords
         clusters = self._cluster_entries(decayed)
         logger.info(f"[DISTILL] grouped: {len(clusters)} clusters")
 
-        # Step 3: Summarize each cluster
-        summaries = []
-        for topic, entries in clusters.items():
-            if len(entries) < self.min_cluster_size:
-                continue
-
-            summary = self._summarize_cluster(topic, entries)
-            if summary:
-                summaries.append((topic, summary, entries))
-
-        # Step 4: Promote to semantic memory
-        for topic, summary, entries in summaries:
-            tags = list(set(
-                tag for entry in entries
-                for tag in entry.tags
-            ))[:5]
-            tags.append("distilled")
-
-            self.memory.store_semantic(
-                content=summary,
-                tags=tags,
-                importance=0.7,
-            )
-
-            # Step 5: Remove originals
-            entry_ids = {e.id for e in entries}
-            self.memory._episodic = [
-                m for m in self.memory._episodic
-                if m.id not in entry_ids
-            ]
-
-            logger.info(f"[DISTILL] promote: '{topic}' -> semantic ({len(entries)} entries freed)")
+        summaries = self._summarize_all_clusters(clusters)
+        self._promote_summaries(summaries)
 
         elapsed = (time.perf_counter() - start) * 1000
         self._distillation_count += 1
@@ -136,17 +88,36 @@ class KnowledgeDistiller:
         self._total_distilled += freed
 
         result = {
-            "distilled": len(summaries),
-            "freed": freed,
+            "distilled": len(summaries), "freed": freed,
             "elapsed_ms": elapsed,
             "semantic_count": len(self.memory._semantic),
             "episodic_remaining": len(self.memory._episodic),
         }
-
         logger.info(f"[DISTILL] complete: {freed} entries distilled into "
                      f"{len(summaries)} semantic entries ({elapsed:.0f}ms)")
-
         return result
+
+    def _summarize_all_clusters(self, clusters: dict) -> list:
+        """Summarize each cluster that meets minimum size."""
+        summaries = []
+        for topic, entries in clusters.items():
+            if len(entries) < self.min_cluster_size:
+                continue
+            summary = self._summarize_cluster(topic, entries)
+            if summary:
+                summaries.append((topic, summary, entries))
+        return summaries
+
+    def _promote_summaries(self, summaries: list):
+        """Promote summarized clusters to semantic memory and remove originals."""
+        for topic, summary, entries in summaries:
+            tags = list(set(tag for entry in entries for tag in entry.tags))[:5]
+            tags.append("distilled")
+            self.memory.store_semantic(content=summary, tags=tags, importance=0.7)
+
+            entry_ids = {e.id for e in entries}
+            self.memory._episodic = [m for m in self.memory._episodic if m.id not in entry_ids]
+            logger.info(f"[DISTILL] promote: '{topic}' -> semantic ({len(entries)} entries freed)")
 
     def _cluster_entries(self, entries: list) -> Dict[str, list]:
         """Cluster entries by tag overlap and keyword similarity."""

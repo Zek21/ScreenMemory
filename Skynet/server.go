@@ -58,6 +58,10 @@ type SkynetServer struct {
 	securityLog []SecurityEvent
 	secMu       sync.RWMutex
 
+	// File I/O mutexes for concurrent goroutine safety
+	godFeedMu   sync.Mutex
+	brainInboxMu sync.Mutex
+
 	// Task queue for pull-based work distribution
 	taskQueue []QueuedTask
 	tqMu      sync.RWMutex
@@ -67,19 +71,28 @@ type SkynetServer struct {
 	wsClients    map[chan []byte]bool
 	wsMu         sync.RWMutex
 	wsBroadcasts int64 // atomic counter
+
+	// Spam filter for bus publish deduplication and rate limiting
+	spamFilter *SpamFilter // signed: delta
+
+	// Task lifecycle tracker — dispatch-to-result visibility
+	// signed: gamma
+	taskTrackers []TaskTracker
+	ttMu         sync.RWMutex
 }
 
 // ConveneSession represents a multi-worker coordination session.
 type ConveneSession struct {
-	ID           string       `json:"id"`
-	Initiator    string       `json:"initiator"`
-	Topic        string       `json:"topic"`
-	Context      string       `json:"context"`
-	NeedWorkers  int          `json:"need_workers"`
-	Participants []string     `json:"participants"`
-	Messages     []BusMessage `json:"messages"`
-	CreatedAt    time.Time    `json:"created_at"`
-	Status       string       `json:"status"`
+	ID              string       `json:"id"`
+	Initiator       string       `json:"initiator"`
+	Topic           string       `json:"topic"`
+	Context         string       `json:"context"`
+	NeedWorkers     int          `json:"need_workers"`
+	Participants    []string     `json:"participants"`
+	Messages        []BusMessage `json:"messages"`
+	CreatedAt       time.Time    `json:"created_at"`
+	Status          string       `json:"status"`
+	StatusChangedAt *time.Time   `json:"status_changed_at,omitempty"` // when status last changed -- signed: beta
 }
 
 // SecurityEvent represents a blocked or flagged security event.
@@ -93,16 +106,18 @@ type SecurityEvent struct {
 
 // QueuedTask represents a task in the pull-based work queue.
 type QueuedTask struct {
-	ID        string    `json:"id"`
-	Task      string    `json:"task"`
-	Priority  int       `json:"priority"` // 0=normal, 1=high, 2=critical
-	Source    string    `json:"source"`    // who posted the task
-	ClaimedBy string   `json:"claimed_by,omitempty"`
-	Status    string    `json:"status"` // "pending", "claimed", "completed", "failed"
-	Result    string    `json:"result,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	ClaimedAt *time.Time `json:"claimed_at,omitempty"`
-	DoneAt    *time.Time `json:"done_at,omitempty"`
+	ID          string     `json:"id"`
+	Task        string     `json:"task"`
+	Priority    int        `json:"priority"` // 0=normal, 1=high, 2=critical
+	Source      string     `json:"source"`   // who posted the task
+	ClaimedBy   string     `json:"claimed_by,omitempty"`
+	Status      string     `json:"status"` // "pending", "claimed", "completed", "failed"
+	Result      string     `json:"result,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ClaimedAt   *time.Time `json:"claimed_at,omitempty"`
+	DoneAt      *time.Time `json:"done_at,omitempty"`
+	ResultSetAt *time.Time `json:"result_set_at,omitempty"` // when result was written -- signed: beta
+	AutoClaimed bool       `json:"auto_claimed,omitempty"`  // true if auto-assigned to idle worker -- signed: alpha
 }
 
 func NewSkynetServer(bus *MessageBus, workers []*Worker, results chan *TaskResult) *SkynetServer {
@@ -120,6 +135,8 @@ func NewSkynetServer(bus *MessageBus, workers []*Worker, results chan *TaskResul
 		securityLog:     make([]SecurityEvent, 0),
 		taskQueue:       make([]QueuedTask, 0),
 		wsClients:       make(map[chan []byte]bool),
+		spamFilter:      NewSpamFilter(), // signed: delta
+		taskTrackers:    make([]TaskTracker, 0), // signed: gamma
 	}
 }
 
@@ -154,6 +171,7 @@ func (s *SkynetServer) Handler() http.Handler {
 	mux.HandleFunc("/security/blocked", s.handleSecurityBlocked)
 	mux.HandleFunc("/ws", s.handleWebSocket)
 	mux.HandleFunc("/ws/stats", s.handleWSStats)
+	mux.HandleFunc("/tasks", s.handleTasks) // Task lifecycle tracker -- signed: gamma
 	mux.HandleFunc("/task/complete", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
 			atomic.AddInt64(&s.tasksCompleted, 1)
@@ -172,6 +190,11 @@ func (s *SkynetServer) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		atomic.AddInt64(&s.totalRequests, 1)
+
+		// Limit request body size to 1MB to prevent DoS
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		}
 
 		// CORS on every response
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -209,12 +232,13 @@ func (s *SkynetServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.thMu.RUnlock()
 
 	payload := DashboardPayload{
-		Agents:   agents,
-		OrchFeed: thoughts,
-		Bus:      s.bus.Recent(20),
-		Uptime:   time.Since(s.startTime).Seconds(),
-		Version:  "2.0.0",
-		System:   "skynet",
+		Agents:    agents,
+		OrchFeed:  thoughts,
+		Bus:       s.bus.Recent(20),
+		Uptime:    time.Since(s.startTime).Seconds(),
+		Version:   "2.0.0",
+		System:    "skynet",
+		Timestamp: time.Now().Format(time.RFC3339), // signed: beta
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -239,12 +263,14 @@ func (s *SkynetServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		wk.mu.RUnlock()
 	}
 	w.Header().Set("Content-Type", "application/json")
+	now := time.Now() // signed: beta
 	json.NewEncoder(w).Encode(HealthResponse{
-		Status:    "ok",
-		Uptime:    time.Since(s.startTime).Seconds(),
-		Workers:   alive,
-		BusDepth:  s.bus.Depth(),
-		Timestamp: time.Now().UnixNano(),
+		Status:       "ok",
+		Uptime:       time.Since(s.startTime).Seconds(),
+		Workers:      alive,
+		BusDepth:     s.bus.Depth(),
+		Timestamp:    now.UnixNano(),
+		TimestampRFC: now.Format(time.RFC3339),
 	})
 }
 
@@ -339,6 +365,22 @@ func (s *SkynetServer) handleDirective(w http.ResponseWriter, r *http.Request) {
 				wk.Enqueue(task)
 				atomic.AddInt64(&s.tasksDispatched, 1)
 
+				// Track task lifecycle -- signed: gamma
+				s.ttMu.Lock()
+				s.taskTrackers = append(s.taskTrackers, TaskTracker{
+					TaskID:       task.ID,
+					Worker:       wk.Name,
+					Goal:         req.Goal,
+					DispatchedAt: now,
+					Status:       "dispatched",
+					DirectiveID:  d.ID,
+				})
+				// Keep only last 200 entries to bound memory
+				if len(s.taskTrackers) > 200 {
+					s.taskTrackers = s.taskTrackers[len(s.taskTrackers)-200:]
+				}
+				s.ttMu.Unlock()
+
 				// Track sub-task for directive completion
 				s.dirMu.Lock()
 				for i := range s.directives {
@@ -418,6 +460,7 @@ func (s *SkynetServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Per-worker stats
+	now := time.Now().Format(time.RFC3339) // signed: beta
 	wStats := make(map[string]WStats)
 	for _, wk := range s.workers {
 		st := wk.GetState()
@@ -426,6 +469,7 @@ func (s *SkynetServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			TotalErrors:    st.TotalErrors,
 			AvgTaskMs:      st.AvgTaskMs,
 			Status:         st.Status,
+			Timestamp:      now, // signed: beta
 		}
 	}
 
@@ -460,9 +504,10 @@ func (s *SkynetServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		BusMessages:     s.bus.Count(),
 		BusDropped:      s.bus.Dropped(),
 		WorkerStats:     wStats,
-		Directives:      DirectiveStats{Total: dTotal, Active: dActive, Completed: dCompleted, Pending: dPending},
+		Directives:      DirectiveStats{Total: dTotal, Active: dActive, Completed: dCompleted, Pending: dPending, Timestamp: now}, // signed: beta
 		GoroutineCount:  runtime.NumGoroutine(),
 		MemAllocMB:      float64(memStats.Alloc) / (1024 * 1024),
+		Timestamp:       now, // signed: beta
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -613,6 +658,10 @@ func (s *SkynetServer) handleDispatch(w http.ResponseWriter, r *http.Request) {
 
 	// Auto load balancing: round-robin with lowest queue depth tiebreaker
 	if req.Worker == "" {
+		if len(s.workers) == 0 {
+			http.Error(w, "no workers available", http.StatusServiceUnavailable)
+			return
+		}
 		best := s.workers[int(atomic.AddInt64(&s.rrCounter, 1)-1)%len(s.workers)]
 		bestDepth := best.QueueDepth()
 		for _, wk := range s.workers {
@@ -779,6 +828,7 @@ func (s *SkynetServer) handleWorkerResult(w http.ResponseWriter, r *http.Request
 	wsMsg, _ := json.Marshal(map[string]interface{}{
 		"type": "worker_update", "worker": workerName, "task_id": req.TaskID,
 		"status": status, "directive_id": directiveID,
+		"timestamp": time.Now().Format(time.RFC3339), // signed: beta
 	})
 	s.broadcastWS(wsMsg)
 
@@ -832,10 +882,19 @@ func (s *SkynetServer) handleWorkerHeartbeat(w http.ResponseWriter, r *http.Requ
         if req.Model != "" {
                 wk.model = req.Model
         }
+        prevStatus := wk.Status
         if req.State != "" {
                 wk.Status = req.State
         }
         wk.mu.Unlock()
+
+	// Auto-claim: when worker transitions to IDLE, assign next pending task -- signed: alpha
+	if req.State == "IDLE" && prevStatus != "IDLE" {
+		if claimed, taskID := s.autoClaimNextTask(workerName); claimed {
+			s.bus.Post("skynet", "tasks", "auto_claimed",
+				fmt.Sprintf("Auto-claimed %s for %s (heartbeat IDLE transition)", taskID, workerName), nil)
+		}
+	}
 
 	if !req.HWNDAlive {
 		s.bus.Post("monitor", "orchestrator", "alert",
@@ -943,6 +1002,7 @@ func (s *SkynetServer) handleWorkerActivityPost(w http.ResponseWriter, r *http.R
 		"type": "worker_activity", "worker": workerName,
 		"current_task": req.CurrentTask, "activity_type": req.ActivityType,
 		"detail": req.Detail,
+		"timestamp": time.Now().Format(time.RFC3339), // signed: beta
 	})
 	s.broadcastWS(wsMsg)
 
@@ -1214,6 +1274,7 @@ func (s *SkynetServer) handleBusTaskComplete(w http.ResponseWriter, r *http.Requ
 			s.taskQueue[i].Status = req.Status
 			s.taskQueue[i].Result = req.Result
 			s.taskQueue[i].DoneAt = &now
+			s.taskQueue[i].ResultSetAt = &now // signed: beta
 			found = true
 			break
 		}
@@ -1223,9 +1284,44 @@ func (s *SkynetServer) handleBusTaskComplete(w http.ResponseWriter, r *http.Requ
 	if found {
 		s.bus.Post(req.Worker, "tasks", req.Status, fmt.Sprintf("%s %s by %s", req.TaskID, req.Status, req.Worker), nil)
 		json.NewEncoder(w).Encode(map[string]string{"status": req.Status, "task_id": req.TaskID})
+		// Auto-claim next pending task for this worker -- signed: alpha
+		if claimed, taskID := s.autoClaimNextTask(req.Worker); claimed {
+			s.bus.Post("skynet", "tasks", "auto_claimed",
+				fmt.Sprintf("Auto-claimed %s for %s after completing %s", taskID, req.Worker, req.TaskID), nil)
+		}
 	} else {
 		http.Error(w, "task not found or not claimed by this worker", http.StatusConflict)
 	}
+}
+
+// autoClaimNextTask finds the highest-priority pending QueuedTask and claims it
+// for the given worker. Returns (true, taskID) if a task was claimed, or
+// (false, "") if no pending tasks exist. Caller must NOT hold s.tqMu.
+// signed: alpha
+func (s *SkynetServer) autoClaimNextTask(workerName string) (bool, string) {
+	s.tqMu.Lock()
+	defer s.tqMu.Unlock()
+
+	bestIdx := -1
+	bestPriority := -1
+	for i := range s.taskQueue {
+		if s.taskQueue[i].Status == "pending" {
+			if bestIdx == -1 || s.taskQueue[i].Priority > bestPriority {
+				bestIdx = i
+				bestPriority = s.taskQueue[i].Priority
+			}
+		}
+	}
+	if bestIdx == -1 {
+		return false, ""
+	}
+
+	now := time.Now()
+	s.taskQueue[bestIdx].Status = "claimed"
+	s.taskQueue[bestIdx].ClaimedBy = workerName
+	s.taskQueue[bestIdx].ClaimedAt = &now
+	s.taskQueue[bestIdx].AutoClaimed = true
+	return true, s.taskQueue[bestIdx].ID
 }
 
 // ─── POST/GET /bus/convene ───────────────────────────────────────
@@ -1254,6 +1350,8 @@ func (s *SkynetServer) handleBusConvene(w http.ResponseWriter, r *http.Request) 
 		for i := range s.conveneSessions {
 			if s.conveneSessions[i].ID == sid {
 				s.conveneSessions[i].Status = "resolved"
+				resolvedAt := time.Now() // signed: beta
+				s.conveneSessions[i].StatusChangedAt = &resolvedAt
 				found = true
 				break
 			}
@@ -1321,16 +1419,18 @@ func (s *SkynetServer) handleBusConvene(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	createdNow := time.Now() // signed: beta
 	session := ConveneSession{
-		ID:           fmt.Sprintf("conv_%d", time.Now().UnixNano()),
-		Initiator:    req.Initiator,
-		Topic:        req.Topic,
-		Context:      req.Context,
-		NeedWorkers:  req.NeedWorkers,
-		Participants: []string{req.Initiator},
-		Messages:     make([]BusMessage, 0),
-		CreatedAt:    time.Now(),
-		Status:       "active",
+		ID:              fmt.Sprintf("conv_%d", createdNow.UnixNano()),
+		Initiator:       req.Initiator,
+		Topic:           req.Topic,
+		Context:         req.Context,
+		NeedWorkers:     req.NeedWorkers,
+		Participants:    []string{req.Initiator},
+		Messages:        make([]BusMessage, 0),
+		CreatedAt:       createdNow,
+		Status:          "active",
+		StatusChangedAt: &createdNow,
 	}
 
 	s.convMu.Lock()
@@ -1370,6 +1470,9 @@ func (s *SkynetServer) addThought(typ, text string) {
 
 // appendGodFeed writes a GOD feed entry to god_feed.json for console display.
 func (s *SkynetServer) appendGodFeed(feedType, text string) {
+	s.godFeedMu.Lock()
+	defer s.godFeedMu.Unlock()
+
 	feedPath := `D:\Prospects\ScreenMemory\data\brain\god_feed.json`
 	var feed []map[string]interface{}
 	if data, err := os.ReadFile(feedPath); err == nil {
@@ -1390,6 +1493,9 @@ func (s *SkynetServer) appendGodFeed(feedType, text string) {
 
 // appendBrainInbox writes a pending directive to brain_inbox.json for Orchestrator polling.
 func (s *SkynetServer) appendBrainInbox(directiveID, goal string) {
+	s.brainInboxMu.Lock()
+	defer s.brainInboxMu.Unlock()
+
 	inboxPath := `D:\Prospects\ScreenMemory\data\brain\brain_inbox.json`
 	var inbox []map[string]interface{}
 	if data, err := os.ReadFile(inboxPath); err == nil {
@@ -1685,6 +1791,10 @@ func (s *SkynetServer) handleOrchestrate(w http.ResponseWriter, r *http.Request)
 		s.addThought("orchestrate", fmt.Sprintf("Auto-dispatched to %d workers: %v", len(assigned), assigned))
 	} else {
 		// No auto-dispatch: pick one worker via round-robin
+		if len(s.workers) == 0 {
+			http.Error(w, "no workers available", http.StatusServiceUnavailable)
+			return
+		}
 		idx := int(atomic.AddInt64(&s.rrCounter, 1)-1) % len(s.workers)
 		wk := s.workers[idx]
 		taskID := fmt.Sprintf("task_%d_%s", now.UnixNano(), wk.Name)
@@ -1893,6 +2003,10 @@ func (s *SkynetServer) handleOrchestratePipeline(w http.ResponseWriter, r *http.
 		s.dirMu.Unlock()
 
 		// Pick worker via round-robin
+		if len(s.workers) == 0 {
+			http.Error(w, "no workers available", http.StatusServiceUnavailable)
+			return
+		}
 		idx := int(atomic.AddInt64(&s.rrCounter, 1)-1) % len(s.workers)
 		wk := s.workers[idx]
 		taskID := fmt.Sprintf("%s_task_%d_%s", pipelineID, i, wk.Name)
@@ -1966,6 +2080,97 @@ func (s *SkynetServer) handleOrchestratePipeline(w http.ResponseWriter, r *http.
 	})
 }
 
+// ─── Spam Filter ─────────────────────────────────────────────────
+// Server-side deduplication and rate limiting for bus messages.
+// signed: delta
+
+// SpamFilter tracks recent message fingerprints and per-sender rates.
+type SpamFilter struct {
+	mu           sync.Mutex
+	fingerprints map[string]time.Time // fingerprint → last seen time
+	senderCounts map[string][]time.Time // sender → list of recent post timestamps
+}
+
+// NewSpamFilter creates a SpamFilter and starts a background cleanup goroutine.
+func NewSpamFilter() *SpamFilter {
+	sf := &SpamFilter{
+		fingerprints: make(map[string]time.Time),
+		senderCounts: make(map[string][]time.Time),
+	}
+	go sf.cleanupLoop()
+	return sf
+}
+
+// cleanupLoop removes stale fingerprints and rate entries every 5 minutes.
+func (sf *SpamFilter) cleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		sf.mu.Lock()
+		now := time.Now()
+		for k, t := range sf.fingerprints {
+			if now.Sub(t) > 60*time.Second {
+				delete(sf.fingerprints, k)
+			}
+		}
+		for sender, times := range sf.senderCounts {
+			var recent []time.Time
+			for _, t := range times {
+				if now.Sub(t) < time.Minute {
+					recent = append(recent, t)
+				}
+			}
+			if len(recent) == 0 {
+				delete(sf.senderCounts, sender)
+			} else {
+				sf.senderCounts[sender] = recent
+			}
+		}
+		sf.mu.Unlock()
+	}
+}
+// signed: delta
+
+// Check returns "" if the message is allowed, or a reason string if blocked.
+func (sf *SpamFilter) Check(sender, topic, msgType, content string) string {
+	sf.mu.Lock()
+	defer sf.mu.Unlock()
+
+	now := time.Now()
+
+	// --- Rate limit: max 10 messages per minute per sender ---
+	times := sf.senderCounts[sender]
+	var recent []time.Time
+	for _, t := range times {
+		if now.Sub(t) < time.Minute {
+			recent = append(recent, t)
+		}
+	}
+	if len(recent) >= 10 {
+		sf.senderCounts[sender] = recent
+		return fmt.Sprintf("rate limit exceeded: %d msgs in last 60s from %s", len(recent), sender)
+	}
+	recent = append(recent, now)
+	sf.senderCounts[sender] = recent
+
+	// --- Dedup: same sender+topic+type within 60s with similar content ---
+	// Fingerprint uses first 200 chars of content to detect near-duplicates
+	contentSnip := content
+	if len(contentSnip) > 200 {
+		contentSnip = contentSnip[:200]
+	}
+	fp := fmt.Sprintf("%s|%s|%s|%s", sender, topic, msgType, contentSnip)
+	if lastSeen, exists := sf.fingerprints[fp]; exists {
+		if now.Sub(lastSeen) < 60*time.Second {
+			return fmt.Sprintf("duplicate message from %s (topic=%s type=%s) within 60s", sender, topic, msgType)
+		}
+	}
+	sf.fingerprints[fp] = now
+
+	return ""
+}
+// signed: delta
+
 // ─── POST /bus/publish ───────────────────────────────────────────
 // Workers and orchestrator publish messages to the bus.
 // Body: { "sender": "alpha", "topic": "results", "type": "report", "content": "...", "metadata": {...} }
@@ -1998,12 +2203,37 @@ func (s *SkynetServer) handleBusPublish(w http.ResponseWriter, r *http.Request) 
 		msg.Type = "message"
 	}
 
+	// Spam filter: dedup + rate limit -- signed: delta
+	if reason := s.spamFilter.Check(msg.Sender, msg.Topic, msg.Type, msg.Content); reason != "" {
+		fmt.Printf("[SPAM_BLOCKED] sender=%s topic=%s type=%s reason=%s\n",
+			msg.Sender, msg.Topic, msg.Type, reason)
+		http.Error(w, "SPAM_BLOCKED: "+reason, http.StatusTooManyRequests)
+		return
+	}
+
 	s.bus.Post(msg.Sender, msg.Topic, msg.Type, msg.Content, msg.Metadata)
+
+	// Task lifecycle: when a worker posts type=result, complete matching tracker -- signed: gamma
+	if msg.Type == "result" && msg.Sender != "" {
+		now := time.Now()
+		s.ttMu.Lock()
+		for i := len(s.taskTrackers) - 1; i >= 0; i-- {
+			tt := &s.taskTrackers[i]
+			if strings.EqualFold(tt.Worker, msg.Sender) && tt.Status == "dispatched" {
+				tt.Status = "completed"
+				tt.CompletedAt = &now
+				tt.DurationMs = float64(now.Sub(tt.DispatchedAt).Milliseconds())
+				break // match most recent dispatched task for this worker
+			}
+		}
+		s.ttMu.Unlock()
+	}
 
 	// Broadcast to WebSocket clients
 	wsMsg, _ := json.Marshal(map[string]interface{}{
 		"type": "bus_message", "sender": msg.Sender, "topic": msg.Topic,
 		"msg_type": msg.Type, "content": msg.Content,
+		"timestamp": time.Now().Format(time.RFC3339), // signed: beta
 	})
 	s.broadcastWS(wsMsg)
 
@@ -2059,6 +2289,65 @@ func (s *SkynetServer) handleBusMessages(w http.ResponseWriter, r *http.Request)
 }
 
 // ─── Embedded Dashboard ──────────────────────────────────────────
+
+// ─── GET /tasks — Task Lifecycle Tracker ─────────────────────────
+// Returns tracked task lifecycle entries. Optional: ?worker=NAME to filter.
+// signed: gamma
+
+func (s *SkynetServer) handleTasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	workerFilter := r.URL.Query().Get("worker")
+	limitStr := r.URL.Query().Get("limit")
+	limit := 100
+	if limitStr != "" {
+		if n, err := strconv.Atoi(limitStr); err == nil && n > 0 {
+			if n > 500 {
+				n = 500
+			}
+			limit = n
+		}
+	}
+
+	s.ttMu.RLock()
+	src := s.taskTrackers
+	s.ttMu.RUnlock()
+
+	// Filter by worker if requested
+	var filtered []TaskTracker
+	if workerFilter != "" {
+		for _, tt := range src {
+			if strings.EqualFold(tt.Worker, workerFilter) {
+				filtered = append(filtered, tt)
+			}
+		}
+	} else {
+		filtered = src
+	}
+
+	// Return last N entries (most recent)
+	if len(filtered) > limit {
+		filtered = filtered[len(filtered)-limit:]
+	}
+
+	// Build summary stats
+	stats := map[string]int{
+		"dispatched": 0, "completed": 0, "failed": 0, "timeout": 0, "processing": 0,
+	}
+	for _, tt := range filtered {
+		stats[tt.Status]++
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"tasks": filtered,
+		"total": len(filtered),
+		"stats": stats,
+	})
+}
 
 // ─── Rate Limiting Middleware ─────────────────────────────────────
 
@@ -2163,6 +2452,7 @@ func (s *SkynetServer) logSecurityEvent(source, eventType, details string, block
 	if blocked {
 		msg, _ := json.Marshal(map[string]interface{}{
 			"type": "security_alert", "event": event,
+			"timestamp": time.Now().Format(time.RFC3339), // signed: beta
 		})
 		s.broadcastWS(msg)
 	}

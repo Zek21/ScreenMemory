@@ -419,14 +419,7 @@ class SandboxExecutor:
         self.working_dir = working_dir or tempfile.gettempdir()
 
     def execute(self, script: GeneratedScript) -> ExecutionResult:
-        """
-        Execute a validated script in a subprocess sandbox.
-
-        LOG FORMAT:
-            [SANDBOX] execute  -- PID=12345, timeout=30s
-            [SANDBOX] success  -- 847 chars output, 2.3s elapsed
-            [SANDBOX] failure  -- TimeoutError after 30s
-        """
+        """Execute a validated script in a subprocess sandbox."""
         if not script.is_safe:
             return ExecutionResult(
                 success=False,
@@ -434,7 +427,6 @@ class SandboxExecutor:
                 error_type="validation_failed",
             )
 
-        # Write script to temporary file
         script_path = Path(self.working_dir) / f"agent_script_{int(time.time())}.py"
         try:
             script_path.write_text(script.code, encoding="utf-8")
@@ -442,71 +434,57 @@ class SandboxExecutor:
             return ExecutionResult(success=False, stderr=str(e), error_type="write_failed")
 
         start = time.perf_counter()
-
         try:
             result = subprocess.run(
                 [sys.executable, str(script_path)],
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                cwd=self.working_dir,
-                env=self._safe_env(),
+                capture_output=True, text=True, timeout=self.timeout,
+                cwd=self.working_dir, env=self._safe_env(),
             )
-
             elapsed = (time.perf_counter() - start) * 1000
-
-            stdout = result.stdout[:self.max_output]
-            stderr = result.stderr[:self.max_output]
-
-            # Try to parse JSON output
-            parsed_data = None
-            if stdout.strip():
-                try:
-                    parsed_data = json.loads(stdout.strip().split("\n")[-1])
-                except (json.JSONDecodeError, IndexError):
-                    pass
-
-            exec_result = ExecutionResult(
-                success=result.returncode == 0,
-                stdout=stdout,
-                stderr=stderr,
-                return_code=result.returncode,
-                elapsed_ms=elapsed,
-                data=parsed_data,
-                error_type="" if result.returncode == 0 else "runtime_error",
-            )
-
-            if exec_result.success:
-                logger.info(f"[SANDBOX] success: {len(stdout)} chars output, {elapsed:.0f}ms")
-            else:
-                logger.warning(f"[SANDBOX] failure: exit={result.returncode}, {stderr[:100]}")
-
-            return exec_result
-
+            return self._build_execution_result(result, elapsed)
         except subprocess.TimeoutExpired:
             elapsed = (time.perf_counter() - start) * 1000
             logger.error(f"[SANDBOX] timeout: {self.timeout}s exceeded")
-            return ExecutionResult(
-                success=False,
-                stderr=f"Timeout after {self.timeout}s",
-                elapsed_ms=elapsed,
-                error_type="timeout",
-            )
+            return ExecutionResult(success=False, stderr=f"Timeout after {self.timeout}s",
+                                  elapsed_ms=elapsed, error_type="timeout")
         except Exception as e:
             elapsed = (time.perf_counter() - start) * 1000
             logger.error(f"[SANDBOX] error: {e}")
-            return ExecutionResult(
-                success=False,
-                stderr=str(e),
-                elapsed_ms=elapsed,
-                error_type="execution_error",
-            )
+            return ExecutionResult(success=False, stderr=str(e),
+                                  elapsed_ms=elapsed, error_type="execution_error")
         finally:
-            # Clean up temp file
             try:
                 script_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+    def _build_execution_result(self, result, elapsed):
+        """Build ExecutionResult from subprocess.CompletedProcess."""
+        stdout = result.stdout[:self.max_output]
+        stderr = result.stderr[:self.max_output]
+        parsed_data = self._try_parse_json_output(stdout)
+        exec_result = ExecutionResult(
+            success=result.returncode == 0,
+            stdout=stdout, stderr=stderr,
+            return_code=result.returncode, elapsed_ms=elapsed,
+            data=parsed_data,
+            error_type="" if result.returncode == 0 else "runtime_error",
+        )
+        if exec_result.success:
+            logger.info(f"[SANDBOX] success: {len(stdout)} chars output, {elapsed:.0f}ms")
+        else:
+            logger.warning(f"[SANDBOX] failure: exit={result.returncode}, {stderr[:100]}")
+        return exec_result
+
+    @staticmethod
+    def _try_parse_json_output(stdout):
+        """Try to parse JSON from the last line of stdout."""
+        if not stdout.strip():
+            return None
+        try:
+            return json.loads(stdout.strip().split("\n")[-1])
+        except (json.JSONDecodeError, IndexError):
+            return None
 
     def _safe_env(self) -> dict:
         """Create a restricted environment for the subprocess."""
@@ -540,76 +518,49 @@ class DynamicCodeEngine:
         self._execution_history: List[dict] = []
 
     def execute_task(self, task: str, context: dict = None) -> ExecutionResult:
-        """
-        Full pipeline: Generate -> Validate -> Execute -> Retry on failure.
-
-        Args:
-            task: Natural language task description
-            context: Additional context (URLs, data, selectors)
-
-        Returns:
-            ExecutionResult from the (possibly retried) execution
-        """
+        """Full pipeline: Generate -> Validate -> Execute -> Retry on failure."""
         context = context or {}
         logger.info(f"[CODEGEN] task: {task[:80]}")
 
         for attempt in range(1, self.max_retries + 1):
-            # Generate
             script = self.generator.generate(task, context)
             script.attempt = attempt
-
-            # Validate
-            is_safe = self.validator.validate(script)
-            if not is_safe:
+            if not self.validator.validate(script):
                 logger.warning(f"[CODEGEN] attempt {attempt}: validation failed")
-                # Add validation errors to context for next attempt
                 context["previous_errors"] = script.validation_errors
                 continue
-
-            # Execute
             result = self.executor.execute(script)
-
-            # Record
-            self._execution_history.append({
-                "task": task,
-                "attempt": attempt,
-                "success": result.success,
-                "elapsed_ms": result.elapsed_ms,
-                "error": result.error_type,
-                "output_length": len(result.stdout),
-            })
-
+            self._record_attempt(task, attempt, result)
             if result.success:
-                # Store success in memory
-                if self.memory:
-                    self.memory.store_episodic(
-                        f"Code execution success: {task[:60]} ({result.elapsed_ms:.0f}ms)",
-                        tags=["codegen", "success"],
-                        source_action="dynamic_code",
-                        importance=0.7,
-                    )
+                self._store_success_memory(task, result)
                 return result
-
-            # Reflexion: feed error back for retry
             logger.warning(f"[CODEGEN] attempt {attempt} failed: {result.error_type}")
             context["previous_error"] = result.stderr[:500]
             context["error_type"] = result.error_type
+            self._store_failure_memory(attempt, result)
 
-            if self.memory:
-                self.memory.store_episodic(
-                    f"Code execution failed (attempt {attempt}): {result.error_type} - {result.stderr[:80]}",
-                    tags=["codegen", "failure", "reflexion"],
-                    source_action="dynamic_code",
-                    importance=0.8,
-                )
-
-        # All retries exhausted
         logger.error(f"[CODEGEN] all {self.max_retries} attempts failed for: {task[:60]}")
-        return ExecutionResult(
-            success=False,
-            stderr=f"All {self.max_retries} attempts failed",
-            error_type="max_retries_exceeded",
-        )
+        return ExecutionResult(success=False, stderr=f"All {self.max_retries} attempts failed",
+                              error_type="max_retries_exceeded")
+
+    def _record_attempt(self, task, attempt, result):
+        self._execution_history.append({
+            "task": task, "attempt": attempt, "success": result.success,
+            "elapsed_ms": result.elapsed_ms, "error": result.error_type,
+            "output_length": len(result.stdout),
+        })
+
+    def _store_success_memory(self, task, result):
+        if self.memory:
+            self.memory.store_episodic(
+                f"Code execution success: {task[:60]} ({result.elapsed_ms:.0f}ms)",
+                tags=["codegen", "success"], source_action="dynamic_code", importance=0.7)
+
+    def _store_failure_memory(self, attempt, result):
+        if self.memory:
+            self.memory.store_episodic(
+                f"Code execution failed (attempt {attempt}): {result.error_type} - {result.stderr[:80]}",
+                tags=["codegen", "failure", "reflexion"], source_action="dynamic_code", importance=0.8)
 
     @property
     def stats(self) -> dict:

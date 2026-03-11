@@ -41,8 +41,16 @@ class Orchestrator:
     def __init__(self, config: dict = None):
         config = config or {}
         self._init_time = time.time()
+        self._init_core_systems(config)
+        self._init_cognitive_engines()
+        self._history: List[dict] = []
+        self._total_queries = 0
+        self._total_blocked = 0
+        self._sop_registry: Dict[str, dict] = {}
+        logger.info("Orchestrator initialized — all systems online")
 
-        # Core systems
+    def _init_core_systems(self, config: dict):
+        """Initialize core routing, agent, DAG, retrieval, and guard systems."""
         from core.difficulty_router import DAAORouter, QueryDifficulty
         from core.agent_factory import AgentFactory, AgentRegistry
         from core.dag_engine import DAGBuilder, DAGExecutor, ExecutionContext
@@ -52,19 +60,20 @@ class Orchestrator:
         self.router = DAAORouter(config.get("backends"))
         self.factory = AgentFactory()
         self.dag_builder = DAGBuilder()
-        self.executor = DAGExecutor(max_feedback_loops=config.get("max_feedback_loops", 3))
+        self.executor = DAGExecutor(
+            max_feedback_loops=config.get("max_feedback_loops", 3)
+        )
         self.retriever = HybridRetriever()
         self.guard = InputGuard(
             block_threshold=config.get("block_threshold", 0.75),
             warn_threshold=config.get("warn_threshold", 0.40),
         )
-
-        # Memory integration (connect to existing systems if available)
         self._memory = None
         self._lance_store = None
         self._guardian = None
 
-        # Cognitive engines (graceful degradation — each is optional)
+    def _init_cognitive_engines(self):
+        """Initialize cognitive engines with graceful degradation."""
         self._planner = None
         self._reflexion = None
         self._episodic_memory = None
@@ -83,22 +92,11 @@ class Orchestrator:
         try:
             from core.cognitive.memory import EpisodicMemory
             self._episodic_memory = EpisodicMemory()
-            # Cross-wire: give reflexion access to episodic memory
             if self._reflexion and self._episodic_memory:
                 self._reflexion.memory = self._episodic_memory
             logger.info("Cognitive: EpisodicMemory connected")
         except Exception as e:
             logger.warning(f"Cognitive: EpisodicMemory unavailable: {e}")
-
-        # Execution history for self-improvement
-        self._history: List[dict] = []
-        self._total_queries = 0
-        self._total_blocked = 0
-
-        # Procedural memory: store successful workflows for MASFly-style reuse
-        self._sop_registry: Dict[str, dict] = {}
-
-        logger.info("Orchestrator initialized — all systems online")
 
     def connect_memory(self, memory):
         """Connect the existing EpisodicMemory system."""
@@ -134,204 +132,218 @@ class Orchestrator:
         t0 = time.perf_counter()
         self._total_queries += 1
         context = context or {}
-
         result = {
-            "query": query,
-            "status": "processing",
-            "pipeline": [],
-            "output": None,
-            "errors": [],
-            "metrics": {},
+            "query": query, "status": "processing", "pipeline": [],
+            "output": None, "errors": [], "metrics": {},
         }
 
         try:
-            # ── Step 0: Cognitive planning (pre-routing) ──
-            if self._planner:
-                try:
-                    cognitive_plan = self._planner.create_plan(query, context.get("retrieved_memories", ""))
-                    result["pipeline"].append({
-                        "step": "cognitive_plan",
-                        "subtask_count": len(cognitive_plan.subtasks),
-                        "subtasks": [s.description for s in cognitive_plan.subtasks],
-                    })
-                except Exception as e:
-                    logger.warning(f"Cognitive planner failed (degraded): {e}")
-
-            # ── Step 1: Security scan ──
-            scan = self.guard.scan(query)
-            result["pipeline"].append({
-                "step": "input_guard",
-                "threat_level": scan.threat_level.value,
-                "score": scan.score,
-                "triggers": scan.triggers,
-            })
-
-            if scan.blocked:
-                self._total_blocked += 1
-                result["status"] = "blocked"
-                result["errors"].append(f"Input blocked: {scan.triggers}")
-                logger.warning(f"Query BLOCKED: {scan.triggers}")
+            safe_query = self._preprocess(query, context, result)
+            if result["status"] == "blocked":
                 return result
-
-            # Use sanitized input going forward
-            safe_query = scan.sanitized_input
-
-            # ── Step 2: DAAO routing ──
-            plan = self.router.route(safe_query, budget)
-            result["pipeline"].append({
-                "step": "daao_route",
-                "difficulty": plan.difficulty.level.name,
-                "operator": plan.operator.value,
-                "backend": plan.backend,
-                "roles": plan.agent_roles,
-                "tools": plan.tool_bindings,
-                "cost_estimate": plan.cost_estimate,
-            })
-
-            # ── Step 3: Memory augmentation ──
-            if self.retriever.bm25.size > 0 or self._lance_store or self._memory:
-                memories = self.retriever.search(safe_query, limit=5)
-                if memories:
-                    memory_context = "\n".join([
-                        f"[{m.rrf_score:.3f}] {m.content[:200]}"
-                        for m in memories
-                    ])
-                    context["retrieved_memories"] = memory_context
-                    result["pipeline"].append({
-                        "step": "memory_retrieval",
-                        "results_count": len(memories),
-                        "top_score": memories[0].rrf_score if memories else 0,
-                    })
-
-            # ── Step 4: Check SOP registry (MASFly pattern) ──
-            sop = self._find_matching_sop(safe_query)
-            if sop:
-                result["pipeline"].append({
-                    "step": "sop_match",
-                    "matched_sop": sop["name"],
-                })
-                # Could override plan with stored SOP here
-
-            # ── Step 5: Create agent team ──
-            team = self.factory.create_team(
-                roles=plan.agent_roles,
-                backend=plan.backend,
+            plan = self._plan_and_retrieve(safe_query, budget, context, result)
+            team, exec_ctx, dag = self._execute_dag_pipeline(
+                safe_query, plan, context, result
             )
-            result["pipeline"].append({
-                "step": "agent_creation",
-                "team_size": len(team),
-                "agents": [a.to_dict() for a in team],
-            })
-
-            # ── Step 6: Generate DAG ──
-            from core.dag_engine import ExecutionContext
-            dag = self.dag_builder.from_workflow_plan(plan)
-            exec_context = ExecutionContext(
-                query=safe_query,
-                shared_state=context,
-            )
-            result["pipeline"].append({
-                "step": "dag_generated",
-                "dag_stats": dag.stats,
-            })
-
-            # ── Step 7: Execute DAG ──
-            exec_context = self.executor.execute(dag, exec_context)
-            result["pipeline"].append({
-                "step": "dag_executed",
-                "final_stats": dag.stats,
-                "node_outputs": {k: str(v)[:200] for k, v in exec_context.node_outputs.items()},
-                "errors": exec_context.errors,
-            })
-
-            # Aggregate output
-            result["output"] = exec_context.node_outputs
-            result["status"] = "success" if not exec_context.errors else "partial"
-            result["errors"] = exec_context.errors
-
-            # ── Step 8: Store in procedural memory (MASFly SOP) ──
-            if result["status"] == "success":
-                self._store_sop(safe_query, plan, dag)
-
-            # ── Step 8b: Store outcome in episodic memory ──
-            if self._episodic_memory:
-                try:
-                    importance = 0.9 if result["status"] == "success" else 0.6
-                    # Safely extract difficulty from pipeline
-                    difficulty_tag = "unknown"
-                    for step in result["pipeline"]:
-                        if step.get("step") == "daao_route":
-                            difficulty_tag = step.get("difficulty", "unknown")
-                            break
-                    self._episodic_memory.store_episodic(
-                        content=f"Query: {safe_query[:100]} | Status: {result['status']} | "
-                                f"Steps: {len(result['pipeline'])}",
-                        tags=["orchestrator", result["status"], difficulty_tag],
-                        source_action="orchestrator.process",
-                        importance=importance,
-                    )
-                except Exception as mem_err:
-                    logger.warning(f"Episodic memory store failed: {mem_err}")
-
-            # ── Step 9: DAAO feedback ──
-            from core.difficulty_router import QueryDifficulty
-            actual_difficulty = plan.difficulty.level
-            self.router.feedback(safe_query, actual_difficulty,
-                                 result["status"] == "success")
-
-            # ── Cleanup ──
-            self.factory.destroy_team(team)
-
+            self._post_process(safe_query, plan, dag, team, exec_ctx, result)
         except Exception as e:
-            result["status"] = "error"
-            result["errors"].append(str(e))
-            logger.error(f"Orchestrator error: {e}", exc_info=True)
+            self._handle_pipeline_error(query, e, result)
 
-            # ── Cognitive: Reflexion on failure ──
-            if self._reflexion:
-                try:
-                    from core.cognitive.reflexion import FailureContext
-                    failure = FailureContext(
-                        action_type="orchestrate",
-                        action_target=query[:100],
-                        error_message=str(e),
-                        error_type=type(e).__name__,
-                        expected_outcome="successful pipeline execution",
-                        actual_outcome=f"error: {str(e)[:200]}",
-                    )
-                    reflection = self._reflexion.on_failure(failure)
-                    result["pipeline"].append({
-                        "step": "reflexion",
-                        "critique": reflection.critique[:200],
-                        "lesson": reflection.lesson[:200],
-                        "adjustment": reflection.action_adjustment[:200],
-                    })
-                    logger.info(f"Reflexion: {reflection.lesson[:100]}")
-                except Exception as ref_err:
-                    logger.warning(f"Reflexion engine failed: {ref_err}")
+        self._finalize_metrics(query, result, t0)
+        return result
 
-        # Metrics
+    def _preprocess(self, query: str, context: dict, result: dict) -> str:
+        """Run cognitive planning and security scan; return sanitized query."""
+        if self._planner:
+            try:
+                cognitive_plan = self._planner.create_plan(
+                    query, context.get("retrieved_memories", "")
+                )
+                result["pipeline"].append({
+                    "step": "cognitive_plan",
+                    "subtask_count": len(cognitive_plan.subtasks),
+                    "subtasks": [s.description for s in cognitive_plan.subtasks],
+                })
+            except Exception as e:
+                logger.warning(f"Cognitive planner failed (degraded): {e}")
+
+        scan = self.guard.scan(query)
+        result["pipeline"].append({
+            "step": "input_guard",
+            "threat_level": scan.threat_level.value,
+            "score": scan.score,
+            "triggers": scan.triggers,
+        })
+
+        if scan.blocked:
+            self._total_blocked += 1
+            result["status"] = "blocked"
+            result["errors"].append(f"Input blocked: {scan.triggers}")
+            logger.warning(f"Query BLOCKED: {scan.triggers}")
+
+        return scan.sanitized_input
+
+    def _plan_and_retrieve(self, safe_query: str, budget: float,
+                           context: dict, result: dict):
+        """Route query, augment with memory, and check SOP registry."""
+        plan = self.router.route(safe_query, budget)
+        result["pipeline"].append({
+            "step": "daao_route",
+            "difficulty": plan.difficulty.level.name,
+            "operator": plan.operator.value,
+            "backend": plan.backend,
+            "roles": plan.agent_roles,
+            "tools": plan.tool_bindings,
+            "cost_estimate": plan.cost_estimate,
+        })
+
+        if self.retriever.bm25.size > 0 or self._lance_store or self._memory:
+            memories = self.retriever.search(safe_query, limit=5)
+            if memories:
+                memory_context = "\n".join([
+                    f"[{m.rrf_score:.3f}] {m.content[:200]}"
+                    for m in memories
+                ])
+                context["retrieved_memories"] = memory_context
+                result["pipeline"].append({
+                    "step": "memory_retrieval",
+                    "results_count": len(memories),
+                    "top_score": memories[0].rrf_score if memories else 0,
+                })
+
+        sop = self._find_matching_sop(safe_query)
+        if sop:
+            result["pipeline"].append({
+                "step": "sop_match",
+                "matched_sop": sop["name"],
+            })
+
+        return plan
+
+    def _execute_dag_pipeline(self, safe_query: str, plan, context: dict,
+                              result: dict) -> tuple:
+        """Create agent team, build DAG, and execute it."""
+        team = self.factory.create_team(
+            roles=plan.agent_roles,
+            backend=plan.backend,
+        )
+        result["pipeline"].append({
+            "step": "agent_creation",
+            "team_size": len(team),
+            "agents": [a.to_dict() for a in team],
+        })
+
+        from core.dag_engine import ExecutionContext
+        dag = self.dag_builder.from_workflow_plan(plan)
+        exec_context = ExecutionContext(
+            query=safe_query,
+            shared_state=context,
+        )
+        result["pipeline"].append({
+            "step": "dag_generated",
+            "dag_stats": dag.stats,
+        })
+
+        exec_context = self.executor.execute(dag, exec_context)
+        result["pipeline"].append({
+            "step": "dag_executed",
+            "final_stats": dag.stats,
+            "node_outputs": {
+                k: str(v)[:200] for k, v in exec_context.node_outputs.items()
+            },
+            "errors": exec_context.errors,
+        })
+
+        result["output"] = exec_context.node_outputs
+        result["status"] = "success" if not exec_context.errors else "partial"
+        result["errors"] = exec_context.errors
+        return team, exec_context, dag
+
+    def _post_process(self, safe_query: str, plan, dag, team,
+                      exec_context, result: dict):
+        """Store SOP, record episodic memory, send feedback, and clean up."""
+        if result["status"] == "success":
+            self._store_sop(safe_query, plan, dag)
+
+        if self._episodic_memory:
+            try:
+                importance = 0.9 if result["status"] == "success" else 0.6
+                difficulty_tag = "unknown"
+                for step in result["pipeline"]:
+                    if step.get("step") == "daao_route":
+                        difficulty_tag = step.get("difficulty", "unknown")
+                        break
+                self._episodic_memory.store_episodic(
+                    content=(
+                        f"Query: {safe_query[:100]} | "
+                        f"Status: {result['status']} | "
+                        f"Steps: {len(result['pipeline'])}"
+                    ),
+                    tags=["orchestrator", result["status"], difficulty_tag],
+                    source_action="orchestrator.process",
+                    importance=importance,
+                )
+            except Exception as mem_err:
+                logger.warning(f"Episodic memory store failed: {mem_err}")
+
+        from core.difficulty_router import QueryDifficulty
+        actual_difficulty = plan.difficulty.level
+        self.router.feedback(safe_query, actual_difficulty,
+                             result["status"] == "success")
+        self.factory.destroy_team(team)
+
+    def _handle_pipeline_error(self, query: str, error: Exception,
+                               result: dict):
+        """Handle pipeline errors and run cognitive reflexion."""
+        result["status"] = "error"
+        result["errors"].append(str(error))
+        logger.error(f"Orchestrator error: {error}", exc_info=True)
+
+        if self._reflexion:
+            try:
+                from core.cognitive.reflexion import FailureContext
+                failure = FailureContext(
+                    action_type="orchestrate",
+                    action_target=query[:100],
+                    error_message=str(error),
+                    error_type=type(error).__name__,
+                    expected_outcome="successful pipeline execution",
+                    actual_outcome=f"error: {str(error)[:200]}",
+                )
+                reflection = self._reflexion.on_failure(failure)
+                result["pipeline"].append({
+                    "step": "reflexion",
+                    "critique": reflection.critique[:200],
+                    "lesson": reflection.lesson[:200],
+                    "adjustment": reflection.action_adjustment[:200],
+                })
+                logger.info(f"Reflexion: {reflection.lesson[:100]}")
+            except Exception as ref_err:
+                logger.warning(f"Reflexion engine failed: {ref_err}")
+
+    def _finalize_metrics(self, query: str, result: dict, t0: float):
+        """Record timing metrics and append to execution history."""
         elapsed = (time.perf_counter() - t0) * 1000
         result["metrics"] = {
             "total_ms": round(elapsed, 1),
             "pipeline_steps": len(result["pipeline"]),
         }
-
         self._history.append({
             "query": query[:100],
             "status": result["status"],
             "difficulty": next(
-                (p.get("difficulty", "unknown") for p in result["pipeline"] if p.get("step") == "daao_route"),
+                (p.get("difficulty", "unknown")
+                 for p in result["pipeline"]
+                 if p.get("step") == "daao_route"),
                 "unknown"
             ),
             "elapsed_ms": elapsed,
             "timestamp": time.time(),
         })
-
-        logger.info(f"Orchestrator: {result['status']} in {elapsed:.0f}ms "
-                    f"({len(result['pipeline'])} steps)")
-
-        return result
+        logger.info(
+            f"Orchestrator: {result['status']} in {elapsed:.0f}ms "
+            f"({len(result['pipeline'])} steps)"
+        )
 
     def _find_matching_sop(self, query: str) -> Optional[dict]:
         """MASFly-style SOP matching — find stored successful patterns."""

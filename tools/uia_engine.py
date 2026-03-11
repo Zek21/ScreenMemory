@@ -168,6 +168,41 @@ class UIAEngine:
         ec = uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_EditControlTypeId)
         return uia.CreateOrCondition(bc, uia.CreateOrCondition(lc, ec))
 
+    def _classify_elements(self, elements, n, result, bottom_threshold, UIA_Mod):
+        """Classify scanned UIA elements into buttons, edits, list items."""
+        for i in range(n):
+            el = elements.GetElement(i)
+            ct = el.CurrentControlType
+            nm = el.CurrentName or ""
+
+            if ct == UIA_ButtonControlTypeId:
+                result.buttons.append(nm)
+                if "Pick Model" in nm:
+                    result.model = nm
+                elif "Delegate Session" in nm:
+                    result.agent = nm
+                elif nm == "Cancel (Alt+Backspace)":
+                    result.has_cancel = True
+
+            elif ct == UIA_EditControlTypeId:
+                if not result.edit_value:
+                    try:
+                        vp = el.GetCurrentPattern(UIA_ValuePatternId)
+                        val_pattern = vp.QueryInterface(UIA_Mod.IUIAutomationValuePattern)
+                        result.edit_value = val_pattern.CurrentValue or ""
+                    except Exception:
+                        pass
+
+            elif ct == UIA_ListItemControlTypeId:
+                if result.has_cancel and "STEERING" in nm.upper():
+                    try:
+                        li_rect = el.CurrentBoundingRectangle
+                        if li_rect.top > bottom_threshold:
+                            result.steering_count += 1
+                            result.list_items.append((nm, li_rect.top))
+                    except Exception:
+                        result.steering_count += 1
+
     def scan(self, hwnd: int) -> WindowScan:
         """Scan a single window. Returns WindowScan with full state.
 
@@ -201,39 +236,7 @@ class UIAEngine:
             n = elements.Length
             result.element_count = n
 
-            for i in range(n):
-                el = elements.GetElement(i)
-                ct = el.CurrentControlType
-                nm = el.CurrentName or ""
-
-                if ct == UIA_ButtonControlTypeId:
-                    result.buttons.append(nm)
-                    if "Pick Model" in nm:
-                        result.model = nm
-                    elif "Delegate Session" in nm:
-                        result.agent = nm
-                    elif nm == "Cancel (Alt+Backspace)":
-                        result.has_cancel = True
-
-                elif ct == UIA_EditControlTypeId:
-                    if not result.edit_value:
-                        try:
-                            vp = el.GetCurrentPattern(UIA_ValuePatternId)
-                            val_pattern = vp.QueryInterface(UIA_Mod.IUIAutomationValuePattern)
-                            result.edit_value = val_pattern.CurrentValue or ""
-                        except Exception:
-                            pass
-
-                elif ct == UIA_ListItemControlTypeId:
-                    if result.has_cancel and "STEERING" in nm.upper():
-                        # Position check: must be in bottom 45% of window
-                        try:
-                            li_rect = el.CurrentBoundingRectangle
-                            if li_rect.top > bottom_threshold:
-                                result.steering_count += 1
-                                result.list_items.append((nm, li_rect.top))
-                        except Exception:
-                            result.steering_count += 1
+            self._classify_elements(elements, n, result, bottom_threshold, UIA_Mod)
 
             # Determine state
             if result.has_cancel and result.steering_count > 0:
@@ -393,6 +396,41 @@ def get_engine() -> UIAEngine:
 
 
 # ─── CLI for testing ────────────────────────────────────────────────────────
+def _run_benchmark(engine, hwnds, workers):
+    """Run UIA benchmark comparing COM vs PowerShell."""
+    import subprocess
+
+    print("=" * 70)
+    print("UIA Engine Benchmark")
+    print("=" * 70)
+
+    t0 = time.perf_counter()
+    for name, hwnd in hwnds.items():
+        engine.scan(hwnd)
+    seq_ms = (time.perf_counter() - t0) * 1000
+
+    t2 = time.perf_counter()
+    engine.scan_all(hwnds)
+    par_ms = (time.perf_counter() - t2) * 1000
+
+    ps = f"""Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+$w=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]{workers[0]['hwnd']})
+$b=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,(New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Button)))
+foreach($x in $b){{if($x.Current.Name -match 'Pick Model'){{Write-Output $x.Current.Name;break}}}}"""
+    t4 = time.perf_counter()
+    subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=10)
+    ps_ms = (time.perf_counter() - t4) * 1000
+
+    per_window_com = seq_ms / len(hwnds)
+    speedup = ps_ms / per_window_com
+
+    print(f"  COM sequential ({len(hwnds)} windows): {seq_ms:.0f}ms ({per_window_com:.0f}ms/window)")
+    print(f"  COM parallel   ({len(hwnds)} windows): {par_ms:.0f}ms")
+    print(f"  PowerShell     (1 window):            {ps_ms:.0f}ms")
+    print(f"  Speedup: {speedup:.1f}x per window")
+    print("=" * 70)
+
+
 def main():
     import json
     import argparse
@@ -435,43 +473,7 @@ def main():
         hwnds["orchestrator"] = orch_hwnd
 
     if args.benchmark:
-        import subprocess
-
-        print("=" * 70)
-        print("UIA Engine Benchmark")
-        print("=" * 70)
-
-        # COM sequential
-        t0 = time.perf_counter()
-        for name, hwnd in hwnds.items():
-            engine.scan(hwnd)
-        t1 = time.perf_counter()
-        seq_ms = (t1 - t0) * 1000
-
-        # COM parallel
-        t2 = time.perf_counter()
-        engine.scan_all(hwnds)
-        t3 = time.perf_counter()
-        par_ms = (t3 - t2) * 1000
-
-        # PowerShell (single window)
-        ps = f"""Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
-$w=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]{workers[0]['hwnd']})
-$b=$w.FindAll([System.Windows.Automation.TreeScope]::Descendants,(New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::Button)))
-foreach($x in $b){{if($x.Current.Name -match 'Pick Model'){{Write-Output $x.Current.Name;break}}}}"""
-        t4 = time.perf_counter()
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=10)
-        t5 = time.perf_counter()
-        ps_ms = (t5 - t4) * 1000
-
-        per_window_com = seq_ms / len(hwnds)
-        speedup = ps_ms / per_window_com
-
-        print(f"  COM sequential ({len(hwnds)} windows): {seq_ms:.0f}ms ({per_window_com:.0f}ms/window)")
-        print(f"  COM parallel   ({len(hwnds)} windows): {par_ms:.0f}ms")
-        print(f"  PowerShell     (1 window):            {ps_ms:.0f}ms")
-        print(f"  Speedup: {speedup:.1f}x per window")
-        print("=" * 70)
+        _run_benchmark(engine, hwnds, workers)
         return
 
     # Default: scan all and display

@@ -123,6 +123,42 @@ class TestConsultantPromptQueue(unittest.TestCase):
         self.assertEqual(payload["metadata"]["worker_count"], "2")
         self.assertEqual(payload["metadata"]["routable"], "True")
 
+    def test_atomic_write_retries_transient_permission_error(self):
+        target = Path(self.tmpdir.name) / "bridge_state.json"
+        real_replace = self.bridge.os.replace
+        attempts = {"count": 0}
+
+        def flaky_replace(src, dst):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise PermissionError(13, "Access is denied")
+            return real_replace(src, dst)
+
+        with patch.object(self.bridge.os, "replace", side_effect=flaky_replace), \
+             patch.object(self.bridge.time, "sleep") as sleep_mock:
+            self.bridge._atomic_write(target, {"status": "LIVE"})
+
+        self.assertEqual(attempts["count"], 2)
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["status"], "LIVE")
+        sleep_mock.assert_called_once()
+
+    def test_heartbeat_loop_survives_transient_write_failure(self):
+        calls = {"count": 0}
+
+        def flaky_write(path, payload):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise PermissionError(13, "Access is denied")
+
+        with patch.object(self.bridge, "_atomic_write", side_effect=flaky_write), \
+             patch.object(self.bridge, "build_live_state", return_value={"status": "LIVE"}), \
+             patch.object(self.bridge.time, "sleep", side_effect=[None, KeyboardInterrupt]), \
+             patch.object(self.bridge.sys, "stderr"):
+            with self.assertRaises(KeyboardInterrupt):
+                self.bridge._heartbeat_loop(2.0, 8.0, 8425)
+
+        self.assertEqual(calls["count"], 2)
+
 
 class TestConsultantDeliveryRouting(unittest.TestCase):
     def setUp(self):
@@ -307,6 +343,22 @@ class TestWatchdogConsultantBridge(unittest.TestCase):
         alert_mock.assert_called_once()
         refresh_mock.assert_called_once()
         incident_mock.assert_called_once()
+
+
+class TestConsultantBootstrapTruth(unittest.TestCase):
+    def test_cc_start_requires_bridge_health_before_live_claim(self):
+        script = Path("CC-Start.ps1").read_text(encoding="utf-8")
+        self.assertIn("http://127.0.0.1:8422/health", script)
+        self.assertIn("started and passed /health on port 8422", script)
+        self.assertIn("failed health verification within 40s", script)
+
+    def test_gc_start_requires_bridge_health_before_live_claim(self):
+        script = Path("GC-Start.ps1").read_text(encoding="utf-8")
+        self.assertIn("http://127.0.0.1:8425/health", script)
+        self.assertIn("started and passed /health on port 8425", script)
+        self.assertIn("failed health verification within 40s", script)
+        self.assertIn("`\"Gemini Consultant`\"", script)
+        self.assertIn("`\"Gemini 3.1 Pro (Preview)`\"", script)
 
 
 if __name__ == "__main__":

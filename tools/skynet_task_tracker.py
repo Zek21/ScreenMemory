@@ -18,6 +18,7 @@ Usage:
     python tools/skynet_task_tracker.py gc --days 7
 """
 
+import argparse
 import json
 import os
 import sys
@@ -191,8 +192,8 @@ def get_pending_count(worker=None):
     return len(get_pending(worker))
 
 
-def main():
-    import argparse
+def _build_tracker_parser():
+    """Build the task tracker CLI parser."""
     parser = argparse.ArgumentParser(description="Skynet Task Tracker")
     sub = parser.add_subparsers(dest="cmd")
 
@@ -216,30 +217,31 @@ def main():
     g = sub.add_parser("gc", help="Garbage collect old tasks")
     g.add_argument("--days", type=int, default=7)
 
-    args = parser.parse_args()
+    return parser
 
+
+def _dispatch_tracker_command(args) -> int:
+    """Dispatch parsed CLI command. Returns 0 on success, 1 on error, -1 for help."""
     if args.cmd == "create":
-        rec = create_task(args.target, args.task, args.priority, args.sender)
-        print(json.dumps(rec, indent=2))
-
-    elif args.cmd == "update":
+        print(json.dumps(create_task(args.target, args.task, args.priority, args.sender), indent=2))
+        return 0
+    if args.cmd == "update":
         rec = update_task(args.id, args.status, args.result)
         if rec:
             print(json.dumps(rec, indent=2))
-        else:
-            print(f"Task {args.id} not found", file=sys.stderr)
-            sys.exit(1)
-
-    elif args.cmd == "pending":
+            return 0
+        print(f"Task {args.id} not found", file=sys.stderr)
+        return 1
+    if args.cmd == "pending":
         worker = getattr(args, "worker", None)
         tasks = get_pending(worker)
         print(json.dumps(tasks, indent=2))
         print(f"\n{len(tasks)} pending task(s)")
-
-    elif args.cmd == "summary":
+        return 0
+    if args.cmd == "summary":
         print(json.dumps(get_summary(), indent=2))
-
-    elif args.cmd == "can-stop":
+        return 0
+    if args.cmd == "can-stop":
         ok, count, tasks = can_stop(args.worker)
         if ok:
             print(f"{args.worker} CAN stop -- no pending tasks")
@@ -248,12 +250,18 @@ def main():
             for t in tasks:
                 print(f"  [{t['status']}] {t['task_id']}: {t['task'][:60]}")
         sys.exit(0 if ok else 1)
-
-    elif args.cmd == "gc":
+    if args.cmd == "gc":
         removed = gc_old_tasks(args.days)
         print(f"Removed {removed} completed task(s) older than {args.days} days")
+        return 0
+    return -1
 
-    else:
+
+def main():
+    parser = _build_tracker_parser()
+    args = parser.parse_args()
+    result = _dispatch_tracker_command(args)
+    if result == -1:
         parser.print_help()
 
 

@@ -258,6 +258,101 @@ class CDP:
         self._verify_connection()
 
     @classmethod
+    @classmethod
+    def _compute_auto_position(cls, extra_args):
+        """Compute window position/size args to avoid overlap. Modifies extra_args in place."""
+        if sys.platform != 'win32':
+            return
+
+        has_pos = any(a.startswith('--window-position') for a in extra_args)
+        has_size = any(a.startswith('--window-size') for a in extra_args)
+        has_max = any(a in ('--start-maximized', '--kiosk') or a.startswith('--start-fullscreen') for a in extra_args)
+
+        if has_pos or has_max:
+            return
+
+        def _virtual_screen():
+            user32 = ctypes.windll.user32
+            return {
+                'x': int(user32.GetSystemMetrics(76)),
+                'y': int(user32.GetSystemMetrics(77)),
+                'w': int(user32.GetSystemMetrics(78)),
+                'h': int(user32.GetSystemMetrics(79)),
+            }
+
+        def _list_chrome_rects():
+            user32 = ctypes.windll.user32
+            rects = []
+            EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+
+            def cb(hwnd, lparam):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                try:
+                    if user32.IsIconic(hwnd):
+                        return True
+                except Exception:
+                    pass
+                cls_buf = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hwnd, cls_buf, 256)
+                if not cls_buf.value.startswith('Chrome_WidgetWin_'):
+                    return True
+                r = ctypes.wintypes.RECT()
+                if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                    return True
+                w, h = r.right - r.left, r.bottom - r.top
+                if w < 200 or h < 200:
+                    return True
+                rects.append({'x': int(r.left), 'y': int(r.top), 'w': int(w), 'h': int(h)})
+                return True
+
+            user32.EnumWindows(EnumProc(cb), 0)
+            return rects
+
+        def _intersect(a, b):
+            return not (
+                (a['x'] + a['w']) <= b['x'] or (b['x'] + b['w']) <= a['x'] or
+                (a['y'] + a['h']) <= b['y'] or (b['y'] + b['h']) <= a['y']
+            )
+
+        def _pick_slot(w, h, margin=16):
+            screen = _virtual_screen()
+            existing = _list_chrome_rects()
+            max_x = screen['x'] + max(0, screen['w'] - w - margin)
+            max_y = screen['y'] + max(0, screen['h'] - h - margin)
+            step_x, step_y = max(40, w + margin), max(40, h + margin)
+            y = screen['y'] + margin
+            while y <= max_y:
+                x = screen['x'] + margin
+                while x <= max_x:
+                    cand = {'x': x, 'y': y, 'w': w, 'h': h}
+                    if not any(_intersect(cand, r) for r in existing):
+                        return x, y
+                    x += step_x
+                y += step_y
+            n = len(existing)
+            return (
+                screen['x'] + margin + (n * 40) % max(1, (screen['w'] - w - margin)),
+                screen['y'] + margin + (n * 40) % max(1, (screen['h'] - h - margin)),
+            )
+
+        w, h = 1280, 800
+        if has_size:
+            for a in extra_args:
+                if a.startswith('--window-size='):
+                    try:
+                        w_s, h_s = a.split('=', 1)[1].split(',', 1)
+                        w, h = int(w_s), int(h_s)
+                    except Exception:
+                        pass
+                    break
+
+        x, y = _pick_slot(w, h)
+        if not has_size:
+            extra_args.append(f'--window-size={w},{h}')
+        extra_args.append(f'--window-position={x},{y}')
+
+    @classmethod
     def launch(cls, chrome_path=None, port=9222, user_data_dir=None,
                headless=False, extra_args=None, timeout=30):
         """Launch Chrome with remote debugging enabled."""
@@ -274,113 +369,15 @@ class CDP:
 
         extra_args = list(extra_args or [])
 
-        # Auto-position window to avoid overlap (Windows only)
-        if sys.platform == 'win32' and not headless:
+        if not headless:
             try:
-                has_pos = any(a.startswith('--window-position') for a in extra_args)
-                has_size = any(a.startswith('--window-size') for a in extra_args)
-                has_max = any(a in ('--start-maximized', '--kiosk') or a.startswith('--start-fullscreen') for a in extra_args)
-
-                def _virtual_screen():
-                    user32 = ctypes.windll.user32
-                    SM_XVIRTUALSCREEN = 76
-                    SM_YVIRTUALSCREEN = 77
-                    SM_CXVIRTUALSCREEN = 78
-                    SM_CYVIRTUALSCREEN = 79
-                    return {
-                        'x': int(user32.GetSystemMetrics(SM_XVIRTUALSCREEN)),
-                        'y': int(user32.GetSystemMetrics(SM_YVIRTUALSCREEN)),
-                        'w': int(user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)),
-                        'h': int(user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)),
-                    }
-
-                def _list_chrome_rects():
-                    user32 = ctypes.windll.user32
-                    rects = []
-                    EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
-
-                    def cb(hwnd, lparam):
-                        if not user32.IsWindowVisible(hwnd):
-                            return True
-                        try:
-                            if user32.IsIconic(hwnd):
-                                return True
-                        except Exception:
-                            pass
-
-                        cls_buf = ctypes.create_unicode_buffer(256)
-                        user32.GetClassNameW(hwnd, cls_buf, 256)
-                        cls_name = cls_buf.value
-                        if not cls_name.startswith('Chrome_WidgetWin_'):
-                            return True
-
-                        r = ctypes.wintypes.RECT()
-                        if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
-                            return True
-                        w = r.right - r.left
-                        h = r.bottom - r.top
-                        if w < 200 or h < 200:
-                            return True
-                        rects.append({'x': int(r.left), 'y': int(r.top), 'w': int(w), 'h': int(h)})
-                        return True
-
-                    user32.EnumWindows(EnumProc(cb), 0)
-                    return rects
-
-                def _intersect(a, b):
-                    return not (
-                        (a['x'] + a['w']) <= b['x'] or (b['x'] + b['w']) <= a['x'] or
-                        (a['y'] + a['h']) <= b['y'] or (b['y'] + b['h']) <= a['y']
-                    )
-
-                def _pick_slot(w, h, margin=16):
-                    screen = _virtual_screen()
-                    existing = _list_chrome_rects()
-                    max_x = screen['x'] + max(0, screen['w'] - w - margin)
-                    max_y = screen['y'] + max(0, screen['h'] - h - margin)
-                    step_x = max(40, w + margin)
-                    step_y = max(40, h + margin)
-
-                    y = screen['y'] + margin
-                    while y <= max_y:
-                        x = screen['x'] + margin
-                        while x <= max_x:
-                            cand = {'x': x, 'y': y, 'w': w, 'h': h}
-                            if not any(_intersect(cand, r) for r in existing):
-                                return x, y
-                            x += step_x
-                        y += step_y
-
-                    n = len(existing)
-                    return (
-                        screen['x'] + margin + (n * 40) % max(1, (screen['w'] - w - margin)),
-                        screen['y'] + margin + (n * 40) % max(1, (screen['h'] - h - margin)),
-                    )
-
-                if not has_pos and not has_max:
-                    w, h = 1280, 800
-                    if has_size:
-                        for a in extra_args:
-                            if a.startswith('--window-size='):
-                                try:
-                                    w_s, h_s = a.split('=', 1)[1].split(',', 1)
-                                    w, h = int(w_s), int(h_s)
-                                except Exception:
-                                    pass
-                                break
-
-                    x, y = _pick_slot(w, h)
-                    if not has_size:
-                        extra_args.append(f'--window-size={w},{h}')
-                    extra_args.append(f'--window-position={x},{y}')
+                cls._compute_auto_position(extra_args)
             except Exception:
                 pass
 
         args.extend(extra_args)
-
         subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        # Wait for Chrome to be ready
         for _ in range(timeout * 2):
             try:
                 urlopen(f'http://127.0.0.1:{port}/json/version', timeout=1)

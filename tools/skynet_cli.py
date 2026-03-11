@@ -228,7 +228,52 @@ def cmd_bus(args):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def main():
+def _add_core_subparsers(sub):
+    """Register core command subparsers (dispatch, health, audit, decompose)."""
+    p_dispatch = sub.add_parser("dispatch", help="Dispatch task to worker(s)")
+    p_dispatch.add_argument("--worker", "-w", default="auto", help="Worker name or 'auto' for smart dispatch")
+    p_dispatch.add_argument("--task", "-t", required=True, help="Task string (or JSON dict for --parallel)")
+    p_dispatch.add_argument("--parallel", "-p", action="store_true", help="Parallel dispatch (--task must be JSON dict)")
+    p_dispatch.set_defaults(func=cmd_dispatch)
+
+    p_health = sub.add_parser("health", help="Run health dashboard")
+    p_health.add_argument("--json", action="store_true")
+    p_health.set_defaults(func=cmd_health)
+
+    p_audit = sub.add_parser("audit", help="Run Skynet auditor")
+    p_audit.add_argument("--json", action="store_true")
+    p_audit.set_defaults(func=cmd_audit)
+
+    p_decompose = sub.add_parser("decompose", help="Decompose prompt into subtasks")
+    p_decompose.add_argument("--prompt", "-p", required=True)
+    p_decompose.add_argument("--json", action="store_true")
+    p_decompose.set_defaults(func=cmd_decompose)
+
+
+def _add_ops_subparsers(sub):
+    """Register operational command subparsers (status, pipeline, metrics, bus)."""
+    p_status = sub.add_parser("status", help="Show worker states and scores")
+    p_status.add_argument("--json", action="store_true")
+    p_status.set_defaults(func=cmd_status)
+
+    p_pipeline = sub.add_parser("pipeline", help="Run composable pipeline")
+    p_pipeline.add_argument("--steps", "-s", required=True, help="JSON list (chain) or dict (parallel)")
+    p_pipeline.set_defaults(func=cmd_pipeline)
+
+    p_metrics = sub.add_parser("metrics", help="Research metrics")
+    p_metrics.add_argument("--export-csv", type=str, help="Export to CSV file")
+    p_metrics.add_argument("--run-benchmarks", action="store_true")
+    p_metrics.set_defaults(func=cmd_metrics)
+
+    p_bus = sub.add_parser("bus", help="Read/post to message bus")
+    p_bus.add_argument("--limit", "-l", type=int, default=20)
+    p_bus.add_argument("--topic", "-t", type=str)
+    p_bus.add_argument("--post", type=str, help="Post a message to the bus")
+    p_bus.set_defaults(func=cmd_bus)
+
+
+def _build_cli_parser():
+    """Build the CLI argument parser with all subparsers."""
     parser = argparse.ArgumentParser(
         prog="skynet",
         description="Unified CLI for Skynet multi-agent system",
@@ -240,53 +285,13 @@ def main():
                "  skynet bus --limit 5 --topic alpha\n",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+    _add_core_subparsers(sub)
+    _add_ops_subparsers(sub)
+    return parser
 
-    # dispatch
-    p_dispatch = sub.add_parser("dispatch", help="Dispatch task to worker(s)")
-    p_dispatch.add_argument("--worker", "-w", default="auto", help="Worker name or 'auto' for smart dispatch")
-    p_dispatch.add_argument("--task", "-t", required=True, help="Task string (or JSON dict for --parallel)")
-    p_dispatch.add_argument("--parallel", "-p", action="store_true", help="Parallel dispatch (--task must be JSON dict)")
-    p_dispatch.set_defaults(func=cmd_dispatch)
 
-    # health
-    p_health = sub.add_parser("health", help="Run health dashboard")
-    p_health.add_argument("--json", action="store_true")
-    p_health.set_defaults(func=cmd_health)
-
-    # audit
-    p_audit = sub.add_parser("audit", help="Run Skynet auditor")
-    p_audit.add_argument("--json", action="store_true")
-    p_audit.set_defaults(func=cmd_audit)
-
-    # decompose
-    p_decompose = sub.add_parser("decompose", help="Decompose prompt into subtasks")
-    p_decompose.add_argument("--prompt", "-p", required=True)
-    p_decompose.add_argument("--json", action="store_true")
-    p_decompose.set_defaults(func=cmd_decompose)
-
-    # status
-    p_status = sub.add_parser("status", help="Show worker states and scores")
-    p_status.add_argument("--json", action="store_true")
-    p_status.set_defaults(func=cmd_status)
-
-    # pipeline
-    p_pipeline = sub.add_parser("pipeline", help="Run composable pipeline")
-    p_pipeline.add_argument("--steps", "-s", required=True, help="JSON list (chain) or dict (parallel)")
-    p_pipeline.set_defaults(func=cmd_pipeline)
-
-    # metrics
-    p_metrics = sub.add_parser("metrics", help="Research metrics")
-    p_metrics.add_argument("--export-csv", type=str, help="Export to CSV file")
-    p_metrics.add_argument("--run-benchmarks", action="store_true")
-    p_metrics.set_defaults(func=cmd_metrics)
-
-    # bus
-    p_bus = sub.add_parser("bus", help="Read/post to message bus")
-    p_bus.add_argument("--limit", "-l", type=int, default=20)
-    p_bus.add_argument("--topic", "-t", type=str)
-    p_bus.add_argument("--post", type=str, help="Post a message to the bus")
-    p_bus.set_defaults(func=cmd_bus)
-
+def main():
+    parser = _build_cli_parser()
     args = parser.parse_args()
 
     try:

@@ -235,83 +235,88 @@ class SkynetAuditor:
         return scorecard
 
     # ── Auto-Fix ─────────────────────────────────────────────────
+    def _fix_dead_monitor(self):
+        """Restart the monitor daemon. Returns a fix result dict."""
+        try:
+            monitor_script = ROOT / "tools" / "skynet_monitor.py"
+            if monitor_script.exists():
+                proc = subprocess.Popen(
+                    [sys.executable, str(monitor_script)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                    if sys.platform == "win32" else 0,
+                )
+                MONITOR_PID_FILE.write_text(str(proc.pid))
+                return {"name": "monitor", "action": "restarted",
+                        "success": True, "pid": proc.pid}
+            return {"name": "monitor", "action": "restart_failed",
+                    "success": False, "reason": "script not found"}
+        except Exception as e:
+            return {"name": "monitor", "action": "restart_failed",
+                    "success": False, "reason": str(e)}
+
+    def _fix_model_drift(self, worker_issues):
+        """Fix model drift for workers with wrong model. Returns list of fix results."""
+        fixes = []
+        for wi in worker_issues:
+            if "wrong model" not in wi:
+                continue
+            worker_name = wi.split(":")[0].strip()
+            try:
+                workers_data = json.loads(WORKERS_FILE.read_text())
+                w_entry = next(
+                    (w for w in workers_data.get("workers", [])
+                     if w["name"] == worker_name), None)
+                if w_entry:
+                    from tools.skynet_monitor import fix_model_via_uia
+                    hwnd = w_entry["hwnd"]
+                    render_hwnd = w_entry.get("render_hwnd", hwnd)
+                    fixed = fix_model_via_uia(hwnd, render_hwnd)
+                    fixes.append({"name": f"model_drift_{worker_name}",
+                                  "action": "fix_model", "success": fixed})
+                else:
+                    fixes.append({"name": f"model_drift_{worker_name}",
+                                  "action": "fix_model",
+                                  "success": False, "reason": "worker not in workers.json"})
+            except Exception as e:
+                fixes.append({"name": f"model_drift_{worker_name}",
+                              "action": "fix_model",
+                              "success": False, "reason": str(e)})
+        return fixes
+
+    def _fix_dead_server(self):
+        """Restart the Skynet backend server. Returns a fix result dict."""
+        try:
+            skynet_exe = ROOT / "Skynet" / "skynet.exe"
+            if skynet_exe.exists():
+                proc = subprocess.Popen(
+                    [str(skynet_exe)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    cwd=str(ROOT / "Skynet"),
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                    if sys.platform == "win32" else 0,
+                )
+                time.sleep(2)
+                return {"name": "server", "action": "restarted",
+                        "success": True, "pid": proc.pid}
+            return {"name": "server", "action": "restart_failed",
+                    "success": False, "reason": "skynet.exe not found"}
+        except Exception as e:
+            return {"name": "server", "action": "restart_failed",
+                    "success": False, "reason": str(e)}
+
     def auto_fix(self, issues):
         """Attempt to fix found issues. Returns list of fix results."""
         fixes = []
-
         for issue in issues:
             name = issue.get("name", "")
-
-            # Fix dead monitor
             if name == "monitor" and issue["status"] == "fail":
-                try:
-                    monitor_script = ROOT / "tools" / "skynet_monitor.py"
-                    if monitor_script.exists():
-                        proc = subprocess.Popen(
-                            [sys.executable, str(monitor_script)],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            creationflags=subprocess.CREATE_NO_WINDOW
-                            if sys.platform == "win32" else 0,
-                        )
-                        MONITOR_PID_FILE.write_text(str(proc.pid))
-                        fixes.append({"name": "monitor", "action": "restarted",
-                                      "success": True, "pid": proc.pid})
-                    else:
-                        fixes.append({"name": "monitor", "action": "restart_failed",
-                                      "success": False, "reason": "script not found"})
-                except Exception as e:
-                    fixes.append({"name": "monitor", "action": "restart_failed",
-                                  "success": False, "reason": str(e)})
-
-            # Fix model drift
+                fixes.append(self._fix_dead_monitor())
             if name == "workers" and issue["status"] in ("warning", "fail"):
                 worker_issues = issue.get("details", {}).get("issues", [])
-                for wi in worker_issues:
-                    if "wrong model" in wi:
-                        worker_name = wi.split(":")[0].strip()
-                        try:
-                            workers_data = json.loads(WORKERS_FILE.read_text())
-                            w_entry = next(
-                                (w for w in workers_data.get("workers", [])
-                                 if w["name"] == worker_name), None)
-                            if w_entry:
-                                from tools.skynet_monitor import fix_model_via_uia
-                                hwnd = w_entry["hwnd"]
-                                render_hwnd = w_entry.get("render_hwnd", hwnd)
-                                fixed = fix_model_via_uia(hwnd, render_hwnd)
-                                fixes.append({"name": f"model_drift_{worker_name}",
-                                              "action": "fix_model", "success": fixed})
-                            else:
-                                fixes.append({"name": f"model_drift_{worker_name}",
-                                              "action": "fix_model",
-                                              "success": False, "reason": "worker not in workers.json"})
-                        except Exception as e:
-                            fixes.append({"name": f"model_drift_{worker_name}",
-                                          "action": "fix_model",
-                                          "success": False, "reason": str(e)})
-
-            # Fix dead server
+                fixes.extend(self._fix_model_drift(worker_issues))
             if name == "server" and issue["status"] == "fail":
-                try:
-                    skynet_exe = ROOT / "Skynet" / "skynet.exe"
-                    if skynet_exe.exists():
-                        proc = subprocess.Popen(
-                            [str(skynet_exe)],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            cwd=str(ROOT / "Skynet"),
-                            creationflags=subprocess.CREATE_NO_WINDOW
-                            if sys.platform == "win32" else 0,
-                        )
-                        time.sleep(2)
-                        fixes.append({"name": "server", "action": "restarted",
-                                      "success": True, "pid": proc.pid})
-                    else:
-                        fixes.append({"name": "server", "action": "restart_failed",
-                                      "success": False, "reason": "skynet.exe not found"})
-                except Exception as e:
-                    fixes.append({"name": "server", "action": "restart_failed",
-                                  "success": False, "reason": str(e)})
-
+                fixes.append(self._fix_dead_server())
         return fixes
 
 

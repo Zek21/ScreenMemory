@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+# Hardcoded paths replaced with sys.executable for portability  # signed: beta
 from types import SimpleNamespace
 from unittest import mock
 
@@ -29,15 +30,18 @@ class _FakeProcess:
 
 class ProcessGuardRegistryTests(unittest.TestCase):
     def test_collapse_wrapper_pids_keeps_real_child_only(self):
+        # Simulate venv wrapper: parent exe differs from child exe (same cmdline)
+        venv_exe = "C:\\project\\env\\Scripts\\python.exe"
+        real_exe = "C:\\Python\\python.exe"
         child = _FakeProcess(
             30504,
-            ["D:\\Prospects\\env\\Scripts\\python.exe", "tools\\skynet_agent_telemetry.py", "start"],
-            "C:\\Python313\\python.exe",
+            [venv_exe, "tools\\skynet_agent_telemetry.py", "start"],
+            real_exe,
         )
         parent = _FakeProcess(
             29752,
-            ["D:\\Prospects\\env\\Scripts\\python.exe", "tools\\skynet_agent_telemetry.py", "start"],
-            "D:\\Prospects\\env\\Scripts\\python.exe",
+            [venv_exe, "tools\\skynet_agent_telemetry.py", "start"],
+            venv_exe,
             children=[child],
         )
         fake_psutil = SimpleNamespace(Process=lambda pid: {29752: parent, 30504: child}[pid])
@@ -45,8 +49,8 @@ class ProcessGuardRegistryTests(unittest.TestCase):
             self.assertEqual(process_guard._collapse_wrapper_pids([29752, 30504]), [30504])
 
     def test_collapse_wrapper_pids_keeps_true_duplicates(self):
-        first = _FakeProcess(1001, ["python.exe", "god_console.py"], "C:\\Python313\\python.exe")
-        second = _FakeProcess(1002, ["python.exe", "god_console.py"], "C:\\Python313\\python.exe")
+        first = _FakeProcess(1001, [sys.executable, "god_console.py"], sys.executable)
+        second = _FakeProcess(1002, [sys.executable, "god_console.py"], sys.executable)
         fake_psutil = SimpleNamespace(Process=lambda pid: {1001: first, 1002: second}[pid])
         with mock.patch.object(process_guard, "psutil", fake_psutil):
             self.assertEqual(process_guard._collapse_wrapper_pids([1001, 1002]), [1001, 1002])

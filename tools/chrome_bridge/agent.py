@@ -172,22 +172,29 @@ class StealthLauncher:
         except Exception:
             return False
 
+    _BASE_CHROME_ARGS = [
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-hang-monitor",
+        "--disable-prompt-on-repost",
+        "--disable-sync",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--mute-audio",
+    ]
+
+    _MODE_ARGS = {
+        'HEADLESS': ["--headless=new", "--disable-gpu", "--window-size=1920,1080"],
+        'OFFSCREEN': ["--window-position=-32000,-32000", "--window-size=1920,1080"],
+        'HIDDEN': ["--window-size=1920,1080"],
+    }
+
     def launch(self, mode: 'StealthLauncher.Mode' = None,
                profile: str = "Default",
                url: str = "about:blank",
                extra_args: List[str] = None) -> CDP:
-        """
-        Launch Chrome invisibly and return a CDP connection.
-
-        Args:
-            mode: StealthLauncher.Mode.HEADLESS | HIDDEN | OFFSCREEN
-            profile: Chrome profile directory name (e.g., "Profile 3")
-            url: Initial URL to open
-            extra_args: Additional Chrome arguments
-
-        Returns:
-            CDP instance connected to the launched Chrome
-        """
+        """Launch Chrome invisibly and return a CDP connection."""
         if mode is None:
             mode = self.Mode.HEADLESS
 
@@ -195,65 +202,36 @@ class StealthLauncher:
         if not chrome_path:
             raise FileNotFoundError("Chrome not found")
 
-        user_data = self.get_user_data_dir()
+        args = self._build_chrome_args(chrome_path, profile, mode, url, extra_args)
+        self._spawn_chrome(args, mode, profile)
+
+        cdp = self._wait_for_cdp(timeout=15)
+        if mode == self.Mode.HIDDEN and sys.platform == 'win32':
+            self._hide_window()
+        return cdp
+
+    def _build_chrome_args(self, chrome_path, profile, mode, url, extra_args):
+        """Assemble Chrome command-line arguments."""
         args = [
             chrome_path,
             f"--remote-debugging-port={self._port}",
-            f"--user-data-dir={user_data}",
+            f"--user-data-dir={self.get_user_data_dir()}",
             f"--profile-directory={profile}",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--disable-hang-monitor",
-            "--disable-prompt-on-repost",
-            "--disable-sync",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--mute-audio",
+            *self._BASE_CHROME_ARGS,
+            *self._MODE_ARGS.get(mode.name, []),
+            *(extra_args or []),
+            url,
         ]
+        return args
 
-        if mode == self.Mode.HEADLESS:
-            args.extend([
-                "--headless=new",
-                "--disable-gpu",
-                "--window-size=1920,1080",
-            ])
-        elif mode == self.Mode.OFFSCREEN:
-            args.extend([
-                "--window-position=-32000,-32000",
-                "--window-size=1920,1080",
-            ])
-        elif mode == self.Mode.HIDDEN:
-            args.extend([
-                "--window-size=1920,1080",
-            ])
-
-        if extra_args:
-            args.extend(extra_args)
-
-        args.append(url)
-
-        # Launch with CREATE_NO_WINDOW on Windows to suppress console
-        creation_flags = 0
-        if sys.platform == 'win32':
-            creation_flags = subprocess.CREATE_NO_WINDOW
-
+    def _spawn_chrome(self, args, mode, profile):
+        """Launch the Chrome subprocess."""
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
         logger.info(f"Launching Chrome in {mode.value} mode, profile={profile}")
         self._process = subprocess.Popen(
-            args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=creation_flags,
         )
-
-        # Wait for CDP to become available
-        cdp = self._wait_for_cdp(timeout=15)
-
-        # If HIDDEN mode, find and hide the window via Win32
-        if mode == self.Mode.HIDDEN and sys.platform == 'win32':
-            self._hide_window()
-
-        return cdp
 
     def _wait_for_cdp(self, timeout: int = 15) -> CDP:
         """Wait for Chrome CDP port to become available."""
@@ -901,64 +879,45 @@ class AutonomousAgent:
         self._on_complete: Optional[Callable] = None
 
     def perceive(self, tab_id: str = None, depth: str = 'standard') -> Observation:
-        """
-        Run a full perception cycle via GOD MODE.
-
-        Returns an Observation containing:
-        - Compressed scene text (for LLM)
-        - Page URL, title, type
-        - Element count
-        - UID-mapped elements for the executor
-        """
+        """Run a full perception cycle via GOD MODE."""
         t0 = time.time()
-
         try:
             self.god._ensure_modules()
             tab_id = tab_id or self.god._get_active_tab()
-
-            # Get the full perception
             result = self.god.see(tab_id=tab_id, depth=depth)
-
-            # Update executor's element map for UID targeting
             elements = result.get('elements', [])
             self.executor.update_elements(elements)
-
-            # Generate compressed scene
             scene = self.god.scene(tab_id=tab_id)
-
-            # Get URL
-            url = ""
-            try:
-                url = self.god.cdp.get_url(tab_id) or ""
-            except Exception:
-                url = self.god.cdp.eval(tab_id, 'window.location.href') or ""
-
-            # Get title
-            title = ""
-            try:
-                title = self.god.cdp.eval(tab_id, 'document.title') or ""
-            except Exception:
-                pass
-
-            elapsed_ms = int((time.time() - t0) * 1000)
-
+            url = self._safe_get_url(tab_id)
+            title = self._safe_get_title(tab_id)
             return Observation(
-                success=True,
-                page_url=url,
-                page_title=title,
-                page_type=result.get('page_type', ''),
-                scene=scene,
+                success=True, page_url=url, page_title=title,
+                page_type=result.get('page_type', ''), scene=scene,
                 elements_count=len(elements),
-                elapsed_ms=elapsed_ms,
+                elapsed_ms=int((time.time() - t0) * 1000),
+            )
+        except Exception as e:
+            return Observation(
+                success=False, error=str(e),
+                elapsed_ms=int((time.time() - t0) * 1000),
             )
 
-        except Exception as e:
-            elapsed_ms = int((time.time() - t0) * 1000)
-            return Observation(
-                success=False,
-                error=str(e),
-                elapsed_ms=elapsed_ms,
-            )
+    def _safe_get_url(self, tab_id: str) -> str:
+        """Get tab URL with fallback."""
+        try:
+            return self.god.cdp.get_url(tab_id) or ""
+        except Exception:
+            try:
+                return self.god.cdp.eval(tab_id, 'window.location.href') or ""
+            except Exception:
+                return ""
+
+    def _safe_get_title(self, tab_id: str) -> str:
+        """Get tab title safely."""
+        try:
+            return self.god.cdp.eval(tab_id, 'document.title') or ""
+        except Exception:
+            return ""
 
     def act(self, action: Action, tab_id: str = None) -> Observation:
         """
@@ -990,117 +949,83 @@ class AutonomousAgent:
 
     def run(self, task: str, decide_fn: Callable, max_steps: int = 30,
             tab_id: str = None, on_step: Callable = None) -> Dict:
-        """
-        Run the full autonomous loop with an LLM decision function.
-
-        Args:
-            task: Natural language task description
-            decide_fn: Function(system_prompt, user_prompt) → str (LLM response)
-                       Must accept two strings and return a string containing JSON action.
-            max_steps: Safety limit on total actions
-            tab_id: Target tab (or auto-detect active)
-            on_step: Optional callback(step_num, action, observation) per step
-
-        Returns:
-            Session summary dict
-
-        Example:
-            def my_llm(system, user):
-                # Call your LLM API here
-                return openai.chat(messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user}
-                ])
-
-            result = agent.run("Log into my account", decide_fn=my_llm)
-        """
+        """Run the full autonomous loop with an LLM decision function."""
         self.session.start(task, max_steps)
         self._on_step = on_step
-        step = 0
 
         try:
-            # Initial perception
             obs = self.perceive(tab_id)
             if not obs.success:
                 self.session.finish(False, f"Initial perception failed: {obs.error}")
                 return self.session.summary()
 
-            # Build initial prompt
             user_prompt = self.protocol.format_initial_prompt(
                 task, obs.scene, obs.page_url, obs.page_type
             )
-
-            while True:
-                step += 1
-
-                # Safety check
-                stop_reason = self.session.should_stop()
-                if stop_reason:
-                    self.session.finish(False, stop_reason)
-                    break
-
-                # Ask LLM for decision
-                try:
-                    llm_response = decide_fn(
-                        self.protocol.SYSTEM_PROMPT,
-                        user_prompt
-                    )
-                except Exception as e:
-                    self.session.finish(False, f"LLM error: {e}")
-                    break
-
-                # Parse LLM response into action
-                action = Action.from_json(llm_response)
-
-                # Terminal actions
-                if action.action == 'done':
-                    obs = Observation(
-                        success=True, action_result=action.reason or "Complete",
-                        step=step, page_url=obs.page_url, page_type=obs.page_type,
-                    )
-                    self.session.record_step(step, action, obs)
-                    self.session.finish(True, action.reason or "Task complete")
-                    break
-
-                if action.action == 'fail':
-                    obs = Observation(
-                        success=False, error=action.reason or "Agent gave up",
-                        step=step, page_url=obs.page_url,
-                    )
-                    self.session.record_step(step, action, obs)
-                    self.session.finish(False, action.reason or "Agent gave up")
-                    break
-
-                # Execute the action
-                obs = self.act(action, tab_id)
-                obs.step = step
-
-                # Record
-                self.session.record_step(step, action, obs)
-
-                # Callback
-                if self._on_step:
-                    try:
-                        self._on_step(step, action, obs)
-                    except Exception:
-                        pass
-
-                # Log
-                status = "✓" if obs.success else "✗"
-                logger.info(
-                    f"Step {step} {status}: {action.action} "
-                    f"→ {obs.action_result or obs.error}"
-                )
-
-                # Build next prompt for LLM
-                user_prompt = self.protocol.format_task_prompt(task, obs)
-
+            self._agent_loop(task, decide_fn, tab_id, obs, user_prompt)
         except KeyboardInterrupt:
             self.session.finish(False, "Interrupted by user")
         except Exception as e:
             self.session.finish(False, f"Unexpected error: {e}")
 
         return self.session.summary()
+
+    def _agent_loop(self, task, decide_fn, tab_id, obs, user_prompt):
+        """Core agent step loop."""
+        step = 0
+        while True:
+            step += 1
+            stop_reason = self.session.should_stop()
+            if stop_reason:
+                self.session.finish(False, stop_reason)
+                break
+
+            llm_response = self._get_llm_decision(decide_fn, user_prompt)
+            if llm_response is None:
+                break
+
+            action = Action.from_json(llm_response)
+
+            if action.action in ('done', 'fail'):
+                self._handle_terminal_action(action, step, obs)
+                break
+
+            obs = self._execute_step(action, tab_id, step)
+            user_prompt = self.protocol.format_task_prompt(task, obs)
+
+    def _get_llm_decision(self, decide_fn, user_prompt):
+        """Call LLM for a decision, finishing session on error."""
+        try:
+            return decide_fn(self.protocol.SYSTEM_PROMPT, user_prompt)
+        except Exception as e:
+            self.session.finish(False, f"LLM error: {e}")
+            return None
+
+    def _handle_terminal_action(self, action, step, obs):
+        """Process done/fail terminal actions."""
+        success = action.action == 'done'
+        reason = action.reason or ("Complete" if success else "Agent gave up")
+        term_obs = Observation(
+            success=success, step=step,
+            page_url=obs.page_url, page_type=obs.page_type,
+            **({"action_result": reason} if success else {"error": reason}),
+        )
+        self.session.record_step(step, action, term_obs)
+        self.session.finish(success, reason)
+
+    def _execute_step(self, action, tab_id, step):
+        """Execute one action step and record it."""
+        obs = self.act(action, tab_id)
+        obs.step = step
+        self.session.record_step(step, action, obs)
+        if self._on_step:
+            try:
+                self._on_step(step, action, obs)
+            except Exception:
+                pass
+        status = "\u2713" if obs.success else "\u2717"
+        logger.info(f"Step {step} {status}: {action.action} \u2192 {obs.action_result or obs.error}")
+        return obs
 
     def run_script(self, actions: List[Dict], tab_id: str = None,
                    delay: float = 0.5) -> Dict:
@@ -1152,95 +1077,89 @@ class AutonomousAgent:
         self.session.finish(True, "Script completed")
         return self.session.summary()
 
+    _INTERACTIVE_BANNER = (
+        "╔══════════════════════════════════════╗\n"
+        "║  GOD MODE Interactive Agent          ║\n"
+        "║  Type actions or 'quit' to exit      ║\n"
+        "╚══════════════════════════════════════╝\n"
+    )
+
     def interactive(self, tab_id: str = None):
-        """
-        Interactive REPL mode — type actions manually.
-
-        Commands:
-            click Submit          → click the Submit button
-            type Email me@x.com  → type into Email field
-            press Enter           → press Enter key
-            scroll down 500       → scroll down 500px
-            see                   → perceive current page
-            scene                 → show LLM scene
-            find login            → find login elements
-            quit                  → exit
-
-        For debugging and testing the action pipeline.
-        """
-        print("╔══════════════════════════════════════╗")
-        print("║  GOD MODE Interactive Agent          ║")
-        print("║  Type actions or 'quit' to exit      ║")
-        print("╚══════════════════════════════════════╝")
-        print()
-
+        """Interactive REPL mode -- type actions manually."""
+        print(self._INTERACTIVE_BANNER)
         while True:
             try:
                 raw = input("agent> ").strip()
             except (EOFError, KeyboardInterrupt):
                 break
-
             if not raw or raw == 'quit':
                 break
 
-            # Built-in commands
-            if raw == 'see':
-                obs = self.perceive(tab_id)
-                print(f"URL: {obs.page_url}")
-                print(f"Type: {obs.page_type}")
-                print(f"Elements: {obs.elements_count}")
-                continue
-            elif raw == 'scene':
-                obs = self.perceive(tab_id)
-                print(obs.scene)
-                continue
-            elif raw.startswith('find '):
-                concept = raw[5:]
-                results = self.god.find(concept, tab_id)
-                for r in results[:5]:
-                    print(f"  [{r.get('similarity', 0):.2f}] {r.get('role', '')} "
-                          f"\"{r.get('name', '')}\" @({r.get('x', 0)},{r.get('y', 0)})")
+            if self._handle_builtin_cmd(raw, tab_id):
                 continue
 
-            # Parse action from natural text
-            parts = raw.split(maxsplit=2)
-            action_type = parts[0].lower()
-
-            action_dict = {'action': action_type}
-            if action_type == 'click' and len(parts) >= 2:
-                action_dict['target'] = ' '.join(parts[1:])
-            elif action_type == 'type' and len(parts) >= 3:
-                action_dict['target'] = parts[1]
-                action_dict['value'] = parts[2]
-            elif action_type == 'press' and len(parts) >= 2:
-                action_dict['value'] = parts[1]
-            elif action_type == 'scroll' and len(parts) >= 2:
-                action_dict['direction'] = parts[1]
-                if len(parts) >= 3:
-                    try:
-                        action_dict['amount'] = int(parts[2])
-                    except ValueError:
-                        pass
-            elif action_type == 'navigate' and len(parts) >= 2:
-                action_dict['value'] = parts[1]
-            elif action_type == 'wait' and len(parts) >= 2:
-                action_dict['target'] = ' '.join(parts[1:])
-            elif action_type == 'dismiss':
-                pass
-            else:
-                # Try as JSON
-                try:
-                    action_dict = json.loads(raw)
-                except json.JSONDecodeError:
-                    print(f"Unknown: {raw}")
-                    continue
-
+            action_dict = self._parse_interactive_action(raw)
+            if action_dict is None:
+                continue
             action = Action.from_dict(action_dict)
             obs = self.act(action, tab_id)
-            status = "✓" if obs.success else "✗"
+            status = "\u2713" if obs.success else "\u2717"
             print(f"  {status} {obs.action_result or obs.error}")
-
         print("Bye.")
+
+    def _handle_builtin_cmd(self, raw, tab_id) -> bool:
+        """Handle built-in REPL commands (see, scene, find). Returns True if handled."""
+        if raw == 'see':
+            obs = self.perceive(tab_id)
+            print(f"URL: {obs.page_url}\nType: {obs.page_type}\nElements: {obs.elements_count}")
+            return True
+        if raw == 'scene':
+            obs = self.perceive(tab_id)
+            print(obs.scene)
+            return True
+        if raw.startswith('find '):
+            results = self.god.find(raw[5:], tab_id)
+            for r in results[:5]:
+                print(f"  [{r.get('similarity', 0):.2f}] {r.get('role', '')} "
+                      f"\"{r.get('name', '')}\" @({r.get('x', 0)},{r.get('y', 0)})")
+            return True
+        return False
+
+    def _parse_interactive_action(self, raw) -> dict:
+        """Parse a natural-text action into an action dict, or None on failure."""
+        parts = raw.split(maxsplit=2)
+        action_type = parts[0].lower()
+
+        parsers = {
+            'click':    lambda p: {'target': ' '.join(p[1:])} if len(p) >= 2 else {},
+            'type':     lambda p: {'target': p[1], 'value': p[2]} if len(p) >= 3 else {},
+            'press':    lambda p: {'value': p[1]} if len(p) >= 2 else {},
+            'scroll':   lambda p: self._parse_scroll(p),
+            'navigate': lambda p: {'value': p[1]} if len(p) >= 2 else {},
+            'wait':     lambda p: {'target': ' '.join(p[1:])} if len(p) >= 2 else {},
+            'dismiss':  lambda p: {},
+        }
+
+        if action_type in parsers:
+            d = {'action': action_type}
+            d.update(parsers[action_type](parts))
+            return d
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            print(f"Unknown: {raw}")
+            return None
+
+    @staticmethod
+    def _parse_scroll(parts):
+        d = {'direction': parts[1]} if len(parts) >= 2 else {}
+        if len(parts) >= 3:
+            try:
+                d['amount'] = int(parts[2])
+            except ValueError:
+                pass
+        return d
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1345,92 +1264,77 @@ def stealth_open(url: str, profile: str = "Default",
 # CLI
 # ═══════════════════════════════════════════════════════════════════════
 
+def _cmd_interactive(args):
+    if args.url and args.profile:
+        launcher, god = stealth_open(args.url, args.profile, args.mode, args.port)
+        try:
+            AutonomousAgent(god=god).interactive()
+        finally:
+            launcher.stop()
+    else:
+        agent = AutonomousAgent(cdp_port=args.port)
+        if args.url:
+            agent.god.navigate(args.url)
+            time.sleep(1)
+        agent.interactive()
+
+
+def _cmd_script(args):
+    if not args.script:
+        print("Usage: agent.py script --script actions.json [--url URL] [--profile PROFILE]")
+        return
+    with open(args.script, 'r') as f:
+        actions = json.load(f)
+    if args.profile:
+        result = quick_script(args.url or 'about:blank', actions, profile=args.profile, port=args.port)
+    else:
+        agent = AutonomousAgent(cdp_port=args.port)
+        if args.url:
+            agent.god.navigate(args.url)
+            time.sleep(1)
+        result = agent.run_script(actions)
+    print(json.dumps(result, indent=2, default=str))
+
+
+def _cmd_stealth(args):
+    if not args.url:
+        print("Usage: agent.py stealth --url URL [--profile PROFILE] [--mode headless]")
+        return
+    profile = args.profile or 'Default'
+    launcher, god = stealth_open(args.url, profile, args.mode, args.port)
+    try:
+        print(f"Connected to {args.url} (stealth/{args.mode})\nProfile: {profile}\n")
+        print(god.scene())
+        print("\nPress Enter to close...")
+        input()
+    finally:
+        launcher.stop()
+
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser(
-        description='Autonomous Agent — AI-driven web navigation')
-    parser.add_argument('command',
-                        choices=['interactive', 'script', 'profiles',
-                                 'stealth', 'perceive', 'status'],
+    parser = argparse.ArgumentParser(description='Autonomous Agent -- AI-driven web navigation')
+    parser.add_argument('command', choices=['interactive', 'script', 'profiles',
+                                            'stealth', 'perceive', 'status'],
                         help='Command to run')
     parser.add_argument('--url', default=None, help='Target URL')
     parser.add_argument('--profile', default=None,
-                        help='Chrome profile directory or display name (e.g. "SOCIALS", "Mak")')
+                        help='Chrome profile directory or display name')
     parser.add_argument('--port', type=int, default=9222, help='CDP port')
     parser.add_argument('--mode', default='headless',
-                        choices=['headless', 'hidden', 'offscreen'],
-                        help='Stealth mode')
+                        choices=['headless', 'hidden', 'offscreen'], help='Stealth mode')
     parser.add_argument('--script', default=None, help='Path to JSON script file')
-
     args = parser.parse_args()
 
-    if args.command == 'profiles':
-        profiles = StealthLauncher.list_profiles()
-        for p in profiles:
-            print(f"  {p['directory']:20s} → {p['name']}")
-
-    elif args.command == 'status':
-        agent = AutonomousAgent(cdp_port=args.port)
-        print(json.dumps(agent.god.status(), indent=2))
-
-    elif args.command == 'perceive':
-        agent = AutonomousAgent(cdp_port=args.port)
-        obs = agent.perceive()
-        print(obs.to_prompt())
-
-    elif args.command == 'interactive':
-        if args.url and args.profile:
-            launcher, god = stealth_open(args.url, args.profile, args.mode, args.port)
-            try:
-                agent = AutonomousAgent(god=god)
-                agent.interactive()
-            finally:
-                launcher.stop()
-        else:
-            agent = AutonomousAgent(cdp_port=args.port)
-            if args.url:
-                agent.god.navigate(args.url)
-                time.sleep(1)
-            agent.interactive()
-
-    elif args.command == 'script':
-        if not args.script:
-            print("Usage: agent.py script --script actions.json [--url URL] [--profile PROFILE]")
-            return
-        with open(args.script, 'r') as f:
-            actions = json.load(f)
-
-        if args.profile:
-            result = quick_script(
-                args.url or 'about:blank', actions,
-                profile=args.profile, port=args.port
-            )
-        else:
-            agent = AutonomousAgent(cdp_port=args.port)
-            if args.url:
-                agent.god.navigate(args.url)
-                time.sleep(1)
-            result = agent.run_script(actions)
-
-        print(json.dumps(result, indent=2, default=str))
-
-    elif args.command == 'stealth':
-        if not args.url:
-            print("Usage: agent.py stealth --url URL [--profile PROFILE] [--mode headless]")
-            return
-        profile = args.profile or 'Default'
-        launcher, god = stealth_open(args.url, profile, args.mode, args.port)
-        try:
-            obs_text = god.scene()
-            print(f"Connected to {args.url} (stealth/{args.mode})")
-            print(f"Profile: {profile}")
-            print()
-            print(obs_text)
-            print()
-            print("Press Enter to close...")
-            input()
-        finally:
-            launcher.stop()
+    handlers = {
+        'profiles':    lambda: [print(f"  {p['directory']:20s} -> {p['name']}") for p in StealthLauncher.list_profiles()],
+        'status':      lambda: print(json.dumps(AutonomousAgent(cdp_port=args.port).god.status(), indent=2)),
+        'perceive':    lambda: print(AutonomousAgent(cdp_port=args.port).perceive().to_prompt()),
+        'interactive': lambda: _cmd_interactive(args),
+        'script':      lambda: _cmd_script(args),
+        'stealth':     lambda: _cmd_stealth(args),
+    }
+    handlers[args.command]()
 
 
 if __name__ == '__main__':

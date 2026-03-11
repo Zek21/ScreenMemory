@@ -118,7 +118,9 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
-        self.send_header('Access-Control-Allow-Origin', '*')
+        origin = self.headers.get('Origin', '')
+        allowed = origin if origin.startswith(('http://localhost', 'http://127.0.0.1')) else 'http://localhost'
+        self.send_header('Access-Control-Allow-Origin', allowed)
         self.end_headers()
         self.wfile.write(body)
 
@@ -331,6 +333,114 @@ def _poll_god_file(god_file, last_god_mtime):
     return last_god_mtime
 
 
+def _poll_worker_results(last_results):
+    """Scan for worker result files (worker_*_result_*.json) and process them."""
+    AGENT_NAMES = ["alpha", "beta", "gamma", "delta"]
+    for result_path in QUEUE_DIR.glob("worker_*_result_*.json"):
+        try:
+            mtime = result_path.stat().st_mtime
+            if last_results.get(result_path.name) != mtime:
+                last_results[result_path.name] = mtime
+                with open(result_path, 'r') as f:
+                    result = json.load(f)
+
+                parts = result_path.stem.split('_')
+                worker_id = int(parts[1])
+                agent_id = AGENT_NAMES[worker_id] if worker_id < len(AGENT_NAMES) else AGENT_NAMES[0]
+
+                _process_result(
+                    agent_id,
+                    result.get("status", "unknown"),
+                    result.get("output", ""),
+                    result.get("description", result.get("task_id", "task")),
+                )
+
+                try:
+                    result_path.unlink()
+                except OSError as e:
+                    logger.debug(f"Failed to clean up {result_path}: {e}")
+        except (json.JSONDecodeError, OSError, IndexError, ValueError) as e:
+            logger.debug(f"Failed to process result {result_path}: {e}")
+
+
+def _poll_legacy_results(last_results):
+    """Check legacy per-agent result files."""
+    AGENT_NAMES = ["alpha", "beta", "gamma", "delta"]
+    for agent_id in AGENT_NAMES:
+        result_file = QUEUE_DIR / f"{agent_id}_result.json"
+        if not result_file.exists():
+            continue
+        try:
+            mtime = result_file.stat().st_mtime
+            key = f"{agent_id}_result"
+            if last_results.get(key) != mtime:
+                last_results[key] = mtime
+                with open(result_file, 'r') as f:
+                    result = json.load(f)
+                _process_result(
+                    agent_id,
+                    result.get("status", "unknown"),
+                    result.get("output", ""),
+                    result.get("description", "task"),
+                )
+        except (json.JSONDecodeError, OSError) as e:
+            logger.debug(f"Failed to process legacy result for {agent_id}: {e}")
+
+
+def _poll_live_status(agent_id, last_live_times, last_worker_status):
+    """Check live status files for a single agent."""
+    worker_id = {"alpha": 0, "beta": 1, "gamma": 2, "delta": 3}[agent_id]
+    status_file = QUEUE_DIR / f"worker_{worker_id}_live.json"
+    legacy_status_file = QUEUE_DIR / f"{agent_id}_live.json"
+
+    active_status_file = status_file if status_file.exists() else (legacy_status_file if legacy_status_file.exists() else None)
+    if not active_status_file:
+        return
+
+    try:
+        mtime = active_status_file.stat().st_mtime
+        if last_live_times.get(agent_id) == mtime:
+            return
+        last_live_times[agent_id] = mtime
+        with open(active_status_file, 'r') as f:
+            live = json.load(f)
+
+        prev_status = last_worker_status.get(agent_id, "IDLE")
+        new_status = live.get("status", "IDLE")
+
+        with lock:
+            state = agent_states[agent_id]
+            if live.get("status"):
+                state["status"] = live["status"]
+            if live.get("tasks_completed"):
+                state["tasks_completed"] = live["tasks_completed"]
+            if live.get("current_task"):
+                state["current_task"] = live["current_task"]
+            elif new_status == "IDLE":
+                state["current_task"] = None
+            lines = live.get("new_lines", [])
+            if lines:
+                state["progress"] = min(90, state.get("progress", 0) + len(lines) * 5)
+            for line in lines:
+                add_log(agent_id, line)
+                add_orch_thought(f"  {agent_id.upper()} \u25b8 {line[:80]}", "info")
+
+        if new_status == "WORKING" and prev_status != "WORKING":
+            task_desc = live.get("current_task", "unknown task")
+            add_log(agent_id, f"\u25b6 Working: {task_desc}")
+            add_orch_thought(f"\u25b8 DISPATCH \u2192 {agent_id.upper()}: {task_desc}", "route")
+            with lock:
+                agent_states[agent_id]["progress"] = 10
+        elif new_status == "IDLE" and prev_status == "WORKING":
+            add_log(agent_id, f"\u2713 Completed task")
+            with lock:
+                agent_states[agent_id]["progress"] = 0
+
+        last_worker_status[agent_id] = new_status
+    except (json.JSONDecodeError, OSError) as e:
+        logger.debug(f"Failed to read live status for {agent_id}: {e}")
+
+
 def poll_agent_status():
     """Poll agent files at high frequency for real-time monitoring."""
     AGENT_NAMES = ["alpha", "beta", "gamma", "delta"]
@@ -347,120 +457,23 @@ def poll_agent_status():
         last_orch_mtime = _poll_orch_file(orch_file, last_orch_mtime)
         last_god_mtime = _poll_god_file(god_file, last_god_mtime)
 
-        # Monitor shared task queue for pending task count
         try:
             mtime = TASK_QUEUE_FILE.stat().st_mtime if TASK_QUEUE_FILE.exists() else 0
             if mtime and last_results.get("task_queue") != mtime:
                 last_results["task_queue"] = mtime
                 queue_status = _read_task_queue_status()
                 if queue_status["size"] > 0:
-                    add_orch_thought(f"📋 QUEUE: {queue_status['size']} tasks pending", "route")
+                    add_orch_thought(f"\U0001f4cb QUEUE: {queue_status['size']} tasks pending", "route")
         except OSError as e:
             logger.debug(f"Failed to check task queue: {e}")
 
-        # Scan for worker result files (worker_*_result_*.json)
-        for result_path in QUEUE_DIR.glob("worker_*_result_*.json"):
-            try:
-                mtime = result_path.stat().st_mtime
-                if last_results.get(result_path.name) != mtime:
-                    last_results[result_path.name] = mtime
-                    with open(result_path, 'r') as f:
-                        result = json.load(f)
+        _poll_worker_results(last_results)
+        _poll_legacy_results(last_results)
 
-                    # Map worker_id to agent_id for dashboard display
-                    parts = result_path.stem.split('_')
-                    worker_id = int(parts[1])
-                    agent_id = AGENT_NAMES[worker_id] if worker_id < len(AGENT_NAMES) else AGENT_NAMES[0]
-
-                    _process_result(
-                        agent_id,
-                        result.get("status", "unknown"),
-                        result.get("output", ""),
-                        result.get("description", result.get("task_id", "task")),
-                    )
-
-                    # Clean up processed result file
-                    try:
-                        result_path.unlink()
-                    except OSError as e:
-                        logger.debug(f"Failed to clean up {result_path}: {e}")
-            except (json.JSONDecodeError, OSError, IndexError, ValueError) as e:
-                logger.debug(f"Failed to process result {result_path}: {e}")
-
-        # Also check legacy per-agent result files
         for agent_id in AGENT_NAMES:
-            result_file = QUEUE_DIR / f"{agent_id}_result.json"
-            if result_file.exists():
-                try:
-                    mtime = result_file.stat().st_mtime
-                    key = f"{agent_id}_result"
-                    if last_results.get(key) != mtime:
-                        last_results[key] = mtime
-                        with open(result_file, 'r') as f:
-                            result = json.load(f)
+            _poll_live_status(agent_id, last_live_times, last_worker_status)
 
-                        _process_result(
-                            agent_id,
-                            result.get("status", "unknown"),
-                            result.get("output", ""),
-                            result.get("description", "task"),
-                        )
-                except (json.JSONDecodeError, OSError) as e:
-                    logger.debug(f"Failed to process legacy result for {agent_id}: {e}")
-
-        # Check live status files (worker_N_live.json or legacy agent_live.json)
-        for agent_id in AGENT_NAMES:
-            worker_id = {"alpha": 0, "beta": 1, "gamma": 2, "delta": 3}[agent_id]
-            status_file = QUEUE_DIR / f"worker_{worker_id}_live.json"
-            legacy_status_file = QUEUE_DIR / f"{agent_id}_live.json"
-
-            active_status_file = status_file if status_file.exists() else (legacy_status_file if legacy_status_file.exists() else None)
-            if active_status_file:
-                try:
-                    mtime = active_status_file.stat().st_mtime
-                    if last_live_times.get(agent_id) != mtime:
-                        last_live_times[agent_id] = mtime
-                        with open(active_status_file, 'r') as f:
-                            live = json.load(f)
-
-                        prev_status = last_worker_status.get(agent_id, "IDLE")
-                        new_status = live.get("status", "IDLE")
-
-                        with lock:
-                            state = agent_states[agent_id]
-                            if live.get("status"):
-                                state["status"] = live["status"]
-                            if live.get("tasks_completed"):
-                                state["tasks_completed"] = live["tasks_completed"]
-                            if live.get("current_task"):
-                                state["current_task"] = live["current_task"]
-                            elif new_status == "IDLE":
-                                state["current_task"] = None
-                            # Progress based on output lines
-                            lines = live.get("new_lines", [])
-                            if lines:
-                                state["progress"] = min(90, state.get("progress", 0) + len(lines) * 5)
-                            for line in lines:
-                                add_log(agent_id, line)
-                                add_orch_thought(f"  {agent_id.upper()} ▸ {line[:80]}", "info")
-
-                        # Detect status transitions and generate synthetic logs
-                        if new_status == "WORKING" and prev_status != "WORKING":
-                            task_desc = live.get("current_task", "unknown task")
-                            add_log(agent_id, f"▶ Working: {task_desc}")
-                            add_orch_thought(f"▸ DISPATCH → {agent_id.upper()}: {task_desc}", "route")
-                            with lock:
-                                agent_states[agent_id]["progress"] = 10
-                        elif new_status == "IDLE" and prev_status == "WORKING":
-                            add_log(agent_id, f"✓ Completed task")
-                            with lock:
-                                agent_states[agent_id]["progress"] = 0
-
-                        last_worker_status[agent_id] = new_status
-                except (json.JSONDecodeError, OSError) as e:
-                    logger.debug(f"Failed to read live status for {agent_id}: {e}")
-
-        time.sleep(0.15)  # 150ms poll for real-time feel
+        time.sleep(0.15)
 
 
 def main():

@@ -98,52 +98,33 @@ def _post(url, body, timeout=5):
         return 0, elapsed, str(e)
 
 
-def stress_endpoints(iterations=100):
-    """Hit all GOD Console endpoints N times, measure response times."""
-    print(f"\n{C_GOLD}{C_BOLD}ENDPOINT STRESS TEST ({iterations} iterations){C_RESET}")
+def _bench_endpoint_list(base_url: str, endpoints: list, iterations: int,
+                         timeout: int = 10) -> dict:
+    """Benchmark a list of endpoints and return {endpoint: stats_dict}."""
     results = {}
-
-    for ep in GOD_ENDPOINTS:
-        url = f"{GOD_CONSOLE}{ep}"
+    for ep in endpoints:
+        url = f"{base_url}{ep}"
         times = []
         errors = 0
         for _ in range(iterations):
-            status, _, ms, err = _fetch(url, timeout=10)
+            status, _, ms, err = _fetch(url, timeout=timeout)
             if err or status >= 500:
                 errors += 1
             times.append(ms)
+        sorted_times = sorted(times)
+        results[ep] = {
+            "avg": sum(times) / len(times),
+            "p50": sorted_times[len(times) // 2],
+            "p99": sorted_times[int(len(times) * 0.99)],
+            "max": max(times),
+            "errors": errors,
+        }
+    return results
 
-        avg = sum(times) / len(times)
-        p50 = sorted(times)[len(times) // 2]
-        p99 = sorted(times)[int(len(times) * 0.99)]
-        mx = max(times)
-        results[ep] = {"avg": avg, "p50": p50, "p99": p99, "max": mx, "errors": errors}
 
-    # Slow endpoints -- fewer iterations (these probe self-awareness)
-    slow_iters = max(3, iterations // 10)
-    print(f"\n{C_GOLD}Slow endpoints ({slow_iters} iterations):{C_RESET}")
-    for ep in SLOW_ENDPOINTS:
-        url = f"{GOD_CONSOLE}{ep}"
-        times = []
-        errors = 0
-        for _ in range(slow_iters):
-            status, _, ms, err = _fetch(url, timeout=30)
-            if err or status >= 500:
-                errors += 1
-            times.append(ms)
-        avg = sum(times) / len(times)
-        mx = max(times)
-        results[ep] = {"avg": avg, "p50": sorted(times)[len(times)//2], "p99": mx, "max": mx, "errors": errors}
-
-        avg = sum(times) / len(times)
-        p50 = sorted(times)[len(times) // 2]
-        p99 = sorted(times)[int(len(times) * 0.99)]
-        mx = max(times)
-        results[ep] = {"avg": avg, "p50": p50, "p99": p99, "max": mx, "errors": errors}
-
-    # Sort by avg descending (slowest first)
+def _print_results_table(results: dict):
+    """Print a formatted results table sorted by avg descending."""
     ranked = sorted(results.items(), key=lambda x: -x[1]["avg"])
-
     print(f"{'ENDPOINT':<30} {'AVG':>8} {'P50':>8} {'P99':>8} {'MAX':>8} {'ERR':>5}")
     print(f"{'-'*30} {'-'*8} {'-'*8} {'-'*8} {'-'*8} {'-'*5}")
     for ep, r in ranked:
@@ -151,12 +132,24 @@ def stress_endpoints(iterations=100):
         print(f"{color}{ep:<30}{C_RESET} {r['avg']:>7.1f}ms {r['p50']:>7.1f}ms "
               f"{r['p99']:>7.1f}ms {r['max']:>7.1f}ms {r['errors']:>5}")
 
+
+def stress_endpoints(iterations=100):
+    """Hit all GOD Console endpoints N times, measure response times."""
+    print(f"\n{C_GOLD}{C_BOLD}ENDPOINT STRESS TEST ({iterations} iterations){C_RESET}")
+
+    results = _bench_endpoint_list(GOD_CONSOLE, GOD_ENDPOINTS, iterations)
+
+    slow_iters = max(3, iterations // 10)
+    print(f"\n{C_GOLD}Slow endpoints ({slow_iters} iterations):{C_RESET}")
+    results.update(_bench_endpoint_list(GOD_CONSOLE, SLOW_ENDPOINTS, slow_iters, timeout=30))
+
+    _print_results_table(results)
+
     # Skynet backend endpoints
     print(f"\n{C_GOLD}{C_BOLD}SKYNET BACKEND ENDPOINTS{C_RESET}")
     for ep in SKYNET_ENDPOINTS:
         url = f"{SKYNET}{ep}"
         if ep == "/stream":
-            # SSE -- just test connection, don't read stream
             status, _, ms, err = _fetch(url, timeout=2)
             label = f"{C_GREEN}OK{C_RESET}" if status == 200 or err and "timeout" in str(err).lower() else f"{C_RED}FAIL{C_RESET}"
             print(f"  {ep:<30} {label} ({ms:.0f}ms)")

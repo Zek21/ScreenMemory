@@ -324,58 +324,38 @@ class DynaActFilter:
     def filter_actions(self, candidate_actions: list,
                        task_description: str,
                        current_state_description: str = "") -> list:
-        """
-        Filter candidate actions to a context-relevant subset.
-
-        Args:
-            candidate_actions: List of all possible actions
-            task_description: Current subtask description
-            current_state_description: Description of current visual state
-
-        Returns:
-            Filtered list of most relevant actions
-        """
+        """Filter candidate actions to a context-relevant subset."""
         task_lower = task_description.lower()
-        scored = []
-
-        for action in candidate_actions:
-            score = 0.5  # Base score
-
-            # Task relevance
-            action_str = str(action).lower() if hasattr(action, '__str__') else str(action).lower()
-
-            # Boost actions matching task keywords
-            task_words = set(task_lower.split())
-            action_words = set(action_str.split())
-            overlap = len(task_words & action_words)
-            score += overlap * 0.15
-
-            # Boost historically successful actions
-            action_key = action_str[:50]
-            if action_key in self._action_success_history:
-                score += min(0.3, self._action_success_history[action_key] * 0.1)
-
-            # Penalize actions that Reflexion says to avoid
-            if self.reflexion:
-                action_type = getattr(action, 'action_type', str(type(action).__name__))
-                target = getattr(action, 'target', '')
-                adjustment = self.reflexion.should_adjust_action(
-                    str(action_type), str(target))
-                if adjustment:
-                    score -= 0.3
-                    logger.debug(f"[DYNAACT] penalize: {action_str[:40]} (reflexion)")
-
-            scored.append((score, action))
-
-        # Sort by score, take top actions
+        scored = [
+            (self._score_action(action, task_lower), action)
+            for action in candidate_actions
+        ]
         scored.sort(key=lambda x: x[0], reverse=True)
-
-        # Take at least 3, at most 8 actions
         n = max(3, min(8, len(scored) // 2))
         filtered = [action for _, action in scored[:n]]
-
         logger.info(f"[DYNAACT] filter: {len(candidate_actions)} -> {len(filtered)} actions")
         return filtered
+
+    def _score_action(self, action, task_lower: str) -> float:
+        """Compute relevance score for a single action."""
+        score = 0.5
+        action_str = str(action).lower()
+
+        task_words = set(task_lower.split())
+        action_words = set(action_str.split())
+        score += len(task_words & action_words) * 0.15
+
+        action_key = action_str[:50]
+        if action_key in self._action_success_history:
+            score += min(0.3, self._action_success_history[action_key] * 0.1)
+
+        if self.reflexion:
+            action_type = getattr(action, 'action_type', str(type(action).__name__))
+            target = getattr(action, 'target', '')
+            adjustment = self.reflexion.should_adjust_action(str(action_type), str(target))
+            if adjustment:
+                score -= 0.3
+        return score
 
     def record_success(self, action_str: str):
         """Record a successful action for future boosting."""

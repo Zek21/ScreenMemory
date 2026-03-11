@@ -44,22 +44,8 @@ def discover_test_files(pattern: Optional[str] = None) -> list[Path]:
     return files
 
 
-def run_pytest(test_files: list[Path], timeout: int = 300) -> dict:
-    """Run pytest on given files and return structured results."""
-    if not test_files:
-        return {
-            "exit_code": 0,
-            "passed": 0,
-            "failed": 0,
-            "errors": 0,
-            "skipped": 0,
-            "total": 0,
-            "duration_s": 0.0,
-            "output": "No test files to run",
-            "files": [],
-        }
-
-    file_args = [str(f) for f in test_files]
+def _check_recursion_depth(test_files):
+    """Check CI recursion depth. Returns early-return dict if nested, else None."""
     depth = 0
     try:
         depth = int(os.environ.get(CI_DEPTH_ENV, "0"))
@@ -77,13 +63,14 @@ def run_pytest(test_files: list[Path], timeout: int = 300) -> dict:
             "output": f"Nested skynet_ci pytest invocation blocked at depth={depth}",
             "files": [f.name for f in test_files],
         }
+    return None
 
+
+def _execute_pytest(file_args, env, timeout):
+    """Run pytest subprocess and return (output, exit_code, duration)."""
     cmd = [sys.executable, "-m", "pytest"] + file_args + [
         "-v", "--tb=short", "--no-header", "-q",
     ]
-    env = os.environ.copy()
-    env[CI_DEPTH_ENV] = str(depth + 1)
-
     start = time.time()
     try:
         proc = subprocess.run(
@@ -103,18 +90,35 @@ def run_pytest(test_files: list[Path], timeout: int = 300) -> dict:
         output = f"Error running pytest: {e}"
         exit_code = -2
     duration = round(time.time() - start, 2)
+    return output, exit_code, duration
 
+
+def run_pytest(test_files: list[Path], timeout: int = 300) -> dict:
+    """Run pytest on given files and return structured results."""
+    if not test_files:
+        return {
+            "exit_code": 0, "passed": 0, "failed": 0, "errors": 0,
+            "skipped": 0, "total": 0, "duration_s": 0.0,
+            "output": "No test files to run", "files": [],
+        }
+
+    blocked = _check_recursion_depth(test_files)
+    if blocked:
+        return blocked
+
+    file_args = [str(f) for f in test_files]
+    env = os.environ.copy()
+    depth = int(env.get(CI_DEPTH_ENV, "0"))
+    env[CI_DEPTH_ENV] = str(depth + 1)
+
+    output, exit_code, duration = _execute_pytest(file_args, env, timeout)
     passed, failed, errors, skipped = _parse_summary(output)
 
     return {
         "exit_code": exit_code,
-        "passed": passed,
-        "failed": failed,
-        "errors": errors,
-        "skipped": skipped,
-        "total": passed + failed + errors + skipped,
-        "duration_s": duration,
-        "output": output,
+        "passed": passed, "failed": failed, "errors": errors,
+        "skipped": skipped, "total": passed + failed + errors + skipped,
+        "duration_s": duration, "output": output,
         "files": [f.name for f in test_files],
     }
 
@@ -218,19 +222,33 @@ def run_health_scan() -> dict:
     }
 
 
+def _run_optional_scans(full):
+    """Run security audit and health scan if full=True. Returns (security_result, health_result, categories_update)."""
+    if not full:
+        return None, None, {}
+
+    security_result = run_security_audit()
+    health_result = run_health_scan()
+
+    categories = {}
+    categories["security"] = {"status": security_result["status"],
+                               "passed": security_result.get("passed", 0),
+                               "failed": security_result.get("failed", 0)}
+    categories["health"] = {"status": health_result["status"],
+                             "modules_ok": health_result["modules_ok"],
+                             "modules_failed": health_result["modules_failed"]}
+    return security_result, health_result, categories
+
+
 def run_ci(
     pattern: Optional[str] = None,
     timeout: int = 300,
     save: bool = True,
     full: bool = False,
 ) -> dict:
-    """Full CI run: discover tests, execute, generate report, save.
-
-    When full=True, also runs security audit and codebase health scan.
-    """
+    """Full CI run: discover tests, execute, generate report, save."""
     run_id = datetime.now(timezone.utc).strftime("ci-%Y%m%d-%H%M%S")
     test_files = discover_test_files(pattern)
-
     results = run_pytest(test_files, timeout=timeout)
 
     overall_status = "PASS" if results["exit_code"] == 0 else "FAIL"
@@ -238,33 +256,19 @@ def run_ci(
                             "passed": results["passed"], "failed": results["failed"],
                             "errors": results["errors"]}}
 
-    security_result = None
-    health_result = None
-
-    if full:
-        security_result = run_security_audit()
-        categories["security"] = {"status": security_result["status"],
-                                   "passed": security_result.get("passed", 0),
-                                   "failed": security_result.get("failed", 0)}
-        if security_result["status"] == "FAIL":
-            overall_status = "FAIL"
-
-        health_result = run_health_scan()
-        categories["health"] = {"status": health_result["status"],
-                                 "modules_ok": health_result["modules_ok"],
-                                 "modules_failed": health_result["modules_failed"]}
-        if health_result["status"] == "FAIL":
-            overall_status = "FAIL"
+    security_result, health_result, scan_cats = _run_optional_scans(full)
+    categories.update(scan_cats)
+    if security_result and security_result["status"] == "FAIL":
+        overall_status = "FAIL"
+    if health_result and health_result["status"] == "FAIL":
+        overall_status = "FAIL"
 
     report = {
         "run_id": run_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "pattern": pattern,
-        "full": full,
-        "test_count": len(test_files),
-        "results": results,
-        "categories": categories,
-        "status": overall_status,
+        "pattern": pattern, "full": full,
+        "test_count": len(test_files), "results": results,
+        "categories": categories, "status": overall_status,
         "summary": (
             f"{results['passed']} passed, {results['failed']} failed, "
             f"{results['errors']} errors in {results['duration_s']}s"
@@ -274,10 +278,8 @@ def run_ci(
         report["security"] = security_result
     if health_result:
         report["health"] = health_result
-
     if save:
         _save_run(run_id, report)
-
     return report
 
 
@@ -341,15 +343,10 @@ def list_runs(limit: int = 10) -> list[dict]:
     return runs
 
 
-def generate_report(run: Optional[dict] = None) -> str:
-    """Generate a human-readable report from a CI run."""
-    if run is None:
-        run = latest_run()
-    if run is None:
-        return "No CI runs found."
-
+def _report_header_lines(run):
+    """Generate the header section of a CI report."""
     r = run.get("results", {})
-    lines = [
+    return [
         f"{'='*60}",
         f"CI REPORT: {run.get('run_id', '?')}",
         f"{'='*60}",
@@ -365,23 +362,26 @@ def generate_report(run: Optional[dict] = None) -> str:
         f"  Duration:  {r.get('duration_s', 0)}s",
     ]
 
+
+def _report_detail_lines(run):
+    """Generate the detail section of a CI report (categories, security, health, files, output)."""
+    r = run.get("results", {})
+    lines = []
     cats = run.get("categories", {})
     if cats:
-        lines.append(f"  {'─'*40}")
+        lines.append(f"  {'_'*40}")
         lines.append("  Categories:")
         for cat, info in cats.items():
             lines.append(f"    {cat}: {info.get('status', '?')}")
 
     lines.append(f"{'='*60}")
 
-    # Security details
     sec = run.get("security")
     if sec:
         lines.append(f"\n  Security Audit: {sec.get('status', '?')}  "
                       f"(pass={sec.get('passed',0)} fail={sec.get('failed',0)} "
                       f"warn={sec.get('warnings',0)} crit={sec.get('critical',0)})")
 
-    # Health details
     hlth = run.get("health")
     if hlth:
         lines.append(f"  Health Scan:    {hlth.get('status', '?')}  "
@@ -394,6 +394,17 @@ def generate_report(run: Optional[dict] = None) -> str:
     if r.get("output"):
         lines.append("\n--- Output ---")
         lines.append(r["output"][:2000])
+    return lines
+
+
+def generate_report(run: Optional[dict] = None) -> str:
+    """Generate a human-readable report from a CI run."""
+    if run is None:
+        run = latest_run()
+    if run is None:
+        return "No CI runs found."
+    lines = _report_header_lines(run)
+    lines.extend(_report_detail_lines(run))
     return "\n".join(lines)
 
 
@@ -416,7 +427,8 @@ def ci_status() -> dict:
     }
 
 
-def main() -> int:
+def _build_arg_parser():
+    """Build and return the argument parser for skynet_ci."""
     parser = argparse.ArgumentParser(description="Skynet CI Runner")
     sub = parser.add_subparsers(dest="command")
 
@@ -433,7 +445,11 @@ def main() -> int:
 
     p_hist = sub.add_parser("history", help="List recent runs")
     p_hist.add_argument("--limit", type=int, default=10)
+    return parser
 
+
+def main() -> int:
+    parser = _build_arg_parser()
     args = parser.parse_args()
 
     if args.command == "run":

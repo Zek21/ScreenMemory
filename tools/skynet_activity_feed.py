@@ -279,6 +279,71 @@ def _get_worker_state(hwnd):
         return "UNKNOWN"
 
 
+def _process_deltas(name, delta, activity_data, now):
+    """Process delta lines: classify, extract tool info, update activity, post to bus."""
+    for line in delta[-5:]:
+        atype = classify_activity(line)
+        tool, filepath = _extract_tool_info(line)
+
+        activity_data[name]["current_activity"] = line[:200]
+        if tool:
+            activity_data[name]["last_tool"] = tool
+        if filepath:
+            activity_data[name]["last_file"] = filepath
+
+        activity_data[name]["recent_activities"].append({
+            "type": atype,
+            "text": line[:200],
+            "tool": tool,
+            "file": filepath,
+            "timestamp": now,
+        })
+        activity_data[name]["recent_activities"] = \
+            activity_data[name]["recent_activities"][-MAX_RECENT:]
+
+        _post_to_bus(name, atype, line)
+
+
+def _scan_worker(name, hwnd, snapshots, hashes, activity_data, now):
+    """Scan a single worker window, diff, and process deltas. Returns delta list or None."""
+    items = _get_listitem_snapshot(hwnd)
+    if not items:
+        return None
+
+    new_hash = _snapshot_hash(items)
+    if new_hash == hashes[name]:
+        return None
+
+    delta = _extract_delta(snapshots[name], items)
+    snapshots[name] = items
+    hashes[name] = new_hash
+
+    if not delta:
+        return None
+
+    state = _get_worker_state(hwnd)
+    activity_data[name]["state"] = state
+    activity_data[name]["timestamp"] = now
+
+    _process_deltas(name, delta, activity_data, now)
+    return delta
+
+
+def _init_activity_data(workers):
+    """Initialize per-worker activity data structure."""
+    activity_data = {}
+    for name in workers:
+        activity_data[name] = {
+            "state": "UNKNOWN",
+            "current_activity": None,
+            "last_tool": None,
+            "last_file": None,
+            "timestamp": None,
+            "recent_activities": [],
+        }
+    return activity_data
+
+
 def run_daemon():
     """Main daemon loop: scan workers, diff, post deltas."""
     if not _acquire_singleton():
@@ -291,21 +356,9 @@ def run_daemon():
 
     log(f"Activity feed daemon started (PID {os.getpid()}), tracking {len(workers)} workers")
 
-    # Per-worker state
     snapshots = {name: [] for name in workers}
     hashes = {name: "" for name in workers}
-    activity_data = {}
-
-    # Initialize activity_data structure
-    for name in workers:
-        activity_data[name] = {
-            "state": "UNKNOWN",
-            "current_activity": None,
-            "last_tool": None,
-            "last_file": None,
-            "timestamp": None,
-            "recent_activities": [],
-        }
+    activity_data = _init_activity_data(workers)
 
     cycle = 0
     try:
@@ -315,60 +368,14 @@ def run_daemon():
 
             for name, hwnd in workers.items():
                 try:
-                    items = _get_listitem_snapshot(hwnd)
-                    if not items:
-                        continue
-
-                    new_hash = _snapshot_hash(items)
-                    if new_hash == hashes[name]:
-                        continue  # no change
-
-                    # Content changed -- extract delta
-                    delta = _extract_delta(snapshots[name], items)
-                    snapshots[name] = items
-                    hashes[name] = new_hash
-
-                    if not delta:
-                        continue
-
-                    # Get worker state
-                    state = _get_worker_state(hwnd)
-                    activity_data[name]["state"] = state
-                    activity_data[name]["timestamp"] = now
-
-                    # Process each delta line
-                    for line in delta[-5:]:  # cap to last 5 new lines per cycle
-                        atype = classify_activity(line)
-                        tool, filepath = _extract_tool_info(line)
-
-                        activity_data[name]["current_activity"] = line[:200]
-                        if tool:
-                            activity_data[name]["last_tool"] = tool
-                        if filepath:
-                            activity_data[name]["last_file"] = filepath
-
-                        # Append to recent (capped)
-                        activity_data[name]["recent_activities"].append({
-                            "type": atype,
-                            "text": line[:200],
-                            "tool": tool,
-                            "file": filepath,
-                            "timestamp": now,
-                        })
-                        activity_data[name]["recent_activities"] = \
-                            activity_data[name]["recent_activities"][-MAX_RECENT:]
-
-                        # Post to bus
-                        _post_to_bus(name, atype, line)
-
-                    if cycle % 10 == 0 or delta:
+                    delta = _scan_worker(name, hwnd, snapshots, hashes, activity_data, now)
+                    if (cycle % 10 == 0 or delta) and delta is not None:
+                        state = activity_data[name]["state"]
                         log(f"{name}: {len(delta)} new lines, state={state}")
-
                 except Exception as e:
                     if cycle <= 3:
                         log(f"Error scanning {name}: {e}", "WARN")
 
-            # Save activity file periodically
             if cycle % 5 == 0:
                 _save_activity(activity_data)
 

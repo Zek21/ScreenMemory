@@ -15,14 +15,45 @@ _cache = {}
 _cache_time = 0
 CACHE_TTL = 30
 
-def _probe(name, module_path, class_name, engine_type, extras_fn=None):
-    """Probe a single engine: import, then attempt instantiation.
+# All engine probes: (name, module_path, class_name, engine_type, import_only)
+# import_only=True skips instantiation for engines with expensive constructors
+# (network calls, ML model loading, hardware enumeration). Reports "available"
+# truthfully -- import proves the module exists; instantiation is deferred.
+# signed: delta
+_PROBES = [
+    ("router", "core.difficulty_router", "DAAORouter", "routing", False),
+    ("dag", "core.dag_engine", "DAGBuilder", "workflow", False),
+    ("guard", "core.input_guard", "InputGuard", "security", False),
+    ("retriever", "core.hybrid_retrieval", "HybridRetriever", "memory", False),
+    ("capture", "core.capture", "DXGICapture", "vision", True),        # 289ms: monitor enum + mss init
+    ("ocr", "core.ocr", "OCREngine", "vision", True),                  # 635ms: ONNX model load
+    ("orchestrator", "core.orchestrator", "Orchestrator", "cognition", False),
+    ("analyzer", "core.analyzer", "ScreenAnalyzer", "analysis", True),  # 2115ms: Ollama HTTP check
+    ("embedder", "core.embedder", "EmbeddingEngine", "embedding", True),# 2053ms: ML model load
+    ("change_detector", "core.change_detector", "ChangeDetector", "vision", False),
+    ("security", "core.security", "DPAPIKeyManager", "security", False),
+    ("evolution", "core.self_evolution", "SelfEvolutionSystem", "learning", False),
+    ("learning", "core.learning_store", "LearningStore", "learning", False),
+    ("tools", "core.tool_synthesizer", "ToolSynthesizer", "dynamic", False),
+    ("feedback", "core.feedback_loop", "FeedbackLoop", "feedback", False),
+    ("database", "core.database", "ScreenMemoryDB", "storage", False),
+    ("desktop", "winctl", "Desktop", "automation", False),
+    ("godmode", "god_mode", "GodMode", "browser", False),
+]
+
+def _probe(name, module_path, class_name, engine_type, import_only=False, extras_fn=None):
+    """Probe a single engine: import, then optionally attempt instantiation.
 
     Status levels (honest):
-      - "online"    — class was instantiated successfully (verified working)
-      - "available" — module imported and class found, but not instantiated
-      - "offline"   — import failed entirely
+      - "online"    -- class was instantiated successfully (verified working)
+      - "available" -- module imported and class found, but not instantiated
+      - "offline"   -- import failed entirely
+
+    When import_only=True, instantiation is skipped and status is "available"
+    if the import succeeds. This avoids expensive constructors (ML model loads,
+    network calls, hardware init) that dominate probe latency.
     """
+    # signed: delta
     import warnings, io, contextlib
     t0 = time.time()
     with warnings.catch_warnings():
@@ -34,7 +65,13 @@ def _probe(name, module_path, class_name, engine_type, extras_fn=None):
             return {"status": "offline", "name": class_name, "type": engine_type,
                     "error": str(e)[:120], "probe_ms": round((time.time() - t0) * 1000, 1)}
 
-        # Import succeeded — try to instantiate to verify it actually works
+        # Import succeeded -- skip instantiation if flagged as expensive
+        if import_only:
+            return {"status": "available", "name": class_name, "type": engine_type,
+                    "probe_ms": round((time.time() - t0) * 1000, 1),
+                    "note": "import-only probe (expensive constructor skipped)"}
+
+        # Try to instantiate to verify it actually works
         status = "available"
         error = None
         try:
@@ -57,54 +94,33 @@ def _probe(name, module_path, class_name, engine_type, extras_fn=None):
     return info
 
 
-def collect_engine_metrics() -> dict:
-    """Collect metrics from all available engines. Cached for CACHE_TTL seconds."""
-    global _cache, _cache_time
-    now = time.time()
-    if _cache and (now - _cache_time) < CACHE_TTL:
-        return _cache
+def _run_probes(probes: list) -> dict:
+    """Run all engine probes in parallel and return name->result dict.
 
-    t0 = time.time()
-
-    # Define all probes
-    probes = [
-        ("router", "core.difficulty_router", "DAAORouter", "routing"),
-        ("dag", "core.dag_engine", "DAGBuilder", "workflow"),
-        ("guard", "core.input_guard", "InputGuard", "security"),
-        ("retriever", "core.hybrid_retrieval", "HybridRetriever", "memory"),
-        ("capture", "core.capture", "DXGICapture", "vision"),
-        ("ocr", "core.ocr", "OCREngine", "vision"),
-        ("orchestrator", "core.orchestrator", "Orchestrator", "cognition"),
-        ("analyzer", "core.analyzer", "ScreenAnalyzer", "analysis"),
-        ("embedder", "core.embedder", "EmbeddingEngine", "embedding"),
-        ("change_detector", "core.change_detector", "ChangeDetector", "vision"),
-        ("security", "core.security", "DPAPIKeyManager", "security"),
-        ("evolution", "core.self_evolution", "SelfEvolutionSystem", "learning"),
-        ("learning", "core.learning_store", "LearningStore", "learning"),
-        ("tools", "core.tool_synthesizer", "ToolSynthesizer", "dynamic"),
-        ("feedback", "core.feedback_loop", "FeedbackLoop", "feedback"),
-        ("database", "core.database", "ScreenMemoryDB", "storage"),
-        ("desktop", "winctl", "Desktop", "automation"),
-        ("godmode", "god_mode", "GodMode", "browser"),
-    ]
-
-    # Parallel probing via ThreadPoolExecutor
+    Uses max_workers=len(probes) for full parallelism and 5s per-probe timeout.
+    """
+    # signed: delta
     from concurrent.futures import ThreadPoolExecutor
     engines = {}
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futures = {pool.submit(_probe, n, m, c, t): n for n, m, c, t in probes}
+    n_workers = min(len(probes), 18)  # cap at 18 to avoid thread explosion
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_probe, n, m, c, t, io): n
+                   for n, m, c, t, io in probes}
         for fut in futures:
             name = futures[fut]
             try:
-                engines[name] = fut.result(timeout=10)
+                engines[name] = fut.result(timeout=5)
             except Exception as e:
                 engines[name] = {"status": "offline", "name": name, "error": str(e)[:80]}
+    return engines
 
+
+def _build_metrics_result(engines: dict, now: float, t0: float) -> dict:
+    """Build the final metrics dict with summary stats."""
     online = sum(1 for e in engines.values() if e.get("status") == "online")
     available = sum(1 for e in engines.values() if e.get("status") == "available")
     total = len(engines)
-
-    result = {
+    return {
         "engines": engines,
         "summary": {
             "online": online,
@@ -117,30 +133,26 @@ def collect_engine_metrics() -> dict:
         "collection_ms": round((time.time() - t0) * 1000, 1),
     }
 
+
+def collect_engine_metrics() -> dict:
+    """Collect metrics from all available engines. Cached for CACHE_TTL seconds."""
+    global _cache, _cache_time
+    now = time.time()
+    if _cache and (now - _cache_time) < CACHE_TTL:
+        return _cache
+
+    t0 = time.time()
+    engines = _run_probes(_PROBES)
+    result = _build_metrics_result(engines, now, t0)
+
     _cache = result
     _cache_time = now
     return result
 
 
-def collect_learner_health() -> dict:
-    """Truthful learner daemon health telemetry.
-
-    Reports: daemon alive/dead, episode count, last learning timestamp,
-    verifier pass rate. All values from real data files -- never fabricated.
-    """
+def _check_learner_daemon_alive() -> bool:
+    """Check if skynet_learner daemon is running via process list."""
     import subprocess
-    data_dir = ROOT / "data"
-    health: dict = {
-        "daemon_alive": False,
-        "episode_count": 0,
-        "total_learnings": 0,
-        "total_broadcasts": 0,
-        "last_learning_ts": None,
-        "verifier_pass_rate": None,
-        "learner_state_file": str(data_dir / "learner_state.json"),
-    }
-
-    # Check daemon alive via process list
     try:
         result = subprocess.run(
             ["powershell", "-Command",
@@ -148,11 +160,13 @@ def collect_learner_health() -> dict:
              "Select-Object -ExpandProperty CommandLine -ErrorAction SilentlyContinue"],
             capture_output=True, text=True, timeout=5
         )
-        health["daemon_alive"] = "skynet_learner" in (result.stdout or "")
+        return "skynet_learner" in (result.stdout or "")
     except Exception:
-        pass
+        return False
 
-    # Read learner state
+
+def _read_learner_state_files(data_dir: Path, health: dict) -> None:
+    """Populate health dict from learner_state.json and learning_episodes.json."""
     state_file = data_dir / "learner_state.json"
     if state_file.exists():
         try:
@@ -164,7 +178,6 @@ def collect_learner_health() -> dict:
         except Exception:
             pass
 
-    # Read learning episodes if present
     episodes_file = data_dir / "learning_episodes.json"
     if episodes_file.exists():
         try:
@@ -174,26 +187,50 @@ def collect_learner_health() -> dict:
         except Exception:
             pass
 
-    # Verifier pass rate from learning.db if available
-    db_file = data_dir / "learning.db"
-    if db_file.exists():
-        try:
-            import sqlite3
-            conn = sqlite3.connect(str(db_file), timeout=2)
-            cur = conn.cursor()
-            tables = [r[0] for r in cur.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-            if "verifications" in tables:
-                total = cur.execute("SELECT COUNT(*) FROM verifications").fetchone()[0]
-                passed = cur.execute(
-                    "SELECT COUNT(*) FROM verifications WHERE result='pass'").fetchone()[0]
-                health["verifier_pass_rate"] = round(passed / total, 3) if total else None
-                health["verifier_total"] = total
-                health["verifier_passed"] = passed
-            conn.close()
-        except Exception:
-            pass
 
+def _read_verifier_stats(data_dir: Path, health: dict) -> None:
+    """Read verifier pass rate from learning.db if available."""
+    db_file = data_dir / "learning.db"
+    if not db_file.exists():
+        return
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(db_file), timeout=2)
+        cur = conn.cursor()
+        tables = [r[0] for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        if "verifications" in tables:
+            total = cur.execute("SELECT COUNT(*) FROM verifications").fetchone()[0]
+            passed = cur.execute(
+                "SELECT COUNT(*) FROM verifications WHERE result='pass'").fetchone()[0]
+            health["verifier_pass_rate"] = round(passed / total, 3) if total else None
+            health["verifier_total"] = total
+            health["verifier_passed"] = passed
+        conn.close()
+    except Exception:
+        pass
+
+
+def collect_learner_health() -> dict:
+    """Truthful learner daemon health telemetry.
+
+    Reports: daemon alive/dead, episode count, last learning timestamp,
+    verifier pass rate. All values from real data files -- never fabricated.
+    """
+    data_dir = ROOT / "data"
+    health: dict = {
+        "daemon_alive": False,
+        "episode_count": 0,
+        "total_learnings": 0,
+        "total_broadcasts": 0,
+        "last_learning_ts": None,
+        "verifier_pass_rate": None,
+        "learner_state_file": str(data_dir / "learner_state.json"),
+    }
+
+    health["daemon_alive"] = _check_learner_daemon_alive()
+    _read_learner_state_files(data_dir, health)
+    _read_verifier_stats(data_dir, health)
     return health
 
 

@@ -204,47 +204,22 @@ class DAGExecutor:
         for node_id in execution_order:
             node = dag.nodes[node_id]
 
-            # Check conditional edges
             if not self._should_execute(node_id, dag, context):
                 node.status = NodeStatus.SKIPPED
                 logger.info(f"Node {node_id} skipped (condition not met)")
                 continue
 
-            # Execute with retry
             success = self._execute_node(node, context)
 
             if success:
                 context.node_outputs[node_id] = node.output
             else:
                 context.errors.append(f"{node_id}: {node.error}")
+                feedback_count = self._handle_feedback(
+                    node_id, node, dag, context, feedback_count
+                )
 
-                # Check for feedback edges (Generator-Critic loop)
-                feedback_targets = [
-                    e.source for e in dag.edges
-                    if e.target == node_id and e.edge_type == EdgeType.FEEDBACK
-                ]
-                if feedback_targets and feedback_count < self.max_feedback_loops:
-                    feedback_count += 1
-                    logger.info(f"Feedback loop {feedback_count}: "
-                                f"{node_id} → {feedback_targets}")
-                    # Re-execute the source node with feedback
-                    for target in feedback_targets:
-                        target_node = dag.nodes[target]
-                        target_node.status = NodeStatus.PENDING
-                        target_node.metadata["feedback"] = node.error
-                        self._execute_node(target_node, context)
-
-        elapsed = (time.perf_counter() - t0) * 1000
-        logger.info(f"DAG execution complete: {dag.stats} [{elapsed:.0f}ms]")
-
-        self._execution_log.append({
-            "dag": dag.name,
-            "stats": dag.stats,
-            "elapsed_ms": elapsed,
-            "errors": context.errors,
-            "timestamp": time.time(),
-        })
-
+        self._record_execution(dag, (time.perf_counter() - t0) * 1000, context)
         return context
 
     def _execute_node(self, node: DAGNode, context: ExecutionContext) -> bool:
@@ -301,6 +276,36 @@ class DAGExecutor:
 
         return True
 
+    def _handle_feedback(self, node_id: str, node: DAGNode, dag: DAG,
+                         context: ExecutionContext, feedback_count: int) -> int:
+        """Handle feedback loops (Generator-Critic pattern) on node failure."""
+        feedback_targets = [
+            e.source for e in dag.edges
+            if e.target == node_id and e.edge_type == EdgeType.FEEDBACK
+        ]
+        if feedback_targets and feedback_count < self.max_feedback_loops:
+            feedback_count += 1
+            logger.info(f"Feedback loop {feedback_count}: "
+                        f"{node_id} → {feedback_targets}")
+            for target in feedback_targets:
+                target_node = dag.nodes[target]
+                target_node.status = NodeStatus.PENDING
+                target_node.metadata["feedback"] = node.error
+                self._execute_node(target_node, context)
+        return feedback_count
+
+    def _record_execution(self, dag: DAG, elapsed_ms: float,
+                          context: ExecutionContext) -> None:
+        """Log and record DAG execution results."""
+        logger.info(f"DAG execution complete: {dag.stats} [{elapsed_ms:.0f}ms]")
+        self._execution_log.append({
+            "dag": dag.name,
+            "stats": dag.stats,
+            "elapsed_ms": elapsed_ms,
+            "errors": context.errors,
+            "timestamp": time.time(),
+        })
+
     @property
     def execution_history(self) -> List[dict]:
         return list(self._execution_log)
@@ -322,98 +327,120 @@ class DAGBuilder:
 
         dag = DAG(name=f"wf_{plan.operator.value}")
 
-        if plan.operator == OperatorType.DIRECT:
-            dag.add_node(DAGNode(
-                id="execute",
-                role=plan.agent_roles[0] if plan.agent_roles else "reasoner",
-                description=f"Direct execution: {plan.query[:60]}",
-                max_retries=0,
-            ))
+        builders = {
+            OperatorType.DIRECT: DAGBuilder._build_direct,
+            OperatorType.CHAIN_OF_THOUGHT: DAGBuilder._build_chain_of_thought,
+            OperatorType.TOOL_AUGMENTED: DAGBuilder._build_tool_augmented,
+            OperatorType.MULTI_AGENT: DAGBuilder._build_multi_agent,
+            OperatorType.DEBATE: DAGBuilder._build_debate,
+        }
 
-        elif plan.operator == OperatorType.CHAIN_OF_THOUGHT:
-            dag.add_node(DAGNode(
-                id="reason",
-                role="reasoner",
-                description="Chain-of-thought reasoning",
-            ))
-            dag.add_node(DAGNode(
-                id="synthesize",
-                role="reasoner",
-                description="Synthesize reasoning into answer",
-            ))
-            dag.add_edge("reason", "synthesize")
+        builder = builders.get(plan.operator)
+        if builder:
+            builder(dag, plan)
 
-        elif plan.operator == OperatorType.TOOL_AUGMENTED:
-            dag.add_node(DAGNode(
-                id="plan",
-                role="planner",
-                description="Plan tool-augmented execution",
-            ))
-            dag.add_node(DAGNode(
-                id="execute_tools",
-                role="tool_executor",
-                description="Execute tool calls",
-                max_retries=2,
-            ))
-            dag.add_node(DAGNode(
-                id="synthesize",
-                role="reasoner",
-                description="Synthesize tool outputs",
-            ))
-            dag.add_edge("plan", "execute_tools")
-            dag.add_edge("execute_tools", "synthesize")
+        DAGBuilder._add_domain_specialists(dag, plan)
 
-        elif plan.operator == OperatorType.MULTI_AGENT:
-            # Multi-agent: planner → parallel specialists → validator
-            dag.add_node(DAGNode(
-                id="plan",
-                role="planner",
-                description="Decompose into specialist tasks",
-            ))
+        return dag
 
-            specialist_ids = []
-            for i, role in enumerate(plan.agent_roles):
-                if role not in ("planner", "validator"):
-                    sid = f"specialist_{i}"
-                    dag.add_node(DAGNode(
-                        id=sid,
-                        role=role,
-                        description=f"Specialist execution: {role}",
-                    ))
-                    dag.add_edge("plan", sid)
-                    specialist_ids.append(sid)
+    @staticmethod
+    def _build_direct(dag: DAG, plan) -> None:
+        dag.add_node(DAGNode(
+            id="execute",
+            role=plan.agent_roles[0] if plan.agent_roles else "reasoner",
+            description=f"Direct execution: {plan.query[:60]}",
+            max_retries=0,
+        ))
 
-            dag.add_node(DAGNode(
-                id="validate",
-                role="validator",
-                description="Validate and synthesize specialist outputs",
-            ))
-            for sid in specialist_ids:
-                dag.add_edge(sid, "validate")
+    @staticmethod
+    def _build_chain_of_thought(dag: DAG, plan) -> None:
+        dag.add_node(DAGNode(
+            id="reason",
+            role="reasoner",
+            description="Chain-of-thought reasoning",
+        ))
+        dag.add_node(DAGNode(
+            id="synthesize",
+            role="reasoner",
+            description="Synthesize reasoning into answer",
+        ))
+        dag.add_edge("reason", "synthesize")
 
-        elif plan.operator == OperatorType.DEBATE:
-            # Debate: proposer → critic → judge (with feedback loop)
-            dag.add_node(DAGNode(
-                id="propose",
-                role="proposer",
-                description="Generate initial proposal with evidence",
-            ))
-            dag.add_node(DAGNode(
-                id="critique",
-                role="critic",
-                description="Challenge proposal with counterarguments",
-            ))
-            dag.add_node(DAGNode(
-                id="judge",
-                role="judge",
-                description="Evaluate debate and render verdict",
-            ))
-            dag.add_edge("propose", "critique")
-            dag.add_edge("critique", "judge")
-            # Feedback: if judge is unsatisfied, loop back to proposer
-            dag.add_edge("judge", "propose", EdgeType.FEEDBACK)
+    @staticmethod
+    def _build_tool_augmented(dag: DAG, plan) -> None:
+        dag.add_node(DAGNode(
+            id="plan",
+            role="planner",
+            description="Plan tool-augmented execution",
+        ))
+        dag.add_node(DAGNode(
+            id="execute_tools",
+            role="tool_executor",
+            description="Execute tool calls",
+            max_retries=2,
+        ))
+        dag.add_node(DAGNode(
+            id="synthesize",
+            role="reasoner",
+            description="Synthesize tool outputs",
+        ))
+        dag.add_edge("plan", "execute_tools")
+        dag.add_edge("execute_tools", "synthesize")
 
-        # Add domain specialists as parallel nodes where applicable
+    @staticmethod
+    def _build_multi_agent(dag: DAG, plan) -> None:
+        """Multi-agent: planner → parallel specialists → validator"""
+        dag.add_node(DAGNode(
+            id="plan",
+            role="planner",
+            description="Decompose into specialist tasks",
+        ))
+
+        specialist_ids = []
+        for i, role in enumerate(plan.agent_roles):
+            if role not in ("planner", "validator"):
+                sid = f"specialist_{i}"
+                dag.add_node(DAGNode(
+                    id=sid,
+                    role=role,
+                    description=f"Specialist execution: {role}",
+                ))
+                dag.add_edge("plan", sid)
+                specialist_ids.append(sid)
+
+        dag.add_node(DAGNode(
+            id="validate",
+            role="validator",
+            description="Validate and synthesize specialist outputs",
+        ))
+        for sid in specialist_ids:
+            dag.add_edge(sid, "validate")
+
+    @staticmethod
+    def _build_debate(dag: DAG, plan) -> None:
+        """Debate: proposer → critic → judge (with feedback loop)"""
+        dag.add_node(DAGNode(
+            id="propose",
+            role="proposer",
+            description="Generate initial proposal with evidence",
+        ))
+        dag.add_node(DAGNode(
+            id="critique",
+            role="critic",
+            description="Challenge proposal with counterarguments",
+        ))
+        dag.add_node(DAGNode(
+            id="judge",
+            role="judge",
+            description="Evaluate debate and render verdict",
+        ))
+        dag.add_edge("propose", "critique")
+        dag.add_edge("critique", "judge")
+        dag.add_edge("judge", "propose", EdgeType.FEEDBACK)
+
+    @staticmethod
+    def _add_domain_specialists(dag: DAG, plan) -> None:
+        """Add domain specialists as parallel nodes where applicable."""
         for role in plan.agent_roles:
             if role.endswith("_specialist") and role not in [n.role for n in dag.nodes.values()]:
                 dag.add_node(DAGNode(
@@ -421,5 +448,3 @@ class DAGBuilder:
                     role=role,
                     description=f"Domain specialist: {role}",
                 ))
-
-        return dag

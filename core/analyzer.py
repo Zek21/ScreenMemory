@@ -174,76 +174,79 @@ class ScreenAnalyzer:
             data = json.loads(resp.read())
             return data.get("response", "")
 
+    _APP_KEYWORDS = {
+        "vs code": "VS Code", "visual studio": "VS Code", "vscode": "VS Code",
+        "chrome": "Chrome", "firefox": "Firefox", "edge": "Edge",
+        "terminal": "Terminal", "powershell": "PowerShell", "cmd": "Terminal",
+        "word": "Word", "excel": "Excel", "outlook": "Outlook",
+        "slack": "Slack", "discord": "Discord", "teams": "Teams",
+        "explorer": "File Explorer", "notepad": "Notepad",
+    }
+
+    _ACTIVITY_KEYWORDS = {
+        "coding": ["code", "programming", "function", "class", "variable", "debug", "IDE"],
+        "browsing": ["browser", "web", "search", "google", "website", "url"],
+        "writing": ["document", "writing", "text", "word", "typing", "article"],
+        "communication": ["chat", "email", "message", "slack", "teams", "discord"],
+        "terminal": ["terminal", "command", "shell", "powershell", "bash", "cmd"],
+        "media": ["video", "music", "youtube", "spotify", "player"],
+    }
+
+    @staticmethod
+    def _detect_app(description: str) -> str:
+        """Auto-detect active application from description text."""
+        desc_lower = description.lower()
+        for keyword, app_name in ScreenAnalyzer._APP_KEYWORDS.items():
+            if keyword in desc_lower:
+                return app_name
+        return ""
+
+    @staticmethod
+    def _detect_activity(description: str) -> str:
+        """Auto-detect activity type from description text."""
+        desc_lower = description.lower()
+        for atype, keywords in ScreenAnalyzer._ACTIVITY_KEYWORDS.items():
+            if any(kw in desc_lower for kw in keywords):
+                return atype
+        return "other"
+
     def _parse_response(self, response: str, elapsed_ms: float, model: str) -> AnalysisResult:
         """Parse VLM response into structured AnalysisResult."""
-        description = ""
-        ocr_text = ""
-        active_app = ""
-        activity_type = "other"
+        description, ocr_text, active_app, activity_type = self._extract_json_fields(response)
 
-        # Try JSON parse first (for structured models like minicpm-v)
+        if not description:
+            description = response.strip()[:500]
+        if not active_app:
+            active_app = self._detect_app(description)
+        if activity_type == "other":
+            activity_type = self._detect_activity(description)
+        if not ocr_text and len(description) > 50:
+            ocr_text = description
+
+        return AnalysisResult(
+            description=description, ocr_text=ocr_text,
+            active_app=active_app, activity_type=activity_type,
+            confidence=0.8 if description else 0.1,
+            analysis_ms=elapsed_ms, model_used=model, raw_response=response,
+        )
+
+    @staticmethod
+    def _extract_json_fields(response: str):
+        """Try to parse JSON fields from a VLM response."""
         try:
             json_start = response.find("{")
             json_end = response.rfind("}") + 1
             if json_start >= 0 and json_end > json_start:
                 parsed = json.loads(response[json_start:json_end])
-                description = parsed.get("description", "")
-                ocr_text = parsed.get("ocr_text", parsed.get("visible_text", ""))
-                active_app = parsed.get("active_app", "")
-                activity_type = parsed.get("activity_type", "other")
+                return (
+                    parsed.get("description", ""),
+                    parsed.get("ocr_text", parsed.get("visible_text", "")),
+                    parsed.get("active_app", ""),
+                    parsed.get("activity_type", "other"),
+                )
         except (json.JSONDecodeError, ValueError):
             pass
-
-        # For plain text responses (moondream, etc.)
-        if not description:
-            description = response.strip()[:500]
-
-        # Auto-detect active app from description
-        if not active_app:
-            app_keywords = {
-                "vs code": "VS Code", "visual studio": "VS Code", "vscode": "VS Code",
-                "chrome": "Chrome", "firefox": "Firefox", "edge": "Edge",
-                "terminal": "Terminal", "powershell": "PowerShell", "cmd": "Terminal",
-                "word": "Word", "excel": "Excel", "outlook": "Outlook",
-                "slack": "Slack", "discord": "Discord", "teams": "Teams",
-                "explorer": "File Explorer", "notepad": "Notepad",
-            }
-            desc_lower = description.lower()
-            for keyword, app_name in app_keywords.items():
-                if keyword in desc_lower:
-                    active_app = app_name
-                    break
-
-        # Auto-detect activity type
-        if activity_type == "other":
-            activity_keywords = {
-                "coding": ["code", "programming", "function", "class", "variable", "debug", "IDE"],
-                "browsing": ["browser", "web", "search", "google", "website", "url"],
-                "writing": ["document", "writing", "text", "word", "typing", "article"],
-                "communication": ["chat", "email", "message", "slack", "teams", "discord"],
-                "terminal": ["terminal", "command", "shell", "powershell", "bash", "cmd"],
-                "media": ["video", "music", "youtube", "spotify", "player"],
-            }
-            desc_lower = description.lower()
-            for atype, keywords in activity_keywords.items():
-                if any(kw in desc_lower for kw in keywords):
-                    activity_type = atype
-                    break
-
-        # Extract OCR-like text from description if not provided
-        if not ocr_text and len(description) > 50:
-            ocr_text = description
-
-        return AnalysisResult(
-            description=description,
-            ocr_text=ocr_text,
-            active_app=active_app,
-            activity_type=activity_type,
-            confidence=0.8 if description else 0.1,
-            analysis_ms=elapsed_ms,
-            model_used=model,
-            raw_response=response,
-        )
+        return "", "", "", "other"
 
     def _fallback_analyze(self, image: Image.Image) -> AnalysisResult:
         """

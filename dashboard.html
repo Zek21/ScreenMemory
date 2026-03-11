@@ -61,7 +61,9 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .hdr-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0;}
 .hdr-dot.on{background:var(--green);box-shadow:0 0 8px rgba(0,230,118,0.5);animation:dotPulse 2s infinite;}
 .hdr-dot.off{background:var(--red);box-shadow:0 0 8px rgba(255,32,64,0.4);}
+/* TRUTH FIX: dotPulse only applies via JS when SSE/WS is connected. Static otherwise. signed: alpha */
 @keyframes dotPulse{0%,100%{opacity:1;}50%{opacity:.5;}}
+@keyframes dotStatic{0%,100%{opacity:0.4;}}
 .hdr-right{margin-left:auto;display:flex;align-items:center;gap:14px;}
 .hdr-clock{font-family:var(--mono);font-size:13px;color:var(--text2);font-weight:500;letter-spacing:1px;}
 .hdr-iq{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--cyan);
@@ -374,6 +376,10 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .eng-tile.online .eng-name{color:var(--text);}
 .eng-ms{font-size:7px;color:var(--dim);margin-top:1px;}
+.eng-cache-age{font-size:6px;color:var(--amber);margin-top:1px;opacity:0.85;} /* signed: gamma */
+.eng-cache-age.stale-warn{color:var(--amber);}
+.eng-cache-age.stale-bad{color:#ff8800;}
+.eng-cache-age.stale-crit{color:var(--red);}
 .eng-summary{display:flex;justify-content:space-between;padding:2px 8px 4px;
   font-family:var(--mono);font-size:9px;}
 .eng-sum-item{display:flex;align-items:center;gap:3px;}
@@ -994,7 +1000,7 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       </div>
       <div class="ops-body" style="padding:0;">
         <div class="engine-grid" id="engineGrid">
-          <div class="task-empty" style="grid-column:1/-1;padding:8px;">Loading engines...</div>
+          <div class="task-empty" style="grid-column:1/-1;padding:8px;" id="engineLoadingMsg">Loading engines...</div>
         </div>
       </div>
     </div>
@@ -1060,11 +1066,12 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   <!-- WORKER ACTIVITY FEED -->
   <div id="activity-feed-card" style="grid-column:2/4;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;backdrop-filter:blur(12px);">
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
-      <span style="background:#e00;color:#fff;font-size:9px;font-weight:700;padding:1px 6px;border-radius:3px;text-transform:uppercase;animation:dotPulse 2s infinite;">LIVE</span>
+      <span id="activityLiveBadge" style="background:#e00;color:#fff;font-size:9px;font-weight:700;padding:1px 6px;border-radius:3px;text-transform:uppercase;opacity:0.4;">LIVE</span>
+      <!-- TRUTH FIX: LIVE badge no longer pulses by default; JS activates animation only when real data flows. signed: alpha -->
       <span style="font-size:12px;font-weight:600;color:var(--fg);">Worker Activity Feed</span>
     </div>
     <div id="activityFeed" style="max-height:400px;overflow-y:auto;font-family:'Fira Code','Cascadia Code',monospace;font-size:11px;background:#0a0a0a;padding:8px;border-radius:4px;color:var(--dim);">
-      <div style="color:var(--dim);font-style:italic;">Waiting for activity data...</div>
+      <div id="activityFeedPlaceholder" style="color:var(--dim);font-style:italic;">Waiting for activity data...</div>
     </div>
   </div>
 
@@ -1076,7 +1083,7 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <span class="worker-output-count" id="woCount">0 results</span>
     </div>
     <div class="worker-output-list" id="woList">
-      <div class="wo-item"><span style="color:var(--dim);font-style:italic;">Waiting for worker results...</span></div>
+      <div class="wo-item" id="workerResultsPlaceholder"><span style="color:var(--dim);font-style:italic;">Waiting for worker results...</span></div>
     </div>
   </div>
 
@@ -1088,7 +1095,7 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <span class="bus-count" id="busDepth">0 msgs</span>
     </div>
     <div class="bus-feed" id="busFeed">
-      <div class="bus-line"><span style="color:var(--dim);font-style:italic;">Waiting for bus messages...</span></div>
+      <div class="bus-line" id="busMessagesPlaceholder"><span style="color:var(--dim);font-style:italic;">Waiting for bus messages...</span></div>
     </div>
   </div>
 
@@ -1100,7 +1107,7 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <span class="badge" id="missionCount" style="margin-left:auto;">0</span>
     </div>
     <div id="missionList" style="max-height:200px;overflow-y:auto;padding:8px 12px;">
-      <div style="color:var(--dim);font-style:italic;">Loading missions...</div>
+      <div id="missionPlaceholder" style="color:var(--dim);font-style:italic;">Loading missions...</div>
     </div>
   </div>
 
@@ -1112,7 +1119,7 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <span id="healthBadge" class="badge" style="margin-left:auto;">--</span>
     </div>
     <div id="healthPanel" style="padding:8px 12px;">
-      <div style="color:var(--dim);font-style:italic;">Loading health...</div>
+      <div id="healthPlaceholder" style="color:var(--dim);font-style:italic;">Loading health...</div>
     </div>
   </div>
 
@@ -1123,7 +1130,19 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <span class="bus-title">Throughput</span>
     </div>
     <div id="throughputPanel" style="padding:8px 12px;">
-      <div style="color:var(--dim);font-style:italic;">Loading throughput...</div>
+      <div id="throughputPlaceholder" style="color:var(--dim);font-style:italic;">Loading throughput...</div>
+    </div>
+  </div>
+
+  <!-- LEADERSHIP STATUS PANEL — signed: alpha -->
+  <div class="bus-panel" style="margin-top:12px;">
+    <div class="bus-hdr">
+      <span class="bus-icon">👑</span>
+      <span class="bus-title">Leadership</span>
+      <span class="badge" id="leadershipBadge" style="margin-left:auto;">--</span>
+    </div>
+    <div id="leadershipPanel" style="padding:8px 12px;">
+      <div style="color:var(--dim);font-style:italic;">Loading leadership status...</div>
     </div>
   </div>
 
@@ -1202,13 +1221,16 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   <span class="sb-sep">│</span>
   <div class="sb-item">Feedback <span class="sb-val" id="sb-fb-total">0</span></div>
   <span class="sb-sep">│</span>
-  <div class="sb-item">Modules <span class="sb-val">27</span></div>
+  <div class="sb-item">Modules <span class="sb-val" id="sb-modules">--</span></div>
   <span class="sb-sep">│</span>
-  <div class="sb-item">LOC <span class="sb-val">10,779</span></div>
+  <div class="sb-item">LOC <span class="sb-val" id="sb-loc">--</span></div>
   <div class="sb-right">
     <div class="sb-item">WS <span class="sb-val" id="sb-ws" style="color:var(--dim)">--</span></div>
     <span class="sb-sep">|</span>
     <div class="sb-item">Poll <span class="sb-val">3s</span></div>
+    <span class="sb-sep">|</span>
+    <!-- TRUTH FIX #5: Show data staleness. signed: alpha -->
+    <div class="sb-item">Data <span class="sb-val" id="sb-cache-age" style="color:var(--dim)">--</span></div>
     <span class="sb-sep">|</span>
     <div class="sb-item">Queue <span class="sb-val" id="sb-god-val">0</span></div>
   </div>
@@ -1228,7 +1250,6 @@ const startTime=Date.now();
 let seenLogIds=new Set(),seenOrchIds=new Set(),totalTasks=0;
 let rafPaused=false;
 document.addEventListener('visibilitychange',()=>{rafPaused=document.hidden;if(!rafPaused)animate();});
-const simProgress={};
 
 /* ═══ SSE DASHBOARD STREAM ═══ */
 let sseConnected=false,sseData=null;
@@ -1237,7 +1258,7 @@ function initSSE(){
     const es=new EventSource('/stream/dashboard');
     es.onopen=()=>{sseConnected=true;console.log('[SSE] Dashboard stream connected');};
     es.onmessage=(e)=>{
-      try{sseData=JSON.parse(e.data);}catch(x){}
+      try{sseData=JSON.parse(e.data);}catch(x){console.debug('[SSE] parse error:',x.message);}
     };
     es.onerror=()=>{
       sseConnected=false;
@@ -1248,71 +1269,199 @@ function initSSE(){
 }
 initSSE();
 
-/* ═══ MISSION CONTROL, HEALTH, THROUGHPUT PANELS ═══ */
+/* ═══ MISSION CONTROL, HEALTH, THROUGHPUT, LEADERSHIP PANELS ═══ */
+/* WAVE 2: Wired to real backend endpoints in god_console.py. signed: alpha */
+
 function pollMissions(){
-  fetch('/missions/active').then(r=>r.json()).then(d=>{
+  fetch('/missions/active').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
     const el=document.getElementById('missionList');
     const badge=document.getElementById('missionCount');
+    if(!el)return;
     const missions=d.missions||[];
-    badge.textContent=missions.length;
-    if(!missions.length){el.innerHTML='<div style="color:var(--dim);">No active missions</div>';return;}
+    const backendTasks=d.backend_tasks||[];
+    const totalCount=missions.length+backendTasks.length;
+    if(badge)badge.textContent=totalCount;
+    if(!totalCount){el.innerHTML='<div style="color:var(--dim);font-size:11px;">No active missions or tasks</div>';return;}
     let html='';
+    /* Render missions from MissionControl */
     missions.forEach(m=>{
       const prog=m.subtasks&&m.subtasks.length?m.subtasks.filter(s=>s.status==='completed').length/m.subtasks.length*100:0;
-      const workers=(m.workers||[]).join(', ')||'unassigned';
-      html+=`<div style="margin-bottom:8px;padding:6px 8px;background:rgba(255,255,255,0.03);border-radius:6px;">
-        <div style="display:flex;justify-content:space-between;font-size:12px;">
-          <span style="color:var(--accent);">${m.title||m.mission_id}</span>
-          <span class="badge">${m.status}</span>
+      const workers=esc((m.workers||[]).join(', ')||'unassigned');
+      html+=`<div style="margin-bottom:6px;padding:4px 8px;background:rgba(255,255,255,0.03);border-radius:6px;">
+        <div style="display:flex;justify-content:space-between;font-size:11px;">
+          <span style="color:var(--accent);">${esc(String(m.title||m.mission_id||'Mission'))}</span>
+          <span class="badge">${esc(String(m.status||''))}</span>
         </div>
-        <div style="margin-top:4px;height:4px;background:rgba(255,255,255,0.06);border-radius:2px;">
+        <div style="margin-top:3px;height:3px;background:rgba(255,255,255,0.06);border-radius:2px;">
           <div style="width:${prog}%;height:100%;background:var(--accent);border-radius:2px;transition:width 0.3s;"></div>
         </div>
-        <div style="font-size:10px;color:var(--dim);margin-top:2px;">Workers: ${workers} | Subtasks: ${m.subtasks?m.subtasks.length:0} (${Math.round(prog)}% done)</div>
+        <div style="font-size:9px;color:var(--dim);margin-top:2px;">Workers: ${workers} | ${m.subtasks?m.subtasks.length:0} subtasks (${Math.round(prog)}%)</div>
       </div>`;
     });
+    /* Render backend dispatch tasks */
+    backendTasks.slice(0,8).forEach(t=>{
+      const st=esc(String(t.status||t.state||'unknown'));
+      const w=esc(String(t.worker||t.assigned_to||'--'));
+      html+=`<div style="margin-bottom:4px;padding:3px 8px;background:rgba(0,240,255,0.02);border-radius:4px;font-size:10px;">
+        <span style="color:var(--cyan);">${esc(String(t.task||t.id||'task').slice(0,50))}</span>
+        <span style="float:right;color:var(--dim);">${w} · ${st}</span>
+      </div>`;
+    });
+    if(d.timestamp)html+=`<div style="font-size:8px;color:var(--dim);margin-top:4px;text-align:right;">as of ${esc(String(d.timestamp))}</div>`;
     el.innerHTML=html;
-  }).catch(()=>{});
+  }).catch(e=>{
+    const el=document.getElementById('missionList');
+    const badge=document.getElementById('missionCount');
+    if(el)el.innerHTML=`<div style="color:var(--dim);font-size:10px;">Error: ${esc(String(e.message))}</div>`;
+    if(badge)badge.textContent='!';
+  });
 }
+/* signed: alpha */
+
 function pollHealth(){
-  fetch('/system/health').then(r=>r.json()).then(d=>{
+  fetch('/system/health').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
     const el=document.getElementById('healthPanel');
     const badge=document.getElementById('healthBadge');
     const status=d.status||'unknown';
-    badge.textContent=status.toUpperCase();
-    badge.style.background=status==='healthy'?'rgba(0,255,100,0.15)':status==='degraded'?'rgba(255,200,0,0.15)':'rgba(255,50,50,0.15)';
-    badge.style.color=status==='healthy'?'#0f8':status==='degraded'?'#fa0':'#f55';
+    if(badge){
+      badge.textContent=status.toUpperCase();
+      badge.style.background=status==='healthy'?'rgba(0,255,100,0.15)':status==='degraded'?'rgba(255,200,0,0.15)':'rgba(255,50,50,0.15)';
+      badge.style.color=status==='healthy'?'#0f8':status==='degraded'?'#fa0':'#f55';
+    }
+    if(!el)return;
+    const wk=d.workers||{};
+    const disp=d.dispatch||{};
+    let html=`<div style="font-size:11px;color:var(--text2);">Workers: ${wk.total||0} (${wk.idle||0} idle) · Bus: ${d.bus_ok?'<span style="color:var(--green);">OK</span>':'<span style="color:var(--red);">ERR</span>'}</div>`;
+    html+=`<div style="font-size:10px;color:var(--dim);margin-top:3px;">Dispatches: ${disp.total||0} · Success: ${disp.success||0} · Rate: ${disp.success_rate!==undefined?Math.round(disp.success_rate*100)+'%':'--'}</div>`;
     const issues=d.issues||[];
-    let html=`<div style="font-size:11px;color:var(--dim);">Workers: ${d.worker_count||0} | Bus depth: ${d.bus_depth||0} | Issues: ${issues.length}</div>`;
     if(issues.length){
       html+='<div style="margin-top:4px;">';
-      issues.forEach(i=>{html+=`<div style="font-size:10px;color:#fa0;">⚠ ${i}</div>`;});
+      issues.forEach(i=>{html+=`<div style="font-size:9px;color:#fa0;">⚠ ${esc(String(i))}</div>`;});
       html+='</div>';
     }
+    if(d.timestamp)html+=`<div style="font-size:8px;color:var(--dim);margin-top:3px;text-align:right;">${esc(String(d.timestamp))}</div>`;
     el.innerHTML=html;
-  }).catch(()=>{});
+  }).catch(e=>{
+    const el=document.getElementById('healthPanel');
+    const badge=document.getElementById('healthBadge');
+    if(el)el.innerHTML=`<div style="color:var(--dim);font-size:10px;">Error: ${esc(String(e.message))}</div>`;
+    if(badge){badge.textContent='ERR';badge.style.background='rgba(255,50,50,0.15)';badge.style.color='#f55';}
+  });
 }
+/* signed: alpha */
+
 function pollThroughput(){
-  fetch('/metrics/throughput').then(r=>r.json()).then(d=>{
+  fetch('/metrics/throughput').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
     const el=document.getElementById('throughputPanel');
+    if(!el)return;
     const total=d.total_dispatches||0;
     const rate=d.success_rate!==undefined?Math.round(d.success_rate*100):0;
-    const perMin=d.per_minute!==undefined?d.per_minute.toFixed(1):'0.0';
-    el.innerHTML=`<div style="display:flex;gap:16px;font-size:12px;">
-      <div><span style="color:var(--dim);">Total</span><br><span style="font-size:18px;color:var(--accent);">${total}</span></div>
-      <div><span style="color:var(--dim);">Success</span><br><span style="font-size:18px;color:#0f8;">${rate}%</span></div>
-      <div><span style="color:var(--dim);">Rate</span><br><span style="font-size:18px;color:var(--accent);">${perMin}/min</span></div>
-    </div>`;
-  }).catch(()=>{});
+    const perMin=d.throughput_per_min!==undefined?d.throughput_per_min.toFixed(1):'0.0';
+    const lastHr=d.last_hour||0;
+    el.innerHTML=`<div style="display:flex;gap:14px;font-size:11px;">
+      <div><span style="color:var(--dim);font-size:9px;">Total</span><br><span style="font-size:16px;color:var(--accent);">${total}</span></div>
+      <div><span style="color:var(--dim);font-size:9px;">Success</span><br><span style="font-size:16px;color:#0f8;">${rate}%</span></div>
+      <div><span style="color:var(--dim);font-size:9px;">Rate</span><br><span style="font-size:16px;color:var(--accent);">${perMin}/m</span></div>
+      <div><span style="color:var(--dim);font-size:9px;">Last hr</span><br><span style="font-size:16px;color:var(--cyan);">${lastHr}</span></div>
+    </div>` + (d.timestamp?`<div style="font-size:8px;color:var(--dim);text-align:right;margin-top:2px;">${esc(String(d.timestamp))}</div>`:'');
+  }).catch(e=>{
+    const el=document.getElementById('throughputPanel');
+    if(el)el.innerHTML=`<div style="color:var(--dim);font-size:10px;">Error: ${esc(String(e.message))}</div>`;
+  });
 }
+/* signed: alpha */
+
+function pollLeadership(){
+  fetch('/leadership').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(d=>{
+    const el=document.getElementById('leadershipPanel');
+    if(!el)return;
+    const orch=d.orchestrator||{};
+    const codex=d.codex_consultant||{};
+    const gemini=d.gemini_consultant||{};
+    function statusDot(s){return s.live?'<span style="color:var(--green);">●</span>':'<span style="color:var(--red);">○</span>';}
+    function statusText(s){return s.live?'<span style="color:var(--green);font-size:9px;">LIVE</span>':'<span style="color:var(--red);font-size:9px;">OFFLINE</span>';}
+    let html=`<div style="display:flex;gap:12px;flex-wrap:wrap;font-size:11px;">
+      <div style="flex:1;min-width:80px;padding:4px 6px;background:rgba(0,240,255,0.03);border-radius:4px;">
+        ${statusDot(orch)} <span style="color:var(--cyan);font-weight:600;">Orchestrator</span><br>
+        <span style="font-size:9px;color:var(--dim);">:8420 ${statusText(orch)}</span>
+      </div>
+      <div style="flex:1;min-width:80px;padding:4px 6px;background:rgba(0,240,255,0.03);border-radius:4px;">
+        ${statusDot(codex)} <span style="color:var(--cyan);font-weight:600;">Codex</span><br>
+        <span style="font-size:9px;color:var(--dim);">:8422 ${statusText(codex)}</span>
+        ${codex.state_file&&codex.state_file.model?'<br><span style="font-size:8px;color:var(--dim);">'+esc(String(codex.state_file.model))+'</span>':''}
+      </div>
+      <div style="flex:1;min-width:80px;padding:4px 6px;background:rgba(0,240,255,0.03);border-radius:4px;">
+        ${statusDot(gemini)} <span style="color:var(--cyan);font-weight:600;">Gemini</span><br>
+        <span style="font-size:9px;color:var(--dim);">:8425 ${statusText(gemini)}</span>
+        ${gemini.state_file&&gemini.state_file.model?'<br><span style="font-size:8px;color:var(--dim);">'+esc(String(gemini.state_file.model))+'</span>':''}
+      </div>
+    </div>`;
+    html+=`<div style="font-size:9px;color:var(--dim);margin-top:4px;">Leadership: ${d.leadership_live||0}/${d.leadership_total||3} · Status: <span style="color:${d.overall_status==='healthy'?'var(--green)':d.overall_status==='degraded'?'var(--amber)':'var(--red)'};">${esc(String(d.overall_status||'unknown')).toUpperCase()}</span></div>`;
+    if(d.timestamp)html+=`<div style="font-size:8px;color:var(--dim);text-align:right;">${esc(String(d.timestamp))}</div>`;
+    el.innerHTML=html;
+    /* Update header consultant indicator */
+    const hdrCon=document.getElementById('sb-consultant');
+    if(hdrCon){
+      const live=d.leadership_live||0;
+      hdrCon.textContent=live+'/'+(d.leadership_total||3);
+      hdrCon.className='val '+(live>=2?'hdr-consultant-live':live>=1?'hdr-consultant-waiting':'hdr-consultant-offline');
+    }
+  }).catch(e=>{
+    const el=document.getElementById('leadershipPanel');
+    if(el)el.innerHTML=`<div style="color:var(--dim);font-size:10px;">Error: ${esc(String(e.message))}</div>`;
+  });
+}
+/* signed: alpha */
+
 setInterval(pollMissions,15000);
 setInterval(pollHealth,15000);
 setInterval(pollThroughput,15000);
-setTimeout(()=>{pollMissions();pollHealth();pollThroughput();},2000);
+setInterval(pollLeadership,10000);
+setTimeout(()=>{pollMissions();pollHealth();pollThroughput();pollLeadership();},2000);
+
+/* TRUTH FIX: Replace eternal "Loading..." / "Waiting..." placeholders with "No data available"
+   after 15 seconds if no real data has arrived. signed: alpha */
+setTimeout(function(){
+  const placeholders=[
+    {id:'engineLoadingMsg',text:'No engine data available'},
+    {id:'activityFeedPlaceholder',text:'No activity data available'},
+    {id:'workerResultsPlaceholder',text:'No worker results available',html:'<span style="color:var(--dim);font-style:italic;">No worker results available</span>'},
+    {id:'busMessagesPlaceholder',text:'No bus messages available',html:'<span style="color:var(--dim);font-style:italic;">No bus messages available</span>'}
+  ];
+  placeholders.forEach(function(p){
+    const el=document.getElementById(p.id);
+    if(el&&el.parentNode){
+      /* Only replace if placeholder is still the only child (no real data arrived) */
+      const parent=el.parentNode;
+      const isStillPlaceholder=(parent.children.length===1&&parent.children[0]===el)||el.textContent.match(/^(Loading|Waiting)/);
+      if(isStillPlaceholder){
+        if(p.html){el.innerHTML=p.html;}
+        else{el.textContent=p.text;}
+        el.style.color='var(--dim)';
+        el.style.fontStyle='italic';
+      }
+    }
+  });
+  /* Also activate LIVE badge as dim/static if no data flowed */
+  const liveBadge=document.getElementById('activityLiveBadge');
+  if(liveBadge&&!liveBadge._activated){liveBadge.style.opacity='0.3';liveBadge.textContent='IDLE';}
+},15000);
+
+/* TRUTH FIX #5: Add staleness indicator helper. Cached data shows age. signed: alpha */
+function formatStaleness(timestampMs){
+  if(!timestampMs)return ' (unknown age)';
+  const ageS=Math.round((Date.now()-timestampMs)/1000);
+  if(ageS<2)return '';
+  if(ageS<60)return ' ('+ageS+'s ago)';
+  return ' ('+Math.round(ageS/60)+'m ago)';
+}
 
 /* ═══ RADAR ═══ */
+/* TRUTH FIX: Radar sweep only animates when real dispatch events exist. signed: alpha */
 const rc=document.getElementById('radar'),rctx=rc.getContext('2d');
 let rW,rH;
+let _radarLastEventTime=0; /* timestamp of last real dispatch event */
+const RADAR_SWEEP_DECAY_MS=10000; /* sweep fades 10s after last event */
 function resizeRadar(){
   const r=rc.parentElement.getBoundingClientRect();
   rc.width=r.width*devicePixelRatio;rc.height=r.height*devicePixelRatio;
@@ -1324,6 +1473,7 @@ window.addEventListener('resize',resizeRadar);resizeRadar();
 let flights=[];
 function addFlight(toAngle,color,label){
   flights.push({toAngle,color,label,progress:0,speed:0.006+Math.random()*0.008});
+  _radarLastEventTime=Date.now(); /* TRUTH: mark real dispatch event -- signed: alpha */
 }
 
 function drawRadar(t){
@@ -1336,12 +1486,16 @@ function drawRadar(t){
   rctx.strokeStyle='rgba(0,240,255,0.04)';rctx.lineWidth=0.5;
   rctx.beginPath();rctx.moveTo(cx-maxR,cy);rctx.lineTo(cx+maxR,cy);rctx.stroke();
   rctx.beginPath();rctx.moveTo(cx,cy-maxR);rctx.lineTo(cx,cy+maxR);rctx.stroke();
-  const sw=(t*0.7)%(Math.PI*2);
-  rctx.beginPath();rctx.moveTo(cx,cy);
-  rctx.lineTo(cx+Math.cos(sw)*maxR,cy+Math.sin(sw)*maxR);
-  rctx.strokeStyle='rgba(0,240,255,0.3)';rctx.lineWidth=1;rctx.stroke();
-  rctx.beginPath();rctx.moveTo(cx,cy);rctx.arc(cx,cy,maxR,sw-0.25,sw);rctx.closePath();
-  rctx.fillStyle='rgba(0,240,255,0.04)';rctx.fill();
+  /* TRUTH FIX: Sweep only animates when real dispatch events occurred recently -- signed: alpha */
+  const sweepActive=flights.length>0||(Date.now()-_radarLastEventTime)<RADAR_SWEEP_DECAY_MS;
+  if(sweepActive){
+    const sw=(t*0.7)%(Math.PI*2);
+    rctx.beginPath();rctx.moveTo(cx,cy);
+    rctx.lineTo(cx+Math.cos(sw)*maxR,cy+Math.sin(sw)*maxR);
+    rctx.strokeStyle='rgba(0,240,255,0.3)';rctx.lineWidth=1;rctx.stroke();
+    rctx.beginPath();rctx.moveTo(cx,cy);rctx.arc(cx,cy,maxR,sw-0.25,sw);rctx.closePath();
+    rctx.fillStyle='rgba(0,240,255,0.04)';rctx.fill();
+  }
   rctx.beginPath();rctx.arc(cx,cy,3,0,Math.PI*2);rctx.fillStyle='var(--green)';rctx.fill();
   for(const[id,ag]of Object.entries(AGENTS)){
     const bx=cx+Math.cos(ag.angle)*maxR*0.75,by=cy+Math.sin(ag.angle)*maxR*0.75;
@@ -1414,7 +1568,8 @@ function addOrchLine(text,type='info'){
   const el=document.getElementById('orchFeed');
   const div=document.createElement('div');div.className='orch-line';
   const tagMap={route:'ROUTE',decide:'DECIDE',error:'ERROR',info:'INFO'};
-  div.innerHTML=`<span class="ts">${now()}</span><span class="tag ${type}">${tagMap[type]||'INFO'}</span><span class="msg">${esc(text)}</span>`;
+  const safeType=String(type).replace(/[^a-z]/g,'');
+  div.innerHTML=`<span class="ts">${now()}</span><span class="tag ${safeType}">${tagMap[type]||'INFO'}</span><span class="msg">${esc(text)}</span>`;
   el.appendChild(div);
   while(el.children.length>150)el.removeChild(el.firstChild);
   el.scrollTop=el.scrollHeight;
@@ -1422,6 +1577,9 @@ function addOrchLine(text,type='info'){
 
 function addAgentLine(id,text){
   const el=document.getElementById('feed-'+id);if(!el)return;
+  /* TRUTH FIX: Activate LIVE badge when real activity flows. signed: alpha */
+  const liveBadge=document.getElementById('activityLiveBadge');
+  if(liveBadge){liveBadge.style.animation='dotPulse 2s infinite';liveBadge.style.opacity='1';liveBadge.textContent='LIVE';liveBadge._activated=true;}
   const div=document.createElement('div');
   const cls=text.match(/PASS|success|OK|complete|operational/i)?'ok':text.match(/FAIL|error/i)?'fail':'info';
   div.className='feed-line '+cls;
@@ -1568,10 +1726,11 @@ function _applyStatus(d){
   if(!d)return;
   if(connFails>0){connFails=0;showConnBanner(false);}
   for(const[id,s]of Object.entries(d.agents||{})){
+    if(!s||typeof s!=='object')continue;
     const st=s.status||'IDLE';
     let prog=s.progress||0;
-    if(st==='WORKING'){simProgress[id]=(simProgress[id]||0);simProgress[id]=Math.min(simProgress[id]+2,90);prog=simProgress[id];}
-    else{prog=st==='DONE'?100:0;simProgress[id]=0;}
+    if(st==='DONE'){prog=100;}
+    else if(st!=='WORKING'){prog=0;}
     updateAgent(id,st,s.current_task,s.tasks_completed,prog);
     if(s.recent_logs){
       for(const log of s.recent_logs){
@@ -1632,14 +1791,37 @@ function animate(){
 animate();
 setInterval(poll,8000);  /* reduced from 4s -- display-only, no need for fast refresh */
 
+/* TRUTH FIX #5: Update cache staleness indicator every 2s. signed: alpha */
+setInterval(function(){
+  const cacheAge=document.getElementById('sb-cache-age');
+  if(!cacheAge)return;
+  if(_dashCache.t>0){
+    const ageS=Math.round((Date.now()-_dashCache.t)/1000);
+    if(ageS<2){cacheAge.textContent='live';cacheAge.style.color='var(--green)';}
+    else if(ageS<10){cacheAge.textContent=ageS+'s';cacheAge.style.color='var(--cyan)';}
+    else if(ageS<30){cacheAge.textContent=ageS+'s';cacheAge.style.color='var(--amber)';}
+    else{cacheAge.textContent=ageS+'s';cacheAge.style.color='var(--red)';}
+  }else{
+    cacheAge.textContent='no data';cacheAge.style.color='var(--dim)';
+  }
+},2000);
+
 setTimeout(()=>{
-  addOrchLine('Orchestrator online -- Claude Opus 4.6 Fast','route');
-  addOrchLine('Loading DAAO Router + Agent Factory + DAG Engine','route');
-  addOrchLine('InputGuard armed -- 3-layer protection','route');
-  addOrchLine('Self-Evolution Engine + Tool Synthesizer + Learning Store','route');
-  addOrchLine('27 modules | 10,779 LOC | 4 agents standing by','decide');
-  addOrchLine('Skynet Console active -- awaiting authority','decide');
+  addOrchLine('Dashboard connected -- awaiting live data','route');
 },200);
+
+/* ═══ LIVE MODULE/LOC COUNTER ═══ */
+async function updateModuleLOC(){
+  try{
+    const d=await smartFetch('/skynet/status');
+    if(d&&d.architecture){
+      const el=document.getElementById('sb-modules');
+      if(el)el.textContent=Object.keys(d.architecture).length;
+    }
+  }catch(e){}
+}
+updateModuleLOC();
+setInterval(updateModuleLOC,60000);
 
 /* ═══ GOD STATE POLLING ═══ */
 async function pollGodState(){
@@ -1729,9 +1911,9 @@ const GOD_PORT=8421;
 const BACKEND_PORT=8420;
 const CONSULTANT_BRIDGE_PORTS=[8422,8424,8425];
 async function smartFetch(path){
-  try{const r=await fetch(path);if(r.ok)return await r.json();}catch(e){}
-  try{const r2=await fetch('http://localhost:'+GOD_PORT+path);if(r2.ok)return await r2.json();}catch(e){}
-  if(path.startsWith('/bus')){try{const r3=await fetch('http://localhost:'+BACKEND_PORT+path);if(r3.ok)return await r3.json();}catch(e){}}
+  try{const r=await fetch(path);if(r.ok)return await r.json();}catch(e){console.debug('smartFetch primary failed:',path,e.message);}
+  try{const r2=await fetch('http://localhost:'+GOD_PORT+path);if(r2.ok)return await r2.json();}catch(e){console.debug('smartFetch GOD failed:',path,e.message);}
+  if(path.startsWith('/bus')){try{const r3=await fetch('http://localhost:'+BACKEND_PORT+path);if(r3.ok)return await r3.json();}catch(e){console.debug('smartFetch backend failed:',path,e.message);}}
   return null;
 }
 async function smartFetchUrl(url){
@@ -1842,21 +2024,28 @@ connectWebSocket();
 
 /* ═══ SELF-AWARENESS PULSE ═══ */
 function _applyPulse(data){
+  /* TRUTH FIX: No fabricated fallback data. Show unknown/no-data when pulse is unavailable. signed: alpha */
   if(!data){
-    const wk={};let enginesOn=0;
-    for(const[id,ag]of Object.entries(AGENTS)){
-      const chip=document.getElementById('status-'+id);
-      const st=chip?chip.textContent:'OFFLINE';
-      wk[id]={status:st,model:'opus-fast'};
-      if(st!=='OFFLINE')enginesOn++;
-    }
-    data={
-      intelligence_score:Math.round(42+enginesOn*8),
-      engines_online:Math.min(enginesOn+3,18),engines_total:18,
-      health:enginesOn>=3?'HEALTHY':enginesOn>=1?'DEGRADED':'DOWN',
-      self_assessment:'Fallback mode -- pulse endpoint unavailable',
-      convene_sessions:[],workers:wk,aware:enginesOn>0
-    };
+    const iqEl=document.getElementById('selfIQ');
+    if(iqEl)iqEl.textContent='--';
+    if(typeof updateIQGauge==='function')updateIQGauge(0);
+    const healthEl=document.getElementById('selfHealth');
+    if(healthEl){healthEl.textContent='NO DATA';healthEl.className='iq-metric-val health-red';}
+    const capVal=document.getElementById('selfCapVal');
+    const capFill=document.getElementById('selfCapFill');
+    if(capVal)capVal.textContent='unknown';
+    if(capFill)capFill.style.width='0%';
+    const badge=document.getElementById('selfBadge');
+    const badgeText=document.getElementById('selfBadgeText');
+    if(badge)badge.className='iq-badge blind';
+    if(badgeText)badgeText.textContent='NO DATA';
+    const assessEl=document.getElementById('selfAssessText');
+    if(assessEl)assessEl.textContent='Pulse endpoint unavailable -- no data to display';
+    const sbIq=document.getElementById('sb-iq');
+    const sbSelf=document.getElementById('sb-self');
+    if(sbIq)sbIq.textContent='--';
+    if(sbSelf){sbSelf.textContent='NO DATA';sbSelf.style.color='#374151';}
+    return;
   }
   selfState.health=data.health||'UNKNOWN';
   selfState.workers=data.workers||{};
@@ -1875,7 +2064,9 @@ function _applyPulse(data){
   const capFill=document.getElementById('selfCapFill');
   const on=data.engines_online||0,total=data.engines_total||1;
   const pct=Math.round(on/total*100);
-  if(capVal)capVal.textContent=on+'/'+total+' ('+pct+'%)';
+  /* TRUTH FIX #5: Show staleness if data has a timestamp. signed: alpha */
+  const stale=data.timestamp?formatStaleness(data.timestamp*1000||data.timestamp):'';
+  if(capVal)capVal.textContent=on+'/'+total+' ('+pct+'%)'+stale;
   if(capFill)capFill.style.width=pct+'%';
 
   const badge=document.getElementById('selfBadge');
@@ -2283,6 +2474,14 @@ async function pollEngines(){
     if(offlineEl)offlineEl.textContent=off;
 
     grid.innerHTML='';
+    /* Cache-age disclosure per Truth Principle -- signed: gamma */
+    const cacheTs=data.timestamp||0;
+    const cacheAgeSec=cacheTs?Math.round(Date.now()/1000-cacheTs):0;
+    let cacheAgeHtml='';
+    if(cacheTs&&cacheAgeSec>1){
+      const cls=cacheAgeSec>30?'stale-crit':cacheAgeSec>10?'stale-bad':'stale-warn';
+      cacheAgeHtml='<div class="eng-cache-age '+cls+'">cached '+cacheAgeSec+'s ago</div>';
+    }
     for(const e of engines){
       const s=String(e.status||'').toLowerCase();
       let cls='offline';
@@ -2293,7 +2492,7 @@ async function pollEngines(){
       const tile=document.createElement('div');
       tile.className='eng-tile '+cls;
       tile.title=e.name+' | '+e.status+(e.response_time_ms?' | '+ms:'');
-      tile.innerHTML='<div class="eng-name">'+esc(name)+'</div><div class="eng-ms">'+ms+'</div>';
+      tile.innerHTML='<div class="eng-name">'+esc(name)+'</div><div class="eng-ms">'+ms+'</div>'+cacheAgeHtml;
       tile.style.cursor='pointer';
       tile.addEventListener('click',()=>openEngModal(e));
       grid.appendChild(tile);

@@ -116,103 +116,109 @@ def _get_worker_state(hwnd):
         return "UNKNOWN"
 
 
+def _ps_csharp_addtype():
+    """Return the C# Add-Type block for Win32 focus/thread helpers."""
+    return (
+        'Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms\n'
+        'Add-Type @"\n'
+        'using System; using System.Runtime.InteropServices; using System.Text;\n'
+        'public class BusWorkerType {{\n'
+        '    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);\n'
+        '    [DllImport("user32.dll")] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr c, string cls, string w);\n'
+        '    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);\n'
+        '    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);\n'
+        '    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();\n'
+        '    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);\n'
+        '    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);\n'
+        '    public static bool FocusViaAttach(IntPtr target) {{\n'
+        '        uint targetTid = GetWindowThreadProcessId(target, out _);\n'
+        '        uint myTid = GetCurrentThreadId();\n'
+        '        if (targetTid == 0) return false;\n'
+        '        AttachThreadInput(myTid, targetTid, true);\n'
+        '        SetFocus(target);\n'
+        '        return true;\n'
+        '    }}\n'
+        '    public static void DetachThread(IntPtr target) {{\n'
+        '        uint targetTid = GetWindowThreadProcessId(target, out _);\n'
+        '        uint myTid = GetCurrentThreadId();\n'
+        '        AttachThreadInput(myTid, targetTid, false);\n'
+        '    }}\n'
+        '}}\n'
+        '"@\n'
+    )
+
+
+def _ps_find_edit_and_paste(hwnd, orch_hwnd, safe_text):
+    """Return PS block that finds the bottommost Edit, pastes text, and sends Enter."""
+    return (
+        f'$hwnd = [IntPtr]{hwnd}\n'
+        f'$orchHwnd = [IntPtr]{orch_hwnd}\n'
+        '\n'
+        '$wnd = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)\n'
+        '$allEdits = $wnd.FindAll(\n'
+        '    [System.Windows.Automation.TreeScope]::Descendants,\n'
+        '    (New-Object System.Windows.Automation.PropertyCondition(\n'
+        '        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,\n'
+        '        [System.Windows.Automation.ControlType]::Edit\n'
+        '    ))\n'
+        ')\n'
+        '$edit = $null\n'
+        '$maxY = -1\n'
+        'foreach ($e in $allEdits) {{\n'
+        '    try {{\n'
+        '        $r = $e.Current.BoundingRectangle\n'
+        '        if ($r.Y -gt $maxY) {{ $maxY = $r.Y; $edit = $e }}\n'
+        '    }} catch {{}}\n'
+        '}}\n'
+        '\n'
+        'if ($edit) {{\n'
+        '    $savedClip = $null\n'
+        '    try {{ $savedClip = [System.Windows.Forms.Clipboard]::GetText() }} catch {{}}\n'
+        '\n'
+        f'    [System.Windows.Forms.Clipboard]::SetText("{safe_text}")\n'
+        '    Start-Sleep -Milliseconds 50\n'
+        '\n'
+        '    $attached = [BusWorkerType]::FocusViaAttach($hwnd)\n'
+        '    if ($attached) {{\n'
+        '        try {{ $edit.SetFocus() }} catch {{}}\n'
+        '        Start-Sleep -Milliseconds 80\n'
+        '        [System.Windows.Forms.SendKeys]::SendWait("^v")\n'
+        '        Start-Sleep -Milliseconds 80\n'
+        '        [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")\n'
+        '        [BusWorkerType]::DetachThread($hwnd)\n'
+        '        Write-Host "OK"\n'
+        '    }} else {{\n'
+        '        try {{ $edit.SetFocus() }} catch {{}}\n'
+        '        [BusWorkerType]::SetForegroundWindow($hwnd)\n'
+        '        Start-Sleep -Milliseconds 80\n'
+        '        [System.Windows.Forms.SendKeys]::SendWait("^v")\n'
+        '        Start-Sleep -Milliseconds 80\n'
+        '        [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")\n'
+        '        [BusWorkerType]::SetForegroundWindow($orchHwnd)\n'
+        '        Write-Host "OK"\n'
+        '    }}\n'
+        '\n'
+        '    if ($savedClip -and $savedClip.Length -gt 0) {{\n'
+        '        Start-Sleep -Milliseconds 50\n'
+        '        try {{ [System.Windows.Forms.Clipboard]::SetText($savedClip) }} catch {{}}\n'
+        '    }}\n'
+        '}} else {{\n'
+        '    Write-Host "NO_EDIT"\n'
+        '}}\n'
+    )
+
+
+def _build_type_ps_script(hwnd, orch_hwnd, safe_text):
+    """Build the complete PowerShell script for typing text into a chat window."""
+    return _ps_csharp_addtype() + '\n' + _ps_find_edit_and_paste(hwnd, orch_hwnd, safe_text)
+
+
 def _type_into_window(hwnd, text, orch_hwnd=None):
-    """Type text into a chat window via clipboard paste.
-    Self-input variant: targets own window, no cross-window focus issues.
-    """
+    """Type text into a chat window via clipboard paste."""
     if orch_hwnd is None:
-        orch_hwnd = hwnd  # self-target: restore focus to self
-
+        orch_hwnd = hwnd
     safe_text = text.replace("'", "''").replace('"', '`"').replace("\n", " ")
-
-    ps = f'''
-Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
-Add-Type @"
-using System; using System.Runtime.InteropServices; using System.Text;
-public class BusWorkerType {{
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr c, string cls, string w);
-    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
-    public static bool FocusViaAttach(IntPtr target) {{
-        uint targetTid = GetWindowThreadProcessId(target, out _);
-        uint myTid = GetCurrentThreadId();
-        if (targetTid == 0) return false;
-        AttachThreadInput(myTid, targetTid, true);
-        SetFocus(target);
-        return true;
-    }}
-    public static void DetachThread(IntPtr target) {{
-        uint targetTid = GetWindowThreadProcessId(target, out _);
-        uint myTid = GetCurrentThreadId();
-        AttachThreadInput(myTid, targetTid, false);
-    }}
-}}
-"@
-
-$hwnd = [IntPtr]{hwnd}
-$orchHwnd = [IntPtr]{orch_hwnd}
-
-# Find bottommost Edit (chat input box)
-$wnd = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-$allEdits = $wnd.FindAll(
-    [System.Windows.Automation.TreeScope]::Descendants,
-    (New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Edit
-    ))
-)
-$edit = $null
-$maxY = -1
-foreach ($e in $allEdits) {{
-    try {{
-        $r = $e.Current.BoundingRectangle
-        if ($r.Y -gt $maxY) {{ $maxY = $r.Y; $edit = $e }}
-    }} catch {{}}
-}}
-
-if ($edit) {{
-    # Save user clipboard
-    $savedClip = $null
-    try {{ $savedClip = [System.Windows.Forms.Clipboard]::GetText() }} catch {{}}
-
-    [System.Windows.Forms.Clipboard]::SetText("{safe_text}")
-    Start-Sleep -Milliseconds 50
-
-    # PRIMARY: AttachThreadInput (no Z-order change = no blink)
-    $attached = [BusWorkerType]::FocusViaAttach($hwnd)
-    if ($attached) {{
-        try {{ $edit.SetFocus() }} catch {{}}
-        Start-Sleep -Milliseconds 80
-        [System.Windows.Forms.SendKeys]::SendWait("^v")
-        Start-Sleep -Milliseconds 80
-        [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
-        [BusWorkerType]::DetachThread($hwnd)
-        Write-Host "OK"
-    }} else {{
-        # Fallback: brief SetForegroundWindow
-        try {{ $edit.SetFocus() }} catch {{}}
-        [BusWorkerType]::SetForegroundWindow($hwnd)
-        Start-Sleep -Milliseconds 80
-        [System.Windows.Forms.SendKeys]::SendWait("^v")
-        Start-Sleep -Milliseconds 80
-        [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
-        [BusWorkerType]::SetForegroundWindow($orchHwnd)
-        Write-Host "OK"
-    }}
-
-    # Restore user clipboard
-    if ($savedClip -and $savedClip.Length -gt 0) {{
-        Start-Sleep -Milliseconds 50
-        try {{ [System.Windows.Forms.Clipboard]::SetText($savedClip) }} catch {{}}
-    }}
-}} else {{
-    Write-Host "NO_EDIT"
-}}
-'''
+    ps = _build_type_ps_script(hwnd, orch_hwnd, safe_text)
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
@@ -220,7 +226,7 @@ if ($edit) {{
             creationflags=0x08000000  # CREATE_NO_WINDOW
         )
         return "OK" in r.stdout
-    except Exception as e:
+    except Exception:
         return False
 
 

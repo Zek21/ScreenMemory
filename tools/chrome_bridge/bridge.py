@@ -2220,7 +2220,7 @@ class AsyncHub:
         try:
             async for raw in self._ws:
                 try: msg = json.loads(raw)
-                except: continue
+                except (ValueError, TypeError): continue
                 if msg.get("type") == "agents":
                     self._agents = msg["agents"]
                     continue

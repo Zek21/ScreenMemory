@@ -85,20 +85,23 @@ def _get_state(hwnd: int) -> str:
         return "UNKNOWN"
 
 
+def _check_worker_processing(hwnd: int, worker_name: str, task: str,
+                              pre_state: str, wait_seconds: float) -> bool | None:
+    """Check if worker transitioned to PROCESSING. Returns True/False or None for retry."""
+    time.sleep(wait_seconds)
+    post_state = _get_state(hwnd)
+
+    if post_state in ("PROCESSING", "TYPING", "STEERING"):
+        outcome = "VERIFIED_STEERING" if post_state == "STEERING" else "VERIFIED"
+        _log_verification(worker_name, task, pre_state, post_state, outcome, False)
+        return True
+
+    return None  # still idle, needs retry
+
+
 def verify_dispatch(worker_name: str, task: str, wait_seconds: float = 10.0,
                     auto_redispatch: bool = True) -> bool:
-    """Verify a dispatch was received by checking worker state after a delay.
-
-    Args:
-        worker_name: Target worker name (alpha/beta/gamma/delta).
-        task: The task text that was dispatched (for logging/re-dispatch).
-        wait_seconds: Seconds to wait before checking state (default 10).
-        auto_redispatch: If True and worker still IDLE, re-dispatch once.
-
-    Returns:
-        True if worker confirmed PROCESSING (dispatch received).
-        False if worker still IDLE after verification (dispatch failed).
-    """
+    """Verify a dispatch was received by checking worker state after a delay."""
     hwnd = _get_worker_hwnd(worker_name)
     if not hwnd:
         _log_verification(worker_name, task, "NO_HWND", "NO_HWND",
@@ -106,40 +109,26 @@ def verify_dispatch(worker_name: str, task: str, wait_seconds: float = 10.0,
         return False
 
     pre_state = _get_state(hwnd)
-    time.sleep(wait_seconds)
+    result = _check_worker_processing(hwnd, worker_name, task, pre_state, wait_seconds)
+    if result is not None:
+        return result
+
     post_state = _get_state(hwnd)
-
-    if post_state in ("PROCESSING", "TYPING"):
-        _log_verification(worker_name, task, pre_state, post_state,
-                          "VERIFIED", False)
-        return True
-
-    if post_state == "STEERING":
-        _log_verification(worker_name, task, pre_state, post_state,
-                          "VERIFIED_STEERING", False)
-        return True
-
-    # Worker still IDLE -- dispatch likely failed silently
     if not auto_redispatch:
         _log_verification(worker_name, task, pre_state, post_state,
                           "FAILED_STILL_IDLE", False)
         return False
 
-    # Re-dispatch once
     print(f"[VERIFY] WARNING: {worker_name} still {post_state} after dispatch. Re-dispatching...")
     retry_success = _redispatch(worker_name, task, hwnd)
     retry_outcome = "RETRY_SUCCESS" if retry_success else "RETRY_FAILED"
-
     _log_verification(worker_name, task, pre_state, post_state,
                       "FAILED_RETRIED", True, retry_outcome)
 
     if retry_success:
-        # Wait again and confirm
-        time.sleep(wait_seconds)
-        final_state = _get_state(hwnd)
-        if final_state in ("PROCESSING", "TYPING", "STEERING"):
-            return True
-
+        result = _check_worker_processing(hwnd, worker_name, task, post_state, wait_seconds)
+        if result is not None:
+            return result
     return False
 
 

@@ -1,14 +1,33 @@
 # ScreenMemory Dependencies
+
 # Core
 Pillow>=10.0
 numpy>=1.24
 psutil>=5.9
+requests>=2.31
 
 # Screen capture (DXGI-backed on Windows)
 mss>=9.0
 
 # Database
 sqlite-vec>=0.1.1
+lancedb>=0.4
+
+# HTTP & Networking
+websockets>=12.0
+orjson>=3.9
+
+# AWS (SES email, prospecting)
+boto3>=1.34
+
+# Browser automation
+playwright>=1.40
+
+# Data parsing
+pydantic>=2.5
+
+# Windows COM automation (UIA engine)
+comtypes>=1.1.14
 
 # VLM Analysis (via Ollama — install separately: https://ollama.ai)
 # No pip dependency — uses HTTP API
@@ -29,5 +48,3 @@ sqlite-vec>=0.1.1
 # Optional: Advanced OCR fallback
 # doctr[torch]>=0.9
 # paddleocr>=2.7
-
-comtypes>=1.1.14  # Windows COM automation (UIA engine)

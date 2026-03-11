@@ -196,18 +196,14 @@ def locate_artifacts() -> tuple[dict[str, Any], Path, Path]:
     return source_manifest, crx_path, zip_path
 
 
-def inspect_artifact() -> dict[str, Any]:
-    source_manifest, crx_path, zip_path = locate_artifacts()
-    crx_bytes = crx_path.read_bytes()
-
+def _parse_crx_header(crx_bytes: bytes, crx_path):
+    """Parse and validate CRX3 file header. Returns (magic, version, header_size, zip_start)."""
     if len(crx_bytes) < 12:
         raise ProofError(f"CRX file is too short: {crx_path}")
-
     magic = crx_bytes[:4].decode("ascii", errors="replace")
     crx_version = struct.unpack("<I", crx_bytes[4:8])[0]
     header_size = struct.unpack("<I", crx_bytes[8:12])[0]
     zip_start = 12 + header_size
-
     if magic != "Cr24":
         raise ProofError(f"Unexpected CRX magic: {magic}")
     if crx_version != 3:
@@ -216,6 +212,13 @@ def inspect_artifact() -> dict[str, Any]:
         raise ProofError("CRX header points past the end of the file")
     if crx_bytes[zip_start:zip_start + 2] != b"PK":
         raise ProofError("Embedded ZIP payload is missing or corrupt")
+    return magic, crx_version, header_size, zip_start
+
+
+def inspect_artifact() -> dict[str, Any]:
+    source_manifest, crx_path, zip_path = locate_artifacts()
+    crx_bytes = crx_path.read_bytes()
+    magic, crx_version, header_size, zip_start = _parse_crx_header(crx_bytes, crx_path)
 
     with zipfile.ZipFile(BytesIO(crx_bytes[zip_start:])) as embedded_zip:
         embedded_entries = sorted(embedded_zip.namelist())

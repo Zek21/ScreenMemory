@@ -191,50 +191,56 @@ def bring_to_front(hwnd: int) -> None:
         pass
 
 
-def main() -> int:
+def _build_bookmark_parser():
+    """Build the bookmark folder CLI parser."""
     parser = argparse.ArgumentParser(
         description="Open a Chrome profile and bookmark folder without quoting bugs."
     )
     parser.add_argument("profile", help='Profile directory or display name, e.g. "Mak" or "Profile 3"')
     parser.add_argument("folder", nargs="?", default=None,
                         help='Bookmark folder name, e.g. "AI". If omitted, just opens/focuses the profile.')
-    parser.add_argument(
-        "--mode",
-        choices=("manager", "urls", "both"),
-        default="both",
-        help="Open the bookmark manager, the folder URLs, or both",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Resolve the profile and folder, then print the command without launching Chrome",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Open even if the profile window is already open",
-    )
-    args = parser.parse_args()
+    parser.add_argument("--mode", choices=("manager", "urls", "both"), default="both",
+                        help="Open the bookmark manager, the folder URLs, or both")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Resolve the profile and folder, then print the command without launching Chrome")
+    parser.add_argument("--force", action="store_true",
+                        help="Open even if the profile window is already open")
+    return parser
 
+
+def _focus_existing_profile(profile: dict, force: bool) -> int | None:
+    """Try to focus an existing profile window. Returns 0 if focused, None to continue."""
+    if force:
+        return None
+    hwnd = is_profile_window_open(profile["directory"])
+    if hwnd:
+        bring_to_front(hwnd)
+        return 0
+    return None
+
+
+def _open_profile_only(chrome_path: str, profile: dict) -> int:
+    """Open a Chrome profile without a specific folder."""
+    subprocess.Popen(
+        [chrome_path, f"--profile-directory={profile['directory']}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    print(f'Opened profile "{profile["name"]}" ({profile["directory"]}).')
+    return 0
+
+
+def main() -> int:
+    parser = _build_bookmark_parser()
+    args = parser.parse_args()
     chrome_path = find_chrome()
     profile = resolve_profile(args.profile)
 
-    # Check if profile is already open
-    if not args.force:
-        hwnd = is_profile_window_open(profile["directory"])
-        if hwnd and not args.folder:
-            bring_to_front(hwnd)
+    if not args.folder:
+        result = _focus_existing_profile(profile, args.force)
+        if result is not None:
             print(f'Profile "{profile["name"]}" is already open. Brought to foreground.')
             return 0
-
-    if not args.folder:
-        # Just open/focus the profile without a specific folder
-        subprocess.Popen(
-            [chrome_path, f"--profile-directory={profile['directory']}"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        print(f'Opened profile "{profile["name"]}" ({profile["directory"]}).')
-        return 0
+        return _open_profile_only(chrome_path, profile)
 
     bookmarks = load_bookmarks(profile["directory"])
     folder = find_bookmark_folder(bookmarks, args.folder)
@@ -247,33 +253,23 @@ def main() -> int:
 
     if args.dry_run:
         print(json.dumps({
-            "chrome_path": chrome_path,
-            "profile": profile,
-            "folder": {
-                "id": folder["id"],
-                "name": folder["name"],
-                "url_count": len(urls),
-            },
+            "chrome_path": chrome_path, "profile": profile,
+            "folder": {"id": folder["id"], "name": folder["name"], "url_count": len(urls)},
             "launch_args": launch_args,
         }, indent=2))
         return 0
 
-    # If profile is already open, just bring to front — don't re-open bookmarks
     if not args.force:
         hwnd = is_profile_window_open(profile["directory"])
         if hwnd:
             bring_to_front(hwnd)
-            print(
-                f'Profile "{profile["name"]}" is already open with these tabs. '
-                f'Brought to foreground. Use --force to open duplicates.'
-            )
+            print(f'Profile "{profile["name"]}" is already open with these tabs. '
+                  f'Brought to foreground. Use --force to open duplicates.')
             return 0
 
     subprocess.Popen([chrome_path, *launch_args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(
-        f'Opened profile "{profile["name"]}" ({profile["directory"]}) '
-        f'with bookmark folder "{folder["name"]}" ({len(urls)} URLs).'
-    )
+    print(f'Opened profile "{profile["name"]}" ({profile["directory"]}) '
+          f'with bookmark folder "{folder["name"]}" ({len(urls)} URLs).')
     return 0
 
 

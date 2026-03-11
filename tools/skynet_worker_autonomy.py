@@ -202,6 +202,30 @@ def pick_improvement(worker_name, log_data):
     return random.choice(all_tasks)
 
 
+def _dispatch_improvement(worker: str, category: str, task: str) -> bool:
+    """Dispatch an improvement task to a worker. Returns success flag."""
+    try:
+        sys.path.insert(0, str(ROOT))
+        from tools.skynet_dispatch import dispatch_to_worker
+        return dispatch_to_worker(worker, task)
+    except Exception as e:
+        print(f"  [ERROR] Failed to dispatch to {worker}: {e}")
+        return False
+
+
+def _record_dispatch(log_data: dict, worker: str, category: str,
+                     task: str, task_hash: str, success: bool):
+    """Record a dispatch entry in the autonomy log."""
+    log_data["dispatches"].append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "worker": worker, "category": category,
+        "task": task[:200], "task_hash": task_hash, "success": success,
+    })
+    log_data["stats"]["total"] += 1
+    log_data["stats"]["by_category"][category] = log_data["stats"]["by_category"].get(category, 0) + 1
+    log_data["stats"]["by_worker"][worker] = log_data["stats"]["by_worker"].get(worker, 0) + 1
+
+
 def scan_and_dispatch(dry_run=False):
     """Main scan cycle: find idle workers, check for pending work, dispatch improvements."""
     idle_workers = get_idle_workers()
@@ -210,7 +234,6 @@ def scan_and_dispatch(dry_run=False):
 
     pending_todos = get_pending_todos()
     pending_bus = get_pending_bus_tasks()
-
     if pending_todos > 0 or len(pending_bus) > 0:
         return {
             "dispatched": 0,
@@ -222,8 +245,7 @@ def scan_and_dispatch(dry_run=False):
     dispatched = []
 
     for worker in idle_workers:
-        worker_todos = get_pending_todos(worker)
-        if worker_todos > 0:
+        if get_pending_todos(worker) > 0:
             continue
 
         category, task, task_hash = pick_improvement(worker, log_data)
@@ -233,33 +255,13 @@ def scan_and_dispatch(dry_run=False):
             dispatched.append({"worker": worker, "category": category, "task": task[:80]})
             continue
 
-        # Dispatch via skynet_dispatch module
-        try:
-            sys.path.insert(0, str(ROOT))
-            from tools.skynet_dispatch import dispatch_to_worker
-            success = dispatch_to_worker(worker, task)
-        except Exception as e:
-            print(f"  [ERROR] Failed to dispatch to {worker}: {e}")
-            success = False
-
-        entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "worker": worker,
-            "category": category,
-            "task": task[:200],
-            "task_hash": task_hash,
-            "success": success,
-        }
-        log_data["dispatches"].append(entry)
-        log_data["stats"]["total"] += 1
-        log_data["stats"]["by_category"][category] = log_data["stats"]["by_category"].get(category, 0) + 1
-        log_data["stats"]["by_worker"][worker] = log_data["stats"]["by_worker"].get(worker, 0) + 1
+        success = _dispatch_improvement(worker, category, task)
+        _record_dispatch(log_data, worker, category, task, task_hash, success)
 
         if success:
             dispatched.append({"worker": worker, "category": category})
             _post_bus("autonomy", "orchestrator", "autonomy_dispatch",
                       f"Auto-dispatched [{category}] improvement to {worker.upper()}")
-
         time.sleep(0.5)
 
     if not dry_run:

@@ -45,6 +45,8 @@ BOOT_IN_PROGRESS_FILE = DATA_DIR / "boot_in_progress.json"
 HEALTH_FILE = DATA_DIR / "self_prompt_health.json"
 DELIVERED_FILE = DATA_DIR / "self_prompt_delivered.json"
 BUS_URL = "http://localhost:8420"
+DAEMON_NAME = "self_prompt"
+DAEMON_VERSION = "1.2.0"
 
 # Defaults (overridden by brain_config.json -> self_prompt section)
 LOOP_INTERVAL = 300
@@ -54,18 +56,25 @@ IDLE_WORKER_THRESHOLD = 90    # raised: 30s was too aggressive, workers need tim
 ORCH_INACTIVE_THRESHOLD = 45
 MAX_LOG_ENTRIES = 50
 HEALTH_REPORT_INTERVAL = 300  # report health to bus every 5 min
-MAX_CONSECUTIVE_PROMPTS = 3   # stop after N prompts without orchestrator action
+MAX_CONSECUTIVE_PROMPTS = 2   # stop after N prompts without orchestrator action
 
 ALL_IDLE_INTERVAL = 60  # faster prompting when all workers idle
+BOOT_PROMPT_ENABLED = True
+
+# Ollama integration for smarter self-prompts
+USE_OLLAMA = True
+OLLAMA_MODEL = "qwen3:14b"
+REQUIRED_WORKERS = ("alpha", "beta", "gamma", "delta")
 
 def _load_config_overrides():
     """Load self_prompt thresholds from brain_config.json. Called on startup AND each cycle (hot-reload)."""
     global LOOP_INTERVAL, MIN_PROMPT_GAP, IDLE_WORKER_THRESHOLD
     global ORCH_INACTIVE_THRESHOLD, HEALTH_REPORT_INTERVAL, PROMPT_THRESHOLD, MAX_CONSECUTIVE_PROMPTS
-    global ALL_IDLE_INTERVAL
+    global ALL_IDLE_INTERVAL, USE_OLLAMA, OLLAMA_MODEL, BOOT_PROMPT_ENABLED
     try:
         cfg = json.loads(BRAIN_CONFIG_FILE.read_text(encoding="utf-8"))
         sp = cfg.get("self_prompt", {})
+        god = cfg.get("god_protocol", {})
         if sp.get("loop_interval"):
             LOOP_INTERVAL = sp["loop_interval"]
         if sp.get("min_prompt_gap"):
@@ -82,6 +91,12 @@ def _load_config_overrides():
             MAX_CONSECUTIVE_PROMPTS = sp["max_consecutive"]
         if sp.get("all_idle_interval"):
             ALL_IDLE_INTERVAL = sp["all_idle_interval"]
+        if "use_ollama" in sp:
+            USE_OLLAMA = bool(sp["use_ollama"])
+        if sp.get("ollama_model"):
+            OLLAMA_MODEL = sp["ollama_model"]
+        if "boot_prompt_enabled" in god:
+            BOOT_PROMPT_ENABLED = bool(god["boot_prompt_enabled"])
     except Exception:
         pass
 
@@ -128,21 +143,40 @@ def _fetch_json(url, timeout=5):
 
 
 def _post_bus(topic, msg_type, content):
+    msg = {"sender": "self_prompt", "topic": topic, "type": msg_type, "content": content}
     try:
-        payload = json.dumps({
-            "sender": "self_prompt",
-            "topic": topic,
-            "type": msg_type,
-            "content": content,
-        }).encode()
-        req = urllib.request.Request(
-            f"{BUS_URL}/bus/publish", payload,
-            {"Content-Type": "application/json"}
-        )
-        urllib.request.urlopen(req, timeout=5)
-        return True
+        from tools.skynet_spam_guard import guarded_publish
+        result = guarded_publish(msg)
+        return result.get("allowed", False)
+    except ImportError:
+        # Fallback: direct HTTP if SpamGuard not available
+        try:
+            payload = json.dumps(msg).encode()
+            req = urllib.request.Request(
+                f"{BUS_URL}/bus/publish", payload,
+                {"Content-Type": "application/json"}
+            )
+            urllib.request.urlopen(req, timeout=5)
+            return True
+        except Exception:
+            return False
     except Exception:
         return False
+    # signed: gamma
+
+
+def _get_skynet_version():
+    try:
+        from tools.skynet_version import current_version
+        cur = current_version() or {}
+        version = cur.get("version")
+        return str(version) if version else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _versioned_signal(prefix, text):
+    return f"{prefix} v{DAEMON_VERSION}: {text}"
 
 
 def _load_json(path):
@@ -180,10 +214,15 @@ def _load_workers():
 
 
 def _get_orch_hwnd():
-    data = _load_json(ORCH_FILE)
-    if data:
-        return data.get("orchestrator_hwnd", 0)
-    return 0
+    try:
+        sys.path.insert(0, str(ROOT / "tools"))
+        from skynet_delivery import resolve_orchestrator_hwnd
+        return int(resolve_orchestrator_hwnd() or 0)
+    except Exception:
+        data = _load_json(ORCH_FILE)
+        if data:
+            return data.get("orchestrator_hwnd", 0)
+        return 0
 
 
 def _update_last_action(reason="prompt_sent"):
@@ -258,10 +297,9 @@ def _send_self_prompt(orch_hwnd, prompt_text):
     """Type a prompt into the orchestrator's chat window."""
     try:
         sys.path.insert(0, str(ROOT / "tools"))
-        from skynet_dispatch import ghost_type_to_worker
-        # For self-prompt, target=orchestrator, orch_hwnd=orchestrator (focus returns to self)
-        ok = ghost_type_to_worker(orch_hwnd, prompt_text, orch_hwnd)
-        return ok
+        from skynet_delivery import deliver_to_orchestrator
+        result = deliver_to_orchestrator(prompt_text, sender="self_prompt", also_bus=False)
+        return bool(result.get("success"))
     except Exception as e:
         log(f"Send failed: {e}", "ERROR")
         return False
@@ -388,7 +426,18 @@ class ChainOfThought:
         return " -> ".join(parts)
 
     def critical_conclusions(self):
-        return [s["conclusion"] for s in self.steps if "CRITICAL" in s.get("conclusion", "").upper() or "URGENT" in s.get("conclusion", "").upper()]
+        """Return only genuinely critical conclusions (system failures, not idle workers)."""
+        dominated = []
+        for s in self.steps:
+            c = s.get("conclusion", "").upper()
+            # Only surface CRITICAL for real system failures (DEAD, DOWN, security)
+            # URGENT for genuine stalls (dispatch drought, failure spikes) -- NOT idle workers
+            if "CRITICAL" in c and any(kw in c for kw in ("DEAD", "DOWN", "SECURITY", "RESTORE", "FAILURE RATE")):
+                dominated.append(s["conclusion"])
+            # URGENT only for genuine system failures -- NOT dispatch pauses
+            elif "URGENT" in c and any(kw in c for kw in ("SPIKE", "SECURITY", "DEAD")):
+                dominated.append(s["conclusion"])
+        return dominated
 
     def reset(self):
         self.steps = []
@@ -422,52 +471,43 @@ class SelfPromptDaemon:
         self.cycles = 0
         self._boot_done = False
 
-        # Restore delivered IDs from persistent file to avoid re-delivering after restart
+        # Restore delivered IDs from persistent file
         delivered = _load_json(DELIVERED_FILE)
         if delivered and isinstance(delivered, dict):
             self.seen_result_ids = set(delivered.get("result", []))
             self.seen_alert_ids = set(delivered.get("alert", []))
 
-        # ── CONSECUTIVE PROMPT LIMITER ──
+        # Consecutive prompt limiter
         self.consecutive_prompts = 0
         self.max_consecutive = MAX_CONSECUTIVE_PROMPTS
         self.last_dispatch_check_count = 0
+        self.last_cycle_complete_time = 0.0
+        self.all_idle_since = 0.0
 
-        # ── INTELLIGENCE SUBSYSTEMS ──
-        # Temporal Pattern Engine: sliding window of events
-        self.event_history = []          # list of TemporalEvent (last 500)
+        self._init_intelligence()
+        self._load_persistent_state()
+
+    def _init_intelligence(self):
+        """Initialize intelligence subsystems (temporal, cognitive, mission, calibration)."""
+        self.event_history = []
         self.EVENT_WINDOW = 500
-
-        # Worker Cognitive Models: real-time cognitive profile per worker
-        self.worker_models = {}          # name -> WorkerCognitiveModel
-
-        # Mission Continuity: track active missions across prompts
-        self.active_missions = []        # list of {id, goal, dispatched_to, started, status}
+        self.worker_models = {}
+        self.active_missions = []
         self.mission_counter = 0
-
-        # Self-Calibration: effectiveness tracking
-        self.prompt_effectiveness = []   # last 50 (prompt_time, was_acted_on)
+        self.prompt_effectiveness = []
         self.dynamic_threshold = PROMPT_THRESHOLD
         self.dynamic_gap = MIN_PROMPT_GAP
-
-        # Chain of Thought: per-cycle reasoning
         self.cot = ChainOfThought()
-
-        # Anomaly Detection: baseline metrics
-        self.baseline_dispatch_rate = 0.0  # dispatches per hour
+        self.baseline_dispatch_rate = 0.0
         self.baseline_completion_rate = 0.0
         self.anomaly_alerts = []
 
-        # ── PLANNER INTEGRATION (Level 4) ──
-        # HierarchicalPlanner for autonomous mission generation
+        # Planner integration
         self._planner = None
         self._last_mission_plan_time = 0.0
-        self._mission_plan_cooldown = 300  # generate at most 1 mission plan per 5 min
-        self._mission_plan_history = []     # last 20 generated plans
+        self._mission_plan_cooldown = 300
+        self._mission_plan_history = []
         self._init_planner()
-
-        # Load persistent state
-        self._load_persistent_state()
 
     def _load_persistent_state(self):
         """Restore temporal memory from disk."""
@@ -511,21 +551,14 @@ class SelfPromptDaemon:
             self._planner = None
 
     def _plan_autonomous_mission(self, perception, patterns):
-        """Use HierarchicalPlanner to generate an autonomous improvement mission.
+        """Generate an autonomous improvement mission when workers are idle and no work exists.
         
-        Called when workers are idle and no pending work exists.
-        Analyzes system state to identify the highest-impact improvement goal,
-        decomposes it into subtasks, and returns a dispatch-ready mission.
-        
-        Returns: (mission_goal, subtask_descriptions) or (None, None) if no mission needed.
+        Returns: (mission_goal, subtask_descriptions) or (None, None).
         """
         now = time.time()
-        
-        # Cooldown: don't plan missions too frequently
         if now - self._last_mission_plan_time < self._mission_plan_cooldown:
             return None, None
 
-        # Only plan when workers are idle AND no pending work
         idle_workers = [n for n, i in perception["workers"].items() 
                        if i.get("state") == "IDLE" and i.get("alive")]
         if not idle_workers:
@@ -533,107 +566,98 @@ class SelfPromptDaemon:
 
         pending = perception.get("pending_todos", 0) + perception.get("pending_tasks", 0)
         if pending > 0:
-            return None, None  # there's already work to do, no need to generate more
+            return None, None
 
-        # Analyze system state to determine best improvement goal
         goal = self._identify_improvement_goal(perception, patterns)
         if not goal:
             return None, None
 
-        # Use Planner to decompose goal into subtasks
         if self._planner:
             try:
                 plan = self._planner.create_plan(goal, context=self._build_planning_context(perception))
-                subtask_descriptions = [st.description for st in plan.subtasks]
-                
-                self._last_mission_plan_time = now
-                self.mission_counter += 1
-                
-                mission = {
-                    "id": f"mission_{self.mission_counter}",
-                    "goal": goal,
-                    "subtasks": subtask_descriptions,
-                    "dispatched_to": idle_workers[:len(subtask_descriptions)],
-                    "started": now,
-                    "status": "planned",
-                    "source": "planner",
-                }
-                self.active_missions.append(mission)
-                self._mission_plan_history.append({
-                    "goal": goal,
-                    "subtasks": len(subtask_descriptions),
-                    "time": datetime.now().isoformat(),
-                })
-                if len(self._mission_plan_history) > 20:
-                    self._mission_plan_history = self._mission_plan_history[-20:]
-
-                log(f"PLANNER: Generated mission '{goal}' with {len(subtask_descriptions)} subtasks")
-                return goal, subtask_descriptions
+                subtasks = [st.description for st in plan.subtasks]
+                self._register_mission(goal, subtasks, idle_workers, now)
+                return goal, subtasks
             except Exception as e:
                 log(f"Planner decomposition failed: {e}", "WARN")
 
-        # Fallback: return the raw goal without decomposition
         self._last_mission_plan_time = now
         return goal, [goal]
+
+    def _register_mission(self, goal, subtasks, idle_workers, now):
+        """Record a planned mission in active missions and history."""
+        self._last_mission_plan_time = now
+        self.mission_counter += 1
+        self.active_missions.append({
+            "id": f"mission_{self.mission_counter}",
+            "goal": goal,
+            "subtasks": subtasks,
+            "dispatched_to": idle_workers[:len(subtasks)],
+            "started": now,
+            "status": "planned",
+            "source": "planner",
+        })
+        self._mission_plan_history.append({
+            "goal": goal,
+            "subtasks": len(subtasks),
+            "time": datetime.now().isoformat(),
+        })
+        if len(self._mission_plan_history) > 20:
+            self._mission_plan_history = self._mission_plan_history[-20:]
+        log(f"PLANNER: Generated mission '{goal}' with {len(subtasks)} subtasks")
+
+    _COGNITIVE_GOALS = [
+        "Wire core/cognitive/reflexion.py into the dispatch pipeline -- after task failures, auto-generate verbal self-critiques and store in learning_store",
+        "Wire core/cognitive/graph_of_thoughts.py into skynet_brain.py -- use GoT for complex multi-branch reasoning on COMPLEX/ADVERSARIAL tasks",
+        "Wire core/cognitive/knowledge_distill.py as a background daemon -- consolidate decaying episodic memories into durable semantic knowledge",
+        "Wire core/cognitive/mcts.py into web navigation tasks -- use R-MCTS for autonomous browser interaction planning",
+    ]
+
+    _GENERAL_GOALS = [
+        "Audit and improve test coverage for tools/skynet_*.py -- identify untested functions and add targeted tests",
+        "Review and optimize the dispatch pipeline -- measure latency, identify bottlenecks, reduce overhead",
+        "Update AGENTS.md documentation to reflect Level 4 capabilities and new features",
+        "Scan codebase for TODO/FIXME/HACK comments and create actionable improvement tickets",
+        "Profile and optimize the UIA engine scan performance -- target sub-100ms per scan",
+    ]
 
     def _identify_improvement_goal(self, perception, patterns) -> str:
         """Analyze system state to identify the highest-impact improvement goal.
         
-        Priority order:
-        1. Fix failures: if recent failures detected, investigate root cause
-        2. Activate dormant engines: if engines are available but not online
-        3. Improve low-IQ metrics: if IQ trending down
-        4. Wire unused cognitive modules: GoT, MCTS, Reflexion
-        5. General self-improvement: codebase audit, test coverage, docs
+        Priority: failures > dormant engines > low IQ > cognitive wiring > general.
         """
-        # Priority 1: Recent failures need investigation
         if patterns.get("failure_rate_10m", 0) >= 2:
             return "Investigate and fix recent task failures -- check worker logs, bus error messages, and dispatch pipeline"
 
-        # Priority 2: Dormant engines (available but not online)
-        engine_status = perception.get("engine_status")
-        if engine_status and isinstance(engine_status, dict):
-            engines = engine_status.get("engines", {})
-            available_but_offline = [
-                name for name, info in engines.items()
-                if isinstance(info, dict) and info.get("status") == "available"
-            ]
-            if available_but_offline:
-                target = available_but_offline[0]
-                return f"Activate dormant engine '{target}' -- investigate why it is 'available' but not 'online', fix dependencies"
+        dormant = self._find_dormant_engine(perception)
+        if dormant:
+            return f"Activate dormant engine '{dormant}' -- investigate why it is 'available' but not 'online', fix dependencies"
 
-        # Priority 3: IQ trend analysis
         iq_data = perception.get("iq")
         if iq_data and isinstance(iq_data, dict):
             iq_val = iq_data.get("iq", 0)
             if iq_val < 0.80:
                 return f"Improve collective IQ (currently {iq_val:.4f}) -- audit low-scoring engines, add missing capabilities, improve test coverage"
 
-        # Priority 4: Wire cognitive modules
-        cognitive_goals = [
-            "Wire core/cognitive/reflexion.py into the dispatch pipeline -- after task failures, auto-generate verbal self-critiques and store in learning_store",
-            "Wire core/cognitive/graph_of_thoughts.py into skynet_brain.py -- use GoT for complex multi-branch reasoning on COMPLEX/ADVERSARIAL tasks",
-            "Wire core/cognitive/knowledge_distill.py as a background daemon -- consolidate decaying episodic memories into durable semantic knowledge",
-            "Wire core/cognitive/mcts.py into web navigation tasks -- use R-MCTS for autonomous browser interaction planning",
-        ]
-        # Pick one that hasn't been planned recently
-        recent_goals = {m.get("goal", "") for m in self._mission_plan_history[-10:]}
-        for g in cognitive_goals:
-            if g not in recent_goals:
-                return g
+        return self._pick_novel_goal(self._COGNITIVE_GOALS) or self._pick_novel_goal(self._GENERAL_GOALS) or ""
 
-        # Priority 5: General improvement
-        general_goals = [
-            "Audit and improve test coverage for tools/skynet_*.py -- identify untested functions and add targeted tests",
-            "Review and optimize the dispatch pipeline -- measure latency, identify bottlenecks, reduce overhead",
-            "Update AGENTS.md documentation to reflect Level 4 capabilities and new features",
-            "Scan codebase for TODO/FIXME/HACK comments and create actionable improvement tickets",
-            "Profile and optimize the UIA engine scan performance -- target sub-100ms per scan",
-        ]
-        for g in general_goals:
-            if g not in recent_goals:
-                return g
+    def _find_dormant_engine(self, perception) -> str:
+        """Return the name of the first engine that is 'available' but not 'online', or ''."""
+        engine_status = perception.get("engine_status")
+        if not engine_status or not isinstance(engine_status, dict):
+            return ""
+        engines = engine_status.get("engines", {})
+        for name, info in engines.items():
+            if isinstance(info, dict) and info.get("status") == "available":
+                return name
+        return ""
 
+    def _pick_novel_goal(self, goal_list) -> str:
+        """Return the first goal from goal_list not recently planned, or ''."""
+        recent = {m.get("goal", "") for m in self._mission_plan_history[-10:]}
+        for g in goal_list:
+            if g not in recent:
+                return g
         return ""
 
     def _build_planning_context(self, perception) -> str:
@@ -730,8 +754,15 @@ class SelfPromptDaemon:
             "iq": None,
             "learning_store": None,
         }
+        self._perceive_workers(perception)
+        self._perceive_bus(perception)
+        perception["pending_todos"] = _get_pending_todos()
+        perception["pending_tasks"] = _get_pending_tasks()
+        self._perceive_metadata(perception)
+        return perception
 
-        # Worker states via UIA
+    def _perceive_workers(self, perception):
+        """Scan worker states via UIA and update cognitive models."""
         workers = _load_workers()
         for w in workers:
             name = w.get("name", "?")
@@ -741,7 +772,6 @@ class SelfPromptDaemon:
             if alive:
                 state = _get_worker_state(hwnd)
 
-            # Initialize or update cognitive model
             if name not in self.worker_models:
                 specs = []
                 try:
@@ -761,44 +791,51 @@ class SelfPromptDaemon:
                 "model": model,
             }
 
-        # Bus messages
+    def _perceive_bus(self, perception):
+        """Process bus messages into results and alerts."""
         bus_msgs = _fetch_json(f"{BUS_URL}/bus/messages?limit=50")
-        if bus_msgs and isinstance(bus_msgs, list):
-            for m in bus_msgs:
-                mid = m.get("id", "")
-                msg_type = m.get("type", "")
-                msg_topic = m.get("topic", "")
+        if not bus_msgs or not isinstance(bus_msgs, list):
+            return
 
-                # Results addressed to orchestrator
-                if msg_type == "result" and msg_topic == "orchestrator":
-                    if mid and mid not in self.seen_result_ids:
-                        self.seen_result_ids.add(mid)
-                        perception["bus_results"].append(m)
-                        self._record_event(EVT_RESULT, m.get("sender", "?"), str(m.get("content", ""))[:100])
-                        # Update worker cognitive model
-                        sender = m.get("sender", "")
-                        if sender in self.worker_models:
-                            content_lower = str(m.get("content", "")).lower()
-                            if any(kw in content_lower for kw in ("error", "failed", "timeout")):
-                                self.worker_models[sender].tasks_failed += 1
-                                self.worker_models[sender].last_result_quality = "failure"
-                                self._record_event(EVT_FAILURE, sender, content_lower[:80])
-                            else:
-                                self.worker_models[sender].tasks_completed += 1
-                                self.worker_models[sender].last_result_quality = "success"
+        for m in bus_msgs:
+            mid = m.get("id", "")
+            msg_type = m.get("type", "")
+            msg_topic = m.get("topic", "")
 
-                # Alerts (all types including urgent)
-                if msg_type in ("alert", "monitor_alert", "service_alert", "urgent"):
-                    if mid and mid not in self.seen_alert_ids:
-                        self.seen_alert_ids.add(mid)
-                        perception["bus_alerts"].append(m)
-                        self._record_event(EVT_ALERT, m.get("sender", "?"), str(m.get("content", ""))[:80])
+            if msg_type == "result" and msg_topic == "orchestrator":
+                if mid and mid not in self.seen_result_ids:
+                    self.seen_result_ids.add(mid)
+                    perception["bus_results"].append(m)
+                    self._record_event(EVT_RESULT, m.get("sender", "?"), str(m.get("content", ""))[:100])
+                    self._update_worker_model_from_result(m)
 
-        # Pending work
-        perception["pending_todos"] = _get_pending_todos()
-        perception["pending_tasks"] = _get_pending_tasks()
+            if msg_type in ("alert", "monitor_alert", "service_alert", "urgent"):
+                sender = str(m.get("sender", ""))
+                content = str(m.get("content", ""))
+                if sender == "self_prompt" and content.startswith("SELF_PROMPT_"):
+                    continue
+                if mid and mid not in self.seen_alert_ids:
+                    self.seen_alert_ids.add(mid)
+                    perception["bus_alerts"].append(m)
+                    self._record_event(EVT_ALERT, m.get("sender", "?"), str(m.get("content", ""))[:80])
 
-        # Agent profiles
+    def _update_worker_model_from_result(self, msg):
+        """Update a worker's cognitive model based on a result message."""
+        sender = msg.get("sender", "")
+        if sender not in self.worker_models:
+            return
+        content_lower = str(msg.get("content", "")).lower()
+        model = self.worker_models[sender]
+        if any(kw in content_lower for kw in ("error", "failed", "timeout")):
+            model.tasks_failed += 1
+            model.last_result_quality = "failure"
+            self._record_event(EVT_FAILURE, sender, content_lower[:80])
+        else:
+            model.tasks_completed += 1
+            model.last_result_quality = "success"
+
+    def _perceive_metadata(self, perception):
+        """Gather agent profiles, engine status, IQ, and learning store."""
         try:
             pdata = _load_json(DATA_DIR / "agent_profiles.json") or {}
             for k, v in pdata.items():
@@ -807,13 +844,9 @@ class SelfPromptDaemon:
         except Exception:
             pass
 
-        # Skynet backend status
         perception["skynet_status"] = _fetch_json(f"{BUS_URL}/status")
-
-        # Engine health
         perception["engine_status"] = _fetch_json("http://localhost:8421/engines")
 
-        # IQ
         try:
             iq_data = _load_json(DATA_DIR / "iq_history.json") or {}
             h = iq_data.get("history", [])
@@ -822,15 +855,11 @@ class SelfPromptDaemon:
         except Exception:
             pass
 
-        # Learning store
         try:
             from core.learning_store import LearningStore
-            ls = LearningStore()
-            perception["learning_store"] = ls.stats()
+            perception["learning_store"] = LearningStore().stats()
         except Exception:
             pass
-
-        return perception
 
     # ── PHASE 2: REMEMBER (Temporal Pattern Analysis) ───────────────────────
 
@@ -890,13 +919,21 @@ class SelfPromptDaemon:
         """Chain-of-thought reasoning over observations and patterns."""
         self.cot.reset()
         score = 0
+        score += self._reason_worker_utilization(perception)
+        score += self._reason_results(perception, patterns)
+        score += self._reason_temporal(perception, patterns)
+        score += self._reason_alerts(perception)
+        score += self._reason_strategic(perception)
+        score += self._reason_missions()
+        score += self._reason_calibration()
+        score += 5  # routine tick
+        return score
 
-        # ── Thought 1: Worker Utilization Analysis ──
+    def _reason_worker_utilization(self, perception):
+        """Thought 1: Worker utilization analysis."""
+        score = 0
         idle = [n for n, i in perception["workers"].items() if i["state"] == "IDLE"]
-        busy = [n for n, i in perception["workers"].items() if i["state"] in ("PROCESSING", "TYPING")]
         dead = [n for n, i in perception["workers"].items() if not i["alive"]]
-        total_workers = len(perception["workers"])
-        utilization = len(busy) / max(total_workers, 1)
 
         if dead:
             self.cot.think(
@@ -909,10 +946,10 @@ class SelfPromptDaemon:
         if idle and perception["pending_todos"] > 0:
             self.cot.think(
                 f"{len(idle)} idle worker(s) with {perception['pending_todos']} pending tasks",
-                "Idle capacity exists while work is queued. Dispatch bottleneck.",
-                f"URGENT: Dispatch to {','.join(w.upper() for w in idle[:2])}"
+                "Idle capacity available. Orchestrator may dispatch when ready.",
+                f"Idle workers: {','.join(w.upper() for w in idle[:2])} -- {perception['pending_todos']} tasks queued"
             )
-            score += 80
+            score += 15
         elif idle and perception["pending_todos"] == 0:
             self.cot.think(
                 f"{len(idle)} idle worker(s), 0 pending tasks",
@@ -920,39 +957,46 @@ class SelfPromptDaemon:
                 f"Workers {','.join(w.upper() for w in idle)} ready for new assignments"
             )
             score += 15
+        return score
 
-        # ── Thought 2: Result Synthesis ──
+    def _reason_results(self, perception, patterns):
+        """Thought 2: Result synthesis analysis."""
+        score = 0
         new_results = perception["bus_results"]
-        if new_results:
-            senders = set(m.get("sender", "?").upper() for m in new_results)
-            failure_results = [m for m in new_results
-                               if any(kw in str(m.get("content", "")).lower()
-                                      for kw in ("failed", "error", "timeout", "blocked"))]
-            if failure_results:
-                self.cot.think(
-                    f"{len(failure_results)} failure report(s) from {', '.join(senders)}",
-                    "Task failures require reassignment or root cause analysis.",
-                    f"CRITICAL: Review failures from {', '.join(m.get('sender','?').upper() for m in failure_results[:2])}"
-                )
-                score += 70
-            else:
-                self.cot.think(
-                    f"{len(new_results)} new result(s) from {', '.join(senders)}",
-                    "Results ready for synthesis. Orchestrator should collect and integrate.",
-                    f"Synthesize {len(new_results)} result(s) from {'+'.join(senders)}"
-                )
-                score += 50
+        if not new_results:
+            return score
 
-            # Convergence insight
-            if patterns["convergence"]:
-                self.cot.think(
-                    f"Multiple workers converged on topics: {', '.join(patterns['convergence'][:3])}",
-                    "Convergence indicates strong signal. Cross-reference findings.",
-                    f"High-confidence insights on: {', '.join(patterns['convergence'][:3])}"
-                )
-                score += 20
+        senders = set(m.get("sender", "?").upper() for m in new_results)
+        failure_results = [m for m in new_results
+                           if any(kw in str(m.get("content", "")).lower()
+                                  for kw in ("failed", "error", "timeout", "blocked"))]
+        if failure_results:
+            self.cot.think(
+                f"{len(failure_results)} failure report(s) from {', '.join(senders)}",
+                "Task failures require reassignment or root cause analysis.",
+                f"CRITICAL: Review failures from {', '.join(m.get('sender','?').upper() for m in failure_results[:2])}"
+            )
+            score += 70
+        else:
+            self.cot.think(
+                f"{len(new_results)} new result(s) from {', '.join(senders)}",
+                "Results ready for synthesis. Orchestrator should collect and integrate.",
+                f"Synthesize {len(new_results)} result(s) from {'+'.join(senders)}"
+            )
+            score += 50
 
-        # ── Thought 3: Temporal Pattern Analysis ──
+        if patterns["convergence"]:
+            self.cot.think(
+                f"Multiple workers converged on topics: {', '.join(patterns['convergence'][:3])}",
+                "Convergence indicates strong signal. Cross-reference findings.",
+                f"High-confidence insights on: {', '.join(patterns['convergence'][:3])}"
+            )
+            score += 20
+        return score
+
+    def _reason_temporal(self, perception, patterns):
+        """Thought 3: Temporal pattern analysis."""
+        score = 0
         if patterns["stall_pattern"]:
             self.cot.think(
                 "Worker state cycling detected (IDLE->PROCESSING->IDLE) without results",
@@ -962,12 +1006,15 @@ class SelfPromptDaemon:
             score += 40
 
         if patterns["dispatch_drought"] and perception["pending_todos"] > 0:
+            # Idle workers + pending TODOs is NORMAL when orchestrator is
+            # deliberately pausing (e.g. strategic pivot, busywork purge).
+            # Only flag as informational, never URGENT/CRITICAL.
             self.cot.think(
                 f"No dispatches in 10 minutes but {perception['pending_todos']} pending tasks",
-                "Orchestrator may be sleeping or stuck. Wake-up needed.",
-                "URGENT: Orchestrator dispatch pipeline stalled"
+                "Orchestrator may be strategically pausing dispatch. Inform, do not escalate.",
+                f"Info: {perception['pending_todos']} pending tasks, dispatch paused"
             )
-            score += 60
+            score += 10
 
         if patterns["failure_rate_10m"] >= 3:
             self.cot.think(
@@ -976,66 +1023,71 @@ class SelfPromptDaemon:
                 f"CRITICAL: Failure rate spike -- {patterns['failure_rate_10m']} in 10min"
             )
             score += 50
-
-        # ── Thought 4: Alert Processing ──
-        if perception["bus_alerts"]:
-            alert_content = str(perception["bus_alerts"][0].get("content", ""))[:60]
-            self.cot.think(
-                f"{len(perception['bus_alerts'])} active alert(s): {alert_content}",
-                "Alerts require orchestrator attention. Triage and respond.",
-                f"{len(perception['bus_alerts'])} alert(s) need attention"
-            )
-            score += 40
-
-        # ── Thought 5: Strategic Assessment ──
-        if perception["skynet_status"]:
-            status = perception["skynet_status"]
-            uptime_h = status.get("uptime_s", 0) / 3600
-            done = status.get("tasks_completed", 0)
-            total = status.get("tasks_dispatched", 0)
-            rate = done / max(uptime_h, 0.01)
-
-            if rate < 1.0 and uptime_h > 0.5:
-                self.cot.think(
-                    f"Task completion rate: {rate:.1f}/hr over {uptime_h:.1f}h",
-                    "Low throughput relative to uptime. Workers may be underutilized.",
-                    f"Throughput concern: {rate:.1f} tasks/hr ({done}/{total})"
-                )
-                score += 15
-
-        # ── Thought 6: Mission Continuity ──
-        stale_missions = [m for m in self.active_missions
-                          if time.time() - m.get("started", 0) > 600
-                          and m.get("status") == "active"]
-        if stale_missions:
-            names = [m.get("goal", "?")[:30] for m in stale_missions[:2]]
-            self.cot.think(
-                f"{len(stale_missions)} mission(s) running >10min: {'; '.join(names)}",
-                "Long-running missions may be stalled. Check worker progress.",
-                f"Check missions: {'; '.join(names)}"
-            )
-            score += 25
-
-        # ── Thought 7: Self-Calibration ──
-        if len(self.prompt_effectiveness) >= 10:
-            recent = self.prompt_effectiveness[-10:]
-            effective = sum(1 for _, acted in recent if acted)
-            eff_rate = effective / len(recent)
-            if eff_rate < 0.3:
-                # Cap threshold increase -- never go above 80 to ensure urgent items get through
-                self.dynamic_threshold = min(self.dynamic_threshold + 5, 80)
-                self.cot.think(
-                    f"Prompt effectiveness low: {eff_rate:.0%} of last 10 prompts acted on",
-                    "Raising threshold to reduce noise. Fewer, higher-quality prompts.",
-                    f"Self-calibrated: threshold raised to {self.dynamic_threshold}"
-                )
-            elif eff_rate > 0.8 and self.dynamic_threshold > 30:
-                self.dynamic_threshold = max(self.dynamic_threshold - 5, 30)
-
-        # Routine tick
-        score += 5
-
         return score
+
+    def _reason_alerts(self, perception):
+        """Thought 4: Alert processing."""
+        if not perception["bus_alerts"]:
+            return 0
+        alert_content = str(perception["bus_alerts"][0].get("content", ""))[:60]
+        self.cot.think(
+            f"{len(perception['bus_alerts'])} active alert(s): {alert_content}",
+            "Alerts require orchestrator attention. Triage and respond.",
+            f"{len(perception['bus_alerts'])} alert(s) need attention"
+        )
+        return 40
+
+    def _reason_strategic(self, perception):
+        """Thought 5: Strategic assessment."""
+        if not perception["skynet_status"]:
+            return 0
+        status = perception["skynet_status"]
+        uptime_h = status.get("uptime_s", 0) / 3600
+        done = status.get("tasks_completed", 0)
+        total = status.get("tasks_dispatched", 0)
+        rate = done / max(uptime_h, 0.01)
+
+        if rate < 1.0 and uptime_h > 0.5:
+            self.cot.think(
+                f"Task completion rate: {rate:.1f}/hr over {uptime_h:.1f}h",
+                "Low throughput relative to uptime. Workers may be underutilized.",
+                f"Throughput concern: {rate:.1f} tasks/hr ({done}/{total})"
+            )
+            return 15
+        return 0
+
+    def _reason_missions(self):
+        """Thought 6: Mission continuity check."""
+        stale = [m for m in self.active_missions
+                 if time.time() - m.get("started", 0) > 600
+                 and m.get("status") == "active"]
+        if not stale:
+            return 0
+        names = [m.get("goal", "?")[:30] for m in stale[:2]]
+        self.cot.think(
+            f"{len(stale)} mission(s) running >10min: {'; '.join(names)}",
+            "Long-running missions may be stalled. Check worker progress.",
+            f"Check missions: {'; '.join(names)}"
+        )
+        return 25
+
+    def _reason_calibration(self):
+        """Thought 7: Self-calibration of prompt effectiveness."""
+        if len(self.prompt_effectiveness) < 10:
+            return 0
+        recent = self.prompt_effectiveness[-10:]
+        effective = sum(1 for _, acted in recent if acted)
+        eff_rate = effective / len(recent)
+        if eff_rate < 0.3:
+            self.dynamic_threshold = min(self.dynamic_threshold + 5, 80)
+            self.cot.think(
+                f"Prompt effectiveness low: {eff_rate:.0%} of last 10 prompts acted on",
+                "Raising threshold to reduce noise. Fewer, higher-quality prompts.",
+                f"Self-calibrated: threshold raised to {self.dynamic_threshold}"
+            )
+        elif eff_rate > 0.8 and self.dynamic_threshold > 30:
+            self.dynamic_threshold = max(self.dynamic_threshold - 5, 30)
+        return 0
 
     # ── PHASE 4: PREDICT ────────────────────────────────────────────────────
 
@@ -1071,68 +1123,161 @@ class SelfPromptDaemon:
     def _synthesize_prompt(self, perception, patterns, predictions, score):
         """Generate a compact Skynet Intelligence briefing with status + actionable commands.
 
-        Format: 'Skynet Messenger: [STATUS LINE] | [TOP ACTION WITH COMMAND]'
-        Example: 'Skynet Intel: Alpha=IDLE Beta=PROC(45s) | 2 results | 1 alert: STUCK | 3 TODOs | Daemons: OK'
-        Only generates if there's something to act on (avoids spam).
+        Tries Ollama first (if enabled), falls back to template-based generation.
+        Only generates if there's something actionable (avoids spam).
         """
-        # ── Build compact worker status ──
-        worker_parts = []
+        # Try Ollama-powered smart prompt first
+        stamp = self._prompt_timestamp()
+
+        if USE_OLLAMA and self._should_use_ollama_for_prompt():
+            ollama_prompt = self._try_ollama_prompt(perception, patterns)
+            if ollama_prompt:
+                return self._format_prompt(stamp, ollama_prompt)
+
+        # Template fallback
+        new_results = self._filter_undelivered(perception.get("bus_results", []), "result")
+        new_alerts = self._filter_undelivered(perception.get("bus_alerts", []), "alert")
+        pending_todos = perception["pending_todos"]
+        orch_todos = _get_pending_todo_items("orchestrator", limit=3)
+        idle_workers = [n for n, i in perception["workers"].items() if i["state"] == "IDLE"]
+        daemon_status = self._collect_daemon_health(perception.get("bus_alerts", []))
+
+        status_line = self._build_status_line(
+            perception, new_results, new_alerts, pending_todos, orch_todos, daemon_status)
+
+        actions = self._build_actions(
+            perception, patterns, new_results, new_alerts, pending_todos, orch_todos, idle_workers)
+
+        if not self._has_actionable(
+                new_results, new_alerts, idle_workers, pending_todos, patterns, daemon_status, perception):
+            return ""
+
+        self._mark_delivered(new_results, "result")
+        self._mark_delivered(new_alerts, "alert")
+
+        actions.sort(key=lambda x: x[0], reverse=True)
+        top_action = actions[0][1] if actions else "System needs attention."
+        prompt_counter = f"({self.consecutive_prompts + 1}/{self.max_consecutive})"
+        return self._format_prompt(
+            stamp,
+            f"Skynet Intel: {status_line} || {top_action} {prompt_counter}",
+        )
+
+    def _prompt_timestamp(self):
+        return datetime.now().astimezone().isoformat(timespec="seconds")
+
+    def _format_prompt(self, stamp, content):
+        return f"[SELF-PROMPT {stamp}] {content}"
+
+    def _try_ollama_prompt(self, perception, patterns):
+        """Attempt to generate a prompt via Ollama. Returns prompt string or None."""
+        try:
+            from tools.skynet_ollama_prompt import generate_technical_prompt
+
+            workers_summary = {}
+            for name, info in perception["workers"].items():
+                w = {"state": info["state"], "alive": info["alive"]}
+                model = info.get("model")
+                if info["state"] == "PROCESSING" and model and model.state_since:
+                    w["processing_elapsed_s"] = int(time.time() - model.state_since)
+                workers_summary[name] = w
+
+            new_results = self._filter_undelivered(perception.get("bus_results", []), "result")
+            new_alerts = self._filter_undelivered(perception.get("bus_alerts", []), "alert")
+            orch_todos = _get_pending_todo_items("orchestrator", limit=3)
+            daemon_status = self._collect_daemon_health(perception.get("bus_alerts", []))
+
+            ollama_perception = {
+                "timestamp": self._prompt_timestamp(),
+                "workers": workers_summary,
+                "new_results": new_results,
+                "new_alerts": new_alerts,
+                "pending_todos": perception["pending_todos"],
+                "orch_todos": orch_todos,
+                "daemon_status": daemon_status,
+                "skynet_purpose": (
+                    "Serve GOD by keeping the orchestrator truthfully aware, prioritizing the highest-value "
+                    "next move, coordinating workers as a CEO, avoiding busywork/noise, surfacing urgent "
+                    "failures/results, and driving security, architecture, integration, and mission progress."
+                ),
+                "shot_context": {
+                    "mode": "final_shot",
+                    "shot_number": self.consecutive_prompts + 1,
+                    "max_shots": self.max_consecutive,
+                    "cooldown_after_s": int(MIN_PROMPT_GAP),
+                },
+                "patterns": {
+                    "stall_pattern": patterns.get("stall_pattern", False),
+                    "failure_rate_10m": patterns.get("failure_rate_10m", 0),
+                    "dispatch_drought": patterns.get("dispatch_drought", False),
+                },
+            }
+
+            result = generate_technical_prompt(ollama_perception, model=OLLAMA_MODEL)
+            if result:
+                self._mark_delivered(new_results, "result")
+                self._mark_delivered(new_alerts, "alert")
+                return f"Skynet Intel [Qwen3 {self.consecutive_prompts + 1}/{self.max_consecutive}]: {result}"
+        except Exception as e:
+            log(f"Ollama prompt generation failed, falling back to template: {e}")
+        return None
+
+    def _should_use_ollama_for_prompt(self):
+        """Reserve Ollama synthesis for the final consecutive self-prompt shot."""
+        if not USE_OLLAMA:
+            return False
+        next_shot = self.consecutive_prompts + 1
+        return next_shot >= max(1, int(self.max_consecutive))
+
+    def _build_worker_status_parts(self, perception):
+        """Build compact worker status string (e.g. 'A=IDLE B=PROC(45s)')."""
+        parts = []
         for name, info in sorted(perception["workers"].items()):
             state = info["state"]
             model = info.get("model")
             if state == "PROCESSING" and model and model.state_since:
                 elapsed = int(time.time() - model.state_since)
-                if elapsed > 180:
-                    worker_parts.append(f"{name[0].upper()}=STUCK({elapsed}s)")
-                else:
-                    worker_parts.append(f"{name[0].upper()}=PROC({elapsed}s)")
+                label = f"STUCK({elapsed}s)" if elapsed > 180 else f"PROC({elapsed}s)"
+                parts.append(f"{name[0].upper()}={label}")
             elif state == "DEAD":
-                worker_parts.append(f"{name[0].upper()}=DEAD!")
+                parts.append(f"{name[0].upper()}=DEAD!")
             elif state == "IDLE":
-                worker_parts.append(f"{name[0].upper()}=IDLE")
+                parts.append(f"{name[0].upper()}=IDLE")
             else:
-                worker_parts.append(f"{name[0].upper()}={state[:4]}")
-        status_workers = " ".join(worker_parts)
+                parts.append(f"{name[0].upper()}={state[:4]}")
+        return " ".join(parts)
 
-        # Count unread items (using delivered tracking for dedup)
-        results = perception.get("bus_results", [])
-        new_results = self._filter_undelivered(results, "result")
-        alerts = perception.get("bus_alerts", [])
-        new_alerts = self._filter_undelivered(alerts, "alert")
-        pending_todos = perception["pending_todos"]
-        pending_tasks = perception["pending_tasks"]
-        orch_todos = _get_pending_todo_items("orchestrator", limit=3)
-
-        # Daemon health from heartbeat files + alert messages
+    def _collect_daemon_health(self, alerts):
+        """Check daemon health from watchdog status, monitor file, and alert messages."""
         daemon_issues = []
-        # Check watchdog status file
         watchdog_status = _load_json(DATA_DIR / "watchdog_status.json")
         if watchdog_status and isinstance(watchdog_status, dict):
             for svc in ("skynet", "god_console", "sse_daemon"):
                 svc_status = watchdog_status.get(svc, "unknown")
                 if svc_status not in ("ok", "unknown"):
                     daemon_issues.append(f"{svc}={svc_status}")
-        # Check monitor health file freshness
+
         monitor_health_file = DATA_DIR / "monitor_health.json"
         if monitor_health_file.exists():
             try:
-                mh_age = time.time() - monitor_health_file.stat().st_mtime
-                if mh_age > 120:  # monitor should update every ~10s
+                if time.time() - monitor_health_file.stat().st_mtime > 120:
                     daemon_issues.append("monitor=stale")
             except Exception:
                 pass
         elif (DATA_DIR / "monitor.pid").exists():
             daemon_issues.append("monitor=no_health")
-        # Also check alerts for daemon issues
+
         for a in alerts:
             content = str(a.get("content", "")).lower()
             if "daemon" in content and ("dead" in content or "down" in content or "stale" in content):
                 daemon_issues.append("alert")
                 break
-        daemon_status = ",".join(daemon_issues) if daemon_issues else "OK"
 
-        # Build status segments
-        status_parts = [status_workers]
+        return ",".join(daemon_issues) if daemon_issues else "OK"
+
+    def _build_status_line(self, perception, new_results, new_alerts, pending_todos, orch_todos, daemon_status):
+        """Assemble the status line from components."""
+        status_parts = [self._build_worker_status_parts(perception)]
         if new_results:
             senders = list({r.get("sender", "?").title() for r in new_results})
             status_parts.append(f"{len(new_results)} result(s) from {','.join(senders[:3])}")
@@ -1144,90 +1289,61 @@ class SelfPromptDaemon:
         if orch_todos:
             status_parts.append(f"OrchTODOs: {len(orch_todos)}")
         status_parts.append(f"Daemons: {daemon_status}")
+        return " | ".join(status_parts)
 
-        status_line = " | ".join(status_parts)
+    def _build_actions(self, perception, patterns, new_results, new_alerts, pending_todos, orch_todos, idle_workers):
+        """Build prioritized action list for the prompt."""
+        actions = []
 
-        # ── Build action line (most urgent action with executable command) ──
-        actions = []  # (priority, text)
-
-        # Critical/urgent from chain-of-thought
         if self.cot.has_conclusions():
             for c in self.cot.critical_conclusions()[:1]:
-                actions.append((100, f"CRITICAL: {c.strip()} Run: python tools/orch_realtime.py status"))
+                actions.append((100, f"CRITICAL: {c.strip()}"))
 
-        # Explicit orchestrator TODOs should outrank generic status summaries.
         if orch_todos:
-            top_todo = orch_todos[0]
-            pri = str(top_todo.get("priority", "normal")).upper()
-            task = str(top_todo.get("task", "pending orchestrator task"))[:160]
+            top = orch_todos[0]
+            pri = str(top.get("priority", "normal")).upper()
+            task = str(top.get("task", "pending orchestrator task"))[:160]
             actions.append((97, f"EXECUTE ORCH TODO [{pri}]: {task}"))
             if len(orch_todos) > 1:
-                next_todo = orch_todos[1]
-                next_pri = str(next_todo.get("priority", "normal")).upper()
-                next_task = str(next_todo.get("task", "next orchestrator task"))[:120]
-                actions.append((96, f"NEXT TODO [{next_pri}]: {next_task}"))
+                n = orch_todos[1]
+                actions.append((96, f"NEXT TODO [{str(n.get('priority','normal')).upper()}]: {str(n.get('task',''))[:120]}"))
 
-        # Anomalies
         if patterns["stall_pattern"]:
-            actions.append((90, "Worker stall detected. Run: python tools/orch_realtime.py status"))
+            actions.append((90, "Worker stall detected -- investigate worker cycling."))
         if patterns["failure_rate_10m"] >= 3:
-            actions.append((85, f"Failure spike: {patterns['failure_rate_10m']} in 10min. Run: python tools/orch_realtime.py pending"))
+            actions.append((85, f"Failure spike: {patterns['failure_rate_10m']} failures in last 10min."))
         if patterns["dispatch_drought"] and pending_todos > 0:
-            actions.append((80, "Dispatch drought. Run: python tools/orch_realtime.py status -- dispatch TODOs NOW."))
+            actions.append((30, f"Info: {pending_todos} pending tasks, dispatch paused by orchestrator."))
 
-        # New results
         if new_results:
-            actions.append((70, "ACTION: Run python tools/orch_realtime.py pending -- read and act on results."))
+            senders = list({r.get("sender", "?").title() for r in new_results})
+            actions.append((70, f"{len(new_results)} result(s) from {','.join(senders[:3])} ready for synthesis."))
 
-        # Idle workers + pending TODOs
-        idle_workers = [n for n, i in perception["workers"].items() if i["state"] == "IDLE"]
         if idle_workers and pending_todos > 0:
-            todo_list = _get_pending_todo_items(limit=10)
-            if todo_list:
-                top_todo = todo_list[0].get("task", "next task")[:50]
-                worker = idle_workers[0]
-                actions.append((60, f"DISPATCH: python tools/skynet_dispatch.py --worker {worker} --task \"{top_todo}\""))
+            actions.append((40, f"{len(idle_workers)} idle worker(s), {pending_todos} tasks queued."))
         elif idle_workers and not pending_todos and not new_results:
-            # Planner-driven mission generation
-            mission_goal, subtasks = self._plan_autonomous_mission(perception, patterns)
-            if mission_goal and subtasks:
-                subtask_preview = subtasks[0][:50] if subtasks else ""
-                target_worker = idle_workers[0]
-                actions.append((55, f"MISSION: \"{mission_goal[:60]}\" -- python tools/skynet_dispatch.py --worker {target_worker} --task \"{subtask_preview}\""))
+            actions.append((20, f"{len(idle_workers)} idle worker(s), no pending work."))
 
-        # Alerts with action
         if new_alerts:
-            alert_content = str(new_alerts[0].get("content", ""))[:80]
-            actions.append((75, f"ALERT: {alert_content}"))
+            actions.append((75, f"ALERT: {str(new_alerts[0].get('content', ''))[:80]}"))
 
-        # ── Decide if this is worth sending ──
-        # Only send if there is SOMETHING to act on
-        has_actionable = (
+        return actions
+
+    def _has_actionable(self, new_results, new_alerts, idle_workers, pending_todos, patterns, daemon_status, perception):
+        """Determine if there's anything worth prompting about.
+
+        Idle workers with pending tasks is NORMAL, not actionable on its own.
+        Only genuine system issues or unprocessed results/alerts trigger prompts.
+        """
+        return (
             len(new_results) > 0
             or len(new_alerts) > 0
-            or (idle_workers and pending_todos > 0)
             or patterns["stall_pattern"]
             or patterns["failure_rate_10m"] >= 3
             or any(not i["alive"] for i in perception["workers"].values())
             or self.cot.has_conclusions()
             or daemon_status != "OK"
         )
-
-        if not has_actionable:
-            return ""  # Empty string = don't send (no spam)
-
-        # Mark delivered
-        self._mark_delivered(new_results, "result")
-        self._mark_delivered(new_alerts, "alert")
-
-        # Build final prompt
-        actions.sort(key=lambda x: x[0], reverse=True)
-        top_action = actions[0][1] if actions else "System needs attention."
-
-        prompt_counter = f"({self.consecutive_prompts + 1}/{self.max_consecutive})"
-        prompt = f"Skynet Intel: {status_line} || {top_action} {prompt_counter}"
-
-        return prompt
 
     def _filter_undelivered(self, messages, category):
         """Filter out messages that have already been delivered to the orchestrator."""
@@ -1294,7 +1410,10 @@ class SelfPromptDaemon:
         if not sections:
             sections = ["[STATUS] System clean, no pending work."]
 
-        prompt = "Skynet Messenger: BOOT BRIEF -- " + " | ".join(sections)
+        prompt = self._format_prompt(
+            self._prompt_timestamp(),
+            "Skynet Intel: " + " | ".join(sections),
+        )
 
         log(f"Boot prompt: {prompt[:200]}...")
         ok = _send_self_prompt(orch_hwnd, prompt)
@@ -1345,9 +1464,19 @@ class SelfPromptDaemon:
         can always check daemon health via data/self_prompt_health.json.
         """
         now = time.time()
-        orch_hwnd = _get_orch_hwnd()
-        health = {
-            "daemon": "self_prompt",
+        health = self._build_health_payload(now=now)
+        try:
+            _save_json(HEALTH_FILE, health)
+        except Exception:
+            pass  # never crash the daemon for a health write
+
+    def _build_health_payload(self, now=None, orch_hwnd=None):
+        now = time.time() if now is None else now
+        orch_hwnd = _get_orch_hwnd() if orch_hwnd is None else orch_hwnd
+        return {
+            "daemon": DAEMON_NAME,
+            "daemon_version": DAEMON_VERSION,
+            "skynet_version": _get_skynet_version(),
             "cycles": self.cycles,
             "sent": self.prompts_sent,
             "failed": self.prompts_failed,
@@ -1357,10 +1486,6 @@ class SelfPromptDaemon:
             "uptime_s": int(now - getattr(self, '_start_time', now)),
             "timestamp": datetime.now().isoformat(),
         }
-        try:
-            _save_json(HEALTH_FILE, health)
-        except Exception:
-            pass  # never crash the daemon for a health write
 
     def _report_health(self):
         """Post health status to bus periodically (separate from per-cycle file write)."""
@@ -1368,93 +1493,87 @@ class SelfPromptDaemon:
         if now - self.last_health_report < HEALTH_REPORT_INTERVAL:
             return
         self.last_health_report = now
+        health = self._build_health_payload(now=now)
         _post_bus("orchestrator", "daemon_health",
-                  f"SELF_PROMPT_HEALTH: cycles={self.cycles} sent={self.prompts_sent} failed={self.prompts_failed}")
+                  _versioned_signal(
+                      "SELF_PROMPT_HEALTH",
+                      f"cycles={self.cycles} sent={self.prompts_sent} failed={self.prompts_failed} "
+                      f"skynet_v={health['skynet_version']}"
+                  ))
         log(f"Health report posted (cycles={self.cycles}, sent={self.prompts_sent})")
 
     def _scan_triggers(self):
-        """CHAIN-OF-THOUGHT trigger system.
-
-        Runs the full 7-phase intelligence pipeline:
-          PERCEIVE -> REMEMBER -> REASON -> PREDICT -> DECIDE -> SYNTHESIZE -> LEARN
-
-        Returns (should_prompt, reasons, prompt_text, score).
-        """
-        reasons = []
-
+        """CHAIN-OF-THOUGHT trigger system. Returns (should_prompt, reasons, prompt_text, score)."""
         orch_hwnd = _get_orch_hwnd()
         if not orch_hwnd or not _is_window_alive(orch_hwnd):
             return False, ["orch_window_dead"], "", 0
 
-        # Collision guard: don't prompt while dispatch is typing into a worker
         if self._is_dispatch_active():
             return False, ["dispatch_active"], "", 0
-
-        # Boot guard: don't prompt while skynet_start.py is running UIA-heavy phases
         if self._is_boot_in_progress():
             return False, ["boot_in_progress"], "", 0
 
-        # Only block for TYPING (user actively typing). PROCESSING is fine.
         orch_state = _get_worker_state(orch_hwnd)
         if orch_state == "TYPING":
             return False, ["orch_typing"], "", 0
 
-        # ── Full Chain-of-Thought Pipeline ──
-        perception = self._perceive()           # Phase 1: scan everything
-        patterns = self._remember(perception)   # Phase 2: temporal patterns
-        score = self._reason(perception, patterns)  # Phase 3: chain-of-thought
-        predictions = self._predict(perception, patterns)  # Phase 4: anticipate
+        # Full Chain-of-Thought Pipeline
+        perception = self._perceive()
+        patterns = self._remember(perception)
+        score = self._reason(perception, patterns)
+        predictions = self._predict(perception, patterns)
+        reasons = self._extract_cot_reasons()
 
-        # Extract reasons from chain-of-thought steps
-        for step in self.cot.steps:
-            conclusion = step.get("conclusion", "")
-            if "CRITICAL" in conclusion.upper():
-                reasons.append("critical_finding")
-            elif "URGENT" in conclusion.upper():
-                reasons.append("urgent_finding")
-            elif "Dispatch" in conclusion or "dispatch" in conclusion:
-                reasons.append("dispatch_opportunity")
-            elif "Synthesize" in conclusion:
-                reasons.append("results_ready")
-            elif "failure" in conclusion.lower() or "FAILURE" in conclusion:
-                reasons.append("failure_detected")
-            elif "anomaly" in conclusion.lower() or "ANOMALY" in conclusion.upper():
-                reasons.append("anomaly_detected")
-
-        if not reasons:
-            reasons.append("routine_tick")
-
-        # Accumulate with carry-forward (uses self-calibrating threshold)
         total_score = self.accumulated_score + score
         should_prompt = total_score >= self.dynamic_threshold
-
-        # URGENT BYPASS: alerts, pending results, and dispatch drought ALWAYS force a prompt
-        # regardless of threshold. This prevents the daemon from going silent when action is needed.
-        urgent_bypass = False
-        if "critical_finding" in reasons or "urgent_finding" in reasons:
-            urgent_bypass = True
-        elif "results_ready" in reasons and total_score >= 30:
-            urgent_bypass = True
-        elif "failure_detected" in reasons:
-            urgent_bypass = True
+        urgent_bypass = self._check_urgent_bypass(reasons, total_score)
 
         prompt_text = ""
         if should_prompt or urgent_bypass:
             prompt_text = self._synthesize_prompt(perception, patterns, predictions, total_score)
             if not prompt_text:
-                # Synthesizer determined nothing actionable -- don't spam
-                self.accumulated_score = total_score  # keep score for next cycle
+                self.accumulated_score = total_score
                 return False, ["nothing_actionable"], "", total_score
             self.accumulated_score = 0
             bypass_tag = " [URGENT_BYPASS]" if (urgent_bypass and not should_prompt) else ""
             self._record_event(EVT_PROMPT, "system", f"score={total_score} reasons={','.join(reasons[:3])}{bypass_tag}")
-
-            # Phase 7: LEARN -- save persistent state every prompt
             self._save_persistent_state()
         else:
             self.accumulated_score = total_score
 
         return (should_prompt or urgent_bypass), reasons, prompt_text, total_score
+
+    def _extract_cot_reasons(self):
+        """Extract reason tags from chain-of-thought conclusions."""
+        reasons = []
+        keyword_map = {
+            "CRITICAL": "critical_finding",
+            "URGENT": "urgent_finding",
+            "Dispatch": "dispatch_opportunity",
+            "dispatch": "dispatch_opportunity",
+            "Synthesize": "results_ready",
+            "failure": "failure_detected",
+            "FAILURE": "failure_detected",
+            "anomaly": "anomaly_detected",
+            "ANOMALY": "anomaly_detected",
+        }
+        for step in self.cot.steps:
+            conclusion = step.get("conclusion", "")
+            for keyword, reason in keyword_map.items():
+                if keyword in conclusion:
+                    reasons.append(reason)
+                    break
+        return reasons or ["routine_tick"]
+
+    def _check_urgent_bypass(self, reasons, total_score):
+        """Determine if conditions warrant bypassing the score threshold."""
+        if "critical_finding" in reasons or "urgent_finding" in reasons:
+            return True
+        if "results_ready" in reasons and total_score >= 30:
+            return True
+        if "failure_detected" in reasons:
+            return True
+        return False
 
     def _deliver_queued_directives(self):
         """Check orch_queue.json for pending directives and type them into the orchestrator."""
@@ -1462,142 +1581,171 @@ class SelfPromptDaemon:
             if not ORCH_QUEUE_FILE.exists():
                 return 0
             data = json.loads(ORCH_QUEUE_FILE.read_text(encoding="utf-8"))
-            queue = data.get("queue", [])
-            pending = [e for e in queue if e.get("status") == "pending"]
+            pending = [e for e in data.get("queue", []) if e.get("status") == "pending"]
             if not pending:
                 return 0
 
             orch_hwnd = _get_orch_hwnd()
             if not orch_hwnd or not _is_window_alive(orch_hwnd):
                 return 0
-
-            # Only block if user is actively typing
-            state = _get_worker_state(orch_hwnd)
-            if state == "TYPING":
+            if _get_worker_state(orch_hwnd) == "TYPING":
                 return 0
 
             delivered = 0
             for entry in pending:
-                content = entry.get("content", "")
-                msg_id = entry.get("msg_id", "")
-                sender = entry.get("sender", "?")
-                priority = str(entry.get("priority", "normal")).upper()
-                if not content:
-                    continue
-
-                prompt = (
-                    f"SKYNET {priority} DIRECTIVE from {sender}. "
-                    f"Act now. Use workers for implementation, not hands-on orchestrator edits. "
-                    f"Directive: {content}"
-                )
-                log(f"Delivering queued directive from {sender}: {content[:60]}...")
-
-                ok = _send_self_prompt(orch_hwnd, prompt)
+                ok = self._deliver_one_directive(entry, orch_hwnd, data)
                 if ok:
-                    entry["status"] = "delivered"
-                    entry["delivered_at"] = datetime.now().isoformat()
-                    data["stats"]["total_delivered"] = data["stats"].get("total_delivered", 0) + 1
                     delivered += 1
-                    log(f"Queued directive DELIVERED (msg_id={msg_id})")
-                    self.last_prompt_time = time.time()  # update rate limit
-                    time.sleep(2)  # gap between directives
                 else:
-                    log(f"Queued directive delivery FAILED", "ERROR")
-                    break  # stop trying if delivery fails
+                    break
 
             if delivered > 0:
                 ORCH_QUEUE_FILE.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
-
             return delivered
         except Exception as e:
             log(f"Queued directive delivery error: {e}", "ERROR")
             return 0
+
+    def _deliver_one_directive(self, entry, orch_hwnd, data):
+        """Deliver a single queued directive. Returns True on success."""
+        content = entry.get("content", "")
+        if not content:
+            return False
+
+        sender = entry.get("sender", "?")
+        priority = str(entry.get("priority", "normal")).upper()
+        prompt = (
+            f"SKYNET {priority} DIRECTIVE from {sender}. "
+            f"Act now. Use workers for implementation, not hands-on orchestrator edits. "
+            f"Directive: {content}"
+        )
+        log(f"Delivering queued directive from {sender}: {content[:60]}...")
+
+        ok = _send_self_prompt(orch_hwnd, prompt)
+        if ok:
+            entry["status"] = "delivered"
+            entry["delivered_at"] = datetime.now().isoformat()
+            data["stats"]["total_delivered"] = data["stats"].get("total_delivered", 0) + 1
+            log(f"Queued directive DELIVERED (msg_id={entry.get('msg_id', '')})")
+            self.last_prompt_time = time.time()
+            time.sleep(2)
+        else:
+            log("Queued directive delivery FAILED", "ERROR")
+        return ok
 
     def check_and_prompt(self, deliver_queue_first=True):
         """Single check cycle with priority scoring and anti-spam. Returns True if prompt was sent."""
         self.cycles += 1
         now = time.time()
 
-        # Health self-report
         self._report_health()
 
-        # First: deliver any queued directives (these take priority)
         if deliver_queue_first:
             queued_delivered = self._deliver_queued_directives()
             if queued_delivered > 0:
                 log(f"Delivered {queued_delivered} queued directive(s)")
                 return True
 
-        # Rate limit — use shorter gap when all workers idle
-        effective_gap = MIN_PROMPT_GAP
-        if self._all_workers_idle():
-            effective_gap = min(ALL_IDLE_INTERVAL, MIN_PROMPT_GAP)
+        live_snapshot = self._fetch_worker_status_snapshot()
+        if not self._refresh_all_idle_window(now, live_snapshot):
+            return False
+
+        if not self._all_idle_window_ready(now):
+            return False
+
+        effective_gap = max(1.0, float(MIN_PROMPT_GAP))
         if now - self.last_prompt_time < effective_gap:
             return False
 
-        # Consecutive prompt limiter: reset if orchestrator acted independently
+        # Consecutive prompt limiter
         if self._orchestrator_took_action():
             if self.consecutive_prompts > 0:
                 log(f"Orchestrator took action -- resetting consecutive counter ({self.consecutive_prompts} -> 0)")
             self.consecutive_prompts = 0
-
-        if self.consecutive_prompts >= self.max_consecutive:
-            log(f"Consecutive limit reached ({self.consecutive_prompts}/{self.max_consecutive}) -- waiting for orchestrator action")
+            self.last_cycle_complete_time = 0.0
+        if self._final_shot_cooldown_active(now):
             return False
 
         should, reasons, prompt, total_score = self._scan_triggers()
-
         if not should:
-            return False  # score below threshold
+            return False
 
         orch_hwnd = _get_orch_hwnd()
         if not orch_hwnd:
             log("No orchestrator HWND", "ERROR")
             return False
 
-        # COLLISION GUARD: Only block if user is actively TYPING.
-        # PROCESSING is fine -- VS Code queues input after current generation.
-        # This is the GOD Protocol: prompts queue naturally like user messages.
-        try:
-            sys.path.insert(0, str(ROOT / "tools"))
-            from uia_engine import get_engine
-            engine = get_engine()
-            orch_state = engine.get_state(orch_hwnd)
-            if orch_state == "TYPING":
-                log(f"Orchestrator TYPING -- skipping prompt (collision guard)")
-                return False
-            if orch_state == "PROCESSING":
-                log(f"Orchestrator PROCESSING -- queuing prompt (VS Code will queue)")
-        except Exception as e:
-            log(f"State check failed: {e} -- prompting anyway", "WARN")
+        if self._check_orch_typing(orch_hwnd):
+            return False
 
-        # Anti-spam: dedup identical prompts within 60s
-        prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:12]
-        if prompt_hash == self.last_prompt_hash and (now - self.last_prompt_hash_time) < 60:
-            log(f"Duplicate prompt suppressed (hash={prompt_hash})")
+        if self._is_duplicate_prompt(prompt, now):
+            return False
+
+        pre_fire_now = time.time()
+        pre_fire_snapshot = self._fetch_worker_status_snapshot()
+        if not self._refresh_all_idle_window(pre_fire_now, pre_fire_snapshot):
+            log(
+                "Aborting self-prompt: live worker state changed before fire "
+                f"({self._format_worker_snapshot(pre_fire_snapshot)})",
+                "WARN",
+            )
+            return False
+        if not self._all_idle_window_ready(pre_fire_now):
+            log("Aborting self-prompt: all-idle window not yet satisfied at fire time", "WARN")
             return False
 
         log(f"TRIGGERING (score={total_score}): {', '.join(reasons)}")
         log(f"Prompt: {prompt[:120]}...")
 
         ok = _send_self_prompt(orch_hwnd, prompt)
+        self._record_prompt_delivery(ok, now, prompt, reasons, total_score)
+        return ok
 
+    def _check_orch_typing(self, orch_hwnd):
+        """Check if orchestrator is actively typing (collision guard)."""
+        try:
+            sys.path.insert(0, str(ROOT / "tools"))
+            from uia_engine import get_engine
+            orch_state = get_engine().get_state(orch_hwnd)
+            if orch_state == "TYPING":
+                log("Orchestrator TYPING -- skipping prompt (collision guard)")
+                return True
+            if orch_state == "PROCESSING":
+                log("Orchestrator PROCESSING -- queuing prompt (VS Code will queue)")
+        except Exception as e:
+            log(f"State check failed: {e} -- prompting anyway", "WARN")
+        return False
+
+    def _is_duplicate_prompt(self, prompt, now):
+        """Anti-spam: suppress identical prompts within 60s."""
+        prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:12]
+        if prompt_hash == self.last_prompt_hash and (now - self.last_prompt_hash_time) < 60:
+            log(f"Duplicate prompt suppressed (hash={prompt_hash})")
+            return True
+        return False
+
+    def _record_prompt_delivery(self, ok, now, prompt, reasons, total_score):
+        """Record prompt delivery outcome and update tracking state."""
+        prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:12]
         self.last_prompt_time = now
         self.last_prompt_hash = prompt_hash
         self.last_prompt_hash_time = now
-        entry = {
+
+        _append_log({
             "timestamp": datetime.now().isoformat(),
             "trigger_reasons": reasons,
             "score": total_score,
             "prompt": prompt[:200],
             "delivered": ok,
-        }
-        _append_log(entry)
+        })
         _update_last_action("self_prompt_sent")
 
         if ok:
             self.prompts_sent += 1
             self.consecutive_prompts += 1
+            self.all_idle_since = now
+            if self.consecutive_prompts >= self.max_consecutive:
+                self.last_cycle_complete_time = now
             log(f"Prompt DELIVERED (consecutive {self.consecutive_prompts}/{self.max_consecutive})")
             _post_bus("orchestrator", "self_prompt",
                       f"Self-prompt sent (score={total_score}, {self.consecutive_prompts}/{self.max_consecutive}): {', '.join(reasons)}")
@@ -1605,59 +1753,131 @@ class SelfPromptDaemon:
             self.prompts_failed += 1
             log("Prompt FAILED to deliver", "ERROR")
 
-        return ok
-
-    def _all_workers_idle(self):
-        """Check if ALL 4 workers (alpha/beta/gamma/delta) report IDLE via /status endpoint.
-        Returns True only when every registered worker is IDLE. If any is busy, returns False.
-        Uses a 30-second cache to avoid expensive HTTP calls every 5s cycle.
-        """
-        now = time.time()
-        cache_ttl = 30.0
-        if (hasattr(self, '_worker_state_cache') and
-                hasattr(self, '_worker_state_cache_ts') and
-                now - self._worker_state_cache_ts < cache_ttl):
-            return self._worker_state_cache
-
-        result = self._fetch_all_workers_idle()
-        self._worker_state_cache = result
-        self._worker_state_cache_ts = now
-        return result
-
-    def _fetch_all_workers_idle(self):
-        """Actual HTTP call to check worker idle status."""
-        try:
-            data = _fetch_json(f"{BUS_URL}/status")
-            if not data:
-                return False
-            agents = data.get("agents", {})
-            if not agents:
-                return False
-            worker_names = {"alpha", "beta", "gamma", "delta"}
-            for name in worker_names:
-                agent = agents.get(name, {})
-                status = agent.get("status", "unknown").upper()
-                if status != "IDLE":
-                    return False
-            return True
-        except Exception:
+    def _final_shot_cooldown_active(self, now):
+        """After the last shot fires, wait MIN_PROMPT_GAP before starting a new cycle."""
+        if self.consecutive_prompts < self.max_consecutive:
             return False
 
-    def run(self):
-        """Main daemon loop -- STATUS-BASED, not timer-based.
+        if not self.last_cycle_complete_time:
+            self.last_cycle_complete_time = self.last_prompt_time or now
 
-        Polls /status every 5 seconds. Only triggers check_and_prompt() when
-        ALL 4 workers report IDLE. If any worker is busy, the cycle is skipped.
-        This prevents the daemon from prompting the orchestrator mid-wave.
+        cooldown_s = max(1.0, float(MIN_PROMPT_GAP))
+        remaining = cooldown_s - (now - self.last_cycle_complete_time)
+        if remaining > 0:
+            log(
+                f"Consecutive limit reached ({self.consecutive_prompts}/{self.max_consecutive}) -- "
+                f"cooldown {int(remaining)}s since final shot"
+            )
+            return True
+
+        log("Final-shot cooldown elapsed -- resetting self-prompt shot counter")
+        self.consecutive_prompts = 0
+        self.last_cycle_complete_time = 0.0
+        return False
+
+    def _fetch_worker_status_snapshot(self):
+        """Fetch live worker state from registered HWNDs using UIA truth.
+
+        This is stricter than backend /status. If a worker HWND is missing,
+        dead, or unreadable, the gate fails closed with UNKNOWN/DEAD.
         """
-        self._start_time = time.time()
-        log("Self-prompt daemon starting (status-based, 5s poll)")
-        log(f"Config: poll=5s gap={MIN_PROMPT_GAP}s threshold={PROMPT_THRESHOLD} idle_thresh={IDLE_WORKER_THRESHOLD}s")
-        _post_bus("orchestrator", "monitor_alert",
-                  "SELF_PROMPT_ONLINE: Orchestrator heartbeat daemon started (status-based polling)")
+        snapshot = {name: "UNKNOWN" for name in REQUIRED_WORKERS}
+        try:
+            workers = _load_workers()
+            if not workers:
+                return snapshot
 
-        # Boot prompt: wait for skynet-start boot phases to complete before touching orchestrator
-        # Phase 8 launches us, but phases 3-6 may still be finishing UIA operations
+            worker_map = {
+                str(w.get("name", "")).lower(): w
+                for w in workers
+                if isinstance(w, dict)
+            }
+            for name in REQUIRED_WORKERS:
+                w = worker_map.get(name)
+                if not w:
+                    snapshot[name] = "UNKNOWN"
+                    continue
+                hwnd = int(w.get("hwnd", 0) or 0)
+                if not hwnd:
+                    snapshot[name] = "UNKNOWN"
+                    continue
+                if not _is_window_alive(hwnd):
+                    snapshot[name] = "DEAD"
+                    continue
+                state = str(_get_worker_state(hwnd) or "UNKNOWN").upper()
+                snapshot[name] = state
+            return snapshot
+        except Exception:
+            return snapshot
+
+    def _snapshot_all_workers_idle(self, snapshot):
+        return all(str(snapshot.get(name, "UNKNOWN")).upper() == "IDLE" for name in REQUIRED_WORKERS)
+
+    def _format_worker_snapshot(self, snapshot):
+        ordered = sorted(REQUIRED_WORKERS)
+        return " ".join(f"{name[0].upper()}={str(snapshot.get(name, 'UNKNOWN')).upper()}" for name in ordered)
+
+    def _refresh_all_idle_window(self, now, snapshot=None):
+        snapshot = snapshot or self._fetch_worker_status_snapshot()
+        if self._snapshot_all_workers_idle(snapshot):
+            if not self.all_idle_since:
+                self.all_idle_since = now
+                log(f"All workers IDLE -- starting quiet window ({int(ALL_IDLE_INTERVAL)}s)")
+            return True
+
+        if self.all_idle_since:
+            quiet_s = int(now - self.all_idle_since)
+            log(
+                f"All-idle quiet window reset after {quiet_s}s "
+                f"({self._format_worker_snapshot(snapshot)})"
+            )
+        self.all_idle_since = 0.0
+        return False
+
+    def _all_idle_window_ready(self, now):
+        if not self.all_idle_since:
+            return False
+        return (now - self.all_idle_since) >= max(1.0, float(ALL_IDLE_INTERVAL))
+
+    def run(self):
+        """Main daemon loop -- status-based with configurable cadence."""
+        self._start_time = time.time()
+        log(f"Self-prompt daemon v{DAEMON_VERSION} starting (status-based, {LOOP_INTERVAL}s poll)")
+        log(f"Config: poll={LOOP_INTERVAL}s gap={MIN_PROMPT_GAP}s threshold={PROMPT_THRESHOLD} idle_thresh={IDLE_WORKER_THRESHOLD}s")
+        _post_bus("orchestrator", "monitor_alert",
+                  _versioned_signal(
+                      "SELF_PROMPT_ONLINE",
+                      f"Orchestrator heartbeat daemon started (status-based polling, skynet_v={_get_skynet_version()})"
+                  ))
+
+        self._wait_for_boot_completion()
+
+        if BOOT_PROMPT_ENABLED:
+            try:
+                self._boot_prompt()
+            except Exception as e:
+                log(f"Boot prompt failed: {e}", "ERROR")
+        else:
+            self.last_prompt_time = time.time()
+            log(f"Boot prompt disabled -- priming quiet period for {int(MIN_PROMPT_GAP)}s")
+
+        try:
+            while True:
+                self._main_loop_cycle()
+                time.sleep(max(1, float(LOOP_INTERVAL)))
+        except KeyboardInterrupt:
+            log("Shutting down (Ctrl+C)")
+        finally:
+            _post_bus("orchestrator", "monitor_alert",
+                      _versioned_signal("SELF_PROMPT_OFFLINE", "Heartbeat daemon stopped"))
+            if PID_FILE.exists():
+                try:
+                    PID_FILE.unlink()
+                except Exception:
+                    pass
+
+    def _wait_for_boot_completion(self):
+        """Wait for skynet_start.py boot phases to finish before touching orchestrator."""
         boot_wait = 0
         while self._is_boot_in_progress() and boot_wait < 120:
             time.sleep(5)
@@ -1667,43 +1887,21 @@ class SelfPromptDaemon:
         if boot_wait > 0:
             log(f"Boot completed after {boot_wait}s wait", "OK")
         else:
-            time.sleep(5)  # minimal settle time even if no boot lock
+            time.sleep(5)
+
+    def _main_loop_cycle(self):
+        """Single iteration of the main daemon loop."""
         try:
-            self._boot_prompt()
+            _load_config_overrides()
+            self._write_health_file()
+
+            queued_delivered = self._deliver_queued_directives()
+            if queued_delivered > 0:
+                log(f"Delivered {queued_delivered} queued directive(s)")
+            else:
+                self.check_and_prompt(deliver_queue_first=False)
         except Exception as e:
-            log(f"Boot prompt failed: {e}", "ERROR")
-
-        POLL_INTERVAL = 5  # check status every 5 seconds
-
-        try:
-            while True:
-                try:
-                    # Hot-reload config every cycle (file read is cheap, ~0.1ms)
-                    _load_config_overrides()
-
-                    # Persist health to file EVERY cycle (survives bus ring buffer rotation)
-                    self._write_health_file()
-
-                    # Always deliver queued directives, even mid-wave.
-                    queued_delivered = self._deliver_queued_directives()
-                    if queued_delivered > 0:
-                        log(f"Delivered {queued_delivered} queued directive(s)")
-                    # STATUS-BASED: only synthesize generic prompts when ALL workers are IDLE
-                    elif self._all_workers_idle():
-                        self.check_and_prompt(deliver_queue_first=False)
-                except Exception as e:
-                    log(f"Check failed: {e}", "ERROR")
-                time.sleep(POLL_INTERVAL)
-        except KeyboardInterrupt:
-            log("Shutting down (Ctrl+C)")
-        finally:
-            _post_bus("orchestrator", "monitor_alert",
-                      "SELF_PROMPT_OFFLINE: Heartbeat daemon stopped")
-            if PID_FILE.exists():
-                try:
-                    PID_FILE.unlink()
-                except Exception:
-                    pass
+            log(f"Check failed: {e}", "ERROR")
 
 
 def _check_existing():
@@ -1721,57 +1919,54 @@ def _check_existing():
     return None
 
 
+def _action_status():
+    """Show last self-prompt log entry and daemon PID."""
+    log_data = _load_json(LOG_FILE)
+    health = _load_json(HEALTH_FILE) or {}
+    print(f"{DAEMON_NAME} v{health.get('daemon_version', DAEMON_VERSION)}")
+    print(f"Skynet version: {health.get('skynet_version', _get_skynet_version())}")
+    if log_data and isinstance(log_data, list) and len(log_data) > 0:
+        print(json.dumps(log_data[-1], indent=2))
+        print(f"\nTotal prompts logged: {len(log_data)}")
+    else:
+        print("No self-prompt log found.")
+    pid = _check_existing()
+    print(f"Daemon running: PID {pid}" if pid else "Daemon not running.")
+
+
+def _action_version():
+    print(f"{DAEMON_NAME} v{DAEMON_VERSION} (Skynet v{_get_skynet_version()})")
+
+
+def _action_start():
+    """Start the self-prompt daemon if not already running."""
+    existing = _check_existing()
+    if existing:
+        print(f"Already running (PID {existing}). Use 'status' to check.")
+        return
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(str(os.getpid()))
+    log(f"Self-prompt daemon v{DAEMON_VERSION} PID {os.getpid()}")
+    _update_last_action("daemon_start")
+    SelfPromptDaemon().run()
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Skynet Self-Prompt -- Orchestrator Heartbeat")
     parser.add_argument("action", nargs="?", default="status",
-                        choices=["start", "status", "once", "stop"],
-                        help="start=daemon, status=last prompt, once=single check, stop=show PID")
+                        choices=["start", "status", "once", "stop", "version"],
+                        help="start=daemon, status=last prompt, once=single check, stop=show PID, version=show daemon version")
     args = parser.parse_args()
 
-    if args.action == "status":
-        log_data = _load_json(LOG_FILE)
-        if log_data and isinstance(log_data, list) and len(log_data) > 0:
-            last = log_data[-1]
-            print(json.dumps(last, indent=2))
-            print(f"\nTotal prompts logged: {len(log_data)}")
-        else:
-            print("No self-prompt log found.")
-        pid = _check_existing()
-        if pid:
-            print(f"Daemon running: PID {pid}")
-        else:
-            print("Daemon not running.")
-        return
-
-    if args.action == "once":
-        daemon = SelfPromptDaemon()
-        daemon.check_and_prompt()
-        return
-
-    if args.action == "stop":
-        pid = _check_existing()
-        if pid:
-            print(f"Self-prompt daemon running as PID {pid}.")
-        else:
-            print("Daemon not running.")
-        return
-
-    if args.action == "start":
-        existing = _check_existing()
-        if existing:
-            print(f"Already running (PID {existing}). Use 'status' to check.")
-            return
-
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        PID_FILE.write_text(str(os.getpid()))
-        log(f"Self-prompt daemon PID {os.getpid()}")
-
-        # Seed last action to now to avoid immediate prompting
-        _update_last_action("daemon_start")
-
-        daemon = SelfPromptDaemon()
-        daemon.run()
+    actions = {
+        "status": _action_status,
+        "version": _action_version,
+        "once": lambda: SelfPromptDaemon().check_and_prompt(),
+        "stop": lambda: print(f"Self-prompt daemon running as PID {p}." if (p := _check_existing()) else "Daemon not running."),
+        "start": _action_start,
+    }
+    actions[args.action]()
 
 
 if __name__ == "__main__":

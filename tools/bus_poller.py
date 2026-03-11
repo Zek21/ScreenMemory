@@ -206,7 +206,55 @@ def subscribe_sse_threaded(callback):
     return t, stop
 
 
-def main():
+def _handle_result(args):
+    """Handle --result: publish a result message."""
+    sender, content = args.result
+    result = publish_result(sender, content)
+    if result:
+        print(f"[BUS] Result published: {json.dumps(result)}")
+
+
+def _handle_publish(args):
+    """Handle --publish: publish a message as orchestrator."""
+    result = bus_publish("orchestrator", args.pub_topic, args.pub_type, args.publish)
+    if result:
+        print(f"[BUS] Published: {json.dumps(result)}")
+
+
+def _handle_collect(args):
+    """Handle --collect: block until results from all senders arrive."""
+    senders = [s.strip() for s in args.collect.split(",") if s.strip()]
+    collected = collect_results(senders, timeout=args.timeout, poll_interval=args.interval)
+    print(f"\n[COLLECT] Results ({len(collected)}/{len(senders)}):")
+    for s, m in sorted(collected.items()):
+        print(f"  {s.upper()}: {(m.get('content') or '')[:200]}")
+    if len(collected) < len(senders):
+        sys.exit(1)
+
+
+def _handle_subscribe():
+    """Handle --subscribe: SSE real-time listener."""
+    print("[SSE] Subscribing to bus stream... Press Ctrl+C to stop\n")
+    try:
+        subscribe_sse(lambda m: print(format_message(m)) or sys.stdout.flush())
+    except KeyboardInterrupt:
+        print("\n[SSE] Stopped.")
+
+
+def _handle_default(args):
+    """Handle default: one-shot fetch or continuous watch."""
+    if args.watch:
+        watch_loop(interval=args.interval, sender=args.sender, topic=args.topic)
+    else:
+        msgs = bus_messages(limit=args.limit, sender=args.sender, topic=args.topic)
+        for m in msgs:
+            print(format_message(m))
+        if not msgs:
+            print("[BUS] No messages.")
+
+
+def _build_poller_parser():
+    """Build the argument parser for bus_poller."""
     parser = argparse.ArgumentParser(description="Skynet Bus Poller")
     parser.add_argument("--watch", action="store_true", help="Continuous polling mode")
     parser.add_argument("--interval", type=int, default=3, help="Poll interval in seconds")
@@ -221,47 +269,22 @@ def main():
     parser.add_argument("--subscribe", action="store_true", help="SSE real-time listener")
     parser.add_argument("--result", type=str, nargs=2, metavar=("SENDER", "CONTENT"),
                         help="Publish a result message: --result gamma 'task done'")
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = _build_poller_parser().parse_args()
 
     if args.result:
-        sender, content = args.result
-        result = publish_result(sender, content)
-        if result:
-            print(f"[BUS] Result published: {json.dumps(result)}")
-        return
-
-    if args.publish:
-        result = bus_publish("orchestrator", args.pub_topic, args.pub_type, args.publish)
-        if result:
-            print(f"[BUS] Published: {json.dumps(result)}")
-        return
-
-    if args.collect:
-        senders = [s.strip() for s in args.collect.split(",") if s.strip()]
-        collected = collect_results(senders, timeout=args.timeout, poll_interval=args.interval)
-        print(f"\n[COLLECT] Results ({len(collected)}/{len(senders)}):")
-        for s, m in sorted(collected.items()):
-            print(f"  {s.upper()}: {(m.get('content') or '')[:200]}")
-        if len(collected) < len(senders):
-            sys.exit(1)
-        return
-
-    if args.subscribe:
-        print("[SSE] Subscribing to bus stream... Press Ctrl+C to stop\n")
-        try:
-            subscribe_sse(lambda m: print(format_message(m)) or sys.stdout.flush())
-        except KeyboardInterrupt:
-            print("\n[SSE] Stopped.")
-        return
-
-    if args.watch:
-        watch_loop(interval=args.interval, sender=args.sender, topic=args.topic)
+        _handle_result(args)
+    elif args.publish:
+        _handle_publish(args)
+    elif args.collect:
+        _handle_collect(args)
+    elif args.subscribe:
+        _handle_subscribe()
     else:
-        msgs = bus_messages(limit=args.limit, sender=args.sender, topic=args.topic)
-        for m in msgs:
-            print(format_message(m))
-        if not msgs:
-            print("[BUS] No messages.")
+        _handle_default(args)
 
 
 if __name__ == "__main__":

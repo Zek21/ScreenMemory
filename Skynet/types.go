@@ -32,6 +32,7 @@ type Task struct {
 	DispatchedAt time.Time         `json:"dispatched_at"`
 	RetryCount   int               `json:"retry_count"`
 	MaxRetries   int               `json:"max_retries"`
+	RetryAt      *time.Time        `json:"retry_at,omitempty"`      // timestamp of last retry event -- signed: beta
 	Metadata     map[string]string `json:"metadata,omitempty"`
 }
 
@@ -105,20 +106,22 @@ type AgentView struct {
 // ─── API Payloads ────────────────────────────────────────────────
 
 type DashboardPayload struct {
-	Agents   map[string]*AgentView `json:"agents"`
-	OrchFeed []ThoughtEntry        `json:"orch_thinking"`
-	Bus      []BusMessage          `json:"bus"`
-	Uptime   float64               `json:"uptime_s"`
-	Version  string                `json:"version"`
-	System   string                `json:"system"`
+	Agents    map[string]*AgentView `json:"agents"`
+	OrchFeed  []ThoughtEntry        `json:"orch_thinking"`
+	Bus       []BusMessage          `json:"bus"`
+	Uptime    float64               `json:"uptime_s"`
+	Version   string                `json:"version"`
+	System    string                `json:"system"`
+	Timestamp string                `json:"timestamp"` // RFC3339 server timestamp -- signed: beta
 }
 
 type HealthResponse struct {
-	Status    string  `json:"status"`
-	Uptime    float64 `json:"uptime_s"`
-	Workers   int     `json:"workers_alive"`
-	BusDepth  int     `json:"bus_depth"`
-	Timestamp int64   `json:"timestamp_ns"`
+	Status       string  `json:"status"`
+	Uptime       float64 `json:"uptime_s"`
+	Workers      int     `json:"workers_alive"`
+	BusDepth     int     `json:"bus_depth"`
+	Timestamp    int64   `json:"timestamp_ns"`
+	TimestampRFC string  `json:"timestamp"` // RFC3339 standardized -- signed: beta
 }
 
 type MetricsResponse struct {
@@ -136,6 +139,7 @@ type MetricsResponse struct {
 	Directives      DirectiveStats     `json:"directives"`
 	GoroutineCount  int                `json:"goroutine_count"`
 	MemAllocMB      float64            `json:"mem_alloc_mb"`
+	Timestamp       string             `json:"timestamp"` // RFC3339 server timestamp -- signed: beta
 }
 
 type WStats struct {
@@ -143,13 +147,15 @@ type WStats struct {
 	TotalErrors    int     `json:"total_errors"`
 	AvgTaskMs      float64 `json:"avg_task_ms"`
 	Status         string  `json:"status"`
+	Timestamp      string  `json:"timestamp"` // RFC3339 snapshot time -- signed: beta
 }
 
 type DirectiveStats struct {
-	Total     int `json:"total"`
-	Active    int `json:"active"`
-	Completed int `json:"completed"`
-	Pending   int `json:"pending"`
+	Total     int    `json:"total"`
+	Active    int    `json:"active"`
+	Completed int    `json:"completed"`
+	Pending   int    `json:"pending"`
+	Timestamp string `json:"timestamp"` // RFC3339 snapshot time -- signed: beta
 }
 
 // ─── GOD Feed ────────────────────────────────────────────────────
@@ -171,4 +177,19 @@ type WorkerTask struct {
 	Result      string `json:"result,omitempty"`
 	AssignedAt  string `json:"assigned_at"`
 	CompletedAt string `json:"completed_at,omitempty"`
+}
+
+// ─── Task Lifecycle Tracker ──────────────────────────────────────
+// Tracks the full dispatch-to-result lifecycle for real task visibility.
+// signed: gamma
+
+type TaskTracker struct {
+	TaskID       string     `json:"task_id"`
+	Worker       string     `json:"worker"`
+	Goal         string     `json:"goal"`
+	DispatchedAt time.Time  `json:"dispatched_at"`
+	Status       string     `json:"status"` // dispatched, processing, completed, failed, timeout
+	CompletedAt  *time.Time `json:"completed_at,omitempty"`
+	DurationMs   float64    `json:"duration_ms,omitempty"`
+	DirectiveID  string     `json:"directive_id,omitempty"`
 }

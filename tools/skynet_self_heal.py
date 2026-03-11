@@ -114,6 +114,51 @@ def detect_stuck_tasks(threshold_s: Optional[float] = None) -> list[dict]:
     return stuck
 
 
+def _try_cancel_worker(worker: str) -> tuple[bool, str | None]:
+    """Attempt to cancel a stuck worker via UIA. Returns (cancelled, error)."""
+    try:
+        from tools.uia_engine import get_engine
+        workers_json = ROOT / "data" / "workers.json"
+        if workers_json.exists():
+            wdata = json.loads(workers_json.read_text(encoding="utf-8"))
+            hwnd = wdata.get(worker, {}).get("hwnd")
+            if hwnd:
+                engine = get_engine()
+                engine.cancel_generation(hwnd)
+                return True, None
+    except Exception as e:
+        return False, str(e)
+    return False, None
+
+
+def _log_and_broadcast_heals(actions: list[dict]):
+    """Log heal actions to file and broadcast summary to bus."""
+    log_data = _load_json(HEAL_LOG)
+    if not isinstance(log_data, list):
+        log_data = []
+    log_data.append({
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "actions": actions,
+    })
+    _save_json(HEAL_LOG, log_data[-100:])
+
+    try:
+        import requests
+        summary = "; ".join(f"{a['worker']}:{a['action']}" for a in actions)
+        requests.post(
+            "http://localhost:8420/bus/publish",
+            json={
+                "sender": "self_heal",
+                "topic": "orchestrator",
+                "type": "alert",
+                "content": f"AUTO-HEAL: {summary}",
+            },
+            timeout=3,
+        )
+    except Exception:
+        pass
+
+
 def auto_heal(dry_run: bool = False) -> list[dict]:
     """Auto-heal stuck tasks by cancelling and optionally re-dispatching.
 
@@ -137,63 +182,17 @@ def auto_heal(dry_run: bool = False) -> list[dict]:
         if dry_run:
             action["action"] = "would_cancel"
             action["result"] = "dry_run"
-            actions.append(action)
-            continue
-
-        # Attempt to cancel via UIA
-        cancelled = False
-        try:
-            from tools.uia_engine import get_engine
-            workers_json = ROOT / "data" / "workers.json"
-            if workers_json.exists():
-                wdata = json.loads(workers_json.read_text(encoding="utf-8"))
-                hwnd = wdata.get(worker, {}).get("hwnd")
-                if hwnd:
-                    engine = get_engine()
-                    engine.cancel_generation(hwnd)
-                    cancelled = True
-        except Exception as e:
-            action["cancel_error"] = str(e)
-
-        if cancelled:
-            action["action"] = "cancelled"
-            action["result"] = "success"
         else:
-            action["action"] = "cancel_failed"
-            action["result"] = "manual_intervention_needed"
+            cancelled, err = _try_cancel_worker(worker)
+            if err:
+                action["cancel_error"] = err
+            action["action"] = "cancelled" if cancelled else "cancel_failed"
+            action["result"] = "success" if cancelled else "manual_intervention_needed"
 
         actions.append(action)
 
-    # Log heal actions
     if actions and not dry_run:
-        log = _load_json(HEAL_LOG)
-        if not isinstance(log, list):
-            log = []
-        log.append({
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "actions": actions,
-        })
-        _save_json(HEAL_LOG, log[-100:])  # Keep last 100
-
-    # Post to bus if actions taken
-    if actions and not dry_run:
-        try:
-            import requests
-            summary = "; ".join(
-                f"{a['worker']}:{a['action']}" for a in actions
-            )
-            requests.post(
-                "http://localhost:8420/bus/publish",
-                json={
-                    "sender": "self_heal",
-                    "topic": "orchestrator",
-                    "type": "alert",
-                    "content": f"AUTO-HEAL: {summary}",
-                },
-                timeout=3,
-            )
-        except Exception:
-            pass
+        _log_and_broadcast_heals(actions)
 
     return actions
 

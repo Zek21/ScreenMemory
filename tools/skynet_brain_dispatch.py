@@ -152,19 +152,14 @@ def route_to_best_worker(subtask: str, workers_state: dict = None, expertise: di
 
 # ── Plan Representation ──────────────────────────────────────────
 
-def _brain_think(goal: str) -> dict:
-    """Generate an intelligent execution plan.
-
-    Tries to import SkynetBrain first. Falls back to rule-based decomposition
-    using SkynetOrchestrator's decompose_task if brain is unavailable.
-    """
+def _try_brain_plan(goal: str):
+    """Try to generate a plan via SkynetBrain. Returns dict or None."""
     try:
         from skynet_brain import SkynetBrain
         from dataclasses import asdict
         brain = SkynetBrain()
         plan = brain.think(goal)
         result = asdict(plan)
-        # Normalize subtask field names for smart_dispatch compatibility
         for st in result.get("subtasks", []):
             if "task_text" in st and "task" not in st:
                 st["task"] = st.pop("task_text")
@@ -172,67 +167,74 @@ def _brain_think(goal: str) -> dict:
                 st["worker"] = st.pop("assigned_worker")
         return result
     except ImportError:
-        pass
+        return None
 
-    # Fallback: rule-based decomposition via SkynetOrchestrator
-    agents = _get_status()
-    idle = _get_idle_workers(agents)
 
+def _classify_difficulty(goal: str) -> str:
+    """Classify goal difficulty as easy/medium/hard based on text signals."""
     goal_lower = goal.lower()
-
-    # Classify difficulty
     if len(goal) > 300 or any(k in goal_lower for k in ["all", "every", "entire", "comprehensive"]):
-        difficulty = "hard"
-    elif len(goal) > 100 or any(k in goal_lower for k in ["review", "audit", "fix", "build"]):
-        difficulty = "medium"
-    else:
-        difficulty = "easy"
+        return "hard"
+    if len(goal) > 100 or any(k in goal_lower for k in ["review", "audit", "fix", "build"]):
+        return "medium"
+    return "easy"
 
-    # Decompose into subtasks
+
+def _decompose_subtasks(goal: str, idle: list, difficulty: str) -> list:
+    """Decompose goal into worker subtasks using rule-based heuristics."""
+    import re
     subtasks = []
 
     # Check for explicit worker assignments: "alpha: X, beta: Y"
-    import re
     explicit = re.findall(
         r'\b(alpha|beta|gamma|delta)\s*:\s*(.+?)(?=\b(?:alpha|beta|gamma|delta)\s*:|$)',
         goal, re.IGNORECASE)
 
     if explicit:
         for worker, task in explicit:
+            subtasks.append({"worker": worker.lower(), "task": task.strip(), "depends_on": None})
+        return subtasks
+
+    # Check for multi-path patterns
+    paths = re.findall(r'(?:core/|tools/|Skynet/|tests/|ui/|docs/)\S*', goal)
+    if len(paths) >= 2 and len(idle) >= 2:
+        base = re.split(r'(?:core/|tools/|Skynet/|tests/|ui/|docs/)', goal)[0].strip()
+        for i, path in enumerate(paths):
+            worker = idle[i % len(idle)]
+            subtasks.append({"worker": worker, "task": f"{base} {path}".strip(), "depends_on": None})
+        return subtasks
+
+    if difficulty == "easy" or len(idle) <= 1:
+        worker = idle[0] if idle else "alpha"
+        subtasks.append({"worker": worker, "task": goal, "depends_on": None})
+    else:
+        n = min(len(idle), 4 if difficulty == "hard" else 2)
+        for i in range(n):
             subtasks.append({
-                "worker": worker.lower(),
-                "task": task.strip(),
+                "worker": idle[i],
+                "task": goal if n == 1 else f"{goal} (worker {i+1}/{n}, focus on your assigned portion)",
                 "depends_on": None,
             })
-    else:
-        # Check for multi-path patterns
-        paths = re.findall(r'(?:core/|tools/|Skynet/|tests/|ui/|docs/)\S*', goal)
-        if len(paths) >= 2 and len(idle) >= 2:
-            base = re.split(r'(?:core/|tools/|Skynet/|tests/|ui/|docs/)', goal)[0].strip()
-            for i, path in enumerate(paths):
-                worker = idle[i % len(idle)]
-                subtasks.append({
-                    "worker": worker,
-                    "task": f"{base} {path}".strip(),
-                    "depends_on": None,
-                })
-        elif difficulty == "easy" or len(idle) <= 1:
-            worker = idle[0] if idle else "alpha"
-            subtasks.append({"worker": worker, "task": goal, "depends_on": None})
-        else:
-            # Medium/hard: split across available workers
-            n = min(len(idle), 4 if difficulty == "hard" else 2)
-            for i in range(n):
-                subtasks.append({
-                    "worker": idle[i],
-                    "task": goal if n == 1 else f"{goal} (worker {i+1}/{n}, focus on your assigned portion)",
-                    "depends_on": None,
-                })
+    return subtasks
 
-    # Check for dependencies
+
+def _brain_think(goal: str) -> dict:
+    """Generate an intelligent execution plan.
+
+    Tries to import SkynetBrain first. Falls back to rule-based decomposition
+    using SkynetOrchestrator's decompose_task if brain is unavailable.
+    """
+    brain_plan = _try_brain_plan(goal)
+    if brain_plan is not None:
+        return brain_plan
+
+    agents = _get_status()
+    idle = _get_idle_workers(agents)
+    difficulty = _classify_difficulty(goal)
+    subtasks = _decompose_subtasks(goal, idle, difficulty)
+
+    goal_lower = goal.lower()
     has_deps = any(k in goal_lower for k in ["then", "after that", "once done", "followed by"])
-
-    # Generate unique strategy_id for this plan
     strategy_id = hashlib.sha256(f"{goal}:{time.time()}".encode()).hexdigest()[:16]
 
     return {
@@ -331,20 +333,12 @@ def _brain_learn(plan: dict, results: dict, success: bool):
 
 # ── Smart Dispatch Pipeline ──────────────────────────────────────
 
-def smart_dispatch(goal: str, wait_timeout: int = 120) -> dict:
-    """Full intelligent dispatch pipeline.
-
-    think → enrich → dispatch → wait → synthesize → learn → return
-    """
-    t0 = time.time()
-    log(f"Brain dispatch: {goal[:100]}", "SYS")
-
-    # Step 1: Think — generate plan
-    plan = _brain_think(goal)
+def _print_plan_summary(plan: dict) -> None:
+    """Print the plan summary to stdout."""
     subtasks = plan.get("subtasks", [])
     difficulty = plan.get("difficulty", "?")
-    reasoning = plan.get("reasoning", "")
     strategy_id = plan.get("strategy_id", "")
+    cog_strategy = plan.get("cognitive_strategy") or "direct"
 
     print(f"\n{C_GOLD}{C_BOLD}PLAN{C_RESET}")
     print(f"  Difficulty:  {C_BOLD}{difficulty}{C_RESET}")
@@ -352,60 +346,99 @@ def smart_dispatch(goal: str, wait_timeout: int = 120) -> dict:
     print(f"  Workers:     {', '.join(st['worker'] for st in subtasks)}")
     print(f"  Dependencies:{' yes' if plan.get('has_dependencies') else ' none'}")
     print(f"  Strategy ID: {C_DIM}{strategy_id}{C_RESET}")
-    # Show cognitive strategy if present
-    cog_strategy = plan.get("cognitive_strategy") or "direct"
     if cog_strategy != "direct":
         print(f"  {C_PURPLE}Cognitive:   {cog_strategy.upper()}{C_RESET}")
-    print(f"  Reasoning:   {C_DIM}{reasoning}{C_RESET}\n")
+    print(f"  Reasoning:   {C_DIM}{plan.get('reasoning', '')}{C_RESET}\n")
 
-    if not subtasks:
-        log("No subtasks generated", "ERR")
-        return {"success": False, "error": "Empty plan", "elapsed_s": time.time() - t0}
 
-    # Step 2: Enrich tasks with context
-    learnings = _get_knowledge(20)
-    for st in subtasks:
-        st["task"] = context_enrich(st["task"], learnings)
-
-    # Step 3: Consume old results
-    from orch_realtime import consume_all
-    consume_all()
-
-    # Step 4: Dispatch
+def _dispatch_subtasks(subtasks: list, plan: dict, wait_timeout: int) -> dict:
+    """Dispatch subtasks to workers. Returns dispatch success map {worker: bool}."""
     from skynet_dispatch import dispatch_to_worker, dispatch_parallel
-
-    # Wire cognitive strategy and strategy_id into dispatch context for learner correlation
-    os.environ["SKYNET_STRATEGY"] = cog_strategy
-    os.environ["SKYNET_STRATEGY_ID"] = strategy_id
 
     dispatch_results = {}
     if len(subtasks) == 1:
         st = subtasks[0]
-        log(f"Single dispatch → {st['worker'].upper()}", "SYS")
+        log(f"Single dispatch -> {st['worker'].upper()}", "SYS")
         ok = dispatch_to_worker(st["worker"], st["task"])
         dispatch_results[st["worker"]] = ok
     elif plan.get("has_dependencies"):
-        # Sequential dispatch for dependent tasks
         log(f"Sequential dispatch ({len(subtasks)} steps)", "SYS")
         for i, st in enumerate(subtasks):
-            log(f"Step {i+1}/{len(subtasks)} → {st['worker'].upper()}", "SYS")
+            log(f"Step {i+1}/{len(subtasks)} -> {st['worker'].upper()}", "SYS")
             ok = dispatch_to_worker(st["worker"], st["task"])
             dispatch_results[st["worker"]] = ok
             if ok and i < len(subtasks) - 1:
-                # Wait for this step before dispatching next
                 from orch_realtime import wait
                 result = wait(st["worker"], timeout=wait_timeout // len(subtasks))
                 if result:
-                    # Feed result into next task's context
-                    next_st = subtasks[i + 1]
                     prev_content = result.get("content", "")[:300]
-                    next_st["task"] = f"{next_st['task']}\n\nPREVIOUS STEP RESULT ({st['worker']}):\n{prev_content}"
+                    subtasks[i + 1]["task"] = (
+                        f"{subtasks[i + 1]['task']}\n\nPREVIOUS STEP RESULT ({st['worker']}):\n{prev_content}"
+                    )
     else:
-        # Parallel dispatch
         tasks_by_worker = {st["worker"]: st["task"] for st in subtasks}
-        log(f"Parallel dispatch → {list(tasks_by_worker.keys())}", "SYS")
+        log(f"Parallel dispatch -> {list(tasks_by_worker.keys())}", "SYS")
         dispatch_results = dispatch_parallel(tasks_by_worker)
+    return dispatch_results
 
+
+def _collect_worker_results(dispatched_workers: list, wait_timeout: int) -> dict:
+    """Wait for results from dispatched workers."""
+    from orch_realtime import wait, wait_all
+    if len(dispatched_workers) == 1:
+        result = wait(dispatched_workers[0], timeout=wait_timeout)
+        return {dispatched_workers[0]: result} if result else {}
+    return wait_all(dispatched_workers, timeout=wait_timeout)
+
+
+def _finalize_dispatch(plan, dispatch_results, results, synthesis, t0):
+    """Learn from outcomes and build the final result dict."""
+    dispatched_workers = [w for w, ok in dispatch_results.items() if ok]
+    success = len(results) == len(dispatched_workers) and all(results.values())
+    _brain_learn(plan, results, success)
+    elapsed = time.time() - t0
+    log(f"Brain dispatch complete in {elapsed:.1f}s (success={success})", "OK" if success else "WARN")
+    return {
+        "success": success,
+        "plan": plan,
+        "strategy_id": plan.get("strategy_id", ""),
+        "dispatch_results": dispatch_results,
+        "results": {k: (v.get("content", "") if isinstance(v, dict) else str(v)) for k, v in results.items()},
+        "synthesis": synthesis,
+        "elapsed_s": elapsed,
+    }
+
+
+def smart_dispatch(goal: str, wait_timeout: int = 120) -> dict:
+    """Full intelligent dispatch pipeline.
+
+    think -> enrich -> dispatch -> wait -> synthesize -> learn -> return
+    """
+    t0 = time.time()
+    log(f"Brain dispatch: {goal[:100]}", "SYS")
+
+    plan = _brain_think(goal)
+    subtasks = plan.get("subtasks", [])
+    strategy_id = plan.get("strategy_id", "")
+    cog_strategy = plan.get("cognitive_strategy") or "direct"
+
+    _print_plan_summary(plan)
+    if not subtasks:
+        log("No subtasks generated", "ERR")
+        return {"success": False, "error": "Empty plan", "elapsed_s": time.time() - t0}
+
+    # Enrich tasks with context
+    learnings = _get_knowledge(20)
+    for st in subtasks:
+        st["task"] = context_enrich(st["task"], learnings)
+
+    from orch_realtime import consume_all
+    consume_all()
+
+    os.environ["SKYNET_STRATEGY"] = cog_strategy
+    os.environ["SKYNET_STRATEGY_ID"] = strategy_id
+
+    dispatch_results = _dispatch_subtasks(subtasks, plan, wait_timeout)
     failed = [w for w, ok in dispatch_results.items() if not ok]
     if failed:
         log(f"Dispatch failed for: {failed}", "WARN")
@@ -415,35 +448,13 @@ def smart_dispatch(goal: str, wait_timeout: int = 120) -> dict:
         log("All dispatches failed", "ERR")
         return {"success": False, "error": "All dispatches failed", "elapsed_s": time.time() - t0}
 
-    # Step 5: Wait for results
-    from orch_realtime import wait, wait_all
-    if len(dispatched_workers) == 1:
-        result = wait(dispatched_workers[0], timeout=wait_timeout)
-        results = {dispatched_workers[0]: result} if result else {}
-    else:
-        results = wait_all(dispatched_workers, timeout=wait_timeout)
+    results = _collect_worker_results(dispatched_workers, wait_timeout)
 
-    # Step 6: Synthesize
     synthesis = _brain_synthesize(plan, results)
     print(f"\n{C_CYAN}{C_BOLD}SYNTHESIS{C_RESET}")
     print(synthesis)
 
-    # Step 7: Learn
-    success = len(results) == len(dispatched_workers) and all(results.values())
-    _brain_learn(plan, results, success)
-
-    elapsed = time.time() - t0
-    log(f"Brain dispatch complete in {elapsed:.1f}s (success={success})", "OK" if success else "WARN")
-
-    return {
-        "success": success,
-        "plan": plan,
-        "strategy_id": strategy_id,
-        "dispatch_results": dispatch_results,
-        "results": {k: (v.get("content", "") if isinstance(v, dict) else str(v)) for k, v in results.items()},
-        "synthesis": synthesis,
-        "elapsed_s": elapsed,
-    }
+    return _finalize_dispatch(plan, dispatch_results, results, synthesis, t0)
 
 
 # ── CLI ───────────────────────────────────────────────────────────

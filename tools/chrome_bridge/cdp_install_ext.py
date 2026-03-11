@@ -23,20 +23,10 @@ def hotkey(*vks):
         user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
         time.sleep(0.02)
 
-def install_extension(chrome, tab_id):
-    """Install extension via CDP eval + Win32 file dialog handling."""
-    
-    # Navigate to chrome://extensions
-    print("  Navigating to chrome://extensions...")
-    chrome.navigate(tab_id, 'chrome://extensions')
-    time.sleep(3)
-    
-    url = chrome.eval(tab_id, 'window.location.href')
-    print(f"  URL: {url}")
-    
-    # Enable Developer Mode
+def _enable_developer_mode(chrome, tab_id) -> str:
+    """Enable Developer Mode on chrome://extensions. Returns status string."""
     print("  Enabling Developer Mode...")
-    dev_result = chrome.eval(tab_id, """
+    result = chrome.eval(tab_id, """
         (function() {
             var mgr = document.querySelector('extensions-manager');
             if (!mgr || !mgr.shadowRoot) return 'no-manager';
@@ -51,12 +41,15 @@ def install_extension(chrome, tab_id):
             return 'already-on';
         })()
     """)
-    print(f"  Developer Mode: {dev_result}")
+    print(f"  Developer Mode: {result}")
     time.sleep(1)
-    
-    # Click Load Unpacked
+    return result
+
+
+def _click_load_unpacked(chrome, tab_id) -> bool:
+    """Click Load unpacked button. Returns True if clicked."""
     print("  Clicking Load unpacked...")
-    load_result = chrome.eval(tab_id, """
+    result = chrome.eval(tab_id, """
         (function() {
             var mgr = document.querySelector('extensions-manager');
             var toolbar = mgr.shadowRoot.querySelector('extensions-toolbar');
@@ -66,70 +59,64 @@ def install_extension(chrome, tab_id):
             return 'clicked';
         })()
     """)
-    print(f"  Load unpacked: {load_result}")
-    
-    if load_result != 'clicked':
+    print(f"  Load unpacked: {result}")
+    if result != 'clicked':
         print("  FAILED: Could not click Load unpacked")
         return False
-    
-    # Wait for file dialog
+    return True
+
+
+def _handle_file_dialog() -> bool:
+    """Handle the folder picker dialog via Win32. Returns True if dialog closed."""
     print("  Waiting for folder picker dialog...")
     time.sleep(2)
-    
+
     dialog = user32.FindWindowW('#32770', None)
     if not dialog:
         time.sleep(2)
         dialog = user32.FindWindowW('#32770', None)
-    
     if not dialog:
         print("  FAILED: No file dialog appeared")
         return False
-    
+
     print(f"  Dialog found: hwnd={dialog}")
-    
-    # Focus the dialog
     user32.SetForegroundWindow(dialog)
     time.sleep(0.5)
-    
-    # Alt+D to focus address bar
+
     hotkey(0x12, 0x44)  # Alt+D
     time.sleep(0.5)
-    
-    # Set clipboard to extension path
+
     subprocess.run(
         ['powershell', '-NoProfile', '-Command', f'Set-Clipboard -Value "{EXTENSION_PATH}"'],
         check=True, capture_output=True
     )
     time.sleep(0.2)
-    
-    # Ctrl+V to paste path
+
     hotkey(0x11, 0x56)  # Ctrl+V
     time.sleep(0.5)
-    
-    # Enter to navigate to the folder
-    press(0x0D)
+    press(0x0D)  # Enter to navigate
     time.sleep(1.5)
-    
-    # Enter again to select the folder
-    press(0x0D)
+    press(0x0D)  # Enter to select
     time.sleep(3)
-    
-    # Check if dialog closed
+
     dialog2 = user32.FindWindowW('#32770', None)
     if dialog2 == dialog:
         print("  WARNING: Dialog still open, trying again...")
         press(0x0D)
         time.sleep(2)
         dialog2 = user32.FindWindowW('#32770', None)
-    
+
     if dialog2 and dialog2 == dialog:
         print("  FAILED: Dialog did not close")
         return False
-    
+
     print("  Dialog closed, checking extension...")
+    return True
+
+
+def _verify_extension(chrome, tab_id) -> bool:
+    """Verify Chrome Bridge extension is installed."""
     time.sleep(2)
-    
-    # Verify extension was loaded
     verify = chrome.eval(tab_id, """
         (function() {
             var mgr = document.querySelector('extensions-manager');
@@ -147,14 +134,29 @@ def install_extension(chrome, tab_id):
         })()
     """)
     print(f"  Extensions: {verify}")
-    
+
     has_bridge = 'Chrome Bridge' in str(verify)
     if has_bridge:
         print("  SUCCESS: Chrome Bridge extension installed!")
     else:
         print("  Extension list doesn't show Chrome Bridge yet")
-    
     return has_bridge
+
+
+def install_extension(chrome, tab_id):
+    """Install extension via CDP eval + Win32 file dialog handling."""
+    print("  Navigating to chrome://extensions...")
+    chrome.navigate(tab_id, 'chrome://extensions')
+    time.sleep(3)
+    print(f"  URL: {chrome.eval(tab_id, 'window.location.href')}")
+
+    _enable_developer_mode(chrome, tab_id)
+
+    if not _click_load_unpacked(chrome, tab_id):
+        return False
+    if not _handle_file_dialog():
+        return False
+    return _verify_extension(chrome, tab_id)
 
 
 def main():

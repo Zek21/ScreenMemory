@@ -225,17 +225,9 @@ Return as a numbered list."""
         return subtasks
 
     def execute_step(self, plan: Plan, executor_fn: Optional[Callable] = None) -> Subtask:
-        """
-        Execute the next subtask in the plan.
-        
-        LOG FORMAT:
-            [EXECUTOR] subtask_start — step 2/4: Navigate to search engine
-            [EXECUTOR] action — type URL in address bar
-            [REFLECTOR] verify — checking page loaded correctly...
-            [REFLECTOR] success — search engine page loaded ✓
-        """
+        """Execute the next subtask in the plan."""
         if plan.current_step >= len(plan.subtasks):
-            logger.info("Plan complete — all subtasks done")
+            logger.info("Plan complete -- all subtasks done")
             plan.status = TaskStatus.SUCCESS
             return plan.subtasks[-1]
 
@@ -246,55 +238,55 @@ Return as a numbered list."""
         logger.info(f"Executing step {plan.current_step + 1}/{len(plan.subtasks)}: {subtask.description}")
 
         try:
-            if executor_fn:
-                result = executor_fn(subtask)
-                subtask.result = str(result) if result else "completed"
-            else:
-                subtask.result = "simulated_success"
-
-            subtask.status = TaskStatus.SUCCESS
-            subtask.completed_at = time.time()
+            self._run_subtask(subtask, executor_fn)
             plan.current_step += 1
-
-            # Record in memory
-            if self.memory:
-                self.memory.store_episodic(
-                    f"Completed: {subtask.description} → {subtask.result}",
-                    tags=["execution", "subtask"],
-                    source_action="execute_step",
-                )
-
-            logger.info(f"Step {subtask.id} SUCCESS ({subtask.elapsed_ms:.0f}ms): {subtask.result[:80]}")
-
         except Exception as e:
-            subtask.error = str(e)
-            subtask.retries += 1
+            self._handle_subtask_failure(plan, subtask, e)
 
-            if subtask.retries < subtask.max_retries:
-                subtask.status = TaskStatus.RETRYING
-                logger.warning(f"Step {subtask.id} RETRY {subtask.retries}/{subtask.max_retries}: {e}")
-            else:
-                subtask.status = TaskStatus.FAILED
-                subtask.completed_at = time.time()
-                logger.error(f"Step {subtask.id} FAILED after {subtask.retries} retries: {e}")
-
-                # Attempt replan
-                if plan.replan_count < plan.max_replans:
-                    self._replan(plan, subtask)
-
-        # Log action to history
-        self._action_history.append({
-            "timestamp": time.time(),
-            "plan_goal": plan.goal,
-            "step": subtask.id,
-            "description": subtask.description,
-            "status": subtask.status.value,
-            "result": subtask.result,
-            "error": subtask.error,
-            "elapsed_ms": subtask.elapsed_ms,
-        })
-
+        self._record_action(plan, subtask)
         return subtask
+
+    def _run_subtask(self, subtask: Subtask, executor_fn: Optional[Callable]):
+        """Execute a subtask and mark it successful."""
+        if executor_fn:
+            result = executor_fn(subtask)
+            subtask.result = str(result) if result else "completed"
+        else:
+            subtask.result = "simulated_success"
+
+        subtask.status = TaskStatus.SUCCESS
+        subtask.completed_at = time.time()
+
+        if self.memory:
+            self.memory.store_episodic(
+                f"Completed: {subtask.description} -> {subtask.result}",
+                tags=["execution", "subtask"], source_action="execute_step",
+            )
+        logger.info(f"Step {subtask.id} SUCCESS ({subtask.elapsed_ms:.0f}ms): {subtask.result[:80]}")
+
+    def _handle_subtask_failure(self, plan: Plan, subtask: Subtask, error: Exception):
+        """Handle subtask failure with retry/replan logic."""
+        subtask.error = str(error)
+        subtask.retries += 1
+
+        if subtask.retries < subtask.max_retries:
+            subtask.status = TaskStatus.RETRYING
+            logger.warning(f"Step {subtask.id} RETRY {subtask.retries}/{subtask.max_retries}: {error}")
+        else:
+            subtask.status = TaskStatus.FAILED
+            subtask.completed_at = time.time()
+            logger.error(f"Step {subtask.id} FAILED after {subtask.retries} retries: {error}")
+            if plan.replan_count < plan.max_replans:
+                self._replan(plan, subtask)
+
+    def _record_action(self, plan: Plan, subtask: Subtask):
+        """Log action to history."""
+        self._action_history.append({
+            "timestamp": time.time(), "plan_goal": plan.goal,
+            "step": subtask.id, "description": subtask.description,
+            "status": subtask.status.value, "result": subtask.result,
+            "error": subtask.error, "elapsed_ms": subtask.elapsed_ms,
+        })
 
     def verify_outcome(self, subtask: Subtask, pre_screenshot=None,
                        post_screenshot=None, change_detector=None) -> bool:

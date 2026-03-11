@@ -702,16 +702,7 @@ class Desktop:
 
     # ─── UI Automation (accessible elements) ───────────
 
-    def ui_tree(self, window, depth=2, max_children=50):
-        """
-        Get UI automation tree of a window.
-        Uses PowerShell + .NET UIAutomation (no external dependencies).
-        """
-        hwnd = self.find_window(window) if isinstance(window, str) else window
-        if not hwnd:
-            raise ValueError(f'Window not found: {window}')
-
-        ps_script = f'''
+    _UI_TREE_PS = '''
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]{hwnd})
@@ -744,36 +735,16 @@ function Get-Tree($el, $depth, $maxD, $maxC) {{
 $tree = Get-Tree $root 0 {depth} {max_children}
 $tree | ConvertTo-Json -Depth 20 -Compress
 '''
-        try:
-            result = subprocess.run(
-                ['powershell', '-NoProfile', '-Command', ps_script],
-                capture_output=True, text=True, timeout=15
-            )
-            if result.stdout.strip():
-                return json.loads(result.stdout)
-            return {'error': result.stderr.strip()[:500]}
-        except Exception as e:
-            return {'error': str(e)}
 
-    def find_elements(self, window, name=None, type=None, id=None, cls=None):
-        """Find UI elements in a window by properties."""
+    def ui_tree(self, window, depth=2, max_children=50):
+        """Get UI automation tree of a window."""
         hwnd = self.find_window(window) if isinstance(window, str) else window
         if not hwnd:
-            return []
+            raise ValueError(f'Window not found: {window}')
+        ps_script = self._UI_TREE_PS.format(hwnd=hwnd, depth=depth, max_children=max_children)
+        return self._run_ps_json(ps_script, error_fallback=True)
 
-        conditions = []
-        if name:
-            conditions.append(f'$el.Current.Name -like "*{name}*"')
-        if type:
-            conditions.append(f'$el.Current.ControlType.ProgrammaticName -match "{type}"')
-        if id:
-            conditions.append(f'$el.Current.AutomationId -eq "{id}"')
-        if cls:
-            conditions.append(f'$el.Current.ClassName -eq "{cls}"')
-
-        filter_expr = ' -and '.join(conditions) if conditions else '$true'
-
-        ps_script = f'''
+    _FIND_ELEMENTS_PS = '''
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]{hwnd})
@@ -795,6 +766,14 @@ foreach ($el in $all) {{
 }}
 $results | ConvertTo-Json -Compress
 '''
+
+    def find_elements(self, window, name=None, type=None, id=None, cls=None):
+        """Find UI elements in a window by properties."""
+        hwnd = self.find_window(window) if isinstance(window, str) else window
+        if not hwnd:
+            return []
+        filter_expr = self._build_filter_expr(name=name, type=type, id=id, cls=cls)
+        ps_script = self._FIND_ELEMENTS_PS.format(hwnd=hwnd, filter_expr=filter_expr)
         try:
             result = subprocess.run(
                 ['powershell', '-NoProfile', '-Command', ps_script],
@@ -807,26 +786,61 @@ $results | ConvertTo-Json -Compress
         except Exception:
             return []
 
+    @staticmethod
+    def _build_filter_expr(name=None, type=None, id=None, cls=None) -> str:
+        """Build UIA filter expression for find_elements."""
+        conditions = []
+        if name:
+            conditions.append(f'$el.Current.Name -like "*{name}*"')
+        if type:
+            conditions.append(f'$el.Current.ControlType.ProgrammaticName -match "{type}"')
+        if id:
+            conditions.append(f'$el.Current.AutomationId -eq "{id}"')
+        if cls:
+            conditions.append(f'$el.Current.ClassName -eq "{cls}"')
+        return ' -and '.join(conditions) if conditions else '$true'
+
+    def _run_ps_json(self, ps_script, error_fallback=False):
+        """Run a PowerShell script and parse JSON output."""
+        try:
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', ps_script],
+                capture_output=True, text=True, timeout=15
+            )
+            if result.stdout.strip():
+                return json.loads(result.stdout)
+            return {'error': result.stderr.strip()[:500]} if error_fallback else None
+        except Exception as e:
+            return {'error': str(e)} if error_fallback else None
+
     def click_element(self, window, name=None, id=None, type=None):
-        """
-        Click a UI element using InvokePattern (no mouse!).
-        Falls back to expanding/toggling if invoke isn't available.
-        """
+        """Click a UI element using InvokePattern (no mouse!).
+        Falls back to expanding/toggling if invoke isn't available."""
         hwnd = self.find_window(window) if isinstance(window, str) else window
         if not hwnd:
             raise ValueError(f'Window not found: {window}')
+        find_by = self._build_find_condition(name=name, id=id, type=type)
+        ps_script = self._build_click_ps(hwnd, find_by)
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', ps_script],
+            capture_output=True, text=True, timeout=10
+        )
+        return self._parse_click_result(result.stdout.strip())
 
-        find_by = ''
+    @staticmethod
+    def _build_find_condition(name=None, id=None, type=None) -> str:
+        """Build UIA find condition expression."""
         if id:
-            find_by = f'$el.Current.AutomationId -eq "{id}"'
-        elif name:
-            find_by = f'$el.Current.Name -like "*{name}*"'
-        elif type:
-            find_by = f'$el.Current.ControlType.ProgrammaticName -match "{type}"'
-        else:
-            raise ValueError('Provide name, id, or type')
+            return f'$el.Current.AutomationId -eq "{id}"'
+        if name:
+            return f'$el.Current.Name -like "*{name}*"'
+        if type:
+            return f'$el.Current.ControlType.ProgrammaticName -match "{type}"'
+        raise ValueError('Provide name, id, or type')
 
-        ps_script = f'''
+    @staticmethod
+    def _build_click_ps(hwnd, find_by) -> str:
+        return f'''
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]{hwnd})
@@ -864,14 +878,13 @@ foreach ($el in $all) {{
 Write-Host "not_found"
 exit 2
 '''
-        result = subprocess.run(
-            ['powershell', '-NoProfile', '-Command', ps_script],
-            capture_output=True, text=True, timeout=10
-        )
-        output = result.stdout.strip()
-        if output.startswith('invoked:') or output.startswith('toggled:') or \
-           output.startswith('expanded:') or output.startswith('selected:'):
-            return {'action': output.split(':')[0], 'element': output.split(':', 1)[1]}
+
+    @staticmethod
+    def _parse_click_result(output):
+        """Parse click_element PowerShell output."""
+        for prefix in ('invoked:', 'toggled:', 'expanded:', 'selected:'):
+            if output.startswith(prefix):
+                return {'action': prefix[:-1], 'element': output.split(':', 1)[1]}
         raise RuntimeError(f'Click failed: {output}')
 
     def set_value(self, window, name=None, id=None, value=''):
@@ -1028,9 +1041,9 @@ exit 2
 
 # ─── CLI Entry Point ────────────────────────────────────────
 
-def main():
+def _build_winctl_parser():
+    """Build the winctl argparse parser with all subcommands."""
     import argparse
-
     parser = argparse.ArgumentParser(prog='winctl', description='Windows Desktop Controller')
     sub = parser.add_subparsers(dest='command')
 
@@ -1043,6 +1056,14 @@ def main():
     p_shot.add_argument('--output', '-o', default='screenshot.bmp')
     p_shot.add_argument('--window', '-w', default=None)
 
+    _add_window_subcommands(sub)
+    _add_input_subcommands(sub)
+    _add_process_subcommands(sub)
+    return parser
+
+
+def _add_window_subcommands(sub):
+    """Add focus, close, tree, find, click subcommands."""
     p_focus = sub.add_parser('focus', help='Focus window')
     p_focus.add_argument('title')
 
@@ -1064,6 +1085,9 @@ def main():
     p_click.add_argument('--name', '-n', default=None)
     p_click.add_argument('--id', default=None)
 
+
+def _add_input_subcommands(sub):
+    """Add type, key, hotkey, clip subcommands."""
     p_type = sub.add_parser('type', help='Type text')
     p_type.add_argument('text')
 
@@ -1077,6 +1101,9 @@ def main():
     p_clip.add_argument('action', choices=['get', 'set'])
     p_clip.add_argument('text', nargs='?', default='')
 
+
+def _add_process_subcommands(sub):
+    """Add procs, launch, kill subcommands."""
     p_procs = sub.add_parser('procs', help='List processes')
     p_procs.add_argument('--name', '-n', default=None)
 
@@ -1086,63 +1113,46 @@ def main():
     p_kill = sub.add_parser('kill', help='Kill process')
     p_kill.add_argument('pid', type=int)
 
-    args = parser.parse_args()
-    desk = Desktop()
 
-    if args.command == 'windows':
-        for w in desk.windows():
-            print(f"  [{w['hwnd']:>8}] {w['title'][:60]:60s} {w['class'][:25]}")
-    elif args.command == 'screen':
-        print(json.dumps(desk.screen_size(), indent=2))
-    elif args.command == 'monitors':
-        print(json.dumps(desk.monitors(), indent=2))
-    elif args.command == 'foreground':
-        print(json.dumps(desk.foreground(), indent=2))
-    elif args.command == 'screenshot':
-        r = desk.screenshot(args.output, window=args.window)
-        print(f"Saved: {r['path']} ({r['width']}x{r['height']}, {r['size']} bytes)")
-    elif args.command == 'focus':
-        desk.focus(args.title)
-        print(f'Focused: {args.title}')
-    elif args.command == 'close':
-        desk.close(args.title)
-        print(f'Closed: {args.title}')
-    elif args.command == 'tree':
-        print(json.dumps(desk.ui_tree(args.title, depth=args.depth), indent=2, default=str))
-    elif args.command == 'find':
-        elements = desk.find_elements(args.title, name=args.name, id=args.id, type=args.type)
-        for el in elements:
-            rect = el.get('rect') or {}
-            print(f"  [{el.get('type',''):15s}] {el.get('name','')[:40]:40s} id={el.get('id',''):20s} ({rect.get('x',0)},{rect.get('y',0)} {rect.get('w',0)}x{rect.get('h',0)})")
-    elif args.command == 'click':
-        r = desk.click_element(args.title, name=args.name, id=args.id)
-        print(f"Clicked: {r}")
-    elif args.command == 'type':
-        desk.type_text(args.text)
-        print(f'Typed: {args.text[:40]}')
-    elif args.command == 'key':
-        desk.press_key(args.key)
-        print(f'Pressed: {args.key}')
-    elif args.command == 'hotkey':
-        desk.hotkey(*args.keys)
-        print(f'Hotkey: {"+".join(args.keys)}')
-    elif args.command == 'clip':
-        if args.action == 'set':
-            desk.clip_set(args.text)
-            print(f'Clipboard set: {args.text[:40]}')
-        else:
-            print(desk.clip_get())
-    elif args.command == 'procs':
-        for p in desk.processes(args.name):
-            print(f"  [{p.get('Id',0):>6}] {p.get('ProcessName',''):25s} {p.get('MainWindowTitle','')[:40]}")
-    elif args.command == 'launch':
-        r = desk.launch(args.cmd[0], *args.cmd[1:])
-        print(f"Launched: PID {r.get('pid')}")
-    elif args.command == 'kill':
-        desk.kill(args.pid)
-        print(f'Killed: {args.pid}')
+def _winctl_find_handler(desk, args):
+    elements = desk.find_elements(args.title, name=args.name, id=args.id, type=args.type)
+    for el in elements:
+        rect = el.get('rect') or {}
+        print(f"  [{el.get('type',''):15s}] {el.get('name','')[:40]:40s} id={el.get('id',''):20s} ({rect.get('x',0)},{rect.get('y',0)} {rect.get('w',0)}x{rect.get('h',0)})")
+
+
+def _run_winctl_command(desk, args, parser):
+    """Dispatch a winctl command to the appropriate handler."""
+    handlers = {
+        'windows':    lambda: [print(f"  [{w['hwnd']:>8}] {w['title'][:60]:60s} {w['class'][:25]}") for w in desk.windows()],
+        'screen':     lambda: print(json.dumps(desk.screen_size(), indent=2)),
+        'monitors':   lambda: print(json.dumps(desk.monitors(), indent=2)),
+        'foreground': lambda: print(json.dumps(desk.foreground(), indent=2)),
+        'screenshot': lambda: print(f"Saved: {(r := desk.screenshot(args.output, window=args.window))['path']} ({r['width']}x{r['height']}, {r['size']} bytes)"),
+        'focus':      lambda: (desk.focus(args.title), print(f'Focused: {args.title}')),
+        'close':      lambda: (desk.close(args.title), print(f'Closed: {args.title}')),
+        'tree':       lambda: print(json.dumps(desk.ui_tree(args.title, depth=args.depth), indent=2, default=str)),
+        'find':       lambda: _winctl_find_handler(desk, args),
+        'click':      lambda: print(f"Clicked: {desk.click_element(args.title, name=args.name, id=args.id)}"),
+        'type':       lambda: (desk.type_text(args.text), print(f'Typed: {args.text[:40]}')),
+        'key':        lambda: (desk.press_key(args.key), print(f'Pressed: {args.key}')),
+        'hotkey':     lambda: (desk.hotkey(*args.keys), print(f'Hotkey: {"+".join(args.keys)}')),
+        'clip':       lambda: (desk.clip_set(args.text), print(f'Clipboard set: {args.text[:40]}')) if args.action == 'set' else print(desk.clip_get()),
+        'procs':      lambda: [print(f"  [{p.get('Id',0):>6}] {p.get('ProcessName',''):25s} {p.get('MainWindowTitle','')[:40]}") for p in desk.processes(args.name)],
+        'launch':     lambda: print(f"Launched: PID {desk.launch(args.cmd[0], *args.cmd[1:]).get('pid')}"),
+        'kill':       lambda: (desk.kill(args.pid), print(f'Killed: {args.pid}')),
+    }
+    handler = handlers.get(args.command)
+    if handler:
+        handler()
     else:
         parser.print_help()
+
+
+def main():
+    parser = _build_winctl_parser()
+    args = parser.parse_args()
+    _run_winctl_command(Desktop(), args, parser)
 
 
 if __name__ == '__main__':

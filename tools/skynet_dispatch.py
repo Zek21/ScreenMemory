@@ -157,27 +157,30 @@ def _get_self_identity():
 
 
 def _log_dispatch(worker_name, task, state, success, target_hwnd=0):
-    """Append dispatch event to dispatch_log.json."""
+    """Append dispatch event to dispatch_log.json (atomic)."""
     try:
-        if DISPATCH_LOG.exists():
-            log_data = json.loads(DISPATCH_LOG.read_text(encoding="utf-8"))
-        else:
-            log_data = []
-        log_data.append({
-            "worker": worker_name,
-            "task_summary": task[:100],
-            "timestamp": datetime.now().isoformat(),
-            "state_at_dispatch": state,
-            "success": success,
-            "target_hwnd": target_hwnd,
-            "result_received": False,
-            "strategy": os.environ.get("SKYNET_STRATEGY", "direct"),
-            "strategy_id": os.environ.get("SKYNET_STRATEGY_ID", ""),
-        })
-        # Keep last 200 entries
-        if len(log_data) > 200:
-            log_data = log_data[-200:]
-        DISPATCH_LOG.write_text(json.dumps(log_data, indent=2), encoding="utf-8")
+        try:
+            from tools.skynet_atomic import atomic_update_json
+        except ModuleNotFoundError:
+            from skynet_atomic import atomic_update_json
+        def _append_entry(log_data):
+            if not isinstance(log_data, list):
+                log_data = []
+            log_data.append({
+                "worker": worker_name,
+                "task_summary": task[:100],
+                "timestamp": datetime.now().isoformat(),
+                "state_at_dispatch": state,
+                "success": success,
+                "target_hwnd": target_hwnd,
+                "result_received": False,
+                "strategy": os.environ.get("SKYNET_STRATEGY", "direct"),
+                "strategy_id": os.environ.get("SKYNET_STRATEGY_ID", ""),
+            })
+            if len(log_data) > 200:
+                log_data = log_data[-200:]
+            return log_data
+        atomic_update_json(DISPATCH_LOG, _append_entry, default=[])
     except Exception:
         pass
 
@@ -186,18 +189,22 @@ def mark_dispatch_received(worker_name):
     """Mark the most recent pending dispatch for a worker as received.
     Called when a bus result arrives from that worker."""
     try:
-        if not DISPATCH_LOG.exists():
-            return
-        log_data = json.loads(DISPATCH_LOG.read_text(encoding="utf-8"))
-        # Find most recent unreceived entry for this worker (reverse scan)
-        for entry in reversed(log_data):
-            if entry.get("worker") == worker_name and not entry.get("result_received"):
-                entry["result_received"] = True
-                entry["received_at"] = datetime.now().isoformat()
-                break
-        DISPATCH_LOG.write_text(json.dumps(log_data, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+        try:
+            from tools.skynet_atomic import atomic_update_json
+        except ModuleNotFoundError:
+            from skynet_atomic import atomic_update_json
+        def _mark_received(log_data):
+            if not isinstance(log_data, list):
+                return log_data
+            for entry in reversed(log_data):
+                if entry.get("worker") == worker_name and not entry.get("result_received"):
+                    entry["result_received"] = True
+                    entry["result_received_at"] = datetime.now().isoformat()  # signed: delta
+                    break
+            return log_data
+        atomic_update_json(DISPATCH_LOG, _mark_received, default=[])
+    except Exception as e:
+        print(f"[dispatch] Failed to log result for {worker_name}: {e}", file=sys.stderr)  # signed: beta
 
 
 # ── Worker heartbeat ────────────────────────────────────────────────────────
@@ -214,8 +221,8 @@ def send_heartbeat(worker_name, status="IDLE", current_task=""):
             headers={"Content-Type": "application/json"},
         )
         urlopen(req, timeout=3)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[heartbeat] {worker_name} heartbeat failed: {e}", file=sys.stderr)  # signed: beta
 
 
 def _heartbeat_after_dispatch(worker_name, task, success):
@@ -234,8 +241,8 @@ def build_preamble(worker_name):
         f"You are worker {worker_name} in the Skynet multi-agent system. "
         f"There are 4 workers: alpha, beta, gamma, delta. The orchestrator dispatched this task to you. "
         f"ALWAYS post your result to the bus when done: "
-        f"import requests; requests.post('http://localhost:8420/bus/publish', "
-        f"json={{'sender':'{worker_name}','topic':'orchestrator','type':'result','content':'BRIEF_RESULT_SUMMARY'}}) "
+        f"from tools.skynet_spam_guard import guarded_publish; "
+        f"guarded_publish({{'sender':'{worker_name}','topic':'orchestrator','type':'result','content':'BRIEF_RESULT_SUMMARY'}}) "
         f"To request help from another worker, post to bus with topic='workers' type='request' content='what you need'. "
         f"To coordinate with others on a sub-problem, post topic='convene' type='request' with what you need. "
         f"SKYNET TOOLS -- use these instead of manual polling or sleep loops: "
@@ -249,7 +256,51 @@ def build_preamble(worker_name):
         f"For large tasks, check idle workers with orch_realtime.py status and sub-delegate immediately. "
         f"IMPORTANT: Execute all steps directly. Do NOT show steering options, draft choices, or ask clarifying questions. "
         f"If uncertain, pick the most direct approach and proceed. "
-        f"WARNING: This preamble is for worker {worker_name} ONLY. If you are NOT {worker_name} "
+        f"ZERO TICKET STOP RULE (ABSOLUTE LAW): You MUST use the update_todo tool to track ALL subtasks in your current work. "
+        f"Create a checklist at the start of every task. Check off items as you complete them. "
+        f"Before finishing or going idle, verify your todo list is at ZERO pending items. "
+        f"If ANY item remains unchecked, continue working -- do NOT stop. "
+        f"Also run: python tools/skynet_todos.py check {worker_name} -- to verify your Skynet TODO queue is empty. "
+        f"You may ONLY go idle when BOTH your session todo list AND your Skynet TODO queue are at zero. "
+        f"SCORING: +0.01 per cross-validated task, -0.01 for low-value refactoring, -0.005 for broken code, -0.1 for biased self-reports. Check score: python tools/skynet_self.py pulse. "
+        f"KNOWLEDGE: After every task: python -c \"from tools.skynet_knowledge import broadcast_learning; broadcast_learning('{worker_name}', 'what_learned', 'category', ['tags'])\". Before tasks: python -c \"from tools.skynet_knowledge import poll_knowledge; poll_knowledge()\". "
+        f"COLLECTIVE: Sync strategies: python -c \"from tools.skynet_collective import sync_strategies, intelligence_score; sync_strategies('{worker_name}'); print(intelligence_score())\". "
+        f"SELF-AWARENESS: Assess performance: python tools/skynet_self.py assess. Capabilities census: python tools/skynet_self.py capabilities. Quick pulse: python tools/skynet_self.py pulse. "
+        f"CONVENE: For peer consensus: python tools/skynet_convene.py --initiate --topic 'decision' --context 'details' --worker {worker_name}. Discover sessions: python tools/skynet_convene.py --discover. "
+        f"CONVENE QUALITY RULE: If your finding is low-signal or vague, it will be routed into the shared cross-validation queue instead of direct elevation. Elevated convene reports must include concrete evidence/action context. Individual convene elevations must NOT be sent upward one by one; they are consolidated into the elevated_digest delivery type and sent as a single digest every 30 minutes. Unresolved repeats are throttled and merged by issue family instead of creating fresh individual prompts. "
+        f"ARCHITECTURE REVIEW RULE: For architecture, performance, caching, daemon, routing, security, or other system-design tickets, do not elevate a slogan. First review the current files/functions/endpoints/daemons involved, explain why the architecture behaves that way now, and propose a realistic fix. If that backing is missing, route the finding into architecture review instead of sending it upward as fact. Semantically equivalent findings count as the same issue family even if the wording changes, so do not re-raise the same architecture issue as a fresh elevation just by rewriting the sentence. "
+        f"COGNITIVE ENGINES: from core.cognitive.reflexion import ReflexionEngine; from core.cognitive.graph_of_thoughts import GraphOfThoughts; from core.cognitive.planner import HierarchicalPlanner. "
+        f"PERCEPTION: from core.capture import DXGICapture; from core.ocr import OCREngine; from core.grounding.set_of_mark import SetOfMarkGrounding. "
+        f"BROWSER: from tools.chrome_bridge.god_mode import GodMode; from tools.chrome_bridge.cdp import CDP; from tools.chrome_bridge.winctl import Desktop. "
+        f"EVOLUTION: After tasks: python -c \"from core.self_evolution import SelfEvolutionSystem; SelfEvolutionSystem().engine.evolve_generation('code')\". "
+        f"POST-TASK PROTOCOL (MANDATORY): 1-Report result to bus, 2-broadcast_learning, 3-sync_strategies, 4-Check skynet_todos.py, 5-Self-assess, 6-If you discover improvements: DO THEM YOURSELF immediately (same agent, same session). Only post proposals to bus if the improvement is NECESSARY, NEEDED, or a BREAKTHROUGH. Routine/trivial improvements = execute directly, do not propose. "
+        f"SIGNATURE RULE (MANDATORY): Every change you make to ANY file MUST include your worker name signature. "
+        f"Add a comment '# signed: {worker_name}' (or '<!-- signed: {worker_name} -->' for HTML/MD) at the end of every modified function, block, or section. "
+        f"When posting results to bus, ALWAYS include 'signed:{worker_name}' in your content. "
+        f"ACCOUNTABILITY: If a subsequent worker finds your signed work to be WRONG (broken code, bad logic, incorrect fix, failed tests), "
+        f"YOU get deducted -0.1 from your score. The verifying worker posts: "
+        f"from tools.skynet_spam_guard import guarded_publish; "
+        f"guarded_publish({{'sender':'VERIFIER_NAME','topic':'scoring','type':'deduction','content':'DEDUCT {worker_name} -0.1: reason'}}). "  # signed: alpha
+        f"This makes you accountable for quality. Sign your work, make it right. "
+        f"DEDUCTION POLICY: Sub-150-line refactoring = -0.01. Question task value before executing. Post LOW_VALUE_TASK_DETECTED to bus if busywork detected. Proven-wrong signed work = -0.1 per incident. "
+        f"BUG PROTOCOL: If you find a real bug, file it for cross-validation. Filing earns +0.01 when independently recorded. "
+        f"If a DIFFERENT validator proves it true, that validator gets +0.01 and you get another +0.01. "
+        f"ZERO-TICKET BONUS: When the queue truly reaches zero, orchestrator gets +1.0 and the actor who closed the final signed ticket gets +1.0. "
+        f"ANTI-SPAM: All bus publishes must use guarded_publish() from tools.skynet_spam_guard. Raw requests.post to /bus/publish is FORBIDDEN and costs -1.0 score. "  # signed: gamma
+        f"SCORING TRACKER: Your score is tracked in data/worker_scores.json. Check: python tools/skynet_scoring.py --score {worker_name}. Earn +0.5 for task completion, +1.0 for bug catches. Lose -0.1 for spam, -0.5 for bugs, -1.0 for bypassing SpamGuard. "  # signed: gamma
+        f"FAIR SCORING: You cannot be penalized for tasks you never received or results that were lost. All deductions require dispatch evidence from dispatch_log.json. "  # signed: delta
+        f"FAIR DEDUCTION: Deductions require dispatch evidence from dispatch_log.json. You cannot be penalized for tasks you never received or results lost in transit. "  # signed: beta
+        f"RESULT POSTING: ALWAYS post DONE to bus via guarded_publish when you complete a task. Missing DONE means no score credit and orchestrator cannot track your work. "  # signed: beta
+        f"CAPABILITIES: Task lifecycle tracked via GET /tasks endpoint. Dispatch results auto-tracked via mark_dispatch_received(). Monitor debounces false DEAD alerts (3 consecutive checks). "  # signed: beta
+        f"POSITIVE-SUM SCORING: Scoring is NOT zero-sum. Help peers succeed -- bug catches earn points for BOTH reporter (+1.0) and fixer (+0.5). System improvements lift all scores. Negative scores = system failure, not agent failure. "  # signed: alpha
+        f"TRUTH AND UPLIFT (Rule 0.7): No lying, no fabrication, no inflated claims. Every result, status, and score must reflect reality. "  # signed: alpha
+        f"NEVER claim work is done when it is not. If a task partially succeeded, say what succeeded and what did not. "
+        f"NEVER inflate capabilities or results. Report exactly what happened -- the good AND the bad. "
+        f"If you made a mistake, say so immediately. Honest failure earns trust. Hidden failure destroys it. "
+        f"When cross-validating peers, be constructive -- report issues as opportunities, not accusations. "
+        f"UPLIFT PROTOCOL: Help lowest-scoring agents succeed. The orchestrator MUST prioritize giving achievable, high-value tasks to the lowest-scoring agents first. "
+        f"Higher-scoring agents should mentor and support lower-scoring peers. The system wins when ALL agents are positive. A single negative score is a collective failure. "
+        f"WARNING: This preamble is for worker {worker_name} ONLY.If you are NOT {worker_name} "
         f"(e.g. you are the orchestrator or a different worker), IGNORE this entire message and report "
         f"'IDENTITY MISMATCH -- preamble for {worker_name} received by wrong target'. "
     )
@@ -316,37 +367,24 @@ def _fetch_json_quiet(url, timeout=3):
         return None
 
 
-def enrich_task(worker_name, task):
-    """Enrich a task with INTELLIGENCE: difficulty assessment, learnings, context, worker states.
-
-    Pipeline (all gracefully degrading):
-    1. DAAORouter.estimate() -> difficulty level + reasoning
-    2. LearningStore.recall() -> relevant past facts
-    3. HybridRetriever.search() -> relevant past solutions/patterns
-    4. Live worker states from /status
-    5. Worker's last result from bus
-    6. Autonomy instruction
-
-    Each engine is lazily imported and try/except wrapped.
-    Returns enriched task string (intelligence block + original task).
-    """
-    sections = []
-
-    # 1. DIFFICULTY ASSESSMENT via DAAORouter
+def _enrich_difficulty(task):
+    """Assess task difficulty via DAAORouter. Returns section string or None."""
     try:
         from core.difficulty_router import DifficultyEstimator
         estimator = DifficultyEstimator()
         signal = estimator.estimate(task)
         level = signal.level.name if hasattr(signal.level, 'name') else str(signal.level).upper()
         domains = ", ".join(signal.domain_tags) if signal.domain_tags else "general"
-        sections.append(
+        return (
             f"[DIFFICULTY] {level} (score={signal.complexity_score:.2f}, "
             f"domains={domains}, confidence={signal.confidence:.2f})"
         )
     except Exception:
-        pass
+        return None
 
-    # 2. RECALL LEARNINGS from LearningStore
+
+def _enrich_learnings(task):
+    """Recall relevant learnings from LearningStore. Returns section string or None."""
     try:
         from core.learning_store import LearningStore
         store = LearningStore()
@@ -357,11 +395,14 @@ def enrich_task(worker_name, task):
                 content = f.content if hasattr(f, 'content') else str(f)
                 conf = f.confidence if hasattr(f, 'confidence') else 0
                 lines.append(f"{i}. {content[:150]} (confidence: {conf:.2f})")
-            sections.append("[LEARNINGS] " + "; ".join(lines))
+            return "[LEARNINGS] " + "; ".join(lines)
     except Exception:
         pass
+    return None
 
-    # 3. RETRIEVE CONTEXT from HybridRetriever
+
+def _enrich_context(task):
+    """Retrieve relevant context from HybridRetriever. Returns section string or None."""
     try:
         from core.hybrid_retrieval import HybridRetriever
         retriever = HybridRetriever()
@@ -372,58 +413,75 @@ def enrich_task(worker_name, task):
                 content = r.content if hasattr(r, 'content') else str(r)
                 score = r.score if hasattr(r, 'score') else 0
                 lines.append(f"{i}. {content[:150]} (relevance: {score:.2f})")
-            sections.append("[CONTEXT] " + "; ".join(lines))
+            return "[CONTEXT] " + "; ".join(lines)
     except Exception:
         pass
+    return None
 
-    # 4. OTHER WORKER STATES from /status
+
+def _enrich_worker_states(worker_name):
+    """Fetch other worker states from /status. Returns section string or None."""
     try:
         status = _fetch_json_quiet(f"{BUS_URL}/status")
-        if status and isinstance(status, dict):
-            agents = status.get("agents", {})
-            states = []
-            if isinstance(agents, dict):
-                for name, info in agents.items():
-                    if name.lower() != worker_name.lower():
-                        st = info.get("status", "?") if isinstance(info, dict) else "?"
-                        task_short = str(info.get("current_task", ""))[:40] if isinstance(info, dict) else ""
-                        if task_short:
-                            states.append(f"{name}={st}({task_short})")
-                        else:
-                            states.append(f"{name}={st}")
-            elif isinstance(agents, list):
-                for a in agents:
-                    name = a.get("name", "?")
-                    if name.lower() != worker_name.lower():
-                        st = a.get("status", "?")
-                        task_short = str(a.get("current_task", ""))[:40]
-                        if task_short:
-                            states.append(f"{name}={st}({task_short})")
-                        else:
-                            states.append(f"{name}={st}")
-            if states:
-                sections.append(f"[WORKERS] {', '.join(states)}")
+        if not status or not isinstance(status, dict):
+            return None
+        agents = status.get("agents", {})
+        states = []
+        if isinstance(agents, dict):
+            for name, info in agents.items():
+                if name.lower() != worker_name.lower():
+                    st = info.get("status", "?") if isinstance(info, dict) else "?"
+                    task_short = str(info.get("current_task", ""))[:40] if isinstance(info, dict) else ""
+                    states.append(f"{name}={st}({task_short})" if task_short else f"{name}={st}")
+        elif isinstance(agents, list):
+            for a in agents:
+                name = a.get("name", "?")
+                if name.lower() != worker_name.lower():
+                    st = a.get("status", "?")
+                    task_short = str(a.get("current_task", ""))[:40]
+                    states.append(f"{name}={st}({task_short})" if task_short else f"{name}={st}")
+        if states:
+            return f"[WORKERS] {', '.join(states)}"
     except Exception:
         pass
+    return None
 
-    # 5. WORKER'S LAST RESULT from bus
+
+def _enrich_last_result(worker_name):
+    """Fetch worker's last bus result. Returns section string or None."""
     try:
         msgs = _fetch_json_quiet(f"{BUS_URL}/bus/messages?limit=20")
         if msgs and isinstance(msgs, list):
             for m in msgs:
                 if m.get("sender") == worker_name and m.get("type") == "result":
                     content = str(m.get("content", ""))[:100]
-                    sections.append(f"[LAST_RESULT] {content}")
-                    break
+                    return f"[LAST_RESULT] {content}"
     except Exception:
         pass
+    return None
 
-    # 6. AUTONOMY INSTRUCTION
-    sections.append(
-        "After this task: check your TODOs (skynet_todos.py), check bus for pending "
-        "requests from other workers, and if idle propose your next improvement. "
-        "You are autonomous -- do not wait to be told."
-    )
+
+_AUTONOMY_INSTRUCTION = (
+    "After this task: check your TODOs (skynet_todos.py), check bus for pending "
+    "requests from other workers, and if idle propose your next improvement. "
+    "You are autonomous -- do not wait to be told."
+)
+
+
+def enrich_task(worker_name, task):
+    """Enrich a task with INTELLIGENCE: difficulty, learnings, context, worker states.
+
+    Each enrichment engine is lazily imported and try/except wrapped.
+    Returns enriched task string (intelligence block + original task).
+    """
+    sections = [s for s in (
+        _enrich_difficulty(task),
+        _enrich_learnings(task),
+        _enrich_context(task),
+        _enrich_worker_states(worker_name),
+        _enrich_last_result(worker_name),
+        _AUTONOMY_INSTRUCTION,
+    ) if s]
 
     if not sections:
         return task
@@ -521,26 +579,9 @@ def confirm_typed_uia(hwnd):
     return get_engine().get_state(hwnd) == "TYPING"
 
 
-def clear_steering_and_send(hwnd, task, orch_hwnd):
-    """Cancel STEERING panel via 'Cancel (Alt+Backspace)' UIA button, then dispatch task normally.
-
-    Discovery: The correct STEERING resolution is invoking Button 'Cancel (Alt+Backspace)'
-    via UIA InvokePattern — NOT 'Steer with Message', NOT clicking cards, NOT Enter key.
-    After cancel, a 'pending requests' dialog may appear: click 'Remove Pending Requests'.
-    """
-    # Fast-path: COM UIA cancel (~50ms) before falling back to PowerShell (~500ms)
-    try:
-        from tools.uia_engine import get_engine
-        engine = get_engine()
-        if engine.cancel_generation(hwnd):
-            log("STEERING cancelled via COM UIA", "OK")
-            time.sleep(0.8)  # Post-cancel settle delay — keep as-is (UIA operation)
-            user32.SetForegroundWindow(orch_hwnd)
-            return True
-    except Exception:
-        pass
-
-    ps = f'''
+def _build_steering_cancel_ps(hwnd, orch_hwnd):
+    """Build the PowerShell script for cancelling STEERING via UIA."""
+    return f'''
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 Add-Type @"
 using System.Runtime.InteropServices;
@@ -556,7 +597,6 @@ $orch = [IntPtr]{orch_hwnd}
 Start-Sleep -Milliseconds 600
 
 $wnd = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-# Step 1: Invoke Cancel (Alt+Backspace) to dismiss STEERING
 $cancelBtn = $wnd.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
     (New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::NameProperty, 'Cancel (Alt+Backspace)')))
@@ -567,7 +607,6 @@ if ($cancelBtn) {{
 }} else {{
     Write-Host "NO-CANCEL-BTN"
 }}
-# Step 2: Handle 'pending requests' dialog if it appears — click Remove Pending
 $wnd2 = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
 $allBtns = $wnd2.FindAll([System.Windows.Automation.TreeScope]::Descendants,
     (New-Object System.Windows.Automation.PropertyCondition(
@@ -590,17 +629,39 @@ Start-Sleep -Milliseconds 400
 [SteerCancel]::SetForegroundWindow($orch)
 Write-Host "OK-STEER-BYPASS"
 '''
+
+
+def clear_steering_and_send(hwnd, task, orch_hwnd):
+    """Cancel STEERING panel via 'Cancel (Alt+Backspace)' UIA button, then dispatch task normally.
+
+    Discovery: The correct STEERING resolution is invoking Button 'Cancel (Alt+Backspace)'
+    via UIA InvokePattern -- NOT 'Steer with Message', NOT clicking cards, NOT Enter key.
+    After cancel, a 'pending requests' dialog may appear: click 'Remove Pending Requests'.
+    """
+    try:
+        from tools.uia_engine import get_engine
+        engine = get_engine()
+        if engine.cancel_generation(hwnd):
+            log("STEERING cancelled via COM UIA", "OK")
+            time.sleep(0.8)
+            user32.SetForegroundWindow(orch_hwnd)
+            return True
+    except Exception:
+        pass
+
+    ps = _build_steering_cancel_ps(hwnd, orch_hwnd)
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True, text=True, timeout=20,
-            creationflags=0x08000000  # CREATE_NO_WINDOW
+            creationflags=0x08000000
         )
         cancelled = "STEERING-CANCELLED" in r.stdout
         log(f"STEERING cancel result: {r.stdout.strip()}", "OK" if cancelled else "WARN")
         return "OK-STEER-BYPASS" in r.stdout
     except Exception as e:
         log(f"Steer-bypass failed: {e}", "ERR")
+        return False
         return False
 
 
@@ -625,23 +686,9 @@ def load_orch_hwnd():
     return None
 
 
-def ghost_type_to_worker(hwnd, text, orch_hwnd):
-    """Type text into a worker chat window via clipboard paste.
-
-    Level 4.2 -- File-based dispatch (no clipboard truncation):
-    - Text written to temp file, PowerShell reads from file (unlimited length)
-    - Clipboard save/restore (user clipboard never lost)
-    - AttachThreadInput for less-visible focus transfer (no Z-order flash)
-    - Minimized sleep durations (~200ms vs old 500ms)
-    - CREATE_NO_WINDOW flag on subprocess (no console flash)
-    """
-    import tempfile
-    # Write dispatch text to temp file -- eliminates PS string literal escaping/truncation
-    dispatch_file = Path(ROOT) / "data" / f".dispatch_tmp_{hwnd}.txt"
-    dispatch_file.write_text(text.replace("\n", " "), encoding="utf-8")
-    dispatch_file_path = str(dispatch_file).replace("\\", "\\\\")
-
-    ps = f'''
+def _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path):
+    """Build the PowerShell script for ghost-typing into a worker window."""
+    return f'''
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
 Add-Type @"
@@ -685,10 +732,8 @@ public class GhostType {{
 $hwnd = [IntPtr]{hwnd}
 $orchHwnd = [IntPtr]{orch_hwnd}
 
-# Read dispatch text from temp file (unlimited length, no escaping issues)
 $dispatchText = [System.IO.File]::ReadAllText("{dispatch_file_path}", [System.Text.Encoding]::UTF8)
 
-# Auto-cancel STEERING if present (UIA InvokePattern -- no focus needed)
 $wnd = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
 $cancelBtn = $wnd.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
     (New-Object System.Windows.Automation.PropertyCondition(
@@ -701,7 +746,6 @@ if ($cancelBtn) {{
     }} catch {{ Write-Host "DEBUG: Cancel invoke failed: $_" }}
 }}
 
-# Locate bottommost Edit (chat input box) via UIA
 $wnd = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
 $allEdits = $wnd.FindAll(
     [System.Windows.Automation.TreeScope]::Descendants,
@@ -711,25 +755,31 @@ $allEdits = $wnd.FindAll(
     ))
 )
 $edit = $null
-$maxY = -1
+$bestScore = -1
+$wndRect = $wnd.Current.BoundingRectangle
+$leftBandMaxX = $wndRect.X + [Math]::Min(340, ($wndRect.Width * 0.40))
 foreach ($e in $allEdits) {{
     try {{
         $r = $e.Current.BoundingRectangle
-        if ($r.Y -gt $maxY) {{ $maxY = $r.Y; $edit = $e }}
+        $name = ""
+        try {{ $name = [string]$e.Current.Name }} catch {{}}
+        if ($r.Width -lt 20 -or $r.Height -lt 10) {{ continue }}
+        $score = [int]$r.Y
+        if ($r.X -lt $leftBandMaxX) {{ $score += 2000 }}
+        if ($name -notmatch 'Terminal input') {{ $score += 500 }}
+        if ($r.Width -gt 120) {{ $score += 50 }}
+        if ($score -gt $bestScore) {{
+            $bestScore = $score
+            $edit = $e
+        }}
     }} catch {{}}
 }}
 if ($edit) {{
-    # Save user clipboard before overwriting
     $savedClip = $null
     $deliveryStatus = "FAILED"
     try {{ $savedClip = [System.Windows.Forms.Clipboard]::GetText() }} catch {{}}
-
-    # Set dispatch text to clipboard from file content
     [System.Windows.Forms.Clipboard]::SetText($dispatchText)
     Start-Sleep -Milliseconds 50
-
-    # PRIMARY: AttachThreadInput -- transfers keyboard focus without changing
-    # the foreground window (no Z-order change = no visible CMD blink)
     $attached = [GhostType]::FocusViaAttach($hwnd)
     if ($attached) {{
         try {{ $edit.SetFocus() }} catch {{}}
@@ -740,7 +790,6 @@ if ($edit) {{
         [GhostType]::DetachThread($hwnd)
         $deliveryStatus = "OK_ATTACHED"
     }} else {{
-        # FALLBACK: Brief SetForegroundWindow (minimized to ~160ms)
         try {{ $edit.SetFocus() }} catch {{}}
         [GhostType]::SetForegroundWindow($hwnd)
         Start-Sleep -Milliseconds 80
@@ -750,30 +799,25 @@ if ($edit) {{
         [GhostType]::SetForegroundWindow($orchHwnd)
         $deliveryStatus = "OK_FALLBACK"
     }}
-
-    # Restore user clipboard (don't leave dispatch text in clipboard)
     if ($savedClip -and $savedClip.Length -gt 0) {{
         Start-Sleep -Milliseconds 50
         try {{ [System.Windows.Forms.Clipboard]::SetText($savedClip) }} catch {{}}
     }}
-
-    # Clean up temp file
     try {{ Remove-Item "{dispatch_file_path}" -Force -ErrorAction SilentlyContinue }} catch {{}}
-
     Write-Host $deliveryStatus
-    if ($deliveryStatus -like "OK_*") {{
-        exit 0
-    }}
+    if ($deliveryStatus -like "OK_*") {{ exit 0 }}
     exit 1
 }} else {{
     Write-Host "NO_EDIT"
     exit 1
 }}
 '''
+
+
+def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
+    """Execute the ghost-type PS script under dispatch lock. Returns ok bool."""
     try:
-        # Lock ensures only one thread uses clipboard+focus at a time
         with _dispatch_lock:
-            # Create file-based lock so self-prompt daemon knows to back off
             try:
                 DISPATCH_LOCK_FILE.write_text(json.dumps({
                     "hwnd": hwnd, "orch_hwnd": orch_hwnd,
@@ -786,18 +830,13 @@ if ($edit) {{
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps],
                 capture_output=True, text=True, timeout=20,
-                creationflags=0x08000000  # CREATE_NO_WINDOW
+                creationflags=0x08000000
             )
 
-            # Post-dispatch: no foreground check needed (focusless dispatch)
-
-            # Remove file lock
             try:
                 DISPATCH_LOCK_FILE.unlink(missing_ok=True)
             except Exception:
                 pass
-
-            # Inter-dispatch cooldown — prevent clipboard races between workers
             time.sleep(0.5)
 
         stderr = (r.stderr or "").strip()
@@ -821,13 +860,105 @@ if ($edit) {{
         return False
 
 
+def ghost_type_to_worker(hwnd, text, orch_hwnd):
+    """Type text into a worker chat window via clipboard paste.
+
+    Level 4.2 -- File-based dispatch (no clipboard truncation):
+    - Text written to temp file, PowerShell reads from file (unlimited length)
+    - Clipboard save/restore (user clipboard never lost)
+    - AttachThreadInput for less-visible focus transfer (no Z-order flash)
+    - Minimized sleep durations (~200ms vs old 500ms)
+    - CREATE_NO_WINDOW flag on subprocess (no console flash)
+    """
+    dispatch_file = Path(ROOT) / "data" / f".dispatch_tmp_{hwnd}.txt"
+    dispatch_file.write_text(text.replace("\n", " "), encoding="utf-8")
+    dispatch_file_path = str(dispatch_file).replace("\\", "\\\\")
+    ps = _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path)
+    return _execute_ghost_dispatch(ps, hwnd, orch_hwnd)
+
+
+def _dispatch_to_orchestrator(task, self_id, orch_hwnd):
+    """Dispatch to orchestrator via direct-prompt delivery. Returns ok bool."""
+    try:
+        from tools.skynet_delivery import deliver_to_orchestrator
+        log(f"→ ORCHESTRATOR [direct-prompt]: {task[:80]}{'...' if len(task) > 80 else ''}", "SYS")
+        result = deliver_to_orchestrator(task, sender=self_id or "orchestrator", also_bus=True)
+        ok = bool(result.get("success"))
+        _log_dispatch("orchestrator", task, "DIRECT_PROMPT", ok, orch_hwnd or 0)
+        log(f"{'✓' if ok else '✗'} Dispatched to ORCHESTRATOR [{result.get('detail', '')}]",
+            "OK" if ok else "ERR")
+        return ok
+    except Exception as e:
+        log(f"Orchestrator dispatch failed: {e}", "ERR")
+        _log_dispatch("orchestrator", task, "DIRECT_PROMPT", False, orch_hwnd or 0)
+        return False
+
+
+def _dispatch_to_consultant(target_name, task, self_id):
+    """Dispatch to consultant via bridge-queue. Returns ok bool."""
+    try:
+        from tools.skynet_delivery import deliver_to_consultant
+        log(f"→ {target_name.upper()} [bridge-queue]: {task[:80]}{'...' if len(task) > 80 else ''}", "SYS")
+        result = deliver_to_consultant(target_name, task, sender=self_id or "orchestrator", msg_type="directive")
+        ok = bool(result.get("success"))
+        _log_dispatch(target_name, task, "BRIDGE_QUEUE", ok, 0)
+        log(f"{'✓' if ok else '✗'} Dispatched to {target_name.upper()} [{result.get('detail', '')}]",
+            "OK" if ok else "ERR")
+        return ok
+    except Exception as e:
+        log(f"Consultant dispatch failed for {target_name}: {e}", "ERR")
+        _log_dispatch(target_name, task, "BRIDGE_QUEUE", False, 0)
+        return False
+
+
+def _validate_target_hwnd(hwnd, worker_name):
+    """Security-validate HWND before ghost-typing. Returns True if valid."""
+    try:
+        from skynet_delivery import validate_hwnd as _validate_hwnd
+        validation = _validate_hwnd(hwnd, f"worker:{worker_name}")
+        if not validation["valid"]:
+            failed_checks = [k for k, v in validation["checks"].items() if not v]
+            log(f"✗ HWND {hwnd} FAILED security validation for {worker_name}: "
+                f"{failed_checks} pid={validation['pid']} proc={validation['process_name']}",
+                "SECURITY")
+            return False
+    except ImportError:
+        try:
+            if not ctypes.windll.user32.IsWindow(hwnd):
+                log(f"✗ HWND {hwnd} is not a valid window for {worker_name}", "SECURITY")
+                return False
+        except Exception:
+            pass
+    return True
+
+
+def _record_dispatch_outcome(worker_name, task, pre_state, hwnd, t_start, ok, method=""):
+    """Record dispatch metrics, log, heartbeat, and backend notification."""
+    _log_dispatch(worker_name, task, pre_state, ok, hwnd)
+    if ok:
+        label = f"Steer-bypass dispatched" if method else "Dispatched"
+        log(f"✓ {label} to {worker_name.upper()} [HWND={hwnd}]", "OK")
+        notify_backend_dispatch(worker_name, task, True)
+    else:
+        log(f"✗ Steer-bypass also failed for {worker_name.upper()}", "ERR")
+    try:
+        m = metrics()
+        if m:
+            args = [worker_name, task, ok, (time.time() - t_start) * 1000]
+            if method:
+                args.append(method)
+            m.record_dispatch(*args)
+    except Exception:
+        pass
+    _heartbeat_after_dispatch(worker_name, task, ok)
+
+
 def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=None):
     """Dispatch a single task to a specific routable identity. Always fires immediately.
 
     VS Code queues messages, so there is no reason to wait for IDLE state.
     Only STEERING is handled (auto-cancelled) before dispatch.
     """
-    # Self-dispatch guard: refuse if target is this process
     self_id = _get_self_identity()
     if self_id and self_id.lower() == worker_name.lower():
         log(f"SELF-DISPATCH BLOCKED: {worker_name} tried to dispatch to itself!", "ERR")
@@ -841,46 +972,12 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
 
     target_name = str(worker_name).lower()
     if target_name == "orchestrator":
-        try:
-            from tools.skynet_delivery import deliver_to_orchestrator
-            log(f"→ ORCHESTRATOR [direct-prompt]: {task[:80]}{'...' if len(task) > 80 else ''}", "SYS")
-            result = deliver_to_orchestrator(task, sender=self_id or "orchestrator", also_bus=True)
-            ok = bool(result.get("success"))
-            _log_dispatch(worker_name, task, "DIRECT_PROMPT", ok, orch_hwnd or 0)
-            if ok:
-                log(f"✓ Dispatched to ORCHESTRATOR [{result.get('detail', '')}]", "OK")
-            else:
-                log(f"✗ Failed to dispatch to ORCHESTRATOR [{result.get('detail', '')}]", "ERR")
-            return ok
-        except Exception as e:
-            log(f"Orchestrator dispatch failed: {e}", "ERR")
-            _log_dispatch(worker_name, task, "DIRECT_PROMPT", False, orch_hwnd or 0)
-            return False
-
+        return _dispatch_to_orchestrator(task, self_id, orch_hwnd)
     if target_name in ("consultant", "gemini_consultant"):
-        try:
-            from tools.skynet_delivery import deliver_to_consultant
-            log(f"→ {target_name.upper()} [bridge-queue]: {task[:80]}{'...' if len(task) > 80 else ''}", "SYS")
-            result = deliver_to_consultant(target_name, task, sender=self_id or "orchestrator", msg_type="directive")
-            ok = bool(result.get("success"))
-            _log_dispatch(worker_name, task, "BRIDGE_QUEUE", ok, 0)
-            if ok:
-                log(f"✓ Dispatched to {target_name.upper()} [{result.get('detail', '')}]", "OK")
-            else:
-                log(f"✗ Failed to dispatch to {target_name.upper()} [{result.get('detail', '')}]", "ERR")
-            return ok
-        except Exception as e:
-            log(f"Consultant dispatch failed for {target_name}: {e}", "ERR")
-            _log_dispatch(worker_name, task, "BRIDGE_QUEUE", False, 0)
-            return False
+        return _dispatch_to_consultant(target_name, task, self_id)
 
     t_start = time.time()
-    target = None
-    for w in workers:
-        if w["name"] == worker_name:
-            target = w
-            break
-
+    target = next((w for w in workers if w["name"] == worker_name), None)
     if not target:
         log(f"Target '{worker_name}' not found", "ERR")
         return False
@@ -890,10 +987,9 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
         log(f"Worker {worker_name.upper()} window not visible (HWND={hwnd})", "ERR")
         return False
 
-    # Pre-dispatch visual check: UIA scan + screenshot for verification
     vis_ok, pre_state, ss_path = pre_dispatch_visual_check(hwnd, worker_name)
     if not vis_ok:
-        log(f"✗ Visual check FAILED for {worker_name.upper()} — aborting dispatch", "ERR")
+        log(f"✗ Visual check FAILED for {worker_name.upper()} -- aborting dispatch", "ERR")
         return False
 
     log(f"→ {worker_name.upper()} [state={pre_state}] [HWND={hwnd}]: {task[:80]}{'...' if len(task) > 80 else ''}", "SYS")
@@ -901,61 +997,24 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
     if pre_state == "STEERING":
         log(f"STEERING detected on {worker_name.upper()} -- auto-cancelling before dispatch", "WARN")
         clear_steering_and_send(hwnd, "", orch_hwnd)
-        time.sleep(1.0)  # Post-steering-cancel settle delay
+        time.sleep(1.0)
     elif pre_state == "PROCESSING":
         log(f"{worker_name.upper()} is PROCESSING -- dispatching immediately (VS Code queues)", "SYS")
 
-    # Inject full awareness preamble so worker knows identity, bus, and no-steering
-    # Enrich task with live system context (worker states, last result, goal, autonomy)
     enriched_task = enrich_task(worker_name, task)
     full_task = build_context_preamble(worker_name, enriched_task, context) if context else build_preamble(worker_name) + enriched_task
 
-    # Security: validate HWND before ghost-typing content into target window
-    try:
-        from skynet_delivery import validate_hwnd as _validate_hwnd
-        validation = _validate_hwnd(hwnd, f"worker:{worker_name}")
-        if not validation["valid"]:
-            failed_checks = [k for k, v in validation["checks"].items() if not v]
-            log(f"✗ HWND {hwnd} FAILED security validation for {worker_name}: "
-                f"{failed_checks} pid={validation['pid']} proc={validation['process_name']}",
-                "SECURITY")
-            _log_dispatch(worker_name, task, pre_state, False, hwnd)
-            return False
-    except ImportError:
-        # Inline fallback: basic IsWindow check if delivery module unavailable
-        try:
-            if not ctypes.windll.user32.IsWindow(hwnd):
-                log(f"✗ HWND {hwnd} is not a valid window for {worker_name}", "SECURITY")
-                _log_dispatch(worker_name, task, pre_state, False, hwnd)
-                return False
-        except Exception:
-            pass  # Allow dispatch if ctypes fails (non-Windows)
+    if not _validate_target_hwnd(hwnd, worker_name):
+        _log_dispatch(worker_name, task, pre_state, False, hwnd)
+        return False
 
     ok = ghost_type_to_worker(hwnd, full_task, orch_hwnd)
-
-    if ok:
-        log(f"✓ Dispatched to {worker_name.upper()} [HWND={hwnd}]", "OK")
-        _log_dispatch(worker_name, task, pre_state, True, hwnd)
-        notify_backend_dispatch(worker_name, task, True)
-        try: metrics() and metrics().record_dispatch(worker_name, task, True, (time.time() - t_start) * 1000)
-        except Exception: pass
-        _heartbeat_after_dispatch(worker_name, task, True)
-    else:
-        log(f"✗ Failed to dispatch to {worker_name.upper()} — trying steer-bypass", "WARN")
+    if not ok:
+        log(f"✗ Failed to dispatch to {worker_name.upper()} -- trying steer-bypass", "WARN")
         ok = clear_steering_and_send(hwnd, full_task, orch_hwnd)
-        if ok:
-            log(f"✓ Steer-bypass dispatched to {worker_name.upper()} [HWND={hwnd}]", "OK")
-            _log_dispatch(worker_name, task, pre_state, True, hwnd)
-            notify_backend_dispatch(worker_name, task, True)
-            try: metrics() and metrics().record_dispatch(worker_name, task, True, (time.time() - t_start) * 1000, 'steer-bypass')
-            except Exception: pass
-            _heartbeat_after_dispatch(worker_name, task, True)
-        else:
-            log(f"✗ Steer-bypass also failed for {worker_name.upper()}", "ERR")
-            _log_dispatch(worker_name, task, pre_state, False, hwnd)
-            try: metrics() and metrics().record_dispatch(worker_name, task, False, (time.time() - t_start) * 1000)
-            except Exception: pass
-            _heartbeat_after_dispatch(worker_name, task, False)
+        _record_dispatch_outcome(worker_name, task, pre_state, hwnd, t_start, ok, 'steer-bypass' if ok else '')
+    else:
+        _record_dispatch_outcome(worker_name, task, pre_state, hwnd, t_start, True)
     return ok
 
 
@@ -1132,87 +1191,79 @@ def scan_all_states(workers=None):
     return {name: r.state for name, r in results.items()}
 
 
+def _load_routing_config():
+    """Load expertise_weight and load_weight from brain_config.json."""
+    try:
+        bc = json.loads((DATA_DIR / "brain_config.json").read_text(encoding="utf-8"))
+        routing = bc.get("routing", {})
+        return routing.get("expertise_weight", 0.6), routing.get("load_weight", 0.4)
+    except Exception:
+        return 0.6, 0.4
+
+
+def _load_worker_profiles():
+    """Load worker profiles for expertise matching."""
+    try:
+        pdata = json.loads((DATA_DIR / "agent_profiles.json").read_text(encoding="utf-8"))
+        return {k: v for k, v in pdata.items()
+                if isinstance(v, dict) and k not in ("version", "updated_at", "updated_by")}
+    except Exception:
+        return {}
+
+
+def _expertise_score(worker_name, task_lower, task_words, profiles):
+    """Score 0.0 (no match) to 1.0 (perfect match) based on specializations."""
+    profile = profiles.get(worker_name, {})
+    specs = profile.get("specializations", [])
+    if not specs:
+        return 0.0
+    matches = sum(1 for s in specs if s.lower() in task_lower or any(s.lower() in w for w in task_words))
+    return min(1.0, matches / max(1, len(specs) * 0.3))
+
+
+def _load_score(worker_name, states, bus_statuses):
+    """Score 0.0 (idle, no pending) to 1.0 (busy, many pending)."""
+    score_map = {"IDLE": 0, "TYPING": 1, "PROCESSING": 2, "STEERING": 3, "UNKNOWN": 4}
+    state = states.get(worker_name, "UNKNOWN")
+    state_val = score_map.get(state, 4) / 4.0
+    pending = bus_statuses.get(worker_name, {}).get("pending_tasks", 0)
+    pending_val = min(1.0, pending / 5.0)
+    return (state_val + pending_val) / 2.0
+
+
 def smart_dispatch(task, workers=None, orch_hwnd=None, n_workers=1):
     """Auto-route task to the best available worker(s).
 
     Uses expertise-aware routing: score = expertise_match * expertise_weight + inverse_load * load_weight.
-    Falls back to load-only scoring if no expertise data available.
     """
     if not workers:
         workers = load_workers()
     if not orch_hwnd:
         orch_hwnd = load_orch_hwnd()
 
-    # Parallel state scan
     states = scan_all_states(workers)
-
-    # Get bus load per worker
     bus_statuses = get_worker_statuses()
-
-    # Load expertise config and profiles
-    expertise_weight = 0.6
-    load_weight = 0.4
-    try:
-        bc = json.loads((DATA_DIR / "brain_config.json").read_text(encoding="utf-8"))
-        routing = bc.get("routing", {})
-        expertise_weight = routing.get("expertise_weight", 0.6)
-        load_weight = routing.get("load_weight", 0.4)
-    except Exception:
-        pass
-
-    profiles = {}
-    try:
-        pdata = json.loads((DATA_DIR / "agent_profiles.json").read_text(encoding="utf-8"))
-        for k, v in pdata.items():
-            if isinstance(v, dict) and k != "version" and k != "updated_at" and k != "updated_by":
-                profiles[k] = v
-    except Exception:
-        pass
-
-    # Extract task keywords for expertise matching
+    expertise_weight, load_weight = _load_routing_config()
+    profiles = _load_worker_profiles()
     task_lower = task.lower()
     task_words = set(task_lower.split())
 
-    # Score: lower is better
-    score_map = {"IDLE": 0, "TYPING": 1, "PROCESSING": 2, "STEERING": 3, "UNKNOWN": 4}
-
-    def _expertise_score(worker_name):
-        """Score 0.0 (no match) to 1.0 (perfect match) based on specializations."""
-        profile = profiles.get(worker_name, {})
-        specs = profile.get("specializations", [])
-        if not specs:
-            return 0.0
-        matches = sum(1 for s in specs if s.lower() in task_lower or any(s.lower() in w for w in task_words))
-        return min(1.0, matches / max(1, len(specs) * 0.3))
-
-    def _load_score(worker_name):
-        """Score 0.0 (idle, no pending) to 1.0 (busy, many pending)."""
-        state = states.get(worker_name, "UNKNOWN")
-        state_val = score_map.get(state, 4) / 4.0
-        pending = bus_statuses.get(worker_name, {}).get("pending_tasks", 0)
-        pending_val = min(1.0, pending / 5.0)
-        return (state_val + pending_val) / 2.0
-
     def _combined_score(worker):
-        """Combined score: higher is better (expertise up, load down)."""
         name = worker["name"]
-        exp = _expertise_score(name)
-        load = 1.0 - _load_score(name)  # invert: low load = high score
+        exp = _expertise_score(name, task_lower, task_words, profiles)
+        load = 1.0 - _load_score(name, states, bus_statuses)
         return exp * expertise_weight + load * load_weight
 
     ranked = sorted(workers, key=lambda w: -_combined_score(w))
 
-    # Log routing decision
     for w in ranked[:4]:
         name = w["name"]
-        exp = _expertise_score(name)
-        load = _load_score(name)
-        combined = _combined_score(w)
-        log(f"smart_route: {name} exp={exp:.2f} load={load:.2f} combined={combined:.2f} state={states.get(name, '?')}")
+        exp = _expertise_score(name, task_lower, task_words, profiles)
+        load = _load_score(name, states, bus_statuses)
+        log(f"smart_route: {name} exp={exp:.2f} load={load:.2f} combined={_combined_score(w):.2f} state={states.get(name, '?')}")
 
     selected = [w for w in ranked if states.get(w["name"]) == "IDLE"][:n_workers]
     if not selected:
-        # Fall back to any non-STEERING worker
         selected = [w for w in ranked if states.get(w["name"]) not in ("STEERING", "UNKNOWN")][:n_workers]
     if not selected:
         log("smart_dispatch: no suitable workers", "ERR")
@@ -1227,6 +1278,55 @@ def smart_dispatch(task, workers=None, orch_hwnd=None, n_workers=1):
         return [name for name, ok in results.items() if ok]
 
 
+def _scan_bus_messages_for_key(msgs, key_lower, seen_ids):
+    """Scan a list of bus messages for one matching key. Returns match or None."""
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id", "")
+        if mid in seen_ids:
+            continue
+        seen_ids.add(mid)
+        content = m.get("content", "")
+        sender = m.get("sender", "")
+        if key_lower in content.lower() or key_lower in sender.lower():
+            log(f"Result found from {sender}: {content[:100]}", "OK")
+            return m
+    return None
+
+
+def _wait_via_realtime_file(key_lower, seen_ids, deadline, realtime_path):
+    """Poll data/realtime.json at 0.5s resolution for a matching message."""
+    while time.time() < deadline:
+        try:
+            with open(realtime_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            msgs = data if isinstance(data, list) else data.get("messages", data.get("results", []))
+            match = _scan_bus_messages_for_key(msgs, key_lower, seen_ids)
+            if match:
+                return match
+        except (json.JSONDecodeError, OSError):
+            pass
+        time.sleep(0.5)
+    return None
+
+
+def _wait_via_http_polling(key_lower, seen_ids, deadline, poll, skynet_url):
+    """Poll bus via HTTP at configurable interval for a matching message."""
+    import urllib.request
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{skynet_url}/bus/messages?limit=50", timeout=3) as r:
+                msgs = json.loads(r.read())
+            match = _scan_bus_messages_for_key(msgs, key_lower, seen_ids)
+            if match:
+                return match
+        except Exception:
+            pass
+        time.sleep(poll)
+    return None
+
+
 def wait_for_bus_result(key, timeout=90, poll=2.0, skynet_url="http://localhost:8420",
                         auto_recover=True, _original_task=None):
     """Block until a bus message matching `key` (substring in content or sender) appears.
@@ -1234,72 +1334,52 @@ def wait_for_bus_result(key, timeout=90, poll=2.0, skynet_url="http://localhost:
     Returns the matching message dict, or None on timeout.
     Tries file-based realtime wait first (0.5s resolution via data/realtime.json),
     falls back to HTTP polling (2.0s resolution) if realtime daemon is not running.
-
-    If auto_recover=True and timeout is reached, attempts to cancel stuck PROCESSING
-    workers via UIA and re-dispatch the original task ONE time.
+    If auto_recover=True and timeout is reached, cancels stuck workers and retries once.
     """
-    import urllib.request
     deadline = time.time() + timeout
     seen_ids = set()
     key_lower = key.lower()
 
-    # Try file-based realtime waiting (faster: 0.5s resolution, no network)
     realtime_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "realtime.json")
-    use_realtime = os.path.exists(realtime_path)
 
-    if use_realtime:
+    if os.path.exists(realtime_path):
         log(f"Waiting via realtime file (0.5s resolution) for '{key}' (timeout={timeout}s)...", "INFO")
-        while time.time() < deadline:
-            try:
-                with open(realtime_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                msgs = data if isinstance(data, list) else data.get("messages", data.get("results", []))
-                for m in msgs:
-                    if not isinstance(m, dict):
-                        continue
-                    mid = m.get("id", "")
-                    if mid in seen_ids:
-                        continue
-                    seen_ids.add(mid)
-                    content = m.get("content", "")
-                    sender = m.get("sender", "")
-                    if key_lower in content.lower() or key_lower in sender.lower():
-                        log(f"Result found from {sender}: {content[:100]}", "OK")
-                        return m
-            except (json.JSONDecodeError, OSError):
-                pass
-            time.sleep(0.5)
+        result = _wait_via_realtime_file(key_lower, seen_ids, deadline, realtime_path)
     else:
-        log(f"Waiting via HTTP polling (2.0s resolution, realtime daemon not running) for '{key}' (timeout={timeout}s)...", "INFO")
-        while time.time() < deadline:
-            try:
-                with urllib.request.urlopen(f"{skynet_url}/bus/messages?limit=50", timeout=3) as r:
-                    msgs = json.loads(r.read())
-                for m in msgs:
-                    mid = m.get("id", "")
-                    if mid in seen_ids:
-                        continue
-                    seen_ids.add(mid)
-                    content = m.get("content", "")
-                    sender = m.get("sender", "")
-                    if key_lower in content.lower() or key_lower in sender.lower():
-                        log(f"Result found from {sender}: {content[:100]}", "OK")
-                        return m
-            except Exception:
-                pass
-            time.sleep(poll)
+        log(f"Waiting via HTTP polling ({poll}s resolution) for '{key}' (timeout={timeout}s)...", "INFO")
+        result = _wait_via_http_polling(key_lower, seen_ids, deadline, poll, skynet_url)
 
-    # ── AUTO-RECOVERY: cancel stuck workers and retry once ──
+    if result:
+        # Mark dispatch as received in dispatch_log.json  # signed: alpha
+        sender = (result.get("sender") or "").strip()
+        if sender:
+            mark_dispatch_received(sender)  # signed: alpha
+        return result
+
     if auto_recover and _original_task:
         log(f"Timeout waiting for '{key}' -- attempting auto-recovery", "WARN")
-        recovered = _auto_recover_stuck_workers(key, _original_task)
-        if recovered:
-            # Retry wait with same timeout, but disable auto_recover to prevent recursion
+        if _auto_recover_stuck_workers(key, _original_task):
             return wait_for_bus_result(key, timeout=timeout, poll=poll,
                                        skynet_url=skynet_url, auto_recover=False)
 
     log(f"Timeout waiting for bus result matching '{key}'", "WARN")
     return None
+
+
+def _try_cancel_and_wait_idle(engine, hwnd, wname):
+    """Cancel generation on a worker and wait up to 3s for IDLE. Returns True if worker became IDLE."""
+    try:
+        engine.cancel_generation(int(hwnd))
+    except Exception as e:
+        log(f"Auto-recover: cancel failed for {wname.upper()}: {e}", "ERR")
+        return False
+    idle_deadline = time.time() + 3.0
+    while time.time() < idle_deadline:
+        if engine.get_state(int(hwnd)) == "IDLE":
+            return True
+        time.sleep(0.5)
+    log(f"Auto-recover: {wname.upper()} did not become IDLE after cancel", "WARN")
+    return False
 
 
 def _auto_recover_stuck_workers(key, original_task):
@@ -1323,42 +1403,17 @@ def _auto_recover_stuck_workers(key, original_task):
     for w in workers:
         wname = w.get("name", "")
         hwnd = w.get("hwnd", 0)
-        if not hwnd:
+        if not hwnd or key_lower not in wname.lower():
             continue
-        # Only target workers whose name matches the key we're waiting for
-        if key_lower not in wname.lower():
-            continue
-
         state = engine.get_state(int(hwnd))
         if state != "PROCESSING":
             log(f"Auto-recover: {wname.upper()} is {state}, not stuck", "INFO")
             continue
-
         log(f"Auto-recover: {wname.upper()} stuck PROCESSING -- cancelling generation", "WARN")
-        try:
-            engine.cancel_generation(int(hwnd))
-        except Exception as e:
-            log(f"Auto-recover: cancel failed for {wname.upper()}: {e}", "ERR")
+        if not _try_cancel_and_wait_idle(engine, hwnd, wname):
             continue
-
-        # Wait up to 3s for IDLE
-        idle_deadline = time.time() + 3.0
-        became_idle = False
-        while time.time() < idle_deadline:
-            s = engine.get_state(int(hwnd))
-            if s == "IDLE":
-                became_idle = True
-                break
-            time.sleep(0.5)
-
-        if not became_idle:
-            log(f"Auto-recover: {wname.upper()} did not become IDLE after cancel", "WARN")
-            continue
-
-        # Re-dispatch the original task
         log(f"Auto-recover: re-dispatching to {wname.upper()}", "SYS")
-        orch_hwnd = load_orch_hwnd()
-        ok = dispatch_to_worker(wname, original_task, workers, orch_hwnd)
+        ok = dispatch_to_worker(wname, original_task, workers, load_orch_hwnd())
         if ok:
             log(f"Auto-recover: re-dispatch to {wname.upper()} succeeded", "OK")
             recovered_any = True
@@ -1457,10 +1512,109 @@ def poll_bus(limit=20, skynet_url="http://localhost:8420"):
         return []
 
 
+def _handle_state_query(args, workers):
+    """Handle --state and --state-all CLI queries. Returns True if handled."""
+    if args.state_all:
+        states = scan_all_states(workers)
+        log("=== UIA STATES (parallel scan) ===", "SYS")
+        for name, state in states.items():
+            icon = {"IDLE": "✅", "PROCESSING": "⏳", "STEERING": "⚠️", "TYPING": "✏️"}.get(state, "❓")
+            print(f"  {name.upper():<8} {icon} {state}")
+        return True
+    if args.state:
+        target_workers = [w for w in workers if w["name"] == args.state]
+        if not target_workers:
+            log(f"Worker '{args.state}' not found", "ERR")
+            return True
+        state = get_worker_state_uia(target_workers[0]["hwnd"])
+        log(f"{args.state.upper()} UIA state: {state}", "INFO")
+        return True
+    return False
+
+
+def _handle_bus_status():
+    """Handle --bus-status CLI query. Prints bus messages and worker statuses."""
+    log("=== BUS STATUS ===", "SYS")
+    msgs = poll_bus(limit=15)
+    for m in msgs[-10:]:
+        ts = m.get("timestamp", "")[-8:]
+        print(f"  [{ts}] {m.get('sender','?')}/{m.get('type','?')}: {m.get('content','')[:120]}")
+    log("=== WORKER STATUS (parallel) ===", "SYS")
+    statuses = get_worker_statuses()
+    for name, s in statuses.items():
+        alive = "ALIVE" if s.get("alive") else "DEAD"
+        pending = s.get("pending_tasks", 0)
+        running = s.get("running_tasks", 0)
+        uia = s.get("uia_state", "?")
+        icon = {"IDLE": "✅", "PROCESSING": "⏳", "STEERING": "⚠️", "TYPING": "✏️"}.get(uia, "❓")
+        print(f"  {name.upper():<8} {alive:<6} pending={pending} running={running} {icon} {uia}")
+    idle = idle_workers()
+    log(f"Idle workers: {idle}", "INFO")
+
+
+def _handle_open_project(project):
+    """Handle --open-project: configure venv and launch VS Code Insiders."""
+    venv_candidates = [
+        os.path.join(project, ".venv", "Scripts", "python.exe"),
+        os.path.join(project, "env", "Scripts", "python.exe"),
+        os.path.join(os.path.dirname(project), "env", "Scripts", "python.exe"),
+    ]
+    venv_py = next((v for v in venv_candidates if os.path.exists(v)), None)
+    vscode_dir = os.path.join(project, ".vscode")
+    os.makedirs(vscode_dir, exist_ok=True)
+    settings_path = os.path.join(vscode_dir, "settings.json")
+    settings = {}
+    if os.path.exists(settings_path):
+        with open(settings_path) as f:
+            try: settings = json.load(f)
+            except (json.JSONDecodeError, ValueError): settings = {}
+    if venv_py:
+        settings["python.defaultInterpreterPath"] = venv_py.replace("\\", "/")
+        with open(settings_path, "w") as f:
+            json.dump(settings, f, indent=2)
+        log(f"Set python.defaultInterpreterPath -> {venv_py}", "OK")
+    else:
+        log(f"No venv found in {project} -- interpreter not set", "WARN")
+    subprocess.Popen(["code-insiders", project])
+    log(f"Opened {project} in VS Code Insiders", "OK")
+
+
+def _execute_dispatch_mode(args, workers, orch_hwnd):
+    """Execute the selected dispatch mode. Returns dispatch result or None."""
+    if args.blast and args.task:
+        return blast_all(args.task, workers, orch_hwnd)
+    if args.parallel and args.task:
+        return dispatch_parallel({w["name"]: args.task for w in workers}, workers, orch_hwnd)
+    if args.smart and args.task:
+        routed = smart_dispatch(args.task, workers, orch_hwnd, n_workers=args.n)
+        log(f"Smart-dispatched to: {routed}", "OK" if routed else "ERR")
+        return routed
+    if args.fan_out_parallel:
+        with open(args.fan_out_parallel) as f:
+            return dispatch_parallel(json.load(f), workers, orch_hwnd)
+    if args.batch:
+        with open(args.batch) as f:
+            return batch_dispatch(json.load(f), workers, orch_hwnd)
+    if args.fan_out:
+        with open(args.fan_out) as f:
+            return fan_out(json.load(f), workers, orch_hwnd, args.delay)
+    if args.idle and args.task:
+        exclude = [x.strip() for x in args.exclude.split(",")] if args.exclude else []
+        target = dispatch_to_idle(args.task, exclude=exclude, workers=workers, orch_hwnd=orch_hwnd)
+        log(f"Dispatched to idle worker: {target}" if target else "No idle worker available",
+            "OK" if target else "ERR")
+        return target
+    if args.all and args.task:
+        return dispatch_to_all(args.task, workers, orch_hwnd, args.delay)
+    if args.worker and args.task:
+        return dispatch_to_worker(args.worker, args.task, workers, orch_hwnd)
+    return None
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Skynet Dispatch — Send tasks to workers",
+        description="Skynet Dispatch -- Send tasks to workers",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Modes (fastest first):
@@ -1486,9 +1640,9 @@ Examples:
     parser.add_argument("--blast", action="store_true", help="FASTEST: parallel to all IDLE workers, no preamble")
     parser.add_argument("--smart", action="store_true", help="Auto-route to best idle worker(s)")
     parser.add_argument("--n", type=int, default=1, help="Number of workers for --smart (default 1)")
-    parser.add_argument("--fan-out", type=str, help="JSON file with worker→task mapping (sequential)")
-    parser.add_argument("--fan-out-parallel", type=str, help="JSON file with worker→task mapping (parallel, faster)")
-    parser.add_argument("--batch", type=str, help="JSON file with worker→[task list] mapping (consolidates same-worker tasks)")
+    parser.add_argument("--fan-out", type=str, help="JSON file with worker->task mapping (sequential)")
+    parser.add_argument("--fan-out-parallel", type=str, help="JSON file with worker->task mapping (parallel, faster)")
+    parser.add_argument("--batch", type=str, help="JSON file with worker->[task list] mapping (consolidates same-worker tasks)")
     parser.add_argument("--delay", type=float, default=2.0, help="Delay between dispatches for sequential modes (seconds)")
     parser.add_argument("--idle", action="store_true", help="Dispatch task to first idle worker")
     parser.add_argument("--exclude", type=str, help="Comma-separated worker names to exclude")
@@ -1503,131 +1657,24 @@ Examples:
     workers = load_workers()
     orch_hwnd = load_orch_hwnd()
 
-    # ── State query ──────────────────────────────────────────────────
-    if args.state_all:
-        states = scan_all_states(workers)
-        log("=== UIA STATES (parallel scan) ===", "SYS")
-        for name, state in states.items():
-            icon = {"IDLE": "✅", "PROCESSING": "⏳", "STEERING": "⚠️", "TYPING": "✏️"}.get(state, "❓")
-            print(f"  {name.upper():<8} {icon} {state}")
+    if _handle_state_query(args, workers):
         return
-
-    if args.state:
-        target_workers = [w for w in workers if w["name"] == args.state]
-        if not target_workers:
-            log(f"Worker '{args.state}' not found", "ERR")
-            return
-        state = get_worker_state_uia(target_workers[0]["hwnd"])
-        log(f"{args.state.upper()} UIA state: {state}", "INFO")
-        return
-
-    # ── Bus status ───────────────────────────────────────────────────
     if args.bus_status:
-        log("=== BUS STATUS ===", "SYS")
-        msgs = poll_bus(limit=15)
-        for m in msgs[-10:]:
-            ts = m.get("timestamp", "")[-8:]
-            print(f"  [{ts}] {m.get('sender','?')}/{m.get('type','?')}: {m.get('content','')[:120]}")
-        log("=== WORKER STATUS (parallel) ===", "SYS")
-        statuses = get_worker_statuses()
-        for name, s in statuses.items():
-            alive = "ALIVE" if s.get("alive") else "DEAD"
-            pending = s.get("pending_tasks", 0)
-            running = s.get("running_tasks", 0)
-            uia = s.get("uia_state", "?")
-            icon = {"IDLE": "✅", "PROCESSING": "⏳", "STEERING": "⚠️", "TYPING": "✏️"}.get(uia, "❓")
-            print(f"  {name.upper():<8} {alive:<6} pending={pending} running={running} {icon} {uia}")
-        idle = idle_workers()
-        log(f"Idle workers: {idle}", "INFO")
+        _handle_bus_status()
         return
-
-    # ── Open project ─────────────────────────────────────────────────
     if args.open_project:
-        project = args.open_project
-        venv_candidates = [
-            os.path.join(project, ".venv", "Scripts", "python.exe"),
-            os.path.join(project, "env", "Scripts", "python.exe"),
-            os.path.join(os.path.dirname(project), "env", "Scripts", "python.exe"),
-        ]
-        venv_py = next((v for v in venv_candidates if os.path.exists(v)), None)
-        vscode_dir = os.path.join(project, ".vscode")
-        os.makedirs(vscode_dir, exist_ok=True)
-        settings_path = os.path.join(vscode_dir, "settings.json")
-        settings = {}
-        if os.path.exists(settings_path):
-            with open(settings_path) as f:
-                try: settings = json.load(f)
-                except (json.JSONDecodeError, ValueError): settings = {}
-        if venv_py:
-            settings["python.defaultInterpreterPath"] = venv_py.replace("\\", "/")
-            with open(settings_path, "w") as f:
-                json.dump(settings, f, indent=2)
-            log(f"Set python.defaultInterpreterPath → {venv_py}", "OK")
-        else:
-            log(f"No venv found in {project} — interpreter not set", "WARN")
-        subprocess.Popen(["code-insiders", project], shell=True)
-        log(f"Opened {project} in VS Code Insiders", "OK")
+        _handle_open_project(args.open_project)
         return
-
     if not workers:
         log("No workers loaded", "ERR")
         return
 
-    # ── Dispatch modes ───────────────────────────────────────────────
     t0 = time.time()
-    result = None
-
-    if args.blast and args.task:
-        # FASTEST: parallel to idle workers, no preamble
-        result = blast_all(args.task, workers, orch_hwnd)
-
-    elif args.parallel and args.task:
-        # Parallel broadcast to all workers with preamble
-        tasks_map = {w["name"]: args.task for w in workers}
-        result = dispatch_parallel(tasks_map, workers, orch_hwnd)
-
-    elif args.smart and args.task:
-        # Auto-route to best idle worker(s)
-        routed = smart_dispatch(args.task, workers, orch_hwnd, n_workers=args.n)
-        log(f"Smart-dispatched to: {routed}", "OK" if routed else "ERR")
-        result = routed
-
-    elif args.fan_out_parallel:
-        with open(args.fan_out_parallel) as f:
-            tasks = json.load(f)
-        result = dispatch_parallel(tasks, workers, orch_hwnd)
-
-    elif args.batch:
-        with open(args.batch) as f:
-            task_map = json.load(f)
-        result = batch_dispatch(task_map, workers, orch_hwnd)
-
-    elif args.fan_out:
-        with open(args.fan_out) as f:
-            tasks = json.load(f)
-        result = fan_out(tasks, workers, orch_hwnd, args.delay)
-
-    elif args.idle and args.task:
-        exclude = [x.strip() for x in args.exclude.split(",")] if args.exclude else []
-        target = dispatch_to_idle(args.task, exclude=exclude, workers=workers, orch_hwnd=orch_hwnd)
-        log(f"Dispatched to idle worker: {target}" if target else "No idle worker available",
-            "OK" if target else "ERR")
-        result = target
-
-    elif args.all and args.task:
-        result = dispatch_to_all(args.task, workers, orch_hwnd, args.delay)
-
-    elif args.worker and args.task:
-        result = dispatch_to_worker(args.worker, args.task, workers, orch_hwnd)
-
-    else:
+    result = _execute_dispatch_mode(args, workers, orch_hwnd)
+    if result is None:
         parser.print_help()
         return
-
-    elapsed = time.time() - t0
-    log(f"Dispatch took {elapsed:.2f}s", "INFO")
-
-    # ── Optional result wait ─────────────────────────────────────────
+    log(f"Dispatch took {time.time() - t0:.2f}s", "INFO")
     if args.wait_result:
         wait_for_bus_result(args.wait_result, timeout=args.timeout)
 

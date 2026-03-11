@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Tests for the UIA Engine — validates COM-based window scanning."""
+# Hardcoded paths replaced with Path(__file__) for portability  # signed: beta
 
 import sys
 import json
 import time
+from pathlib import Path
 
-sys.path.insert(0, "D:\\Prospects\\ScreenMemory")
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 import pytest
 
-WORKERS_FILE = "D:\\Prospects\\ScreenMemory\\data\\workers.json"
-ORCHESTRATOR_FILE = "D:\\Prospects\\ScreenMemory\\data\\orchestrator.json"
+WORKERS_FILE = ROOT / "data" / "workers.json"
+ORCHESTRATOR_FILE = ROOT / "data" / "orchestrator.json"
 
 VALID_STATES = ("IDLE", "PROCESSING", "STEERING", "TYPING", "UNKNOWN")
 

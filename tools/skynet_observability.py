@@ -326,61 +326,62 @@ def throughput_metrics() -> dict:
     }
 
 
-def main() -> int:
+def _build_observability_parser():
+    """Build the observability CLI parser."""
     parser = argparse.ArgumentParser(description="Skynet Observability")
     sub = parser.add_subparsers(dest="command")
-
     sub.add_parser("snapshot", help="Take a system snapshot")
     sub.add_parser("health", help="System health summary")
     sub.add_parser("throughput", help="Dispatch throughput metrics")
-
     p_compare = sub.add_parser("compare", help="Compare two snapshots")
     p_compare.add_argument("snap_a")
     p_compare.add_argument("snap_b")
-
     p_trends = sub.add_parser("trends", help="Trend analysis")
     p_trends.add_argument("--hours", type=float, default=1.0)
-
     p_list = sub.add_parser("list", help="List snapshots")
     p_list.add_argument("--limit", type=int, default=20)
+    return parser
 
-    args = parser.parse_args()
 
+def _dispatch_observability_command(args) -> int:
+    """Dispatch parsed CLI command."""
     if args.command == "snapshot":
         snap = collect_system_snapshot()
         path = save_snapshot(snap)
         print(f"Snapshot saved: {path}")
         print(json.dumps(snap, indent=2))
         return 0
-
     if args.command == "health":
         print(json.dumps(system_health(), indent=2))
         return 0
-
     if args.command == "throughput":
         print(json.dumps(throughput_metrics(), indent=2))
         return 0
-
     if args.command == "compare":
-        a = load_snapshot(args.snap_a)
-        b = load_snapshot(args.snap_b)
+        a, b = load_snapshot(args.snap_a), load_snapshot(args.snap_b)
         if not a or not b:
             print("Snapshot(s) not found")
             return 1
         print(json.dumps(compare_snapshots(a, b), indent=2))
         return 0
-
     if args.command == "trends":
         print(json.dumps(trend_analysis(hours=args.hours), indent=2))
         return 0
-
     if args.command == "list":
         for s in list_snapshots(limit=args.limit):
             print(f"  {s['snapshot_id']}  {s['timestamp']}  dispatches={s['dispatch_total']}")
         return 0
+    return -1
 
-    parser.print_help()
-    return 0
+
+def main() -> int:
+    parser = _build_observability_parser()
+    args = parser.parse_args()
+    result = _dispatch_observability_command(args)
+    if result == -1:
+        parser.print_help()
+        return 0
+    return result
 
 
 if __name__ == "__main__":

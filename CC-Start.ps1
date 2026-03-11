@@ -46,6 +46,92 @@ function Get-SkynetStatus {
     catch { return $null }
 }
 
+function Test-JsonHealth([string]$url, [int]$timeoutSec = 5) {
+    try {
+        $resp = Invoke-RestMethod $url -TimeoutSec $timeoutSec
+        return ($null -ne $resp -and $resp.status -eq "ok")
+    } catch {
+        return $false
+    }
+}
+
+function Get-ConsultantView([string]$url, [int]$timeoutSec = 5) {
+    try {
+        $resp = Invoke-RestMethod $url -TimeoutSec $timeoutSec
+        if ($null -ne $resp.consultant) { return $resp.consultant }
+        if ($null -ne $resp.id) { return $resp }
+    } catch {}
+    return $null
+}
+
+function Test-ConsultantBridgeTruth([string]$viewUrl, [int]$maxHeartbeatAgeSec = 8) {
+    $view = Get-ConsultantView $viewUrl 5
+    if ($null -eq $view) { return $null }
+
+    $status = [string]($view.status ?? "")
+    $live = [bool]$view.live
+    $acceptsPrompts = [bool]$view.accepts_prompts
+    $heartbeatAge = 999.0
+    if ($null -ne $view.heartbeat_age_s) {
+        $heartbeatAge = [double]$view.heartbeat_age_s
+    } elseif ($null -ne $view.stale_after_s) {
+        $heartbeatAge = [double]$view.stale_after_s + 1.0
+    }
+
+    if ($live -and $acceptsPrompts -and
+        $status.ToUpperInvariant() -eq "LIVE" -and
+        $heartbeatAge -le $maxHeartbeatAgeSec) {
+        return $view
+    }
+
+    return $null
+}
+
+function Wait-ConsultantBridgeTruth([int]$port, [string]$healthUrl, [string]$viewUrl,
+                                    [int]$maxSeconds = 40, [int]$maxHeartbeatAgeSec = 8) {
+    $deadline = (Get-Date).AddSeconds($maxSeconds)
+    do {
+        if ((Test-Port $port 1000) -and (Test-JsonHealth $healthUrl 5)) {
+            $view = Test-ConsultantBridgeTruth $viewUrl $maxHeartbeatAgeSec
+            if ($null -ne $view) { return $view }
+        }
+        Start-Sleep -Seconds 1
+    } while ((Get-Date) -lt $deadline)
+    return $null
+}
+
+function Publish-GuardedBusMessage([hashtable]$Message) {
+    $payload = $Message | ConvertTo-Json -Depth 8 -Compress
+    $pyCode = @'
+import json
+import sys
+from tools.skynet_spam_guard import guarded_publish
+
+message = json.loads(sys.stdin.read())
+print(json.dumps(guarded_publish(message)))
+'@
+    $raw = $payload | & $python -c $pyCode 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $text = ($raw -join "`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    try {
+        return $text | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+}  # signed: consultant
+
+function Wait-HealthyEndpoint([int]$port, [string]$url, [int]$maxSeconds = 40) {
+    $deadline = (Get-Date).AddSeconds($maxSeconds)
+    do {
+        if ((Test-Port $port 1000) -and (Test-JsonHealth $url 5)) {
+            return $true
+        }
+        Start-Sleep -Seconds 1
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
+
 Add-Type -Name "CCUser32" -Namespace "Win32CC" -MemberDefinition @"
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
@@ -241,9 +327,17 @@ foreach ($d in $daemonSpecs) {
 # ── Codex Consultant Bridge + Identity ───────────────────
 
 $consultantBridgeUp = $false
-if (Test-Port 8422 1000) {
+$consultantBridgeHealth = "http://127.0.0.1:8422/health"
+$consultantBridgeViewUrl = "http://127.0.0.1:8422/consultants"
+$consultantBridgeView = $null
+if ((Test-Port 8422 1000) -and (Test-JsonHealth $consultantBridgeHealth 5)) {
     Write-Status "Codex Consultant bridge already running on port 8422" "OK"
-    $consultantBridgeUp = $true
+    $consultantBridgeView = Test-ConsultantBridgeTruth $consultantBridgeViewUrl 8
+    if ($null -ne $consultantBridgeView) {
+        $consultantBridgeUp = $true
+    } else {
+        Write-Status "Codex Consultant bridge responds on 8422 but LIVE truth is not yet verified" "WARN"
+    }
 } else {
     Write-Status "Codex Consultant bridge not running -- starting..." "SYS"
     $bridgeScript = Join-Path $repoRoot "tools\skynet_consultant_bridge.py"
@@ -251,16 +345,12 @@ if (Test-Port 8422 1000) {
         Start-Process -FilePath $python `
             -ArgumentList @($bridgeScript, "--source", "CC-Start", "--api-port", "8422") `
             -WorkingDirectory $repoRoot -WindowStyle Hidden
-        for ($i = 0; $i -lt 10; $i++) {
-            Start-Sleep -Seconds 1
-            if (Test-Port 8422 1000) {
-                $consultantBridgeUp = $true
-                Write-Status "Codex Consultant bridge started on port 8422" "OK"
-                break
-            }
-        }
-        if (-not $consultantBridgeUp) {
-            Write-Status "Codex Consultant bridge failed to start within 10s" "WARN"
+        $consultantBridgeView = Wait-ConsultantBridgeTruth 8422 $consultantBridgeHealth $consultantBridgeViewUrl 40 8
+        if ($null -ne $consultantBridgeView) {
+            $consultantBridgeUp = $true
+            Write-Status "Codex Consultant bridge started and passed /health + live heartbeat truth on port 8422" "OK"
+        } else {
+            Write-Status "Codex Consultant bridge failed live truth verification within 40s" "WARN"
         }
     } else {
         Write-Status "tools\\skynet_consultant_bridge.py not found" "ERR"
@@ -271,28 +361,36 @@ if (Test-Port 8422 1000) {
 if ($skynetUp) {
     try {
         $identityContent = if ($consultantBridgeUp) {
-            "CODEX CONSULTANT LIVE -- CC-Start session active. Model: GPT-5 Codex. Advisory peer ready for tasking."
+            "CODEX CONSULTANT LIVE -- CC-Start session active. Model: GPT-5 Codex. Advisory peer ready for tasking. signed:consultant"
         } else {
-            "CODEX CONSULTANT SESSION ACTIVE -- bridge offline on port 8422. Model: GPT-5 Codex. Advisory peer not promptable yet."
+            "CODEX CONSULTANT SESSION ACTIVE -- bridge offline on port 8422. Model: GPT-5 Codex. Advisory peer not promptable yet. signed:consultant"
         }
         $promptTransport = if ($consultantBridgeUp) { "bridge_queue" } else { "unavailable" }
         $routable = if ($consultantBridgeUp) { "true" } else { "false" }
-        Invoke-RestMethod -Uri "http://localhost:8420/bus/publish" -Method POST `
-            -ContentType "application/json" -TimeoutSec 3 `
-            -Body (ConvertTo-Json @{
-                sender  = "consultant"
-                topic   = "orchestrator"
-                type    = "identity_ack"
-                content = $identityContent
-                metadata = @{
-                    display_name     = "Codex Consultant"
-                    kind             = "advisor"
-                    transport        = "cc-start-bridge"
-                    routable         = $routable
-                    prompt_transport = $promptTransport
-                }
-            }) | Out-Null
-        Write-Status "Codex Consultant identity announced on Skynet bus" "OK"
+        $bridgeStatus = if ($null -ne $consultantBridgeView) { [string]$consultantBridgeView.status } else { "unknown" }
+        $publishResult = Publish-GuardedBusMessage @{
+            sender  = "consultant"
+            topic   = "orchestrator"
+            type    = "identity_ack"
+            content = $identityContent
+            metadata = @{
+                display_name     = "Codex Consultant"
+                kind             = "advisor"
+                transport        = "cc-start-bridge"
+                routable         = $routable
+                prompt_transport = $promptTransport
+                score_actor      = "consultant"
+                signature        = "signed:consultant"
+                bridge_status    = $bridgeStatus
+            }
+        }
+        if ($publishResult -and $publishResult.allowed) {
+            Write-Status "Codex Consultant identity announced on Skynet bus (SpamGuard)" "OK"
+        } elseif ($publishResult) {
+            Write-Status "Codex Consultant identity announcement blocked by SpamGuard: $($publishResult.reason)" "WARN"
+        } else {
+            Write-Status "Codex Consultant identity announcement failed before bus confirmation" "WARN"
+        }
     } catch {
         Write-Status "Bus announcement failed: $_" "WARN"
     }
@@ -347,11 +445,42 @@ Write-Host "    - Bus topic for receiving prompts: consultant"
 Write-Host "    - Bridge port: 8422"
 Write-Host "    - Post results to bus with sender=consultant"
 Write-Host ""
+Write-Host "  Signature + scoring accountability:"
+Write-Host "    - Your score actor ID is consultant."
+Write-Host "    - Check it: python tools/skynet_scoring.py --score consultant"
+Write-Host "    - Check the leaderboard: python tools/skynet_scoring.py --leaderboard"
+Write-Host "    - SIGNATURE RULE: every code/config change you make MUST carry your signature (# signed: consultant, <!-- signed: consultant -->, etc.)."
+Write-Host "    - Every bus result/report you publish must include signed:consultant in content."
+Write-Host "    - Use guarded_publish() for ALL bus messages; raw /bus/publish bypass costs -1.0 score."
+Write-Host "    - RESULT POSTING: if you finish real work and do not post DONE/RESULT, you do not get score credit."
+Write-Host "    - FAIR DEDUCTION: when consultant work was actually dispatched through skynet_dispatch.py, deductions require dispatch_log.json evidence."
+Write-Host "    - If a different validator proves your signed work wrong, that signed incident can cost you -0.1."
+Write-Host "    - If you proactively clear or surface a real Skynet ticket, report it truthfully so consultant scoring can validate the +0.2 award."
+Write-Host ""
 Write-Host "  Failure corrections you must obey:"
 Write-Host "    - CC-Start always means Codex Consultant, never orchestrator."
 Write-Host "    - Report model truth as GPT-5 Codex."
 Write-Host "    - Bring up bridge 8422 before claiming LIVE or routable transport."
+Write-Host "    - Bridge truth rule: do not claim LIVE/routable from a transient port-open alone; require a successful /health check and a surviving state heartbeat."
+Write-Host "    - Startup launch rule: in PowerShell Start-Process, quote any argument value containing spaces or compose a safe single argument string before claiming bootstrap success."
+Write-Host "    - Shared ticket awareness: read bus/TODO/queue state before going idle; if a real Skynet ticket can be cleared or surfaced, do it."
+Write-Host "    - Proactive ticket clearance by consultant/orchestrator is worth +0.2 when independently verified."
+Write-Host "    - Architecture/performance/security/caching/daemon/routing tickets are not valid as plain slogans; require current-path review (real files/functions/endpoints/daemons), why the design behaves that way now, and a realistic fix before treating them as elevated fact."
+Write-Host "    - If that architecture backing is missing, route the finding into architecture review or cross-validation instead of certifying it."
+Write-Host "    - Semantically equivalent findings are the same issue family even if reworded; do not treat rewritten duplicates as new architecture truth."
+Write-Host "    - If a worker files a real bug for cross-validation, record +0.01; if a different validator proves it true, award +0.01 to the validator and another +0.01 to the original filer."
+Write-Host "    - When the live queue truly reaches zero, orchestrator earns +1.0 and the actor who closed the final signed ticket earns +1.0."
 Write-Host "    - Any startup issue must be addressed by the consultant for GOD: verify it, fix it directly when safe, or publish an alert plus remediation artifact if blocked."
+Write-Host "    - If orchestrator presence or self-prompt targeting is disputed, inspect ALL live top-level Code windows yourself before answering: geometry, title, model, agent, and recent UIA-visible transcript."
+Write-Host "    - If a single top-level Code window contains multiple panes, inspect pane-local controls and transcript; do not equate active-pane identity with whole-window identity."
+Write-Host "    - If GOD disputes your window-identity claim, stop arguing from prior scans and perform a fresh pane-level UIA re-probe immediately before answering."
+Write-Host "    - Do not treat title text alone as orchestrator truth; model/agent/transcript identity outranks title and layout guesses."
+Write-Host "    - Distinguish 'a left-side VS Code window exists' from 'a validated orchestrator window exists' and report both facts separately when needed."
+Write-Host "    - Before ANY focus-stealing direct prompt or manual typing into a live VS Code chat, capture a fresh screenshot and verify pane-local target identity from header/tab text, model, agent, and nearby transcript. No screenshot = no fire."
+Write-Host "    - Startup presence/identity announcements stay bus-only unless GOD explicitly requests direct typing."
+Write-Host "    - Self-prompt truth rule: do not claim the daemon is compliant unless the live send path hard-gates on ALL workers staying IDLE for the full quiet window and re-checks worker state immediately before fire."
+Write-Host "    - If a self-prompt fires while any worker is non-IDLE, report it as a real violation immediately; do not defend it from cached status, prior scans, or inferred timing."
+Write-Host "    - For self-prompt gating truth, registered worker HWND/UIA state outranks backend /status. Do not certify compliance from /status alone."
 Write-Host "    - If you fail or drift: write an artifact, post it to Skynet, and verify delivery."
 Write-Host "    - Keep bus payloads schema-safe unless endpoint support is verified."
 Write-Host "    - Do not claim success without a live endpoint check or sender-filtered bus confirmation."

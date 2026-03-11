@@ -266,54 +266,39 @@ Write-Host $count
         return False
 
 
+def _parse_hwnd_from_output(stdout):
+    """Extract HWND integer from new_chat.ps1 output like 'OK HWND=<n> pos=...'."""
+    import re as _re
+    m = _re.search(r'OK HWND=(\d+)', stdout or "")
+    return int(m.group(1)) if m else None
+
+
+def _poll_for_new_window(before_set, exclude_hwnd=None, timeout_s=8):
+    """Poll for a newly appeared VS Code window. Returns HWND or None."""
+    for _ in range(timeout_s):
+        time.sleep(1)
+        after = {w["hwnd"] for w in find_vscode_windows()}
+        new_hwnds = after - before_set
+        if exclude_hwnd:
+            new_hwnds.discard(exclude_hwnd)
+        if new_hwnds:
+            return new_hwnds.pop()
+    return None
+
+
 def open_chat_window(orch_hwnd):
     """Open a new detached chat window using tools/new_chat.ps1.
-
-    new_chat.ps1 is the proven, battle-tested script that:
-      1. Finds the narrow dropdown ▾ button (right side of the chat panel header)
-      2. Ghost-clicks it via PostMessage (no cursor movement)
-      3. Invokes 'New Chat Window' menu item via UIA InvokePattern
-      4. Waits 4000ms for the window to appear
-      5. Runs model guard (ensures Claude Opus 4.6 fast + Copilot CLI)
-
-    We skip new_chat.ps1's built-in grid positioning (we handle that ourselves)
-    and its empty-chat blocker (we manage sequential opens).
-
     Returns the new HWND on success, None on failure.
     """
     before = {w["hwnd"] for w in find_vscode_windows()}
-
     script_path = str(ROOT / "tools" / "new_chat.ps1")
+
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
              "-File", script_path, "-Monitor", "2", "-SkipEmptyCheck"],
-            capture_output=True, text=True, timeout=45,
-            cwd=str(ROOT)
+            capture_output=True, text=True, timeout=45, cwd=str(ROOT)
         )
-        if r.returncode != 0:
-            stderr = r.stderr.strip()[:200] if r.stderr else ""
-            stdout = r.stdout.strip()[:200] if r.stdout else ""
-            if "BLOCKED" in (r.stdout or ""):
-                log(f"new_chat.ps1: blocked (all slots full or consecutive failures)", "WARN")
-            else:
-                log(f"new_chat.ps1 failed (rc={r.returncode}): {stdout} {stderr}", "ERR")
-            return None
-
-        # rc=0 but still blocked (e.g. BLOCKED: all slots full)
-        if "BLOCKED" in (r.stdout or "") and "OK HWND=" not in (r.stdout or ""):
-            log(f"new_chat.ps1: blocked — {(r.stdout or '').strip()[:120]}", "WARN")
-            return None
-
-        log(f"Chat window opened via new_chat.ps1", "OK")
-
-        # Parse HWND directly from new_chat.ps1 output: "OK HWND=<n> pos=..."
-        import re as _re
-        m = _re.search(r'OK HWND=(\d+)', r.stdout or "")
-        if m:
-            hwnd = int(m.group(1))
-            log(f"New chat window: HWND={hwnd}", "OK")
-            return hwnd
     except subprocess.TimeoutExpired:
         log("new_chat.ps1 timed out after 45s", "ERR")
         return None
@@ -321,15 +306,29 @@ def open_chat_window(orch_hwnd):
         log(f"open_chat_window failed: {e}", "ERR")
         return None
 
-    # Poll for new window (up to 8 seconds — new_chat.ps1 already waits 4s internally)
-    for _ in range(8):
-        time.sleep(1)
-        after = {w["hwnd"] for w in find_vscode_windows()}
-        new_hwnds = after - before - {orch_hwnd}
-        if new_hwnds:
-            new_hwnd = new_hwnds.pop()
-            log(f"New chat window detected: HWND={new_hwnd}", "OK")
-            return new_hwnd
+    if r.returncode != 0:
+        if "BLOCKED" in (r.stdout or ""):
+            log("new_chat.ps1: blocked (all slots full or consecutive failures)", "WARN")
+        else:
+            log(f"new_chat.ps1 failed (rc={r.returncode}): {(r.stdout or '')[:200]} {(r.stderr or '')[:200]}", "ERR")
+        return None
+
+    if "BLOCKED" in (r.stdout or "") and "OK HWND=" not in (r.stdout or ""):
+        log(f"new_chat.ps1: blocked -- {(r.stdout or '').strip()[:120]}", "WARN")
+        return None
+
+    log("Chat window opened via new_chat.ps1", "OK")
+
+    hwnd = _parse_hwnd_from_output(r.stdout)
+    if hwnd:
+        log(f"New chat window: HWND={hwnd}", "OK")
+        return hwnd
+
+    # Fallback: poll for new window (up to 8s)
+    new_hwnd = _poll_for_new_window(before, exclude_hwnd=orch_hwnd)
+    if new_hwnd:
+        log(f"New chat window detected: HWND={new_hwnd}", "OK")
+        return new_hwnd
 
     log("New chat window not detected after 8s", "ERR")
     return None
@@ -338,18 +337,9 @@ def open_chat_window(orch_hwnd):
 MAX_SESSION_RESTORE_ATTEMPTS = 2
 
 
-def restore_session_from_panel(session_name, orch_hwnd, slot):
-    """Right-click a session in the SESSIONS panel → Open in New Window.
-    
-    Returns the new HWND on success, None on failure.
-    Max 2 attempts — if both fail, reports failure immediately.
-    """
-    for attempt in range(1, MAX_SESSION_RESTORE_ATTEMPTS + 1):
-        log(f"Restoring session '{session_name}' (attempt {attempt}/{MAX_SESSION_RESTORE_ATTEMPTS})...", "SYS")
-        
-        before = {w["hwnd"] for w in find_vscode_windows()}
-        
-        ps = f'''
+def _build_session_restore_ps(session_name, orch_hwnd):
+    """Build the PowerShell script for right-clicking a session and opening in new window."""
+    return f'''
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 Add-Type @"
 using System; using System.Runtime.InteropServices;
@@ -383,7 +373,6 @@ $render=[SR]::FindRender($orch)
 [SR]::SetForegroundWindow($orch)
 Start-Sleep -Milliseconds 500
 
-# Find the session ListItem by name via UIA
 $orchEl=[System.Windows.Automation.AutomationElement]::FromHandle($orch)
 $allEls=$orchEl.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition)
 $found=$false
@@ -411,49 +400,55 @@ foreach($el in $allEls) {{
 if(-not $found) {{ Write-Host "NOT_FOUND" }}
 [SR]::SetForegroundWindow($orch)
 '''
-        try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps],
-                capture_output=True, text=True, timeout=30
-            )
-        except Exception as e:
-            log(f"Session restore attempt {attempt} failed: {e}", "ERR")
-            continue
-        
-        if "OPENED" not in r.stdout:
-            log(f"Session '{session_name}' not found in SESSIONS panel (attempt {attempt})", "WARN")
-            continue
-        
-        # Poll for new window (up to 8 seconds)
-        new_hwnd = None
-        for _ in range(8):
-            time.sleep(1)
-            after = {w["hwnd"] for w in find_vscode_windows()}
-            new_hwnds = after - before
-            if new_hwnds:
-                new_hwnd = new_hwnds.pop()
-                break
-        
-        if new_hwnd:
-            move_window(new_hwnd, slot["x"], slot["y"], slot["w"], slot["h"])
-            guard_model(new_hwnd, orch_hwnd)
-            focus_window(orch_hwnd)
-            log(f"Session '{session_name}' restored: HWND={new_hwnd} → ({slot['x']},{slot['y']})", "OK")
-            return new_hwnd
-        else:
-            log(f"Window did not appear after restore (attempt {attempt})", "WARN")
-    
+
+
+def _try_single_session_restore(session_name, orch_hwnd, slot, attempt):
+    """Single attempt to restore a session. Returns HWND or None."""
+    log(f"Restoring session '{session_name}' (attempt {attempt}/{MAX_SESSION_RESTORE_ATTEMPTS})...", "SYS")
+    before = {w["hwnd"] for w in find_vscode_windows()}
+    ps = _build_session_restore_ps(session_name, orch_hwnd)
+
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=30
+        )
+    except Exception as e:
+        log(f"Session restore attempt {attempt} failed: {e}", "ERR")
+        return None
+
+    if "OPENED" not in r.stdout:
+        log(f"Session '{session_name}' not found in SESSIONS panel (attempt {attempt})", "WARN")
+        return None
+
+    new_hwnd = _poll_for_new_window(before)
+    if not new_hwnd:
+        log(f"Window did not appear after restore (attempt {attempt})", "WARN")
+        return None
+
+    move_window(new_hwnd, slot["x"], slot["y"], slot["w"], slot["h"])
+    guard_model(new_hwnd, orch_hwnd)
+    focus_window(orch_hwnd)
+    log(f"Session '{session_name}' restored: HWND={new_hwnd} -> ({slot['x']},{slot['y']})", "OK")
+    return new_hwnd
+
+
+def restore_session_from_panel(session_name, orch_hwnd, slot):
+    """Right-click a session in the SESSIONS panel -> Open in New Window.
+    Returns the new HWND on success, None on failure.
+    Max 2 attempts -- if both fail, reports failure immediately.
+    """
+    for attempt in range(1, MAX_SESSION_RESTORE_ATTEMPTS + 1):
+        hwnd = _try_single_session_restore(session_name, orch_hwnd, slot, attempt)
+        if hwnd:
+            return hwnd
     log(f"FAILED: Could not restore session '{session_name}' after {MAX_SESSION_RESTORE_ATTEMPTS} attempts", "ERR")
     return None
 
 
-def guard_model(hwnd, orch_hwnd):
-    """Ensure a chat window is on Claude Opus 4.6 (fast mode) + Copilot CLI.
-    
-    Reads the 'Pick Model' button text via UIA. If it doesn't say 'Opus 4.6.*fast',
-    opens the model picker and selects the correct model.
-    """
-    ps = f'''
+def _build_guard_model_ps(hwnd, orch_hwnd):
+    """Build the PowerShell script that checks/fixes model and agent target."""
+    return f'''
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 Add-Type @"
 using System; using System.Runtime.InteropServices;
@@ -505,7 +500,6 @@ if(-not $modelOk) {{
             $r=$b.Current.BoundingRectangle
             [MG]::Click($render,[int]($r.X+$r.Width/2),[int]($r.Y+$r.Height/2))
             Start-Sleep -Milliseconds 1500
-            # Type "opus" to filter to Claude Opus only (avoids "Grok Code Fast" false match)
             Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
             [System.Windows.Forms.SendKeys]::SendWait("opus")
             Start-Sleep -Milliseconds 1000
@@ -518,7 +512,6 @@ if(-not $modelOk) {{
 }}
 
 if(-not $targetOk) {{
-    # Re-read buttons after model change
     $root2=[System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
     $btns2=$root2.FindAll([System.Windows.Automation.TreeScope]::Descendants,
         (New-Object System.Windows.Automation.PropertyCondition(
@@ -550,6 +543,11 @@ if(-not $targetOk) {{
 if($modelOk -and $targetOk) {{ Write-Host "GUARD_OK" }}
 [MG]::SetForegroundWindow([IntPtr]{orch_hwnd})
 '''
+
+
+def guard_model(hwnd, orch_hwnd):
+    """Ensure a chat window is on Claude Opus 4.6 (fast mode) + Copilot CLI."""
+    ps = _build_guard_model_ps(hwnd, orch_hwnd)
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
@@ -604,24 +602,25 @@ def guard_permissions(hwnd, orch_hwnd):
         time.sleep(0.2)
 
 
-def prompt_worker(hwnd, worker_name, orch_hwnd, boot_memories=None):
-    """Send initialization prompt to a worker chat window via clipboard paste."""
-    # Build memory context from persistent store if available
+def _build_prompt_text(worker_name, boot_memories=None):
+    """Construct the initialization prompt text for a worker."""
     memory_context = _format_memory_context(worker_name, boot_memories) if boot_memories else ""
-
     prompt = (
         f"You are Worker {worker_name.upper()} in the Skynet system. "
         f"Backend: http://localhost:{SKYNET_PORT} | Worker ID: {worker_name} | "
-        f"Workspace: D:\\Prospects\\ScreenMemory. "
+        f"Workspace: {Path(__file__).resolve().parent.parent}. "  # signed: gamma
         f"Reply with ONLY a single short line: "
         f"'Worker {worker_name.upper()} online.' "
         f"Do NOT run any commands, do NOT call any APIs, do NOT check status. "
         f"Just reply with that one line."
     )
-    if memory_context:
-        prompt += memory_context
+    return prompt + memory_context
 
-    ps = f'''
+
+def _build_prompt_ps(hwnd, orch_hwnd, prompt_text):
+    """Build the PowerShell script that pastes a prompt into a chat window."""
+    escaped_prompt = prompt_text.replace(chr(34), '`"')
+    return f'''
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Windows.Forms
@@ -629,11 +628,9 @@ Add-Type -AssemblyName System.Windows.Forms
 $hwnd = [IntPtr]{hwnd}
 $orch = [IntPtr]{orch_hwnd}
 
-# Focus worker
 [System.Windows.Automation.AutomationElement]::FromHandle($hwnd) | Out-Null
 $wnd = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
 
-# Bring to front briefly
 Add-Type @"
 using System; using System.Runtime.InteropServices;
 public class FW {{ [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h); }}
@@ -641,7 +638,6 @@ public class FW {{ [DllImport("user32.dll")] public static extern bool SetForegr
 [FW]::SetForegroundWindow($hwnd)
 Start-Sleep -Milliseconds 600
 
-# Find edit control and focus it
 $edit = $wnd.FindFirst(
     [System.Windows.Automation.TreeScope]::Descendants,
     (New-Object System.Windows.Automation.PropertyCondition(
@@ -652,8 +648,7 @@ $edit = $wnd.FindFirst(
 if ($edit) {{
     try {{ $edit.SetFocus() }} catch {{}}
     Start-Sleep -Milliseconds 300
-    
-    [System.Windows.Forms.Clipboard]::SetText("{prompt.replace(chr(34), '`"')}")
+    [System.Windows.Forms.Clipboard]::SetText("{escaped_prompt}")
     Start-Sleep -Milliseconds 200
     [System.Windows.Forms.SendKeys]::SendWait("^v")
     Start-Sleep -Milliseconds 400
@@ -666,6 +661,12 @@ if ($edit) {{
 Start-Sleep -Milliseconds 500
 [FW]::SetForegroundWindow($orch)
 '''
+
+
+def prompt_worker(hwnd, worker_name, orch_hwnd, boot_memories=None):
+    """Send initialization prompt to a worker chat window via clipboard paste."""
+    prompt_text = _build_prompt_text(worker_name, boot_memories)
+    ps = _build_prompt_ps(hwnd, orch_hwnd, prompt_text)
     try:
         r = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
@@ -679,59 +680,47 @@ Start-Sleep -Milliseconds 500
 
 # ─── ScreenMemory Engine Integration ──────────────────
 
+# Engine connection specs: (module_path, class_name, label, constructor_kwargs)
+_ENGINE_SPECS = [
+    ("core.difficulty_router", "DAAORouter", "router",
+     "DAAORouter connected -- difficulty-aware routing active", {}),
+    ("core.dag_engine", "DAGBuilder", "dag_builder",
+     "DAGEngine connected -- workflow decomposition active", {}),
+    ("core.dag_engine", "DAGExecutor", "dag_executor",
+     None, {"max_feedback_loops": 3}),
+    ("core.input_guard", "InputGuard", "guard",
+     "InputGuard connected -- directive safety filtering active",
+     {"block_threshold": 0.75, "warn_threshold": 0.40}),
+    ("core.hybrid_retrieval", "HybridRetriever", "retriever",
+     "HybridRetriever connected -- memory-augmented context active", {}),
+    ("winctl", "Desktop", "desktop",
+     "Desktop (winctl) connected -- API-level window control active", {}),
+    ("core.orchestrator", "Orchestrator", "orchestrator",
+     "Orchestrator brain connected -- full pipeline active", {}),
+]
+
+
+def _try_connect_engine(module_path, class_name, label, success_msg, ctor_kwargs):
+    """Try to import and instantiate a single engine. Returns (key, instance) or None."""
+    try:
+        mod = __import__(module_path, fromlist=[class_name])
+        cls = getattr(mod, class_name)
+        instance = cls(**ctor_kwargs)
+        if success_msg:
+            log(success_msg, "OK")
+        return (label, instance)
+    except Exception as e:
+        log(f"{class_name} unavailable: {e}", "WARN")
+        return None
+
+
 def connect_engines():
     """Initialize ScreenMemory's core engines for orchestration."""
     engines = {}
-
-    # DAAORouter — difficulty-aware task routing
-    try:
-        from core.difficulty_router import DAAORouter
-        engines["router"] = DAAORouter()
-        log("DAAORouter connected — difficulty-aware routing active", "OK")
-    except Exception as e:
-        log(f"DAAORouter unavailable: {e}", "WARN")
-
-    # DAGEngine — workflow decomposition
-    try:
-        from core.dag_engine import DAGBuilder, DAGExecutor
-        engines["dag_builder"] = DAGBuilder()
-        engines["dag_executor"] = DAGExecutor(max_feedback_loops=3)
-        log("DAGEngine connected — workflow decomposition active", "OK")
-    except Exception as e:
-        log(f"DAGEngine unavailable: {e}", "WARN")
-
-    # InputGuard — safety filtering
-    try:
-        from core.input_guard import InputGuard
-        engines["guard"] = InputGuard(block_threshold=0.75, warn_threshold=0.40)
-        log("InputGuard connected — directive safety filtering active", "OK")
-    except Exception as e:
-        log(f"InputGuard unavailable: {e}", "WARN")
-
-    # HybridRetriever — memory-augmented context
-    try:
-        from core.hybrid_retrieval import HybridRetriever
-        engines["retriever"] = HybridRetriever()
-        log("HybridRetriever connected — memory-augmented context active", "OK")
-    except Exception as e:
-        log(f"HybridRetriever unavailable: {e}", "WARN")
-
-    # Desktop (winctl) — window management
-    try:
-        from winctl import Desktop
-        engines["desktop"] = Desktop()
-        log("Desktop (winctl) connected — API-level window control active", "OK")
-    except Exception as e:
-        log(f"Desktop unavailable: {e}", "WARN")
-
-    # Orchestrator — full pipeline
-    try:
-        from core.orchestrator import Orchestrator
-        engines["orchestrator"] = Orchestrator()
-        log("Orchestrator brain connected — full pipeline active", "OK")
-    except Exception as e:
-        log(f"Orchestrator unavailable: {e}", "WARN")
-
+    for module_path, class_name, label, success_msg, ctor_kwargs in _ENGINE_SPECS:
+        result = _try_connect_engine(module_path, class_name, label, success_msg, ctor_kwargs)
+        if result:
+            engines[result[0]] = result[1]
     return engines
 
 
@@ -952,47 +941,106 @@ def phase_2_dashboard():
     return False
 
 
+def _try_restore_saved_workers(orch_hwnd, num_workers):
+    """Check if saved workers are still alive. Returns list of alive workers or None."""
+    if not WORKERS_FILE.exists():
+        return None
+    saved = json.loads(WORKERS_FILE.read_text())
+    saved_workers = saved.get("workers", [])
+    still_alive = []
+    for idx, sw in enumerate(saved_workers):
+        hwnd = sw.get("hwnd")
+        if hwnd and user32.IsWindowVisible(hwnd):
+            still_alive.append(sw)
+            guard_model(hwnd, orch_hwnd)
+            log(f"Worker {sw['name']}: HWND={hwnd} still alive", "OK")
+            if idx < len(saved_workers) - 1:
+                time.sleep(3)
+    if len(still_alive) >= num_workers:
+        log(f"All {len(still_alive)} workers still connected", "OK")
+        return still_alive
+    return None
+
+
+def _guard_restored_session(hwnd, orch_hwnd):
+    """Apply model guard + permissions for a restored (non-fresh) worker window."""
+    guard_model(hwnd, orch_hwnd)
+    time.sleep(0.5)
+    guard_permissions(hwnd, orch_hwnd)
+    time.sleep(1)
+
+
+def _prompt_and_wait(hwnd, worker_name, orch_hwnd, boot_memories):
+    """Prompt a worker and wait briefly for its response."""
+    log(f"Prompting {worker_name.upper()}...", "SYS")
+    ok = prompt_worker(hwnd, worker_name, orch_hwnd, boot_memories=boot_memories)
+    log(f"Worker {worker_name.upper()} {'prompted' if ok else 'prompt may have failed'}", "OK" if ok else "WARN")
+    for _ in range(6):
+        time.sleep(1)
+        if chat_has_messages(hwnd):
+            log(f"Worker {worker_name.upper()} responded", "OK")
+            break
+
+
+def _open_single_worker(worker_idx, orch_hwnd, fresh, boot_memories, existing_chats):
+    """Open or restore a single worker window. Returns (worker_info, ok)."""
+    worker_name = WORKER_NAMES[worker_idx]
+    slot = GRID_SLOTS[worker_idx]
+    log(f"Opening worker {worker_name.upper()}...", "SYS")
+
+    new_hwnd, opened_fresh = None, False
+
+    if not fresh:
+        new_hwnd = restore_session_from_panel(f"Worker {worker_name.upper()}", orch_hwnd, slot)
+
+    if not new_hwnd:
+        if not fresh:
+            log(f"Session restore failed for {worker_name}, opening fresh window...", "WARN")
+        new_hwnd = open_chat_window(orch_hwnd)
+        opened_fresh = True
+        if not new_hwnd:
+            log(f"Could not open window for {worker_name}", "ERR")
+            return None, False
+        move_window(new_hwnd, slot["x"], slot["y"], slot["w"], slot["h"])
+        time.sleep(0.5)
+
+    if not opened_fresh:
+        _guard_restored_session(new_hwnd, orch_hwnd)
+
+    _prompt_and_wait(new_hwnd, worker_name, orch_hwnd, boot_memories)
+
+    worker_info = {
+        "name": worker_name, "hwnd": new_hwnd, "grid": slot["grid"],
+        "x": slot["x"], "y": slot["y"], "w": slot["w"], "h": slot["h"],
+    }
+    http_post(f"/directive?route={worker_name}", {
+        "goal": f"Worker {worker_name} initialized -- CLI chat HWND={new_hwnd} connected",
+        "priority": 1,
+    })
+    return worker_info, True
+
+
 def phase_3_workers(num_workers=4, orch_hwnd=None, fresh=False, boot_memories=None):
-    """Open worker chat windows, one at a time, with ghost mouse automation.
-    
-    Flow:
-    1. Try restoring sessions from SESSIONS panel (skip if --fresh)
-    2. Fall back to open_chat_window() which uses multi-strategy UIA automation
-    3. For each worker: open window → guard model → prompt → wait for response → open next
-    """
+    """Open worker chat windows, one at a time, with ghost mouse automation."""
     if not orch_hwnd:
         orch_hwnd = get_orchestrator_hwnd()
     if not orch_hwnd:
         log("No orchestrator HWND found in data/orchestrator.json", "ERR")
         return []
 
-    # Clear failure tracker to ensure clean start
+    # Clear failure tracker
     fail_file = DATA_DIR / "chat_open_failures.json"
     if fail_file.exists():
         fail_file.unlink()
         log("Cleared chat_open_failures.json", "SYS")
 
     existing_chats = get_chat_windows(orch_hwnd)
-    workers_created = []
 
-    # Check if workers already exist (reconnect mode) — skip if fresh
-    if not fresh and WORKERS_FILE.exists():
-        saved = json.loads(WORKERS_FILE.read_text())
-        saved_workers = saved.get("workers", [])
-        still_alive = []
-        for idx, sw in enumerate(saved_workers):
-            hwnd = sw.get("hwnd")
-            if hwnd and user32.IsWindowVisible(hwnd):
-                still_alive.append(sw)
-                guard_model(hwnd, orch_hwnd)
-                log(f"Worker {sw['name']}: HWND={hwnd} still alive", "OK")
-                # Stagger guard_model calls — VS Code freezes when UIA operations
-                # hit multiple windows in rapid succession
-                if idx < len(saved_workers) - 1:
-                    time.sleep(3)
-        if len(still_alive) >= num_workers:
-            log(f"All {len(still_alive)} workers still connected", "OK")
-            return still_alive
+    # Check saved workers (skip if fresh)
+    if not fresh:
+        saved = _try_restore_saved_workers(orch_hwnd, num_workers)
+        if saved:
+            return saved
 
     start_idx = len(existing_chats)
     num_to_open = min(num_workers, 4) - start_idx
@@ -1002,88 +1050,25 @@ def phase_3_workers(num_workers=4, orch_hwnd=None, fresh=False, boot_memories=No
 
     log(f"Opening {num_to_open} worker chat window(s)...", "SYS")
 
+    workers_created = []
     consecutive_failures = 0
-    MAX_CONSECUTIVE_FAILURES = 2
 
     for i in range(num_to_open):
-        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+        if consecutive_failures >= 2:
             log(f"Stopping: {consecutive_failures} consecutive failures opening chat windows", "ERR")
             break
-
         worker_idx = start_idx + i
         if worker_idx >= 4:
             break
-        worker_name = WORKER_NAMES[worker_idx]
-        slot = GRID_SLOTS[worker_idx]
 
-        log(f"Opening worker {worker_name.upper()}...", "SYS")
-
-        new_hwnd = None
-        opened_fresh = False
-
-        # Try restoring from SESSIONS panel first (skip if --fresh)
-        if not fresh:
-            new_hwnd = restore_session_from_panel(f"Worker {worker_name.upper()}", orch_hwnd, slot)
-        
-        if not new_hwnd:
-            if not fresh:
-                log(f"Session restore failed for {worker_name}, opening fresh window...", "WARN")
-
-            new_hwnd = open_chat_window(orch_hwnd)
-            opened_fresh = True
-
-            if not new_hwnd:
-                log(f"Could not open window for {worker_name}", "ERR")
-                consecutive_failures += 1
-                continue
-
-            move_window(new_hwnd, slot["x"], slot["y"], slot["w"], slot["h"])
-            time.sleep(0.5)
-
-        # Success — reset failure counter
-        consecutive_failures = 0
-
-        # Guard model + permissions ONLY for restored sessions.
-        # Fresh windows from new_chat.ps1 already have model guard + permission
-        # guard built in — calling them again can revert the state.
-        if not opened_fresh:
-            guard_model(new_hwnd, orch_hwnd)
-            time.sleep(0.5)
-            guard_permissions(new_hwnd, orch_hwnd)
-            time.sleep(1)
-
-        # Prompt the worker
-        log(f"Prompting {worker_name.upper()}...", "SYS")
-        ok = prompt_worker(new_hwnd, worker_name, orch_hwnd, boot_memories=boot_memories)
-        if ok:
-            log(f"Worker {worker_name.upper()} prompted", "OK")
+        worker_info, ok = _open_single_worker(worker_idx, orch_hwnd, fresh, boot_memories, existing_chats)
+        if ok and worker_info:
+            consecutive_failures = 0
+            workers_created.append(worker_info)
+            existing_chats.append({"hwnd": worker_info["hwnd"], "w": worker_info["w"]})
         else:
-            log(f"Prompt may have failed for {worker_name}", "WARN")
+            consecutive_failures += 1
 
-        # Brief wait for response (don't block long — open_chat_window has no empty-chat blocker)
-        for wait in range(6):
-            time.sleep(1)
-            if chat_has_messages(new_hwnd):
-                log(f"Worker {worker_name.upper()} responded", "OK")
-                break
-
-        worker_info = {
-            "name": worker_name,
-            "hwnd": new_hwnd,
-            "grid": slot["grid"],
-            "x": slot["x"], "y": slot["y"],
-            "w": slot["w"], "h": slot["h"],
-        }
-        workers_created.append(worker_info)
-        existing_chats.append({"hwnd": new_hwnd, "w": slot["w"]})
-
-        # Register with Skynet
-        http_post(f"/directive?route={worker_name}", {
-            "goal": f"Worker {worker_name} initialized -- CLI chat HWND={new_hwnd} connected",
-            "priority": 1,
-        })
-
-    # Restore orchestrator focus
     focus_window(orch_hwnd)
     return workers_created
 
@@ -1116,11 +1101,50 @@ def phase_4_register(workers):
         log(f"Registered {w['name'].upper()} with Skynet", "OK")
 
 
+def _build_identity_prompt(name, hwnd, orch_hwnd, profiles):
+    """Build the identity injection prompt for a single worker."""
+    profile = profiles.get(name, {})
+    role = profile.get("role", "worker")
+    specs = profile.get("specializations", [])
+    specs_str = ", ".join(specs) if specs else "general"
+    return (
+        f'You are {name.upper()} -- {role} in the Skynet multi-agent network. '
+        f'Your HWND is {hwnd}. You are running Claude Opus 4.6 fast in Copilot CLI mode. '
+        f'Connected to Skynet backend on port {SKYNET_PORT}. '
+        f'Your orchestrator is the main VS Code window (HWND {orch_hwnd}). '
+        f'Report results by posting to http://localhost:{SKYNET_PORT}/bus/publish with sender={name}. '
+        f'Your specializations: {specs_str}. '
+        f"Acknowledge your identity by posting: "
+        f"Invoke-RestMethod -Uri http://localhost:{SKYNET_PORT}/bus/publish "
+        f"-Method POST -ContentType 'application/json' "
+        f"-Body (ConvertTo-Json @{{sender='{name}';topic='orchestrator';"
+        f"type='identity_ack';content='{name.upper()} identity confirmed -- ready for tasks'}})"
+    )
+
+
+def _dispatch_single_identity(name, identity_prompt):
+    """Dispatch an identity prompt to a single worker. Returns True on success."""
+    try:
+        result = subprocess.run(
+            [PYTHON, str(ROOT / "tools" / "skynet_dispatch.py"),
+             "--worker", name, "--task", identity_prompt],
+            cwd=str(ROOT), timeout=30, capture_output=True, text=True,
+            env={**os.environ, "PYTHONPATH": str(ROOT)},
+        )
+        if result.returncode == 0:
+            log(f"Identity dispatched to {name.upper()}", "OK")
+            return True
+        log(f"Identity dispatch to {name.upper()} failed: {result.stderr[:100]}", "WARN")
+    except Exception as e:
+        log(f"Identity dispatch to {name.upper()} error: {e}", "WARN")
+    return False
+
+
 def phase_4b_identity(workers):
     """Inject identity prompts into each worker so they know who they are."""
     orch_hwnd = get_orchestrator_hwnd()
-    profiles_file = DATA_DIR / "agent_profiles.json"
     profiles = {}
+    profiles_file = DATA_DIR / "agent_profiles.json"
     try:
         if profiles_file.exists():
             profiles = json.loads(profiles_file.read_text(encoding="utf-8"))
@@ -1131,40 +1155,9 @@ def phase_4b_identity(workers):
     for w in workers:
         name = w.get("name", "unknown")
         hwnd = w.get("hwnd", 0)
-        profile = profiles.get(name, {})
-        role = profile.get("role", "worker")
-        specs = profile.get("specializations", [])
-        specs_str = ", ".join(specs) if specs else "general"
-
-        identity_prompt = (
-            f'You are {name.upper()} -- {role} in the Skynet multi-agent network. '
-            f'Your HWND is {hwnd}. You are running Claude Opus 4.6 fast in Copilot CLI mode. '
-            f'Connected to Skynet backend on port {SKYNET_PORT}. '
-            f'Your orchestrator is the main VS Code window (HWND {orch_hwnd}). '
-            f'Report results by posting to http://localhost:{SKYNET_PORT}/bus/publish with sender={name}. '
-            f'Your specializations: {specs_str}. '
-            f"Acknowledge your identity by posting: "
-            f"Invoke-RestMethod -Uri http://localhost:{SKYNET_PORT}/bus/publish "
-            f"-Method POST -ContentType 'application/json' "
-            f"-Body (ConvertTo-Json @{{sender='{name}';topic='orchestrator';"
-            f"type='identity_ack';content='{name.upper()} identity confirmed -- ready for tasks'}})"
-        )
-
-        try:
-            result = subprocess.run(
-                [PYTHON, str(ROOT / "tools" / "skynet_dispatch.py"),
-                 "--worker", name, "--task", identity_prompt],
-                cwd=str(ROOT), timeout=30, capture_output=True, text=True,
-                env={**os.environ, "PYTHONPATH": str(ROOT)},
-            )
-            if result.returncode == 0:
-                log(f"Identity dispatched to {name.upper()}", "OK")
-                dispatched += 1
-            else:
-                log(f"Identity dispatch to {name.upper()} failed: {result.stderr[:100]}", "WARN")
-        except Exception as e:
-            log(f"Identity dispatch to {name.upper()} error: {e}", "WARN")
-
+        prompt = _build_identity_prompt(name, hwnd, orch_hwnd, profiles)
+        if _dispatch_single_identity(name, prompt):
+            dispatched += 1
         time.sleep(3)
 
     # Post orchestrator's own identity
@@ -1186,6 +1179,12 @@ def phase_5_save(workers, engines):
     """Save worker state and engine status."""
     DATA_DIR.mkdir(exist_ok=True)
 
+    now_iso = datetime.now().isoformat()
+    # Ensure each worker entry has last_seen and updated_at ISO timestamps  # signed: delta
+    for w in workers:
+        w.setdefault("last_seen", now_iso)
+        w["updated_at"] = now_iso
+
     state = {
         "workers": workers,
         "layout": "2x2",
@@ -1193,7 +1192,7 @@ def phase_5_save(workers, engines):
         "skynet_port": SKYNET_PORT,
         "god_console_port": GOD_PORT,
         "engines": list(engines.keys()),
-        "created": datetime.now().isoformat(),
+        "created": now_iso,
     }
     WORKERS_FILE.write_text(json.dumps(state, indent=2, default=str))
     log(f"State saved to {WORKERS_FILE}", "OK")
@@ -1201,67 +1200,79 @@ def phase_5_save(workers, engines):
 
 # ─── Status Report ────────────────────────────────────
 
-def show_status():
-    """Show complete system status."""
-    print("\n" + "=" * 60)
-    print("  SKYNET SYSTEM STATUS")
-    print("=" * 60)
-
-    # Backend
+def _show_backend_status():
+    """Print Skynet backend and GOD Console status."""
     if port_open(SKYNET_PORT):
         status = http_get("/status")
         if status:
-            print(f"\n🟢 Skynet v{status.get('version', '?')} — port {SKYNET_PORT}")
-            agents = status.get("agents", {})
-            for name, info in agents.items():
+            print(f"\n🟢 Skynet v{status.get('version', '?')} -- port {SKYNET_PORT}")
+            for name, info in status.get("agents", {}).items():
                 s = info.get("status", "?")
                 tc = info.get("tasks_completed", 0)
                 qd = info.get("queue_depth", 0)
                 emoji = "🟢" if s == "IDLE" else "🔵" if s == "BUSY" else "🔴"
                 print(f"  {emoji} {name.upper()}: {s} | tasks={tc} | queue={qd}")
     else:
-        print(f"\n🔴 Skynet — port {SKYNET_PORT} NOT running")
+        print(f"\n🔴 Skynet -- port {SKYNET_PORT} NOT running")
 
-    # Dashboard
-    if port_open(GOD_PORT):
-        print(f"\n🟢 GOD Console — port {GOD_PORT}")
-    else:
-        print(f"\n🔴 GOD Console — port {GOD_PORT} NOT running")
+    dash_emoji = "🟢" if port_open(GOD_PORT) else "🔴"
+    dash_state = "" if port_open(GOD_PORT) else " NOT running"
+    print(f"\n{dash_emoji} GOD Console -- port {GOD_PORT}{dash_state}")
 
-    # Workers
-    if WORKERS_FILE.exists():
-        data = json.loads(WORKERS_FILE.read_text())
-        workers = data.get("workers", [])
-        print(f"\n📋 Workers ({len(workers)}):")
-        for w in workers:
-            hwnd = w.get("hwnd", 0)
-            alive = user32.IsWindowVisible(hwnd) if hwnd else False
-            emoji = "🟢" if alive else "🔴"
-            print(f"  {emoji} {w['name'].upper()}: HWND={hwnd} | {w.get('grid', '?')}")
-        engines = data.get("engines", [])
-        if engines:
-            print(f"\n⚡ Engines: {', '.join(engines)}")
-    else:
+
+def _show_worker_status():
+    """Print worker window status from workers.json."""
+    if not WORKERS_FILE.exists():
         print("\n📋 No workers.json found")
+        return
+    data = json.loads(WORKERS_FILE.read_text())
+    workers = data.get("workers", [])
+    print(f"\n📋 Workers ({len(workers)}):")
+    for w in workers:
+        hwnd = w.get("hwnd", 0)
+        alive = user32.IsWindowVisible(hwnd) if hwnd else False
+        emoji = "🟢" if alive else "🔴"
+        print(f"  {emoji} {w['name'].upper()}: HWND={hwnd} | {w.get('grid', '?')}")
+    engines = data.get("engines", [])
+    if engines:
+        print(f"\n⚡ Engines: {', '.join(engines)}")
 
-    # Orchestrator
+
+def show_status():
+    """Show complete system status."""
+    print("\n" + "=" * 60)
+    print("  SKYNET SYSTEM STATUS")
+    print("=" * 60)
+    _show_backend_status()
+    _show_worker_status()
     orch = get_orchestrator_hwnd()
     if orch:
         alive = user32.IsWindowVisible(orch)
         emoji = "🟢" if alive else "🔴"
         print(f"\n{emoji} Orchestrator: HWND={orch}")
-
     print("\n" + "=" * 60)
 
 
 # ─── Reconnect Mode ──────────────────────────────────
+
+def _classify_workers(workers):
+    """Split worker list into (alive, dead) based on window visibility."""
+    alive, dead = [], []
+    for w in workers:
+        hwnd = w.get("hwnd", 0)
+        if hwnd and user32.IsWindowVisible(hwnd):
+            alive.append(w)
+        else:
+            dead.append(w)
+    return alive, dead
+
 
 def reconnect():
     """Reconnect to existing workers without opening new windows."""
     log("Reconnecting to existing workers...", "SYS")
 
     if not phase_1_backend():
-        log("Reconnect aborted — Skynet backend required", "ERR")
+        log("Reconnect aborted -- Skynet backend required", "ERR")
         return False
     phase_2_dashboard()
 
@@ -1271,158 +1282,122 @@ def reconnect():
         return False
 
     if not WORKERS_FILE.exists():
-        log("No workers.json — nothing to reconnect", "ERR")
+        log("No workers.json -- nothing to reconnect", "ERR")
         return False
 
     data = json.loads(WORKERS_FILE.read_text())
-    workers = data.get("workers", [])
-    alive = []
-    dead = []
+    alive, dead = _classify_workers(data.get("workers", []))
 
-    for w in workers:
-        hwnd = w.get("hwnd", 0)
-        if hwnd and user32.IsWindowVisible(hwnd):
-            alive.append(w)
-            log(f"Worker {w['name'].upper()}: HWND={hwnd} ✓", "OK")
-        else:
-            dead.append(w)
-            log(f"Worker {w['name'].upper()}: HWND={hwnd} ✗ (dead)", "WARN")
-
+    for w in alive:
+        log(f"Worker {w['name'].upper()}: HWND={w.get('hwnd', 0)} alive", "OK")
+    for w in dead:
+        log(f"Worker {w['name'].upper()}: HWND={w.get('hwnd', 0)} dead", "WARN")
     if dead:
-        log(f"{len(dead)} worker(s) dead — need to reopen", "WARN")
+        log(f"{len(dead)} worker(s) dead -- need to reopen", "WARN")
 
-    # Connect engines
     engines = connect_engines()
-
-    # Re-register alive workers
     phase_4_register(alive)
 
-    # Identity injection for reconnected workers
     if alive:
         log("Reconnect: Identity Injection", "SYS")
         phase_4b_identity(alive)
 
     _start_post_boot_daemons()
 
-    # Update state
-    data["engines"] = list(engines.keys())
-    data["reconnected"] = datetime.now().isoformat()
-    WORKERS_FILE.write_text(json.dumps(data, indent=2, default=str))
+    now_iso = datetime.now().isoformat()
+    # Update timestamps on reconnected workers  # signed: delta
+    for w in data.get("workers", []):
+        w["updated_at"] = now_iso
+        w.setdefault("last_seen", now_iso)
 
+    data["engines"] = list(engines.keys())
+    data["reconnected"] = now_iso
+    WORKERS_FILE.write_text(json.dumps(data, indent=2, default=str))
     return True
 
 
 # ─── Window Hygiene ───────────────────────────────────
 
-WM_CLOSE = 0x0010
+# Essential title substrings (case-insensitive) and system window classes
+_ESSENTIAL_TITLES = [
+    "visual studio code", "screenmemory", "skynet", "god console",
+    "windows terminal", "powershell", "cmd.exe", "task manager", "explorer",
+]
+_SYSTEM_CLASSES = [
+    "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW",
+    "NotifyIconOverflowWindow", "Windows.UI.Core.CoreWindow", "ApplicationFrameWindow",
+]
 
-def close_non_essential_windows():
-    """Close all windows that are not Skynet-essential.
-    
-    Essential windows: orchestrator VS Code, worker VS Code windows,
-    GOD Console browser tab, and any window whose title contains
-    'ScreenMemory' or 'Skynet'.
-    
-    Uses Win32 API only — no pyautogui, no SendKeys, no mouse simulation.
-    Can be called standalone or as part of bootstrap.
-    """
+
+def _build_essential_hwnds():
+    """Build the set of HWNDs that must never be closed."""
+    essential = set()
     orch_hwnd = get_orchestrator_hwnd()
-    
-    # Load worker HWNDs
-    worker_hwnds = set()
+    if orch_hwnd:
+        essential.add(int(orch_hwnd))
     if WORKERS_FILE.exists():
         try:
             wdata = json.loads(WORKERS_FILE.read_text())
             for w in wdata.get("workers", []):
                 h = w.get("hwnd")
                 if h:
-                    worker_hwnds.add(int(h))
+                    essential.add(int(h))
         except Exception:
             pass
-    
-    essential_hwnds = set()
-    if orch_hwnd:
-        essential_hwnds.add(int(orch_hwnd))
-    essential_hwnds.update(worker_hwnds)
-    
-    # Essential title substrings (case-insensitive)
-    essential_titles = [
-        "visual studio code",
-        "screenmemory",
-        "skynet",
-        "god console",
-        "windows terminal",
-        "powershell",
-        "cmd.exe",
-        "task manager",
-        "explorer",  # Windows Explorer shell
-    ]
-    
-    # System process classes to never touch
-    system_classes = [
-        "Shell_TrayWnd",          # Taskbar
-        "Shell_SecondaryTrayWnd",  # Secondary taskbar
-        "Progman",                 # Desktop
-        "WorkerW",                 # Desktop wallpaper
-        "NotifyIconOverflowWindow",
-        "Windows.UI.Core.CoreWindow",
-        "ApplicationFrameWindow",  # UWP host (Settings, etc.)
-    ]
-    
+    return essential
+
+
+def _is_closeable_window(hwnd, essential_hwnds):
+    """Check if a visible window should be closed. Returns (should_close, description)."""
+    if int(hwnd) in essential_hwnds:
+        return False, None
+
+    buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, buf, 512)
+    title = buf.value.strip()
+    if not title:
+        return False, None
+
+    cls_buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, cls_buf, 256)
+    cls_name = cls_buf.value
+
+    if cls_name in _SYSTEM_CLASSES:
+        return False, None
+
+    title_lower = title.lower()
+    if any(et in title_lower for et in _ESSENTIAL_TITLES):
+        return False, None
+
+    rect = ctypes.wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    if (rect.right - rect.left) < 50 or (rect.bottom - rect.top) < 50:
+        return False, None
+
+    return True, f"{title[:60]} (class={cls_name})"
+
+
+def close_non_essential_windows():
+    """Close all windows that are not Skynet-essential using Win32 API only."""
+    essential_hwnds = _build_essential_hwnds()
     closed = []
-    skipped = []
-    
+
     @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
     def enum_cb(hwnd, lparam):
         if not user32.IsWindowVisible(hwnd):
             return True
-        
-        # Skip essential HWNDs
-        if int(hwnd) in essential_hwnds:
-            return True
-        
-        # Get window title
-        buf = ctypes.create_unicode_buffer(512)
-        user32.GetWindowTextW(hwnd, buf, 512)
-        title = buf.value.strip()
-        if not title:
-            return True
-        
-        # Get window class
-        cls_buf = ctypes.create_unicode_buffer(256)
-        user32.GetClassNameW(hwnd, cls_buf, 256)
-        cls_name = cls_buf.value
-        
-        # Skip system classes
-        if cls_name in system_classes:
-            return True
-        
-        # Skip essential titles
-        title_lower = title.lower()
-        for et in essential_titles:
-            if et in title_lower:
-                skipped.append(f"  [KEEP] {title[:60]}")
-                return True
-        
-        # Skip windows with no meaningful size (background/hidden)
-        rect = ctypes.wintypes.RECT()
-        user32.GetWindowRect(hwnd, ctypes.byref(rect))
-        w = rect.right - rect.left
-        h = rect.bottom - rect.top
-        if w < 50 or h < 50:
-            return True
-        
-        # This window is non-essential — close it via WM_CLOSE
-        user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
-        closed.append(f"  [CLOSED] {title[:60]} (class={cls_name})")
+        should_close, desc = _is_closeable_window(hwnd, essential_hwnds)
+        if should_close:
+            user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+            closed.append(desc)
         return True
-    
+
     user32.EnumWindows(enum_cb, 0)
-    
+
     if closed:
         log(f"Window hygiene: closed {len(closed)} non-essential window(s)", "OK")
         for c in closed:
-            log(c, "INFO")
+            log(f"  [CLOSED] {c}", "INFO")
     else:
         log("Window hygiene: all windows are Skynet-essential", "OK")
 
@@ -1650,12 +1625,71 @@ def _start_post_boot_daemons():
 
 # ─── Main ─────────────────────────────────────────────
 
+def _run_full_bootstrap(args):
+    """Execute the full multi-phase bootstrap sequence."""
+    t0 = time.time()
+
+    # Phase 0: Persistent Memory Preload
+    log("Phase 0: Persistent Memory Preload", "SYS")
+    boot_memories = _phase_0_memory_preload()
+    atexit.register(_save_session_memories)
+    _schedule_memory_consolidation(interval_s=600)
+
+    # Phase 1: Backend
+    log("Phase 1: Skynet Backend", "SYS")
+    if not phase_1_backend():
+        log("ABORT -- Skynet backend required", "ERR")
+        return
+
+    # Phase 2: Dashboard
+    log("Phase 2: GOD Console", "SYS")
+    phase_2_dashboard()
+
+    try:
+        _set_boot_phase("phase_3_workers")
+        log("Phase 3: Worker Chat Windows", "SYS")
+        workers = phase_3_workers(num_workers=args.workers, fresh=args.fresh, boot_memories=boot_memories)
+
+        _set_boot_phase("phase_4_register")
+        log("Phase 4: Skynet Registration", "SYS")
+        if workers:
+            phase_4_register(workers)
+
+        _set_boot_phase("phase_4b_identity")
+        log("Phase 4b: Identity Injection", "SYS")
+        if workers:
+            phase_4b_identity(workers)
+
+        _set_boot_phase("phase_5_engines")
+        log("Phase 5: ScreenMemory Engines", "SYS")
+        engines = connect_engines()
+
+        _set_boot_phase("phase_6_save")
+        log("Phase 6: Save State", "SYS")
+        phase_5_save(workers, engines)
+    finally:
+        _clear_boot_phase()
+        log("Boot phase lock released", "OK")
+
+    log("Phase 7: Window Hygiene", "SYS")
+    close_non_essential_windows()
+
+    elapsed = time.time() - t0
+    log(f"SKYNET ONLINE -- {len(workers)} workers, {len(engines)} engines -- {elapsed:.1f}s", "OK")
+
+    log("Phase 8: Background Daemons", "SYS")
+    _start_post_boot_daemons()
+
+    print()
+    show_status()
+
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Skynet Start — Unified Orchestrator Bootstrap")
+    parser = argparse.ArgumentParser(description="Skynet Start -- Unified Orchestrator Bootstrap")
     parser.add_argument("--workers", type=int, default=4, help="Number of workers (1-4)")
     parser.add_argument("--reconnect", action="store_true", help="Reconnect to existing workers")
-    parser.add_argument("--fresh", action="store_true", help="Skip session restore, open fresh windows via new_chat.ps1")
+    parser.add_argument("--fresh", action="store_true", help="Skip session restore, open fresh windows")
     parser.add_argument("--status", action="store_true", help="Show system status")
     parser.add_argument("--dispatch", type=str, help="Dispatch a task to Skynet")
     parser.add_argument("--worker", type=str, help="Target worker for dispatch")
@@ -1666,10 +1700,10 @@ def main():
         return
 
     print()
-    print("╔══════════════════════════════════════════╗")
-    print("║       ⚡ SKYNET ORCHESTRATOR v3.0 ⚡      ║")
-    print("║   ScreenMemory-Powered Multi-Agent AI    ║")
-    print("╚══════════════════════════════════════════╝")
+    print("+" + "=" * 42 + "+")
+    print("|       SKYNET ORCHESTRATOR v3.0           |")
+    print("|   ScreenMemory-Powered Multi-Agent AI    |")
+    print("+" + "=" * 42 + "+")
     print()
 
     if args.dispatch:
@@ -1683,70 +1717,7 @@ def main():
         show_status()
         return
 
-    t0 = time.time()
-
-    # Phase 0: Persistent Memory Preload
-    log("Phase 0: Persistent Memory Preload", "SYS")
-    boot_memories = _phase_0_memory_preload()
-    atexit.register(_save_session_memories)
-    _schedule_memory_consolidation(interval_s=600)
-
-    # Phase 1: Backend
-    log("Phase 1: Skynet Backend", "SYS")
-    if not phase_1_backend():
-        log("ABORT — Skynet backend required", "ERR")
-        return
-
-    # Phase 2: Dashboard
-    log("Phase 2: GOD Console", "SYS")
-    phase_2_dashboard()
-
-    try:
-        # Phase 3: Workers (set boot lock — prevents self-prompt daemon from firing during UIA-heavy phases)
-        _set_boot_phase("phase_3_workers")
-        log("Phase 3: Worker Chat Windows", "SYS")
-        workers = phase_3_workers(num_workers=args.workers, fresh=args.fresh, boot_memories=boot_memories)
-
-        # Phase 4: Register
-        _set_boot_phase("phase_4_register")
-        log("Phase 4: Skynet Registration", "SYS")
-        if workers:
-            phase_4_register(workers)
-
-        # Phase 4b: Identity Injection
-        _set_boot_phase("phase_4b_identity")
-        log("Phase 4b: Identity Injection", "SYS")
-        if workers:
-            phase_4b_identity(workers)
-
-        # Phase 5: Engines
-        _set_boot_phase("phase_5_engines")
-        log("Phase 5: ScreenMemory Engines", "SYS")
-        engines = connect_engines()
-
-        # Phase 6: Save state
-        _set_boot_phase("phase_6_save")
-        log("Phase 6: Save State", "SYS")
-        phase_5_save(workers, engines)
-    finally:
-        # Boot lock released — UIA-heavy phases complete, daemons may resume
-        # In a finally block so the lock is always cleared, even on crash
-        _clear_boot_phase()
-        log("Boot phase lock released", "OK")
-
-    # Phase 7: Window hygiene
-    log("Phase 7: Window Hygiene", "SYS")
-    close_non_essential_windows()
-
-    elapsed = time.time() - t0
-    log(f"SKYNET ONLINE — {len(workers)} workers, {len(engines)} engines — {elapsed:.1f}s", "OK")
-
-    # Phase 8: Background daemons
-    log("Phase 8: Background Daemons", "SYS")
-    _start_post_boot_daemons()
-
-    print()
-    show_status()
+    _run_full_bootstrap(args)
 
 
 if __name__ == "__main__":

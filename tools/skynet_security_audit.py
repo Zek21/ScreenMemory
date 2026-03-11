@@ -164,48 +164,32 @@ def _load_json(path: Path) -> Optional[dict]:
 
 # ── Audit Functions ──────────────────────────────────────────────
 
-def audit_dispatch_pipeline() -> AuditResult:
-    """Audit the full dispatch pipeline for security gaps."""
-    r = AuditResult()
-
-    # Check 1: validate_hwnd is wired into dispatch_to_worker
-    dispatch_src = (TOOLS_DIR / "skynet_dispatch.py").read_text(encoding="utf-8")
-
+def _audit_dispatch_source_check(r, dispatch_src):
+    """Run source-level security checks on dispatch pipeline."""
     if "validate_hwnd" in dispatch_src:
         r.ok("dispatch_hwnd_validation", "validate_hwnd() call found in dispatch pipeline")
     else:
         r.crit("dispatch_hwnd_validation",
                "NO validate_hwnd() in dispatch_to_worker -- HWND injection possible")
 
-    # Check 2: ghost_type_to_worker exists and uses clipboard safely
     if "Clipboard]::SetText" in dispatch_src and "savedClip" in dispatch_src:
         r.ok("clipboard_save_restore", "Clipboard save/restore pattern found")
     else:
         r.fail("clipboard_save_restore", "Clipboard may not be saved/restored during dispatch")
 
-    # Check 3: Self-dispatch guard exists
     if "_get_self_identity" in dispatch_src or "self-dispatch" in dispatch_src.lower():
         r.ok("self_dispatch_guard", "Self-dispatch prevention found")
     else:
         r.warn("self_dispatch_guard", "No explicit self-dispatch guard detected")
 
-    # Check 4: Dispatch log exists and is writable
-    if DISPATCH_LOG.exists():
-        log = _load_json(DISPATCH_LOG)
-        if isinstance(log, list):
-            r.ok("dispatch_log_integrity", f"Dispatch log has {len(log)} entries")
-        else:
-            r.warn("dispatch_log_integrity", "Dispatch log exists but is not a valid list")
-    else:
-        r.warn("dispatch_log_integrity", "No dispatch log file found")
-
-    # Check 5: HMAC dispatch signing
     if "sign_dispatch" in dispatch_src or "hmac" in dispatch_src.lower():
         r.ok("dispatch_signing", "Dispatch signing/HMAC found")
     else:
         r.warn("dispatch_signing", "No HMAC dispatch signing detected")
 
-    # Check 6: skynet_delivery.py has HWND validation
+
+def _audit_delivery_module(r):
+    """Audit skynet_delivery.py for HWND validation."""
     delivery_path = TOOLS_DIR / "skynet_delivery.py"
     if delivery_path.exists():
         delivery_src = delivery_path.read_text(encoding="utf-8")
@@ -218,14 +202,81 @@ def audit_dispatch_pipeline() -> AuditResult:
     else:
         r.fail("delivery_hwnd_validation", "skynet_delivery.py not found")
 
-    # Check 7: Workers.json is read-only or protected
+
+def audit_dispatch_pipeline() -> AuditResult:
+    """Audit the full dispatch pipeline for security gaps."""
+    r = AuditResult()
+    dispatch_src = (TOOLS_DIR / "skynet_dispatch.py").read_text(encoding="utf-8")
+
+    _audit_dispatch_source_check(r, dispatch_src)
+
+    # Dispatch log integrity
+    if DISPATCH_LOG.exists():
+        log = _load_json(DISPATCH_LOG)
+        if isinstance(log, list):
+            r.ok("dispatch_log_integrity", f"Dispatch log has {len(log)} entries")
+        else:
+            r.warn("dispatch_log_integrity", "Dispatch log exists but is not a valid list")
+    else:
+        r.warn("dispatch_log_integrity", "No dispatch log file found")
+
+    _audit_delivery_module(r)
+
     if WORKERS_FILE.exists():
-        # Check if file permissions are reasonable (not world-writable on Windows)
         r.ok("workers_file_exists", f"workers.json exists at {WORKERS_FILE}")
     else:
         r.fail("workers_file_exists", "workers.json not found")
 
     return r
+
+
+def _analyze_bus_messages(r, messages):
+    """Analyze bus messages for security issues (size, injection, unknown senders)."""
+    valid_senders = {"alpha", "beta", "gamma", "delta", "orchestrator",
+                     "convene-gate", "monitor", "system", "delivery",
+                     "consultant", "gemini_consultant", "god_bridge",
+                     "watchdog", "self-prompt", "learner", "brain"}
+
+    oversized = 0
+    suspicious = 0
+    spoofed_topics = 0
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            r.fail("bus_message_format", f"Non-dict message found: {type(msg)}")
+            continue
+
+        content = msg.get("content", "")
+        sender = msg.get("sender", "")
+
+        if len(json.dumps(msg)) > BUS_MAX_PAYLOAD_BYTES:
+            oversized += 1
+
+        for pattern in BUS_SUSPICIOUS_PATTERNS:
+            if re.search(pattern, content, re.IGNORECASE):
+                suspicious += 1
+                r.warn("bus_suspicious_content",
+                       f"Suspicious pattern '{pattern}' from sender={sender}: "
+                       f"{content[:100]}")
+                break
+
+        if sender and sender not in valid_senders:
+            spoofed_topics += 1
+
+    if oversized:
+        r.warn("bus_oversized_payloads", f"{oversized} messages exceed {BUS_MAX_PAYLOAD_BYTES}B")
+    else:
+        r.ok("bus_payload_sizes", "All messages within size limits")
+
+    if suspicious:
+        r.fail("bus_injection_attempts", f"{suspicious} messages contain suspicious patterns")
+    else:
+        r.ok("bus_injection_scan", "No injection patterns detected")
+
+    if spoofed_topics:
+        r.warn("bus_unknown_senders", f"{spoofed_topics} messages from unknown senders")
+    else:
+        r.ok("bus_sender_verification", "All senders are known entities")
 
 
 def audit_bus_messages(limit: int = 100) -> AuditResult:
@@ -246,57 +297,43 @@ def audit_bus_messages(limit: int = 100) -> AuditResult:
         return r
 
     r.ok("bus_connectivity", f"Retrieved {len(messages)} bus messages")
-
-    oversized = 0
-    suspicious = 0
-    spoofed_topics = 0
-    valid_senders = {"alpha", "beta", "gamma", "delta", "orchestrator",
-                     "convene-gate", "monitor", "system", "delivery",
-                     "consultant", "gemini_consultant", "god_bridge",
-                     "watchdog", "self-prompt", "learner", "brain"}
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            r.fail("bus_message_format", f"Non-dict message found: {type(msg)}")
-            continue
-
-        content = msg.get("content", "")
-        sender = msg.get("sender", "")
-        topic = msg.get("topic", "")
-
-        # Check payload size
-        if len(json.dumps(msg)) > BUS_MAX_PAYLOAD_BYTES:
-            oversized += 1
-
-        # Check for suspicious patterns in content
-        for pattern in BUS_SUSPICIOUS_PATTERNS:
-            if re.search(pattern, content, re.IGNORECASE):
-                suspicious += 1
-                r.warn("bus_suspicious_content",
-                       f"Suspicious pattern '{pattern}' from sender={sender}: "
-                       f"{content[:100]}")
-                break
-
-        # Check for unknown senders
-        if sender and sender not in valid_senders:
-            spoofed_topics += 1
-
-    if oversized:
-        r.warn("bus_oversized_payloads", f"{oversized} messages exceed {BUS_MAX_PAYLOAD_BYTES}B")
-    else:
-        r.ok("bus_payload_sizes", "All messages within size limits")
-
-    if suspicious:
-        r.fail("bus_injection_attempts", f"{suspicious} messages contain suspicious patterns")
-    else:
-        r.ok("bus_injection_scan", "No injection patterns detected")
-
-    if spoofed_topics:
-        r.warn("bus_unknown_senders", f"{spoofed_topics} messages from unknown senders")
-    else:
-        r.ok("bus_sender_verification", "All senders are known entities")
+    _analyze_bus_messages(r, messages)
 
     return r
+
+
+def _validate_worker_entry(r, w, seen_names, seen_hwnds, stale_entries):
+    """Validate a single worker registry entry."""
+    name = w.get("name", "?")
+    hwnd = w.get("hwnd", 0)
+
+    if name in seen_names:
+        r.fail("registry_duplicate_name", f"Duplicate worker name: {name}")
+    seen_names.add(name)
+
+    if hwnd in seen_hwnds:
+        r.fail("registry_duplicate_hwnd", f"Duplicate HWND {hwnd} for {name}")
+    seen_hwnds.add(hwnd)
+
+    if hwnd:
+        valid, pid, proc, title = _is_vscode_hwnd(hwnd)
+        if valid:
+            r.ok(f"registry_hwnd_{name}", f"HWND {hwnd} is alive, pid={pid}, proc={proc}")
+        elif _is_window(hwnd):
+            r.warn(f"registry_hwnd_{name}", f"HWND {hwnd} alive but NOT VS Code: proc={proc}")
+        else:
+            r.fail(f"registry_hwnd_{name}", f"HWND {hwnd} is DEAD (IsWindow=False)")
+            stale_entries.append(name)
+    else:
+        r.fail(f"registry_hwnd_{name}", f"HWND is zero for {name}")
+
+    # Grid position bounds check
+    x, y = w.get("x", 0), w.get("y", 0)
+    width, h = w.get("w", 0), w.get("h", 0)
+    for label, val, bounds in [("x", x, _GRID_BOUNDS["x"]), ("y", y, _GRID_BOUNDS["y"]),
+                                ("w", width, _GRID_BOUNDS["w"]), ("h", h, _GRID_BOUNDS["h"])]:
+        if not (bounds[0] <= val <= bounds[1]):
+            r.warn(f"registry_grid_{name}", f"{label}={val} out of bounds")
 
 
 def audit_worker_registry(auto_fix: bool = False) -> AuditResult:
@@ -326,46 +363,7 @@ def audit_worker_registry(auto_fix: bool = False) -> AuditResult:
     stale_entries = []
 
     for w in workers:
-        name = w.get("name", "?")
-        hwnd = w.get("hwnd", 0)
-
-        # Duplicate name check
-        if name in seen_names:
-            r.fail("registry_duplicate_name", f"Duplicate worker name: {name}")
-        seen_names.add(name)
-
-        # Duplicate HWND check
-        if hwnd in seen_hwnds:
-            r.fail("registry_duplicate_hwnd", f"Duplicate HWND {hwnd} for {name}")
-        seen_hwnds.add(hwnd)
-
-        # HWND liveness check
-        if hwnd:
-            valid, pid, proc, title = _is_vscode_hwnd(hwnd)
-            if valid:
-                r.ok(f"registry_hwnd_{name}",
-                     f"HWND {hwnd} is alive, pid={pid}, proc={proc}")
-            elif _is_window(hwnd):
-                r.warn(f"registry_hwnd_{name}",
-                       f"HWND {hwnd} alive but NOT VS Code: proc={proc}")
-            else:
-                r.fail(f"registry_hwnd_{name}",
-                       f"HWND {hwnd} is DEAD (IsWindow=False)")
-                stale_entries.append(name)
-        else:
-            r.fail(f"registry_hwnd_{name}", f"HWND is zero for {name}")
-
-        # Grid position bounds check
-        x, y = w.get("x", 0), w.get("y", 0)
-        width, h = w.get("w", 0), w.get("h", 0)
-        if not (_GRID_BOUNDS["x"][0] <= x <= _GRID_BOUNDS["x"][1]):
-            r.warn(f"registry_grid_{name}", f"x={x} out of bounds")
-        if not (_GRID_BOUNDS["y"][0] <= y <= _GRID_BOUNDS["y"][1]):
-            r.warn(f"registry_grid_{name}", f"y={y} out of bounds")
-        if not (_GRID_BOUNDS["w"][0] <= width <= _GRID_BOUNDS["w"][1]):
-            r.warn(f"registry_grid_{name}", f"w={width} out of bounds")
-        if not (_GRID_BOUNDS["h"][0] <= h <= _GRID_BOUNDS["h"][1]):
-            r.warn(f"registry_grid_{name}", f"h={h} out of bounds")
+        _validate_worker_entry(r, w, seen_names, seen_hwnds, stale_entries)
 
     if stale_entries and auto_fix:
         r.warn("registry_auto_fix",
@@ -374,86 +372,92 @@ def audit_worker_registry(auto_fix: bool = False) -> AuditResult:
     return r
 
 
+def _audit_brain_config(r):
+    """Audit brain_config.json for required keys and compliance guard."""
+    if not BRAIN_CONFIG.exists():
+        r.warn("config_brain_exists", "brain_config.json not found")
+        return
+    bc = _load_json(BRAIN_CONFIG)
+    if bc is None:
+        r.fail("config_brain_json", "brain_config.json is not valid JSON")
+        return
+    r.ok("config_brain_json", "brain_config.json is valid JSON")
+    for key in ["difficulty_thresholds", "routing", "learning", "compliance"]:
+        if key in bc:
+            r.ok(f"config_brain_{key}", f"Required key '{key}' present")
+        else:
+            r.fail(f"config_brain_{key}", f"Required key '{key}' MISSING")
+    comp = bc.get("compliance", {})
+    if comp.get("guard_enabled", False):
+        r.ok("config_compliance_guard", "Compliance guard is enabled")
+    else:
+        r.warn("config_compliance_guard", "Compliance guard is DISABLED")
+
+
+def _audit_orchestrator_config(r):
+    """Audit orchestrator.json for valid HWND and role."""
+    if not ORCH_FILE.exists():
+        r.warn("config_orch_exists", "orchestrator.json not found")
+        return
+    oc = _load_json(ORCH_FILE)
+    if oc is None:
+        r.fail("config_orch_json", "orchestrator.json is not valid JSON")
+        return
+    r.ok("config_orch_json", "orchestrator.json is valid JSON")
+    hwnd = oc.get("hwnd") or oc.get("orchestrator_hwnd") or 0
+    if hwnd:
+        if _is_window(hwnd):
+            r.ok("config_orch_hwnd", f"Orchestrator HWND {hwnd} is alive")
+        else:
+            r.fail("config_orch_hwnd", f"Orchestrator HWND {hwnd} is DEAD")
+    else:
+        r.fail("config_orch_hwnd", "No orchestrator HWND set")
+    if oc.get("role") == "orchestrator":
+        r.ok("config_orch_role", "Role is correctly 'orchestrator'")
+    else:
+        r.warn("config_orch_role", f"Role is '{oc.get('role')}' not 'orchestrator'")
+
+
+def _audit_agent_profiles(r):
+    """Audit agent_profiles.json for completeness."""
+    if not AGENT_PROFILES.exists():
+        r.warn("config_profiles_exists", "agent_profiles.json not found")
+        return
+    ap = _load_json(AGENT_PROFILES)
+    if ap is None:
+        r.fail("config_profiles_json", "agent_profiles.json is not valid JSON")
+        return
+    r.ok("config_profiles_json", "agent_profiles.json is valid JSON")
+    expected_agents = {"orchestrator", "alpha", "beta", "gamma", "delta"}
+    found = set()
+    if isinstance(ap, dict):
+        profiles = ap.get("profiles", ap)
+        if isinstance(profiles, dict):
+            found = set(profiles.keys())
+        elif isinstance(profiles, list):
+            found = {p.get("name", "") for p in profiles if isinstance(p, dict)}
+    missing = expected_agents - found
+    if missing:
+        r.warn("config_profiles_completeness", f"Missing agent profiles: {missing}")
+    else:
+        r.ok("config_profiles_completeness", "All expected agents have profiles")
+
+
 def audit_config_files() -> AuditResult:
     """Validate critical configuration files."""
     r = AuditResult()
 
-    # brain_config.json
-    if BRAIN_CONFIG.exists():
-        bc = _load_json(BRAIN_CONFIG)
-        if bc is None:
-            r.fail("config_brain_json", "brain_config.json is not valid JSON")
-        else:
-            r.ok("config_brain_json", "brain_config.json is valid JSON")
-            required = ["difficulty_thresholds", "routing", "learning", "compliance"]
-            for key in required:
-                if key in bc:
-                    r.ok(f"config_brain_{key}", f"Required key '{key}' present")
-                else:
-                    r.fail(f"config_brain_{key}", f"Required key '{key}' MISSING")
-            # Check compliance guard
-            comp = bc.get("compliance", {})
-            if comp.get("guard_enabled", False):
-                r.ok("config_compliance_guard", "Compliance guard is enabled")
-            else:
-                r.warn("config_compliance_guard", "Compliance guard is DISABLED")
-    else:
-        r.warn("config_brain_exists", "brain_config.json not found")
+    _audit_brain_config(r)
+    _audit_orchestrator_config(r)
+    _audit_agent_profiles(r)
 
-    # orchestrator.json
-    if ORCH_FILE.exists():
-        oc = _load_json(ORCH_FILE)
-        if oc is None:
-            r.fail("config_orch_json", "orchestrator.json is not valid JSON")
-        else:
-            r.ok("config_orch_json", "orchestrator.json is valid JSON")
-            hwnd = oc.get("hwnd") or oc.get("orchestrator_hwnd") or 0
-            if hwnd:
-                if _is_window(hwnd):
-                    r.ok("config_orch_hwnd", f"Orchestrator HWND {hwnd} is alive")
-                else:
-                    r.fail("config_orch_hwnd", f"Orchestrator HWND {hwnd} is DEAD")
-            else:
-                r.fail("config_orch_hwnd", "No orchestrator HWND set")
-            if oc.get("role") == "orchestrator":
-                r.ok("config_orch_role", "Role is correctly 'orchestrator'")
-            else:
-                r.warn("config_orch_role", f"Role is '{oc.get('role')}' not 'orchestrator'")
-    else:
-        r.warn("config_orch_exists", "orchestrator.json not found")
-
-    # agent_profiles.json
-    if AGENT_PROFILES.exists():
-        ap = _load_json(AGENT_PROFILES)
-        if ap is None:
-            r.fail("config_profiles_json", "agent_profiles.json is not valid JSON")
-        else:
-            r.ok("config_profiles_json", "agent_profiles.json is valid JSON")
-            expected_agents = {"orchestrator", "alpha", "beta", "gamma", "delta"}
-            found = set()
-            if isinstance(ap, dict):
-                profiles = ap.get("profiles", ap)
-                if isinstance(profiles, dict):
-                    found = set(profiles.keys())
-                elif isinstance(profiles, list):
-                    found = {p.get("name", "") for p in profiles if isinstance(p, dict)}
-            missing = expected_agents - found
-            if missing:
-                r.warn("config_profiles_completeness",
-                       f"Missing agent profiles: {missing}")
-            else:
-                r.ok("config_profiles_completeness", "All expected agents have profiles")
-    else:
-        r.warn("config_profiles_exists", "agent_profiles.json not found")
-
-    # todos.json
+    # todos.json (optional)
     if TODOS_FILE.exists():
         td = _load_json(TODOS_FILE)
         if td is None:
             r.fail("config_todos_json", "todos.json is not valid JSON")
         else:
             r.ok("config_todos_json", "todos.json is valid JSON")
-    # todos.json is optional
 
     return r
 

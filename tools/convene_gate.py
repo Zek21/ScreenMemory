@@ -17,13 +17,17 @@ Usage:
 """
 
 import argparse
+import atexit
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
+DATA_DIR = ROOT / "data"
+PID_FILE = DATA_DIR / "convene_gate.pid"
 
 import requests
 
@@ -31,6 +35,29 @@ SKYNET = "http://localhost:8420"
 BUS_PUBLISH = f"{SKYNET}/bus/publish"
 BUS_MESSAGES = f"{SKYNET}/bus/messages"
 WORKER_NAMES = ["alpha", "beta", "gamma", "delta"]
+
+
+def _init_pid_guard(pid_file: Path) -> bool:
+    """Prevent duplicate resident gate monitors."""
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text().strip())
+            os.kill(old_pid, 0)
+            print(f"[ConveneGate] Already running (PID {old_pid}) -- exiting to prevent duplicate")
+            return False
+        except (OSError, ValueError):
+            pass
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+
+    def _cleanup_pid():
+        try:
+            pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    atexit.register(_cleanup_pid)
+    return True
 
 
 def _bus_post(sender, topic, msg_type, content):
@@ -117,6 +144,14 @@ class GateMonitor:
         if expired:
             actions.append({"action": "expired", "count": len(expired)})
 
+        digest = self.gate.flush_due_digest()
+        if digest.get("action") == "delivered":
+            actions.append({
+                "action": "digest",
+                "count": digest.get("count", 0),
+                "delivery_type": digest.get("delivery_type", "elevated_digest"),
+            })
+
         return actions
 
     def run(self, interval=5, max_cycles=None):
@@ -135,6 +170,8 @@ class GateMonitor:
                         print(f"  PASS: {a['sender']} bypassed (urgent)")
                     elif a["action"] == "expired":
                         print(f"  EXPIRE: {a['count']} stale proposals expired")
+                    elif a["action"] == "digest":
+                        print(f"  DIGEST: delivered {a['count']} queued finding(s) via {a['delivery_type']}")
                 time.sleep(interval)
                 cycle += 1
         except KeyboardInterrupt:
@@ -186,32 +223,26 @@ def show_stats():
     print("ConveneGate Statistics:")
     print(f"  Total proposed:  {stats.get('total_proposed', 0)}")
     print(f"  Total elevated:  {stats.get('total_elevated', 0)}")
+    print(f"  Digest sends:    {stats.get('total_digest_deliveries', 0)}")
     print(f"  Total rejected:  {stats.get('total_rejected', 0)}")
     print(f"  Total bypassed:  {stats.get('total_bypassed', 0)}")
 
 
-def run_protocol_test():
-    """Simulate the convene-first protocol end-to-end."""
-    from skynet_convene import ConveneGate
-    gate = ConveneGate()
-
-    print("=" * 60)
-    print("CONVENE-FIRST PROTOCOL SIMULATION")
-    print("=" * 60)
-
-    # Test 1: Normal report (needs consensus)
+def _test_normal_report(gate):
+    """Test 1: Normal report needs consensus, stays pending."""
     print("\n[TEST 1] Alpha wants to report a bug to orchestrator")
     r1 = gate.propose("alpha", "Found critical bug in auth module -- session tokens not rotated")
     gate_id = r1.get("gate_id")
     print(f"  Result: {r1['action']} (gate_id={gate_id}, votes={r1.get('votes',0)}/{r1.get('needed',2)})")
     assert r1["action"] == "proposed", "Should be pending"
-
-    # Check -- not yet elevated
     pending = gate.get_pending()
     assert gate_id in pending, "Should be in pending"
     print(f"  Status: PENDING (need {r1.get('needed',2)} votes)")
+    return gate_id
 
-    # Test 2: Beta agrees
+
+def _test_consensus(gate, gate_id):
+    """Test 2: Beta agrees, report gets elevated."""
     print("\n[TEST 2] Beta agrees with alpha's report")
     r2 = gate.vote_gate(gate_id, "beta", approve=True)
     print(f"  Result: {r2['action']}")
@@ -219,19 +250,21 @@ def run_protocol_test():
         print(f"  ELEVATED to orchestrator! Voters: {r2.get('voters', [])}")
     else:
         print(f"  Votes: {r2.get('yes',0)}/{gate.MAJORITY_THRESHOLD} needed")
-
-    # Verify elevated
     assert r2["action"] == "elevated", "Should be elevated after 2 YES votes"
     print("  PASS: Consensus reached, report delivered to orchestrator")
 
-    # Test 3: Urgent bypass
+
+def _test_urgent_bypass(gate):
+    """Test 3: Urgent report bypasses gate."""
     print("\n[TEST 3] Gamma sends urgent report (should bypass)")
     r3 = gate.propose("gamma", "SYSTEM DOWN -- immediate attention needed", urgent=True)
     print(f"  Result: {r3['action']} (delivered={r3.get('delivered', False)})")
     assert r3["action"] == "bypassed", "Urgent should bypass"
     print("  PASS: Urgent report bypassed gate and went directly to orchestrator")
 
-    # Test 4: Rejected report
+
+def _test_rejection(gate):
+    """Test 4: Delta proposes, alpha and beta reject."""
     print("\n[TEST 4] Delta proposes, alpha and beta reject")
     r4 = gate.propose("delta", "Suggest renaming variables for consistency")
     gate_id_4 = r4.get("gate_id")
@@ -244,17 +277,18 @@ def run_protocol_test():
         assert r4b["action"] == "rejected", "Should be rejected after 2 NO votes"
     print("  PASS: Report rejected, not sent to orchestrator")
 
-    # Stats
+
+def _verify_bus_messages(gate):
+    """Print final stats and verify bus messages exist."""
     print("\n" + "=" * 60)
     stats = gate.get_stats()
-    print(f"FINAL STATS:")
+    print("FINAL STATS:")
     print(f"  Proposed:  {stats.get('total_proposed', 0)}")
     print(f"  Elevated:  {stats.get('total_elevated', 0)}")
     print(f"  Rejected:  {stats.get('total_rejected', 0)}")
     print(f"  Bypassed:  {stats.get('total_bypassed', 0)}")
     print("=" * 60)
 
-    # Verify bus messages
     print("\nChecking bus for consensus message...")
     msgs = _bus_poll(10)
     consensus_msgs = [m for m in msgs if m.get("sender") == "convene-gate"
@@ -270,6 +304,22 @@ def run_protocol_test():
                    and m.get("sender") == "gamma"]
     if urgent_msgs:
         print(f"  Found {len(urgent_msgs)} urgent bypass message(s)")
+
+
+def run_protocol_test():
+    """Simulate the convene-first protocol end-to-end."""
+    from skynet_convene import ConveneGate
+    gate = ConveneGate()
+
+    print("=" * 60)
+    print("CONVENE-FIRST PROTOCOL SIMULATION")
+    print("=" * 60)
+
+    gate_id = _test_normal_report(gate)
+    _test_consensus(gate, gate_id)
+    _test_urgent_bypass(gate)
+    _test_rejection(gate)
+    _verify_bus_messages(gate)
 
     print("\nALL TESTS PASSED")
     return True
@@ -293,6 +343,8 @@ def main():
         success = run_protocol_test()
         sys.exit(0 if success else 1)
     elif args.monitor:
+        if not _init_pid_guard(PID_FILE):
+            sys.exit(0)
         monitor = GateMonitor()
         monitor.run(interval=args.interval)
     elif args.propose:

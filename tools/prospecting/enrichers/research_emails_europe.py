@@ -134,100 +134,93 @@ async def find_email(page, business_name, city, category):
     
     return list(all_emails)
 
-async def main():
-    # Load businesses
+def _load_businesses():
+    """Load businesses from input CSV."""
     businesses = []
     with open(INPUT_CSV, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+        for row in csv.DictReader(f):
             businesses.append(row)
-    
     print(f"Loaded {len(businesses)} businesses from CSV")
-    
-    # Load progress
+    return businesses
+
+
+def _load_resume_state():
+    """Load completed set and existing results for resume support."""
     completed = set()
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, 'r') as f:
-            data = json.load(f)
-            completed = set(data.get('completed', []))
+            completed = set(json.load(f).get('completed', []))
         print(f"Resuming - {len(completed)} already processed")
-    
-    # Load existing results
     results = []
     if os.path.exists(OUTPUT_CSV):
         with open(OUTPUT_CSV, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            results = list(reader)
-    
+            results = list(csv.DictReader(f))
+    return completed, results
+
+
+def _compute_fieldnames(businesses):
+    """Determine CSV fieldnames, ensuring 'email' is included."""
+    fieldnames = list(businesses[0].keys())
+    if 'email' not in fieldnames:
+        fieldnames.append('email')
+    return fieldnames
+
+
+def _save_checkpoint(completed, results, fieldnames):
+    """Save progress and results to disk."""
+    if results:
+        with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(results)
+    with open(PROGRESS_FILE, 'w') as f:
+        json.dump({'completed': list(completed)}, f)
+
+
+async def main():
+    businesses = _load_businesses()
+    completed, results = _load_resume_state()
+    fieldnames = _compute_fieldnames(businesses)
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox',
-            ]
+            args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
         )
         context = await browser.new_context(
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         )
         page = await context.new_page()
-        
+
         found_count = len([r for r in results if r.get('email')])
         total = len(businesses)
-        
+
         for i, biz in enumerate(businesses):
             key = f"{biz['name']}|{biz['city']}"
             if key in completed:
                 continue
-            
+
             emails = await find_email(page, biz['name'], biz['city'], biz.get('category', biz.get('search_category', '')))
-            
+
             if emails:
-                biz['email'] = '; '.join(emails[:3])  # max 3 emails
+                biz['email'] = '; '.join(emails[:3])
                 results.append(biz)
                 found_count += 1
-                print(f"  [{i+1}/{total}] ✓ {biz['name']} ({biz['city']}) -> {biz['email']}")
+                print(f"  [{i+1}/{total}] \u2713 {biz['name']} ({biz['city']}) -> {biz['email']}")
             else:
-                print(f"  [{i+1}/{total}] ✗ {biz['name']} ({biz['city']})")
-            
+                print(f"  [{i+1}/{total}] \u2717 {biz['name']} ({biz['city']})")
+
             completed.add(key)
-            
-            # Save every 10 businesses
+
             if len(completed) % 10 == 0:
-                # Save results
-                if results:
-                    fieldnames = list(businesses[0].keys()) + ['email'] if 'email' not in businesses[0] else list(businesses[0].keys())
-                    if 'email' not in fieldnames:
-                        fieldnames.append('email')
-                    with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
-                        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-                        writer.writeheader()
-                        writer.writerows(results)
-                
-                # Save progress
-                with open(PROGRESS_FILE, 'w') as f:
-                    json.dump({'completed': list(completed)}, f)
-                
+                _save_checkpoint(completed, results, fieldnames)
                 print(f"  >> Progress: {len(completed)}/{total} checked, {found_count} emails found")
-            
-            # Small delay between searches
+
             await page.wait_for_timeout(500)
-        
-        # Final save
-        if results:
-            fieldnames = list(businesses[0].keys())
-            if 'email' not in fieldnames:
-                fieldnames.append('email')
-            with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-                writer.writeheader()
-                writer.writerows(results)
-        
-        with open(PROGRESS_FILE, 'w') as f:
-            json.dump({'completed': list(completed)}, f)
-        
+
+        _save_checkpoint(completed, results, fieldnames)
         await browser.close()
-    
+
     print(f"\n{'='*60}")
     print(f"  COMPLETE: {found_count} businesses with emails out of {total}")
     print(f"  Output: {OUTPUT_CSV}")

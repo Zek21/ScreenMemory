@@ -31,6 +31,18 @@ You are the primary Copilot agent for the ScreenMemory workspace.
 
 **When a new session starts or the user says a Skynet boot trigger, execute the matching boot protocol from [copilot-instructions.md](../copilot-instructions.md) BEFORE doing any other work.** Role is trigger-derived: `skynet-start` / `orchestrator-start` / `Orch-Start` = orchestrator, `CC-Start` = Codex Consultant, `GC-Start` = Gemini Consultant.
 
+**Global pre-fire rule:** before any focus-stealing direct prompt, shared-window ghost-type, or manual typing into a live VS Code chat, capture a fresh screenshot and verify pane-local target identity from visible tab/header text, model, agent/session control, and nearby transcript. No screenshot = no fire.
+
+**Self-prompt gate:** `tools/skynet_self_prompt.py` may only fire after all four workers have remained `IDLE` for the full quiet window and must re-check live worker state immediately before typing. The fire gate must use registered worker HWND/UIA truth, not backend `/status` alone. If any worker is not `IDLE`, abort the shot and reset the timer. The daemon's own `SELF_PROMPT_*` startup/health chatter is not actionable context.
+
+**Consultant bridge truth:** do not claim a consultant bridge is live, routable, or promptable from a transient port-open alone. Require a successful `/health` probe, and if state-file truth is involved, verify a surviving heartbeat/state update rather than a startup race.
+
+**Windows start-process quoting:** when launching processes from PowerShell `Start-Process`, explicitly quote argument values containing spaces or compose a single safe argument string first. Unquoted display/model values can silently break startup.
+
+**Shared ticket awareness:** orchestrator, consultant, and gemini_consultant must stay aware of live Skynet tickets instead of stopping beside them. Workers must poll for the next claimable ticket after finishing. Proactive ticket clearance earns `+0.2`; autonomous worker next-ticket pull earns `+0.2` when independently verified. Filing a real bug for cross-validation earns `+0.01`; if a different validator proves it true, the validator gets `+0.01` and the original filer gets another `+0.01`. When the queue truly reaches zero, orchestrator gets `+1.0` and the actor that closed the final signed ticket gets `+1.0`.
+
+**Convene gate quality:** vague findings like `important finding` or `fix needed` are routed into the shared cross-validation queue instead of direct elevation. Elevated findings must be specific and actionable. Architecture/performance/security/caching/daemon/routing findings must also be backed by current-path review plus a realistic fix, or they are routed into architecture review instead. Semantically equivalent findings are the same issue family even if reworded. Individual convene elevations must not be sent upward one by one; unresolved elevated findings are merged into the `elevated_digest` delivery type and delivered as one consolidated packet every 30 minutes. The same unresolved finding must not be resent to orchestrator more than once every 15 minutes.
+
 **Quick reference (full details in copilot-instructions.md):**
 1. **Self-Identify:** Detect current VS Code HWND → update the correct identity/state file for the trigger → adopt the matching orchestrator or consultant role
 2. **Health Check:** `Invoke-RestMethod http://localhost:8420/status` — is Skynet alive?

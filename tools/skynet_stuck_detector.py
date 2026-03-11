@@ -87,35 +87,9 @@ def _get_orch_hwnd():
         return 0
 
 
-def prompt_orchestrator(message):
-    """Type a prompt into the orchestrator's SIDEBAR chat input via UIA.
-
-    The orchestrator window has multiple Edit controls:
-      - Terminal input (y=922, x=543) -- DO NOT target
-      - Terminal input (y=835, x=347) -- DO NOT target
-      - Sidebar chat input (y=844, x=24, w=265) -- TARGET THIS ONE
-
-    ghost_type_to_worker targets the bottommost Edit (highest Y) which hits the
-    terminal. This function instead targets the sidebar Edit (x < 320) which is
-    the Copilot CLI chat input where the orchestrator conversation lives.
-
-    Layout reference: data/orch_layout.json
-    """
-    orch_hwnd = _get_orch_hwnd()
-    if not orch_hwnd:
-        log("Cannot prompt orchestrator: no HWND found", "ERROR")
-        return False
-
-    # Flatten message to single line for clipboard paste
-    flat_msg = message.replace("\n", " ").replace("\r", " ")
-
-    # Write to temp file to avoid escaping issues in PowerShell
-    dispatch_file = DATA_DIR / ".orch_wake_dispatch.txt"
-    dispatch_file.write_text(flat_msg, encoding="utf-8")
-    dispatch_path = str(dispatch_file).replace("\\", "\\\\")
-
-    # PowerShell script that targets the SIDEBAR Edit (x < 320)
-    ps = f'''
+def _build_sidebar_ps_script(orch_hwnd: int, dispatch_path: str) -> str:
+    """Build PowerShell script to target the sidebar chat Edit control."""
+    return f'''
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
 Add-Type @"
@@ -145,7 +119,6 @@ public class WakeHelper {{
 $hwnd = [IntPtr]{orch_hwnd}
 $dispatchText = [System.IO.File]::ReadAllText("{dispatch_path}", [System.Text.Encoding]::UTF8)
 
-# Find the SIDEBAR chat Edit (x < 320, highest Y)
 $wnd = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
 $allEdits = $wnd.FindAll(
     [System.Windows.Automation.TreeScope]::Descendants,
@@ -159,7 +132,6 @@ $maxY = -1
 foreach ($e in $allEdits) {{
     try {{
         $r = $e.Current.BoundingRectangle
-        # Sidebar is x < 320; skip terminal/editor Edits (x >= 320)
         if ($r.X -lt 320 -and $r.Y -gt $maxY -and $r.Width -gt 50) {{
             $maxY = $r.Y
             $sidebarEdit = $e
@@ -202,13 +174,16 @@ Write-Host "OK_SIDEBAR"
 exit 0
 '''
 
+
+def _run_sidebar_ps(ps_script: str, orch_hwnd: int) -> bool:
+    """Execute the sidebar PS script and return success flag."""
+    import subprocess
+    log(f"Sidebar-targeting HWND={orch_hwnd}")
     try:
-        import subprocess
-        log(f"Sidebar-targeting HWND={orch_hwnd}")
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
+            ["powershell", "-NoProfile", "-Command", ps_script],
             capture_output=True, text=True, timeout=20,
-            creationflags=0x08000000  # CREATE_NO_WINDOW
+            creationflags=0x08000000
         )
         ok = r.returncode == 0 and "OK_SIDEBAR" in r.stdout
         if not ok:
@@ -223,96 +198,122 @@ exit 0
         return False
 
 
-def _gather_system_state():
-    """Gather full Skynet system state for rich orchestrator prompts."""
-    state = {
-        "workers": {},
-        "pending_todos": 0,
-        "todo_items": [],
-        "bus_results": [],
-        "bus_alerts": [],
-        "engines": {},
-        "iq": None,
-    }
+def prompt_orchestrator(message):
+    """Type a prompt into the orchestrator's SIDEBAR chat input via UIA."""
+    orch_hwnd = _get_orch_hwnd()
+    if not orch_hwnd:
+        log("Cannot prompt orchestrator: no HWND found", "ERROR")
+        return False
 
-    # Worker states from /status
+    flat_msg = message.replace("\n", " ").replace("\r", " ")
+    dispatch_file = DATA_DIR / ".orch_wake_dispatch.txt"
+    dispatch_file.write_text(flat_msg, encoding="utf-8")
+    dispatch_path = str(dispatch_file).replace("\\", "\\\\")
+
+    ps = _build_sidebar_ps_script(orch_hwnd, dispatch_path)
+    return _run_sidebar_ps(ps, orch_hwnd)
+
+
+def _fetch_worker_states() -> dict:
+    """Fetch worker states from /status endpoint."""
     try:
         import urllib.request
         data = json.loads(urllib.request.urlopen(f"{SKYNET_URL}/status", timeout=3).read())
         agents = data.get("agents", {})
-        for name in ("alpha", "beta", "gamma", "delta"):
-            agent = agents.get(name, {})
-            state["workers"][name] = {
-                "status": agent.get("status", "UNKNOWN"),
-                "tasks_completed": agent.get("tasks_completed", 0),
-                "current_task": agent.get("current_task", ""),
-                "queue_depth": agent.get("queue_depth", 0),
+        return {
+            name: {
+                "status": agents.get(name, {}).get("status", "UNKNOWN"),
+                "tasks_completed": agents.get(name, {}).get("tasks_completed", 0),
+                "current_task": agents.get(name, {}).get("current_task", ""),
+                "queue_depth": agents.get(name, {}).get("queue_depth", 0),
             }
+            for name in ("alpha", "beta", "gamma", "delta")
+        }
     except Exception:
-        pass
+        return {}
 
-    # Pending TODOs
+
+def _fetch_pending_todos() -> tuple[int, list]:
+    """Read pending TODOs from file. Returns (count, top_5_descriptions)."""
     try:
         todos_file = DATA_DIR / "todos.json"
-        if todos_file.exists():
-            td = json.loads(todos_file.read_text(encoding="utf-8"))
-            todo_list = td if isinstance(td, list) else td.get("todos", [])
-            pending = [t for t in todo_list
-                       if isinstance(t, dict) and t.get("status") in ("pending", "active")]
-            state["pending_todos"] = len(pending)
-            # Top 5 by priority
-            priority_rank = {"critical": 0, "high": 1, "medium": 2, "normal": 3, "low": 4}
-            pending.sort(key=lambda t: priority_rank.get(
-                str(t.get("priority", "normal")).lower(), 9))
-            state["todo_items"] = [
-                f"[{t.get('priority','normal')}] {t.get('task','?')[:80]}"
-                for t in pending[:5]
-            ]
+        if not todos_file.exists():
+            return 0, []
+        td = json.loads(todos_file.read_text(encoding="utf-8"))
+        todo_list = td if isinstance(td, list) else td.get("todos", [])
+        pending = [t for t in todo_list
+                   if isinstance(t, dict) and t.get("status") in ("pending", "active")]
+        priority_rank = {"critical": 0, "high": 1, "medium": 2, "normal": 3, "low": 4}
+        pending.sort(key=lambda t: priority_rank.get(
+            str(t.get("priority", "normal")).lower(), 9))
+        items = [f"[{t.get('priority','normal')}] {t.get('task','?')[:80]}" for t in pending[:5]]
+        return len(pending), items
     except Exception:
-        pass
+        return 0, []
 
-    # Recent bus messages (results and alerts for orchestrator)
+
+def _fetch_bus_results_and_alerts() -> tuple[list, list]:
+    """Fetch recent bus results and alerts for the orchestrator."""
+    results, alerts = [], []
     try:
         import urllib.request
         msgs = json.loads(urllib.request.urlopen(
             f"{SKYNET_URL}/bus/messages?limit=20", timeout=3).read())
         if isinstance(msgs, list):
             for m in msgs:
-                if m.get("topic") == "orchestrator":
-                    if m.get("type") == "result":
-                        state["bus_results"].append(
-                            f"{m.get('sender','?')}: {str(m.get('content',''))[:80]}")
-                    elif m.get("type") in ("alert", "urgent"):
-                        state["bus_alerts"].append(
-                            f"{m.get('sender','?')}: {str(m.get('content',''))[:80]}")
+                if m.get("topic") != "orchestrator":
+                    continue
+                snippet = f"{m.get('sender','?')}: {str(m.get('content',''))[:80]}"
+                if m.get("type") == "result":
+                    results.append(snippet)
+                elif m.get("type") in ("alert", "urgent"):
+                    alerts.append(snippet)
     except Exception:
         pass
+    return results, alerts
 
-    # Engine status
+
+def _fetch_engine_statuses() -> dict:
+    """Fetch engine statuses from GOD Console."""
     try:
         import urllib.request
         engines = json.loads(urllib.request.urlopen(
             "http://localhost:8421/engines", timeout=3).read())
         if isinstance(engines, dict):
-            for name, info in engines.get("engines", {}).items():
-                if isinstance(info, dict):
-                    state["engines"][name] = info.get("status", "unknown")
+            return {name: info.get("status", "unknown")
+                    for name, info in engines.get("engines", {}).items()
+                    if isinstance(info, dict)}
     except Exception:
         pass
+    return {}
 
-    # IQ
+
+def _fetch_latest_iq():
+    """Fetch latest IQ score from history file."""
     try:
         iq_file = DATA_DIR / "iq_history.json"
         if iq_file.exists():
-            iq_data = json.loads(iq_file.read_text(encoding="utf-8"))
-            h = iq_data.get("history", [])
+            h = json.loads(iq_file.read_text(encoding="utf-8")).get("history", [])
             if h:
-                latest = h[-1]
-                state["iq"] = round(latest.get("composite", 0), 4)
+                return round(h[-1].get("composite", 0), 4)
     except Exception:
         pass
+    return None
 
-    return state
+
+def _gather_system_state():
+    """Gather full Skynet system state for rich orchestrator prompts."""
+    pending_count, todo_items = _fetch_pending_todos()
+    bus_results, bus_alerts = _fetch_bus_results_and_alerts()
+    return {
+        "workers": _fetch_worker_states(),
+        "pending_todos": pending_count,
+        "todo_items": todo_items,
+        "bus_results": bus_results,
+        "bus_alerts": bus_alerts,
+        "engines": _fetch_engine_statuses(),
+        "iq": _fetch_latest_iq(),
+    }
 
 
 def _compose_wake_prompt(cycle_label, worker_states_line, system_state):
@@ -556,65 +557,60 @@ class StuckDetector:
 
         return issues
 
-    def _auto_intervene(self, name, tracker, diagnosis):
-        """Perform automatic intervention based on diagnosis.
+    def _handle_steering(self, name, tracker):
+        """Handle STEERING condition by auto-cancelling."""
+        log(f"INTERVENTION: {name.upper()} has STEERING -- auto-cancelling", "WARN")
+        if cancel_steering(tracker.hwnd):
+            tracker.record_intervention("steering_cancelled")
+            bus_post("stuck-detector", "orchestrator", "alert",
+                     f"STUCK_FIXED: {name.upper()} had STEERING panel -- auto-cancelled")
+            time.sleep(3)
 
-        CRITICAL RULES:
-          - NEVER send Ctrl+C to a PROCESSING worker (they are thinking)
-          - STEERING auto-cancel is always allowed
-          - DEADLOCKED (self-dispatch) Ctrl+C only if kill switch enabled
-          - LONG_TASK / EXTENDED_PROCESSING: info alert only, never interrupt
-        """
-        condition = diagnosis["condition"]
-
-        # Dedup: suppress same worker+condition alert for ALERT_DEDUP_WINDOW
-        dedup_key = f"{name}:{condition}"
-        now = time.time()
-        last_alert = self._last_alerts.get(dedup_key, 0)
-        if now - last_alert < self.ALERT_DEDUP_WINDOW:
-            return  # already alerted recently
-
-        if condition == "STEERING":
-            log(f"INTERVENTION: {name.upper()} has STEERING -- auto-cancelling", "WARN")
-            if cancel_steering(tracker.hwnd):
-                tracker.record_intervention("steering_cancelled")
-                bus_post("stuck-detector", "orchestrator", "alert",
-                         f"STUCK_FIXED: {name.upper()} had STEERING panel -- auto-cancelled")
-                self._last_alerts[dedup_key] = now
-                time.sleep(3)  # wait before any further action
-
-        elif condition == "LONG_TASK":
-            duration = diagnosis["duration_s"]
-            minutes = duration // 60
+    def _handle_long_processing(self, name, diagnosis, condition):
+        """Handle LONG_TASK or EXTENDED_PROCESSING conditions."""
+        duration = diagnosis["duration_s"]
+        minutes = duration // 60
+        if condition == "LONG_TASK":
             log(f"INFO: {name.upper()} PROCESSING for {minutes}m -- worker is thinking (no intervention)", "INFO")
             bus_post("stuck-detector", "orchestrator", "info",
                      f"WORKER_LONG_TASK: {name.upper()} has been PROCESSING for {minutes}m -- may need attention")
-            self._last_alerts[dedup_key] = now
-
-        elif condition == "EXTENDED_PROCESSING":
-            duration = diagnosis["duration_s"]
-            minutes = duration // 60
+        else:
             log(f"INFO: {name.upper()} PROCESSING for {minutes}m -- normal thinking (no intervention)", "INFO")
-            # Light info post — not an alert, just awareness
             bus_post("stuck-detector", "orchestrator", "info",
                      f"WORKER_THINKING: {name.upper()} has been PROCESSING for {minutes}m -- this is normal")
-            self._last_alerts[dedup_key] = now
 
+    def _handle_deadlock(self, name, tracker):
+        """Handle DEADLOCKED condition."""
+        ctrl_c_enabled = _load_ctrl_c_enabled()
+        if ctrl_c_enabled:
+            log(f"INTERVENTION: {name.upper()} DEADLOCKED (self-dispatch) -- breaking loop", "WARN")
+            send_ctrl_c(tracker.hwnd)
+            tracker.record_intervention("deadlock_broken")
+            bus_post("stuck-detector", "orchestrator", "alert",
+                     f"DEADLOCK_BROKEN: {name.upper()} was dispatching to itself. "
+                     f"Sent Ctrl+C. Needs new task.")
+        else:
+            log(f"ALERT: {name.upper()} DEADLOCKED but kill switch is OFF -- alerting orchestrator", "WARN")
+            bus_post("stuck-detector", "orchestrator", "alert",
+                     f"DEADLOCK_DETECTED: {name.upper()} appears to be in a self-dispatch loop. "
+                     f"Ctrl+C kill switch is OFF. Orchestrator must intervene manually.")
+
+    def _auto_intervene(self, name, tracker, diagnosis):
+        """Perform automatic intervention based on diagnosis."""
+        condition = diagnosis["condition"]
+        dedup_key = f"{name}:{condition}"
+        now = time.time()
+        if now - self._last_alerts.get(dedup_key, 0) < self.ALERT_DEDUP_WINDOW:
+            return
+
+        if condition == "STEERING":
+            self._handle_steering(name, tracker)
+        elif condition in ("LONG_TASK", "EXTENDED_PROCESSING"):
+            self._handle_long_processing(name, diagnosis, condition)
         elif condition == "DEADLOCKED":
-            ctrl_c_enabled = _load_ctrl_c_enabled()
-            if ctrl_c_enabled:
-                log(f"INTERVENTION: {name.upper()} DEADLOCKED (self-dispatch) -- breaking loop", "WARN")
-                send_ctrl_c(tracker.hwnd)
-                tracker.record_intervention("deadlock_broken")
-                bus_post("stuck-detector", "orchestrator", "alert",
-                         f"DEADLOCK_BROKEN: {name.upper()} was dispatching to itself. "
-                         f"Sent Ctrl+C. Needs new task.")
-            else:
-                log(f"ALERT: {name.upper()} DEADLOCKED but kill switch is OFF -- alerting orchestrator", "WARN")
-                bus_post("stuck-detector", "orchestrator", "alert",
-                         f"DEADLOCK_DETECTED: {name.upper()} appears to be in a self-dispatch loop. "
-                         f"Ctrl+C kill switch is OFF. Orchestrator must intervene manually.")
-            self._last_alerts[dedup_key] = now
+            self._handle_deadlock(name, tracker)
+
+        self._last_alerts[dedup_key] = now
 
     def get_health(self):
         """Get per-worker health report."""
@@ -629,16 +625,34 @@ class StuckDetector:
         }
         HISTORY_FILE.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
+    def _check_idle_and_wake(self, cycle, idle_count, status_line, max_cycles) -> bool:
+        """Check if all workers are idle long enough to wake orchestrator.
+        Returns True if monitor should stop."""
+        if max_cycles is None or idle_count < max_cycles:
+            return False
+
+        log(f"Workers IDLE for {idle_count} consecutive intervals -- WAKING ORCHESTRATOR")
+        system_state = _gather_system_state()
+        prompt = _compose_wake_prompt(f"IDLE x{idle_count}", status_line, system_state)
+
+        log(f"Force-typing wake-up prompt ({len(prompt)} chars)")
+        delivered = prompt_orchestrator(prompt)
+        if delivered:
+            log(f"Wake-up prompt DELIVERED to orchestrator")
+            bus_post("stuck-detector", "orchestrator", "heartbeat",
+                     f"WAKE_UP_DELIVERED after {idle_count} idle intervals: {status_line}")
+        else:
+            log(f"Wake-up delivery FAILED", "ERROR")
+            bus_post("stuck-detector", "orchestrator", "alert",
+                     f"WAKE_UP_FAILED after {idle_count} idle intervals")
+
+        log(f"Mission complete -- stopping")
+        bus_post("stuck-detector", "orchestrator", "monitor_alert",
+                 f"WORKER_MONITOR_STOPPED: woke orchestrator after {idle_count} idle intervals")
+        return True
+
     def monitor(self, interval=15, max_cycles=None):
-        """Continuous monitoring loop.
-        
-        Qualification: all 4 workers IDLE.
-        On each interval where all workers are IDLE, increment counter.
-        On the Nth interval (max_cycles, default 3), force-type a rich
-        wake-up prompt into the orchestrator window regardless of its state.
-        Then stop.
-        """
-        ctrl_c = _load_ctrl_c_enabled()
+        """Continuous monitoring loop. Wakes orchestrator after max_cycles idle intervals."""
         log(f"Stuck detector started (interval={interval}s, "
             f"wake_after={max_cycles or 'unlimited'} idle intervals)")
         log(f"Tracking {len(self.trackers)} workers: {list(self.trackers.keys())}")
@@ -653,7 +667,6 @@ class StuckDetector:
                 cycle += 1
                 issues = self.check_all()
 
-                # Build per-worker status summary
                 states = []
                 all_idle = True
                 for name, tracker in self.trackers.items():
@@ -675,28 +688,7 @@ class StuckDetector:
                         log(f"  {issue['worker'].upper()}: {issue['condition']} "
                             f"(severity={issue['severity']})", "WARN")
 
-                # Check if we've hit the wake-up threshold
-                if max_cycles is not None and idle_count >= max_cycles:
-                    log(f"Workers IDLE for {idle_count} consecutive intervals -- WAKING ORCHESTRATOR")
-
-                    system_state = _gather_system_state()
-                    prompt = _compose_wake_prompt(
-                        f"IDLE x{idle_count}", status_line, system_state)
-
-                    log(f"Force-typing wake-up prompt ({len(prompt)} chars)")
-                    delivered = prompt_orchestrator(prompt)
-                    if delivered:
-                        log(f"Wake-up prompt DELIVERED to orchestrator")
-                        bus_post("stuck-detector", "orchestrator", "heartbeat",
-                                 f"WAKE_UP_DELIVERED after {idle_count} idle intervals: {status_line}")
-                    else:
-                        log(f"Wake-up delivery FAILED", "ERROR")
-                        bus_post("stuck-detector", "orchestrator", "alert",
-                                 f"WAKE_UP_FAILED after {idle_count} idle intervals")
-
-                    log(f"Mission complete -- stopping")
-                    bus_post("stuck-detector", "orchestrator", "monitor_alert",
-                             f"WORKER_MONITOR_STOPPED: woke orchestrator after {idle_count} idle intervals")
+                if self._check_idle_and_wake(cycle, idle_count, status_line, max_cycles):
                     break
 
                 self.save_history()

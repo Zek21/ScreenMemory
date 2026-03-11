@@ -100,7 +100,8 @@ def _read_realtime() -> dict:
             "timestamp": time.time(),
             "_source": "http_fallback",
         }
-    except Exception:
+    except Exception as e:
+        print(f"[orch_realtime] Skynet HTTP fallback failed: {e}", file=sys.stderr)  # signed: beta
         return {"agents": {}, "bus": [], "uptime_s": 0, "timestamp": 0, "_source": "unavailable"}
 
 
@@ -116,12 +117,14 @@ def _read_consumed() -> set:
 
 
 def _write_consumed(consumed: set):
-    """Write consumed message IDs to file."""
+    """Write consumed message IDs to file atomically (rename-based)."""  # signed: beta
     DATA.mkdir(parents=True, exist_ok=True)
-    CONSUMED_FILE.write_text(json.dumps({
+    tmp = CONSUMED_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({
         "consumed": list(consumed),
         "updated_at": time.time(),
     }, indent=2), encoding="utf-8")
+    tmp.replace(CONSUMED_FILE)  # atomic on Windows NTFS  # signed: beta
 
 
 # ── Core Functions ─────────────────────────────────────────────────
@@ -251,20 +254,73 @@ def wait(key: str, timeout: float = 90) -> dict | None:
 
             if kl in sender or kl in content or kl in topic:
                 print(f"{C_GREEN}Match found: [{m.get('sender')}] {(m.get('content', ''))[:80]}{C_RESET}")
+                # Mark dispatch as received in dispatch_log.json  # signed: alpha
+                if sender:
+                    try:
+                        from tools.skynet_dispatch import mark_dispatch_received
+                        mark_dispatch_received(sender)  # signed: alpha
+                    except Exception:
+                        pass
                 return m
 
         time.sleep(0.5)
+
+    # Bus HTTP fallback: if realtime.json had no match, try live bus  # signed: delta
+    try:
+        import urllib.request
+        r = urllib.request.urlopen(f"{SKYNET}/bus/messages?limit=20", timeout=3)
+        fallback_msgs = json.loads(r.read())
+        if isinstance(fallback_msgs, list):
+            kl = key.lower()
+            for m in fallback_msgs:
+                mid = m.get("id", "")
+                if mid in consumed:
+                    continue
+                if m.get("type") != "result":
+                    continue
+                sender = (m.get("sender") or "").lower()
+                content = (m.get("content") or "").lower()
+                topic = (m.get("topic") or "").lower()
+                if kl in sender or kl in content or kl in topic:
+                    print(f"{C_GREEN}Match found (bus fallback): [{m.get('sender')}] {(m.get('content', ''))[:80]}{C_RESET}")
+                    if sender:
+                        try:
+                            from tools.skynet_dispatch import mark_dispatch_received
+                            mark_dispatch_received(sender)
+                        except Exception:
+                            pass
+                    return m
+    except Exception:
+        pass  # signed: delta
 
     print(f"{C_RED}Timeout waiting for '{key}'.{C_RESET}")
     return None
 
 
-def wait_all(workers: list | None = None, timeout: float = 120, non_blocking: bool = False) -> dict:
-    """Block until ALL specified workers have posted results since last consume_all.
+def _scan_bus_for_results(workers: list, consumed: set, results: dict):
+    """Scan current bus state for unconsumed result messages from target workers."""
+    state = _read_realtime()
+    bus = state.get("bus", [])
+    newly_found = []
+    for m in bus:
+        mid = m.get("id", "")
+        if mid in consumed or m.get("type") != "result":
+            continue
+        sender = (m.get("sender") or "").lower()
+        if sender in workers and sender not in results:
+            results[sender] = m
+            newly_found.append(sender)
+            # Mark dispatch as received in dispatch_log.json  # signed: alpha
+            try:
+                from tools.skynet_dispatch import mark_dispatch_received
+                mark_dispatch_received(sender)  # signed: alpha
+            except Exception:
+                pass
+    return newly_found
 
-    If non_blocking=True, returns immediately with whatever results are
-    currently available instead of polling until timeout.
-    """
+
+def wait_all(workers: list | None = None, timeout: float = 120, non_blocking: bool = False) -> dict:
+    """Block until ALL specified workers have posted results since last consume_all."""
     if workers is None:
         workers = ["alpha", "beta", "gamma", "delta"]
 
@@ -272,19 +328,7 @@ def wait_all(workers: list | None = None, timeout: float = 120, non_blocking: bo
     results = {}
 
     if non_blocking:
-        # Snapshot mode: read current state once, return immediately
-        state = _read_realtime()
-        bus = state.get("bus", [])
-        for m in bus:
-            mid = m.get("id", "")
-            if mid in consumed:
-                continue
-            if m.get("type") != "result":
-                continue
-            sender = (m.get("sender") or "").lower()
-            if sender in workers and sender not in results:
-                results[sender] = m
-
+        _scan_bus_for_results(workers, consumed, results)
         found = [w for w in workers if w in results]
         missing = [w for w in workers if w not in results]
         if found:
@@ -295,28 +339,22 @@ def wait_all(workers: list | None = None, timeout: float = 120, non_blocking: bo
             print(f"{C_GOLD}Still waiting: {', '.join(missing)}{C_RESET}")
         return results
 
+    return _poll_until_all(workers, consumed, results, timeout)
+
+
+def _poll_until_all(workers: list, consumed: set, results: dict, timeout: float) -> dict:
+    """Poll bus until all workers respond or timeout."""
     deadline = time.time() + timeout
     print(f"{C_CYAN}Waiting for results from: {', '.join(workers)} (timeout {timeout}s)...{C_RESET}")
 
     while time.time() < deadline:
-        state = _read_realtime()
-        bus = state.get("bus", [])
-
-        for m in bus:
-            mid = m.get("id", "")
-            if mid in consumed:
-                continue
-            if m.get("type") != "result":
-                continue
-            sender = (m.get("sender") or "").lower()
-            if sender in workers and sender not in results:
-                results[sender] = m
-                print(f"  {C_GREEN}{sender.upper()}{C_RESET}: {(m.get('content', ''))[:60]}")
+        newly_found = _scan_bus_for_results(workers, consumed, results)
+        for s in newly_found:
+            print(f"  {C_GREEN}{s.upper()}{C_RESET}: {(results[s].get('content', ''))[:60]}")
 
         if all(w in results for w in workers):
             print(f"{C_GREEN}All {len(workers)} workers responded.{C_RESET}")
             return results
-
         time.sleep(0.5)
 
     missing = [w for w in workers if w not in results]
@@ -414,7 +452,8 @@ def dispatch_and_wait(worker: str, task: str, timeout: float = 90) -> dict | Non
     cmd = [sys.executable, str(ROOT / "tools" / "skynet_dispatch.py"),
            "--worker", worker, "--task", task]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=str(ROOT))
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                              cwd=str(ROOT), encoding='utf-8', errors='replace')  # signed: delta
         if proc.returncode != 0:
             print(f"{C_RED}Dispatch failed: {proc.stderr[:200]}{C_RESET}")
             return None
@@ -437,7 +476,8 @@ def dispatch_parallel_and_wait(task: str, timeout: float = 120) -> dict:
     cmd = [sys.executable, str(ROOT / "tools" / "skynet_dispatch.py"),
            "--parallel", "--task", task]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=str(ROOT))
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                              cwd=str(ROOT), encoding='utf-8', errors='replace')  # signed: delta
         if proc.returncode != 0:
             print(f"{C_RED}Parallel dispatch failed: {proc.stderr[:200]}{C_RESET}")
             return {}
@@ -450,7 +490,8 @@ def dispatch_parallel_and_wait(task: str, timeout: float = 120) -> dict:
 
 # ── CLI ───────────────────────────────────────────────────────────
 
-def main():
+def _build_realtime_parser():
+    """Build argparse parser with all subcommands."""
     parser = argparse.ArgumentParser(description="Orchestrator Real-Time Interface")
     sub = parser.add_subparsers(dest="command")
 
@@ -486,28 +527,29 @@ def main():
     p_dpw.add_argument("--task", required=True)
     p_dpw.add_argument("--timeout", type=float, default=120)
 
-    args = parser.parse_args()
+    return parser
 
-    if args.command == "status":
-        status()
-    elif args.command == "pending":
-        pending()
-    elif args.command == "consume":
-        consume(args.msg_id)
-    elif args.command == "consume-all":
-        consume_all()
-    elif args.command == "wait":
-        wait(args.key, args.timeout)
-    elif args.command == "wait-all":
-        wait_all(args.workers, args.timeout, non_blocking=args.non_blocking)
-    elif args.command == "health":
-        health()
-    elif args.command == "bus":
-        bus_messages(args.limit)
-    elif args.command == "dispatch-wait":
-        dispatch_and_wait(args.worker, args.task, args.timeout)
-    elif args.command == "dispatch-parallel-wait":
-        dispatch_parallel_and_wait(args.task, args.timeout)
+
+_COMMAND_MAP = {
+    "status": lambda a: status(),
+    "pending": lambda a: pending(),
+    "consume": lambda a: consume(a.msg_id),
+    "consume-all": lambda a: consume_all(),
+    "wait": lambda a: wait(a.key, a.timeout),
+    "wait-all": lambda a: wait_all(a.workers, a.timeout, non_blocking=a.non_blocking),
+    "health": lambda a: health(),
+    "bus": lambda a: bus_messages(a.limit),
+    "dispatch-wait": lambda a: dispatch_and_wait(a.worker, a.task, a.timeout),
+    "dispatch-parallel-wait": lambda a: dispatch_parallel_and_wait(a.task, a.timeout),
+}
+
+
+def main():
+    parser = _build_realtime_parser()
+    args = parser.parse_args()
+    handler = _COMMAND_MAP.get(args.command)
+    if handler:
+        handler(args)
     else:
         parser.print_help()
 

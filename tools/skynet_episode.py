@@ -56,41 +56,8 @@ def _find_existing_by_fingerprint(fingerprint: str) -> Optional[Path]:
     return None
 
 
-def log_episode(
-    task: str,
-    result: str,
-    outcome: str | Outcome,
-    strategy_id: Optional[str] = None,
-    worker: Optional[str] = None,
-    metadata: Optional[dict] = None,
-) -> dict:
-    """Write an episode record to data/episodes/.
-
-    Deduplication: If an episode with the same fingerprint already exists,
-    the write is skipped and the existing episode is returned with
-    ``deduplicated=True``.
-
-    Args:
-        task: The task description that was dispatched.
-        result: The raw result text returned by the worker.
-        outcome: One of success, failure, unknown.
-        strategy_id: Optional identifier linking to the strategy used.
-        worker: Name of the worker that executed the task.
-        metadata: Arbitrary extra fields.
-
-    Returns:
-        The episode dict that was persisted (includes ``filepath``).
-        If deduplicated, includes ``deduplicated: True``.
-    """
-    if isinstance(outcome, Outcome):
-        outcome_val = outcome.value
-    else:
-        outcome_val = Outcome(outcome).value
-
-    worker_tag = worker or "unknown"
-    fingerprint = compute_fingerprint(worker_tag, task, outcome_val, result)
-
-    # Dedup check: skip if an episode with this fingerprint already exists
+def _check_dedup(fingerprint: str) -> dict | None:
+    """Check if an episode with this fingerprint already exists. Returns episode dict or None."""
     existing = _find_existing_by_fingerprint(fingerprint)
     if existing is not None:
         try:
@@ -99,37 +66,51 @@ def log_episode(
             ep["deduplicated"] = True
             return ep
         except Exception:
-            pass  # Fall through to write if read fails
+            pass
+    return None
 
-    now = datetime.now(timezone.utc)
-    ts = now.strftime("%Y-%m-%d_%H-%M-%S")
 
-    episode = {
-        "timestamp": now.isoformat(),
-        "task": task,
-        "result": result,
-        "outcome": outcome_val,
-        "strategy_id": strategy_id,
-        "worker": worker_tag,
-        "fingerprint": fingerprint,
-        "metadata": metadata or {},
-    }
-
+def _write_episode(episode: dict, worker_tag: str, ts: str) -> str:
+    """Write episode to disk, handling filename collisions. Returns filepath."""
     EPISODES_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"{ts}_{worker_tag}.json"
     filepath = EPISODES_DIR / filename
-
-    # Avoid collisions by appending a counter
     counter = 1
     while filepath.exists():
         filename = f"{ts}_{worker_tag}_{counter}.json"
         filepath = EPISODES_DIR / filename
         counter += 1
-
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(episode, f, indent=2, ensure_ascii=False)
+    return str(filepath)
 
-    episode["filepath"] = str(filepath)
+
+def log_episode(
+    task: str,
+    result: str,
+    outcome: str | Outcome,
+    strategy_id: Optional[str] = None,
+    worker: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> dict:
+    """Write an episode record to data/episodes/ with deduplication."""
+    outcome_val = outcome.value if isinstance(outcome, Outcome) else Outcome(outcome).value
+    worker_tag = worker or "unknown"
+    fingerprint = compute_fingerprint(worker_tag, task, outcome_val, result)
+
+    dedup = _check_dedup(fingerprint)
+    if dedup is not None:
+        return dedup
+
+    now = datetime.now(timezone.utc)
+    episode = {
+        "timestamp": now.isoformat(), "task": task, "result": result,
+        "outcome": outcome_val, "strategy_id": strategy_id,
+        "worker": worker_tag, "fingerprint": fingerprint,
+        "metadata": metadata or {},
+    }
+
+    episode["filepath"] = _write_episode(episode, worker_tag, now.strftime("%Y-%m-%d_%H-%M-%S"))
     return episode
 
 

@@ -190,8 +190,11 @@ class TestRotateRuns(unittest.TestCase):
 
 class TestGenerateReport(unittest.TestCase):
     def test_report_from_none(self):
-        report = ci.generate_report(None)
-        self.assertIn("No CI runs", report)
+        # generate_report(None) calls latest_run(); mock it to return None
+        # so the "No CI runs" path is exercised regardless of disk state.
+        with patch.object(ci, "latest_run", return_value=None):
+            report = ci.generate_report(None)
+        self.assertIn("No CI runs", report)  # signed: beta
 
     def test_report_from_data(self):
         data = {

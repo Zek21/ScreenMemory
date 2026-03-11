@@ -132,13 +132,40 @@ class DifficultyEstimator:
         """Estimate difficulty of a query using feature extraction."""
         t0 = time.perf_counter()
 
-        # Extract features
-        tokens = query.split()
-        token_count = len(tokens)
-        sentence_count = max(1, len(re.split(r'[.!?]+', query)))
-        avg_sentence_len = token_count / sentence_count
+        features = self._extract_features(query)
+        raw_score = self._compute_raw_score(features)
+        level = self._score_to_level(raw_score)
+        confidence = 0.5 + abs(raw_score - 0.5)  # Further from midpoint = more confident
 
-        # Domain detection
+        raw_score, confidence = self._blend_history(query, raw_score, confidence)
+
+        signal = DifficultySignal(
+            level=level,
+            confidence=confidence,
+            complexity_score=raw_score,
+            domain_tags=features["domains"],
+            reasoning_depth=max(1, features["reasoning_hits"] + features["multi_hop_hits"] + len(features["domains"])),
+            requires_tools=("code" in features["domains"] or "web" in features["domains"]
+                            or "system" in features["domains"] or features["constraint_hits"] > 2),
+            requires_debate=raw_score >= 0.7 or (len(features["domains"]) >= 3 and features["reasoning_hits"] >= 2),
+            estimated_tokens={
+                QueryDifficulty.TRIVIAL: 256, QueryDifficulty.SIMPLE: 512,
+                QueryDifficulty.MODERATE: 1024, QueryDifficulty.COMPLEX: 2048,
+                QueryDifficulty.ADVERSARIAL: 4096,
+            }[level],
+        )
+
+        query_hash = hashlib.md5(query.lower().encode()).hexdigest()[:8]
+        self._history[query_hash] = signal
+        elapsed = (time.perf_counter() - t0) * 1000
+        logger.info(f"Difficulty estimate: {level.name} (score={raw_score:.3f}, "
+                    f"conf={confidence:.2f}, domains={features['domains']}) [{elapsed:.1f}ms]")
+        return signal
+
+    def _extract_features(self, query: str) -> dict:
+        """Extract all signal features from a query."""
+        tokens = query.split()
+        sentence_count = max(1, len(re.split(r'[.!?]+', query)))
         domains = []
         domain_density = 0
         for domain, pattern in self.DOMAIN_PATTERNS.items():
@@ -146,89 +173,52 @@ class DifficultyEstimator:
             if matches > 0:
                 domains.append(domain)
                 domain_density += matches
+        return {
+            "token_count": len(tokens),
+            "sentence_count": sentence_count,
+            "domains": domains,
+            "domain_density": domain_density,
+            "reasoning_hits": len(self.REASONING_MARKERS.findall(query)),
+            "multi_hop_hits": len(self.MULTI_HOP_MARKERS.findall(query)),
+            "constraint_hits": len(self.CONSTRAINT_MARKERS.findall(query)),
+            "ambiguity_hits": len(self.AMBIGUITY_MARKERS.findall(query)),
+        }
 
-        # Reasoning depth estimation
-        reasoning_hits = len(self.REASONING_MARKERS.findall(query))
-        multi_hop_hits = len(self.MULTI_HOP_MARKERS.findall(query))
-        constraint_hits = len(self.CONSTRAINT_MARKERS.findall(query))
-        ambiguity_hits = len(self.AMBIGUITY_MARKERS.findall(query))
-
-        # Compute raw complexity score (0-1)
-        length_score = min(1.0, token_count / 200)
-        domain_score = min(1.0, len(domains) / 3)
-        reasoning_score = min(1.0, (reasoning_hits + multi_hop_hits) / 4)
-        constraint_score = min(1.0, constraint_hits / 5)
-        ambiguity_penalty = min(0.3, ambiguity_hits * 0.05)
-
-        raw_score = (
-            length_score * 0.15 +
-            domain_score * 0.25 +
-            reasoning_score * 0.30 +
-            constraint_score * 0.20 +
+    @staticmethod
+    def _compute_raw_score(features: dict) -> float:
+        """Compute the raw complexity score (0-1) from extracted features."""
+        length_score = min(1.0, features["token_count"] / 200)
+        domain_score = min(1.0, len(features["domains"]) / 3)
+        reasoning_score = min(1.0, (features["reasoning_hits"] + features["multi_hop_hits"]) / 4)
+        constraint_score = min(1.0, features["constraint_hits"] / 5)
+        ambiguity_penalty = min(0.3, features["ambiguity_hits"] * 0.05)
+        return (
+            length_score * 0.15 + domain_score * 0.25 +
+            reasoning_score * 0.30 + constraint_score * 0.20 +
             (1 - ambiguity_penalty) * 0.10
         )
 
-        # Determine difficulty level
+    @staticmethod
+    def _score_to_level(raw_score: float) -> "QueryDifficulty":
+        """Map raw score to a difficulty level."""
         if raw_score < 0.15:
-            level = QueryDifficulty.TRIVIAL
+            return QueryDifficulty.TRIVIAL
         elif raw_score < 0.35:
-            level = QueryDifficulty.SIMPLE
+            return QueryDifficulty.SIMPLE
         elif raw_score < 0.55:
-            level = QueryDifficulty.MODERATE
+            return QueryDifficulty.MODERATE
         elif raw_score < 0.80:
-            level = QueryDifficulty.COMPLEX
-        else:
-            level = QueryDifficulty.ADVERSARIAL
+            return QueryDifficulty.COMPLEX
+        return QueryDifficulty.ADVERSARIAL
 
-        # Estimate reasoning hops
-        reasoning_depth = max(1, reasoning_hits + multi_hop_hits + len(domains))
-
-        # Determine tool/debate requirements
-        requires_tools = (
-            "code" in domains or "web" in domains or "system" in domains
-            or constraint_hits > 2
-        )
-        requires_debate = raw_score >= 0.7 or (len(domains) >= 3 and reasoning_hits >= 2)
-
-        # Token budget estimation
-        base_tokens = {
-            QueryDifficulty.TRIVIAL: 256,
-            QueryDifficulty.SIMPLE: 512,
-            QueryDifficulty.MODERATE: 1024,
-            QueryDifficulty.COMPLEX: 2048,
-            QueryDifficulty.ADVERSARIAL: 4096,
-        }
-        estimated_tokens = base_tokens[level]
-
-        # Confidence based on signal clarity
-        signal_strength = abs(raw_score - 0.5) * 2  # Further from midpoint = more confident
-        confidence = 0.5 + signal_strength * 0.5
-
-        # Check history for similar queries (self-adjusting policy)
+    def _blend_history(self, query: str, raw_score: float, confidence: float):
+        """Blend score with historical data for the same query."""
         query_hash = hashlib.md5(query.lower().encode()).hexdigest()[:8]
         if query_hash in self._history:
             prev = self._history[query_hash]
-            # Blend with previous estimate
             raw_score = raw_score * (1 - self._history_weight) + prev.complexity_score * self._history_weight
-            confidence = min(1.0, confidence + 0.1)  # Higher confidence with history
-
-        signal = DifficultySignal(
-            level=level,
-            confidence=confidence,
-            complexity_score=raw_score,
-            domain_tags=domains,
-            reasoning_depth=reasoning_depth,
-            requires_tools=requires_tools,
-            requires_debate=requires_debate,
-            estimated_tokens=estimated_tokens,
-        )
-
-        self._history[query_hash] = signal
-        elapsed = (time.perf_counter() - t0) * 1000
-        logger.info(f"Difficulty estimate: {level.name} (score={raw_score:.3f}, "
-                    f"conf={confidence:.2f}, domains={domains}) [{elapsed:.1f}ms]")
-
-        return signal
+            confidence = min(1.0, confidence + 0.1)
+        return raw_score, confidence
 
     def update_from_feedback(self, query: str, actual_difficulty: QueryDifficulty,
                              success: bool):

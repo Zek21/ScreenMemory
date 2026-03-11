@@ -290,6 +290,49 @@ def _consultant_task_file(consultant_id: str) -> Path:
     return DATA_DIR / f"{consultant_id}_task_state.json"
 
 
+def _process_single_consultant(path: Path, raw: dict, consultant_id: str) -> Dict[str, Any]:
+    """Build a telemetry entry for one consultant from its state and task files."""
+    live_payload = None
+    api_url = raw.get("api_url")
+    if api_url:
+        live_payload = _fetch_json(str(api_url), timeout=1.0)
+        if isinstance(live_payload, dict) and "consultant" in live_payload:
+            raw = live_payload.get("consultant") or raw
+
+    entry = _build_base_entry(consultant_id, "consultant")
+    task_state = _read_json(_consultant_task_file(consultant_id))
+    prompt_store = _read_json(_consultant_prompt_file(consultant_id))
+    prompts = prompt_store.get("prompts", []) if isinstance(prompt_store.get("prompts"), list) else []
+    pending = [p for p in prompts if str(p.get("status", "")).lower() == "pending"]
+    latest_pending = pending[-1] if pending else None
+
+    task_status = str(task_state.get("status") or raw.get("status") or "UNKNOWN").upper()
+    current_task = _sanitize_text(task_state.get("task"), 180)
+    if not current_task and latest_pending:
+        current_task = _sanitize_text(latest_pending.get("content"), 180)
+
+    doing = current_task or ("Queued prompt awaiting acceptance" if latest_pending else _state_doing(task_status))
+    live = bool(raw.get("live")) and str(raw.get("status", "")).upper() == "LIVE"
+    if raw and str(raw.get("status", "")).upper() in ("STALE", "OFFLINE"):
+        live = False
+
+    entry.update({
+        "status": task_status if task_status not in ("", "UNKNOWN") else str(raw.get("status") or "UNKNOWN").upper(),
+        "phase": str(task_state.get("status") or raw.get("status") or "unknown").lower(),
+        "current_task": current_task,
+        "doing": doing,
+        "source": "consultant_bridge",
+        "live": live,
+        "transport": raw.get("prompt_transport") or raw.get("transport"),
+        "typing_visible": "",
+        "typing_source": "not_observable",
+    })
+    if latest_pending:
+        entry["pending_prompt_id"] = latest_pending.get("id")
+        entry["pending_prompt_created_at"] = latest_pending.get("created_at")
+    return entry
+
+
 def _collect_consultant_telemetry() -> Dict[str, Dict[str, Any]]:
     entries: Dict[str, Dict[str, Any]] = {}
     state_files = sorted(
@@ -304,46 +347,7 @@ def _collect_consultant_telemetry() -> Dict[str, Dict[str, Any]]:
         if not consultant_id or consultant_id in seen_ids:
             continue
         seen_ids.add(consultant_id)
-
-        live_payload = None
-        api_url = raw.get("api_url")
-        if api_url:
-            live_payload = _fetch_json(str(api_url), timeout=1.0)
-            if isinstance(live_payload, dict) and "consultant" in live_payload:
-                raw = live_payload.get("consultant") or raw
-
-        entry = _build_base_entry(consultant_id, "consultant")
-        task_state = _read_json(_consultant_task_file(consultant_id))
-        prompt_store = _read_json(_consultant_prompt_file(consultant_id))
-        prompts = prompt_store.get("prompts", []) if isinstance(prompt_store.get("prompts"), list) else []
-        pending = [p for p in prompts if str(p.get("status", "")).lower() == "pending"]
-        latest_pending = pending[-1] if pending else None
-
-        task_status = str(task_state.get("status") or raw.get("status") or "UNKNOWN").upper()
-        current_task = _sanitize_text(task_state.get("task"), 180)
-        if not current_task and latest_pending:
-            current_task = _sanitize_text(latest_pending.get("content"), 180)
-
-        doing = current_task or ("Queued prompt awaiting acceptance" if latest_pending else _state_doing(task_status))
-        live = bool(raw.get("live")) and str(raw.get("status", "")).upper() == "LIVE"
-        if raw and str(raw.get("status", "")).upper() in ("STALE", "OFFLINE"):
-            live = False
-
-        entry.update({
-            "status": task_status if task_status not in ("", "UNKNOWN") else str(raw.get("status") or "UNKNOWN").upper(),
-            "phase": str(task_state.get("status") or raw.get("status") or "unknown").lower(),
-            "current_task": current_task,
-            "doing": doing,
-            "source": "consultant_bridge",
-            "live": live,
-            "transport": raw.get("prompt_transport") or raw.get("transport"),
-            "typing_visible": "",
-            "typing_source": "not_observable",
-        })
-        if latest_pending:
-            entry["pending_prompt_id"] = latest_pending.get("id")
-            entry["pending_prompt_created_at"] = latest_pending.get("created_at")
-        entries[consultant_id] = entry
+        entries[consultant_id] = _process_single_consultant(path, raw, consultant_id)
 
     return entries
 
@@ -666,7 +670,8 @@ def _status_text() -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
+def _build_telemetry_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser with all subcommands."""
     parser = argparse.ArgumentParser(description="Skynet live agent telemetry")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -688,20 +693,18 @@ def main() -> int:
     p_publish.add_argument("--source", default="self_report")
 
     sub.add_parser("status", help="Show latest telemetry summary")
+    return parser
 
-    args = parser.parse_args()
 
+def _run_telemetry_command(args: argparse.Namespace) -> int:
+    """Dispatch parsed CLI args to the appropriate handler."""
     if args.cmd == "once":
         snap = get_snapshot(max_age_s=0.0)
-        if args.pretty:
-            print(json.dumps(snap, indent=2, default=str))
-        else:
-            print(json.dumps(snap, default=str))
+        indent = 2 if args.pretty else None
+        print(json.dumps(snap, indent=indent, default=str))
         return 0
-
     if args.cmd == "start":
         return run_daemon(port=args.port, interval_s=args.interval)
-
     if args.cmd == "publish":
         result = publish_manual(
             agent_id=args.agent.strip().lower(),
@@ -715,12 +718,16 @@ def main() -> int:
         )
         print(json.dumps(result, indent=2, default=str))
         return 0
-
     if args.cmd == "status":
         print(_status_text())
         return 0
-
     return 1
+
+
+def main() -> int:
+    parser = _build_telemetry_parser()
+    args = parser.parse_args()
+    return _run_telemetry_command(args)
 
 
 if __name__ == "__main__":

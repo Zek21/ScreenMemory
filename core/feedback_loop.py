@@ -114,67 +114,72 @@ class FeedbackLoop:
         """Insert outcome, update agent_stats and task_patterns."""
         with self._lock:
             with self._connect() as conn:
-                # 1. Insert outcome
-                conn.execute(
-                    """INSERT OR REPLACE INTO outcomes
-                       (task_id, agent_id, task_type, description, success,
-                        duration_ms, error, output_summary, timestamp)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (outcome.task_id, outcome.agent_id, outcome.task_type,
-                     outcome.description, int(outcome.success),
-                     outcome.duration_ms, outcome.error,
-                     outcome.output_summary, outcome.timestamp),
-                )
-
-                # 2. Upsert agent_stats
-                conn.execute("""
-                    INSERT INTO agent_stats (agent_id, total_tasks, success_count,
-                                            fail_count, avg_duration_ms, last_updated)
-                    VALUES (?, 1, ?, ?, ?, ?)
-                    ON CONFLICT(agent_id) DO UPDATE SET
-                        total_tasks   = total_tasks + 1,
-                        success_count = success_count + ?,
-                        fail_count    = fail_count + ?,
-                        avg_duration_ms = (avg_duration_ms * total_tasks + ?) / (total_tasks + 1),
-                        last_updated  = ?
-                """, (
-                    outcome.agent_id,
-                    int(outcome.success), int(not outcome.success),
-                    outcome.duration_ms, outcome.timestamp,
-                    int(outcome.success), int(not outcome.success),
-                    outcome.duration_ms, outcome.timestamp,
-                ))
-
-                # 3. Upsert task_patterns
-                row = conn.execute(
-                    """SELECT success_rate, avg_duration, sample_count
-                       FROM task_patterns WHERE task_type = ? AND agent_id = ?""",
-                    (outcome.task_type, outcome.agent_id),
-                ).fetchone()
-
-                if row:
-                    n = row["sample_count"]
-                    new_n = n + 1
-                    new_rate = (row["success_rate"] * n + int(outcome.success)) / new_n
-                    new_dur = (row["avg_duration"] * n + outcome.duration_ms) / new_n
-                    conn.execute(
-                        """UPDATE task_patterns
-                           SET success_rate = ?, avg_duration = ?, sample_count = ?
-                           WHERE task_type = ? AND agent_id = ?""",
-                        (new_rate, new_dur, new_n,
-                         outcome.task_type, outcome.agent_id),
-                    )
-                else:
-                    conn.execute(
-                        """INSERT INTO task_patterns
-                           (task_type, agent_id, success_rate, avg_duration, sample_count)
-                           VALUES (?, ?, ?, ?, 1)""",
-                        (outcome.task_type, outcome.agent_id,
-                         float(outcome.success), outcome.duration_ms),
-                    )
-
-        # 4. Write to dashboard JSON
+                self._insert_outcome(conn, outcome)
+                self._upsert_agent_stats(conn, outcome)
+                self._upsert_task_patterns(conn, outcome)
         self._write_dashboard_json(outcome)
+
+    def _insert_outcome(self, conn: sqlite3.Connection, outcome: TaskOutcome):
+        """Insert or replace a single outcome row."""
+        conn.execute(
+            """INSERT OR REPLACE INTO outcomes
+               (task_id, agent_id, task_type, description, success,
+                duration_ms, error, output_summary, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (outcome.task_id, outcome.agent_id, outcome.task_type,
+             outcome.description, int(outcome.success),
+             outcome.duration_ms, outcome.error,
+             outcome.output_summary, outcome.timestamp),
+        )
+
+    def _upsert_agent_stats(self, conn: sqlite3.Connection, outcome: TaskOutcome):
+        """Upsert aggregate stats for the agent."""
+        conn.execute("""
+            INSERT INTO agent_stats (agent_id, total_tasks, success_count,
+                                    fail_count, avg_duration_ms, last_updated)
+            VALUES (?, 1, ?, ?, ?, ?)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                total_tasks   = total_tasks + 1,
+                success_count = success_count + ?,
+                fail_count    = fail_count + ?,
+                avg_duration_ms = (avg_duration_ms * total_tasks + ?) / (total_tasks + 1),
+                last_updated  = ?
+        """, (
+            outcome.agent_id,
+            int(outcome.success), int(not outcome.success),
+            outcome.duration_ms, outcome.timestamp,
+            int(outcome.success), int(not outcome.success),
+            outcome.duration_ms, outcome.timestamp,
+        ))
+
+    def _upsert_task_patterns(self, conn: sqlite3.Connection, outcome: TaskOutcome):
+        """Upsert success-rate and duration stats per task_type+agent pair."""
+        row = conn.execute(
+            """SELECT success_rate, avg_duration, sample_count
+               FROM task_patterns WHERE task_type = ? AND agent_id = ?""",
+            (outcome.task_type, outcome.agent_id),
+        ).fetchone()
+
+        if row:
+            n = row["sample_count"]
+            new_n = n + 1
+            new_rate = (row["success_rate"] * n + int(outcome.success)) / new_n
+            new_dur = (row["avg_duration"] * n + outcome.duration_ms) / new_n
+            conn.execute(
+                """UPDATE task_patterns
+                   SET success_rate = ?, avg_duration = ?, sample_count = ?
+                   WHERE task_type = ? AND agent_id = ?""",
+                (new_rate, new_dur, new_n,
+                 outcome.task_type, outcome.agent_id),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO task_patterns
+                   (task_type, agent_id, success_rate, avg_duration, sample_count)
+                   VALUES (?, ?, ?, ?, 1)""",
+                (outcome.task_type, outcome.agent_id,
+                 float(outcome.success), outcome.duration_ms),
+            )
 
     def _write_dashboard_json(self, outcome: TaskOutcome):
         """Append latest outcome to feedback.json for dashboard visibility."""
@@ -306,74 +311,87 @@ class FeedbackLoop:
     def suggest_improvements(self) -> List[str]:
         """Analyze patterns and return actionable suggestions."""
         suggestions: List[str] = []
-
         with self._connect() as conn:
-            # 1. Agents with high failure rates on specific task types
-            patterns = conn.execute(
-                """SELECT tp.task_type, tp.agent_id, tp.success_rate, tp.sample_count
-                   FROM task_patterns tp
-                   WHERE tp.sample_count >= 2 AND tp.success_rate < 0.6
-                   ORDER BY tp.success_rate ASC"""
-            ).fetchall()
-
-            for p in patterns:
-                fail_pct = round((1 - p["success_rate"]) * 100)
-                # Find a better agent for this task type
-                better = conn.execute(
-                    """SELECT agent_id, success_rate FROM task_patterns
-                       WHERE task_type = ? AND agent_id != ? AND sample_count >= 2
-                       ORDER BY success_rate DESC LIMIT 1""",
-                    (p["task_type"], p["agent_id"]),
-                ).fetchone()
-                if better and better["success_rate"] > p["success_rate"]:
-                    suggestions.append(
-                        f"Agent {p['agent_id']} has {fail_pct}% failure rate on "
-                        f"'{p['task_type']}' tasks — consider reassigning to "
-                        f"Agent {better['agent_id']}"
-                    )
-                else:
-                    suggestions.append(
-                        f"Agent {p['agent_id']} has {fail_pct}% failure rate on "
-                        f"'{p['task_type']}' tasks — investigate root cause"
-                    )
-
-            # 2. Slow task types
-            slow_types = conn.execute(
-                """SELECT task_type, AVG(duration_ms) as avg_dur, COUNT(*) as cnt
-                   FROM outcomes GROUP BY task_type
-                   HAVING cnt >= 2 AND avg_dur > 30000
-                   ORDER BY avg_dur DESC"""
-            ).fetchall()
-            for s in slow_types:
-                avg_sec = round(s["avg_dur"] / 1000)
-                suggestions.append(
-                    f"Task type '{s['task_type']}' averages {avg_sec}s "
-                    f"— check for bottlenecks"
-                )
-
-            # 3. Idle agents (no tasks in last 2 hours)
-            cutoff = time.time() - 7200
-            all_agents = conn.execute(
-                "SELECT agent_id, last_updated FROM agent_stats"
-            ).fetchall()
-            for a in all_agents:
-                if a["last_updated"] < cutoff:
-                    hours_idle = round((time.time() - a["last_updated"]) / 3600, 1)
-                    suggestions.append(
-                        f"Agent {a['agent_id']} has been idle for "
-                        f"{hours_idle} hours — consider rebalancing"
-                    )
-
-            # 4. Overall low success rate warning
-            overall = conn.execute(
-                """SELECT COUNT(*) as total, SUM(success) as ok FROM outcomes"""
-            ).fetchone()
-            if overall["total"] and overall["total"] >= 5:
-                rate = overall["ok"] / overall["total"]
-                if rate < 0.7:
-                    suggestions.append(
-                        f"Overall system success rate is {round(rate*100)}% "
-                        f"— review agent configurations and task decomposition"
-                    )
-
+            suggestions.extend(self._suggest_reassignments(conn))
+            suggestions.extend(self._suggest_slow_type_fixes(conn))
+            suggestions.extend(self._suggest_idle_rebalancing(conn))
+            suggestions.extend(self._suggest_overall_rate_warning(conn))
         return suggestions
+
+    def _suggest_reassignments(self, conn: sqlite3.Connection) -> List[str]:
+        """Suggest reassigning task types away from high-failure agents."""
+        results: List[str] = []
+        patterns = conn.execute(
+            """SELECT tp.task_type, tp.agent_id, tp.success_rate, tp.sample_count
+               FROM task_patterns tp
+               WHERE tp.sample_count >= 2 AND tp.success_rate < 0.6
+               ORDER BY tp.success_rate ASC"""
+        ).fetchall()
+
+        for p in patterns:
+            fail_pct = round((1 - p["success_rate"]) * 100)
+            better = conn.execute(
+                """SELECT agent_id, success_rate FROM task_patterns
+                   WHERE task_type = ? AND agent_id != ? AND sample_count >= 2
+                   ORDER BY success_rate DESC LIMIT 1""",
+                (p["task_type"], p["agent_id"]),
+            ).fetchone()
+            if better and better["success_rate"] > p["success_rate"]:
+                results.append(
+                    f"Agent {p['agent_id']} has {fail_pct}% failure rate on "
+                    f"'{p['task_type']}' tasks — consider reassigning to "
+                    f"Agent {better['agent_id']}"
+                )
+            else:
+                results.append(
+                    f"Agent {p['agent_id']} has {fail_pct}% failure rate on "
+                    f"'{p['task_type']}' tasks — investigate root cause"
+                )
+        return results
+
+    def _suggest_slow_type_fixes(self, conn: sqlite3.Connection) -> List[str]:
+        """Flag task types with average duration above 30s."""
+        results: List[str] = []
+        slow_types = conn.execute(
+            """SELECT task_type, AVG(duration_ms) as avg_dur, COUNT(*) as cnt
+               FROM outcomes GROUP BY task_type
+               HAVING cnt >= 2 AND avg_dur > 30000
+               ORDER BY avg_dur DESC"""
+        ).fetchall()
+        for s in slow_types:
+            avg_sec = round(s["avg_dur"] / 1000)
+            results.append(
+                f"Task type '{s['task_type']}' averages {avg_sec}s "
+                f"— check for bottlenecks"
+            )
+        return results
+
+    def _suggest_idle_rebalancing(self, conn: sqlite3.Connection) -> List[str]:
+        """Identify agents with no tasks in the last 2 hours."""
+        results: List[str] = []
+        cutoff = time.time() - 7200
+        all_agents = conn.execute(
+            "SELECT agent_id, last_updated FROM agent_stats"
+        ).fetchall()
+        for a in all_agents:
+            if a["last_updated"] < cutoff:
+                hours_idle = round((time.time() - a["last_updated"]) / 3600, 1)
+                results.append(
+                    f"Agent {a['agent_id']} has been idle for "
+                    f"{hours_idle} hours — consider rebalancing"
+                )
+        return results
+
+    def _suggest_overall_rate_warning(self, conn: sqlite3.Connection) -> List[str]:
+        """Warn if overall success rate drops below 70%."""
+        overall = conn.execute(
+            """SELECT COUNT(*) as total, SUM(success) as ok FROM outcomes"""
+        ).fetchone()
+        if overall["total"] and overall["total"] >= 5:
+            rate = overall["ok"] / overall["total"]
+            if rate < 0.7:
+                return [
+                    f"Overall system success rate is {round(rate*100)}% "
+                    f"— review agent configurations and task decomposition"
+                ]
+        return []

@@ -86,6 +86,38 @@ def wait_for_cdp(timeout=30):
     return None
 
 
+def _handle_file_dialog():
+    """Handle the file dialog for loading unpacked extension."""
+    time.sleep(2)
+    dialog = user32.FindWindowW('#32770', None)
+    if not dialog:
+        time.sleep(2)
+        dialog = user32.FindWindowW('#32770', None)
+
+    if not dialog:
+        print("    No dialog appeared")
+        return False
+
+    user32.SetForegroundWindow(dialog)
+    time.sleep(0.5)
+
+    hotkey(0x12, 0x44)  # Alt+D
+    time.sleep(0.5)
+
+    subprocess.run(
+        ['powershell', '-NoProfile', '-Command', f'Set-Clipboard -Value "{EXTENSION_PATH}"'],
+        check=True, capture_output=True
+    )
+    time.sleep(0.2)
+
+    hotkey(0x11, 0x56)  # Ctrl+V
+    time.sleep(0.5)
+    press(0x0D)  # Enter (navigate)
+    time.sleep(1.5)
+    press(0x0D)  # Enter (select folder)
+    return True
+
+
 def install_on_tab(chrome, tab_id):
     """Install extension via CDP on the given tab."""
     # Navigate to extensions
@@ -144,35 +176,8 @@ def install_on_tab(chrome, tab_id):
     if load != 'clicked':
         return False
 
-    # Handle file dialog
-    time.sleep(2)
-    dialog = user32.FindWindowW('#32770', None)
-    if not dialog:
-        time.sleep(2)
-        dialog = user32.FindWindowW('#32770', None)
-
-    if not dialog:
-        print("    No dialog appeared")
+    if not _handle_file_dialog():
         return False
-
-    user32.SetForegroundWindow(dialog)
-    time.sleep(0.5)
-
-    # Alt+D → paste path → Enter → Enter
-    hotkey(0x12, 0x44)
-    time.sleep(0.5)
-
-    subprocess.run(
-        ['powershell', '-NoProfile', '-Command', f'Set-Clipboard -Value "{EXTENSION_PATH}"'],
-        check=True, capture_output=True
-    )
-    time.sleep(0.2)
-
-    hotkey(0x11, 0x56)  # Ctrl+V
-    time.sleep(0.5)
-    press(0x0D)  # Enter (navigate)
-    time.sleep(1.5)
-    press(0x0D)  # Enter (select folder)
     time.sleep(3)
 
     # Verify
@@ -226,39 +231,36 @@ def main():
 
     results = {}
 
+
+def _install_profile(profile_dir, profile_name):
+    """Install extension on a single Chrome profile."""
+    print(f"[{profile_dir}] ({profile_name})")
+
+    killed = kill_chrome()
+    if killed:
+        print(f"    Killed {killed} Chrome processes")
+
+    print(f"    Launching Chrome...")
+    launch_chrome(profile_dir)
+
+    chrome = wait_for_cdp()
+    if not chrome:
+        print("    FAILED: CDP not available")
+        return False
+
+    tabs = chrome.tabs()
+    if not tabs:
+        print("    FAILED: No tabs")
+        return False
+
+    tab = tabs[0]['id']
+    success = install_on_tab(chrome, tab)
+    print(f"    Result: {'OK' if success else 'FAILED'}")
+    print()
+    return success
+
     for profile_dir, profile_name in profiles:
-        print(f"[{profile_dir}] ({profile_name})")
-
-        # Kill Chrome
-        killed = kill_chrome()
-        if killed:
-            print(f"    Killed {killed} Chrome processes")
-
-        # Launch Chrome for this profile
-        print(f"    Launching Chrome...")
-        launch_chrome(profile_dir)
-
-        # Wait for CDP
-        chrome = wait_for_cdp()
-        if not chrome:
-            print("    FAILED: CDP not available")
-            results[profile_dir] = False
-            continue
-
-        tabs = chrome.tabs()
-        if not tabs:
-            print("    FAILED: No tabs")
-            results[profile_dir] = False
-            continue
-
-        tab = tabs[0]['id']
-
-        # Install
-        success = install_on_tab(chrome, tab)
-        status = "OK" if success else "FAILED"
-        print(f"    Result: {status}")
-        results[profile_dir] = success
-        print()
+        results[profile_dir] = _install_profile(profile_dir, profile_name)
 
     # Summary
     print("=" * 50)

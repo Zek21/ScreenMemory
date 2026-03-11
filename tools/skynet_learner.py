@@ -345,6 +345,81 @@ class SkynetLearner:
                 return entry
         return None
 
+    def _store_insights(self, result: dict, task_text: str, category: str,
+                        success: bool, insights: list, sender: str):
+        """Store insights in LearningStore via PersistentLearningSystem."""
+        if not (self.learning_system and insights):
+            return
+        try:
+            fact_ids = self.learning_system.learn_from_task(
+                task_description=task_text[:300],
+                category=category, success=success, insights=insights,
+            )
+            result["stored"] = len(fact_ids)
+            self.state["total_learnings"] = self.state.get("total_learnings", 0) + len(fact_ids)
+            logger.info(f"Stored {len(fact_ids)} facts from {sender}'s result (category={category})")
+        except Exception as e:
+            logger.warning(f"LearningStore error: {e}")
+
+    def _update_evolution(self, result: dict, dispatch: dict | None,
+                          dispatch_time: str, category: str, success: bool):
+        """Update evolution fitness from task result."""
+        if not self.evolution_system:
+            return
+        try:
+            latency_ms = 0
+            if dispatch_time:
+                try:
+                    dt = datetime.fromisoformat(dispatch_time)
+                    latency_ms = int((datetime.now() - dt).total_seconds() * 1000)
+                except (ValueError, TypeError):
+                    pass
+            strategy_id = (dispatch.get("strategy_id") or dispatch.get("strategy", f"default_{category}")
+                           if dispatch else f"default_{category}")
+            task_result = {
+                "task_id": str(uuid.uuid4()), "category": category,
+                "strategy_id": strategy_id, "success": success,
+                "latency_ms": min(latency_ms, 3600000), "quality_score": 0.8 if success else 0.3,
+                "tokens_used": 0, "memory_hits": 0, "memory_queries": 1,
+            }
+            fitness = self.evolution_system.record_task(task_result)
+            result["evolution_updated"] = True
+            result["fitness"] = fitness
+            self.state["total_evolution_updates"] = self.state.get("total_evolution_updates", 0) + 1
+            logger.info(f"Evolution fitness updated: {fitness:.3f} (category={category})")
+        except Exception as e:
+            logger.warning(f"SelfEvolution error: {e}")
+
+    def _broadcast_top_insight(self, result: dict, insights: list,
+                               category: str, tags: list):
+        """Broadcast top insight to knowledge bus."""
+        if not insights:
+            return
+        try:
+            from tools.skynet_knowledge import broadcast_learning
+            ok = broadcast_learning(sender="learner", fact=insights[0],
+                                    category=category, tags=tags)
+            if ok:
+                result["broadcast"] = 1
+                self.state["total_broadcasts"] = self.state.get("total_broadcasts", 0) + 1
+        except Exception as e:
+            logger.warning(f"Broadcast error: {e}")
+
+    def _run_distill_hook(self, result: dict, sender: str, task_text: str,
+                          content: str, success: bool):
+        """Run KnowledgeDistiller auto-pattern extraction."""
+        try:
+            from tools.skynet_distill_hook import distill_result
+            dr = distill_result(worker=sender, task_text=task_text[:300],
+                                result_text=content[:500], success=success)
+            result["distill_patterns"] = dr.get("patterns_extracted", 0)
+            result["distill_semantic"] = dr.get("semantic_promoted", 0)
+            if dr.get("patterns_extracted", 0) > 0:
+                logger.info(f"Distilled {dr['patterns_extracted']} patterns, "
+                            f"{dr['semantic_promoted']} promoted to semantic")
+        except Exception as e:
+            logger.warning(f"Distill hook error: {e}")
+
     def process_result(self, msg: dict) -> dict:
         """Process a single bus result message into learnings.
 
@@ -355,116 +430,27 @@ class SkynetLearner:
         content = msg.get("content", "")
         timestamp = msg.get("timestamp", "")
 
-        # Correlate with dispatch log to get original task
         dispatch = self._correlate_with_dispatch(sender, content)
         task_text = dispatch.get("task_summary", content) if dispatch else content
         dispatch_time = dispatch.get("timestamp", "") if dispatch else ""
 
-        # Categorize
         category, tags = categorize_task(task_text)
         success = detect_success(content)
-
-        # Extract insights
         insights = extract_insights(task_text, content, success)
 
         result = {
-            "worker": sender,
-            "task_summary": task_text[:200],
-            "result_summary": content[:200],
-            "success": success,
-            "category": category,
-            "tags": tags,
-            "insights": insights,
-            "timestamp": timestamp,
-            "dispatch_timestamp": dispatch_time,
+            "worker": sender, "task_summary": task_text[:200],
+            "result_summary": content[:200], "success": success,
+            "category": category, "tags": tags, "insights": insights,
+            "timestamp": timestamp, "dispatch_timestamp": dispatch_time,
             "strategy_id": dispatch.get("strategy_id", "") if dispatch else "",
-            "stored": 0,
-            "broadcast": 0,
-            "evolution_updated": False,
+            "stored": 0, "broadcast": 0, "evolution_updated": False,
         }
 
-        # Store in LearningStore via PersistentLearningSystem
-        if self.learning_system and insights:
-            try:
-                fact_ids = self.learning_system.learn_from_task(
-                    task_description=task_text[:300],
-                    category=category,
-                    success=success,
-                    insights=insights,
-                )
-                result["stored"] = len(fact_ids)
-                self.state["total_learnings"] = self.state.get("total_learnings", 0) + len(fact_ids)
-                logger.info(f"Stored {len(fact_ids)} facts from {sender}'s result (category={category})")
-            except Exception as e:
-                logger.warning(f"LearningStore error: {e}")
-
-        # Update evolution fitness
-        if self.evolution_system:
-            try:
-                # Calculate latency if we have dispatch timestamp
-                latency_ms = 0
-                if dispatch_time:
-                    try:
-                        dt = datetime.fromisoformat(dispatch_time)
-                        now = datetime.now()
-                        latency_ms = int((now - dt).total_seconds() * 1000)
-                    except (ValueError, TypeError):
-                        latency_ms = 0
-
-                task_result = {
-                    "task_id": str(uuid.uuid4()),
-                    "category": category,
-                    "strategy_id": dispatch.get("strategy_id") or dispatch.get("strategy", f"default_{category}") if dispatch else f"default_{category}",
-                    "success": success,
-                    "latency_ms": min(latency_ms, 3600000),  # cap at 1 hour
-                    "quality_score": 0.8 if success else 0.3,
-                    "tokens_used": 0,
-                    "memory_hits": 0,
-                    "memory_queries": 1,
-                }
-                fitness = self.evolution_system.record_task(task_result)
-                result["evolution_updated"] = True
-                result["fitness"] = fitness
-                self.state["total_evolution_updates"] = self.state.get("total_evolution_updates", 0) + 1
-                logger.info(f"Evolution fitness updated: {fitness:.3f} (category={category})")
-            except Exception as e:
-                logger.warning(f"SelfEvolution error: {e}")
-
-        # Broadcast top insight to knowledge bus
-        if insights:
-            try:
-                from tools.skynet_knowledge import broadcast_learning
-                top_insight = insights[0]
-                ok = broadcast_learning(
-                    sender="learner",
-                    fact=top_insight,
-                    category=category,
-                    tags=tags,
-                )
-                if ok:
-                    result["broadcast"] = 1
-                    self.state["total_broadcasts"] = self.state.get("total_broadcasts", 0) + 1
-            except Exception as e:
-                logger.warning(f"Broadcast error: {e}")
-
-        # Level 4: KnowledgeDistiller auto-pattern extraction
-        try:
-            from tools.skynet_distill_hook import distill_result
-            dr = distill_result(
-                worker=sender,
-                task_text=task_text[:300],
-                result_text=content[:500],
-                success=success,
-            )
-            result["distill_patterns"] = dr.get("patterns_extracted", 0)
-            result["distill_semantic"] = dr.get("semantic_promoted", 0)
-            if dr.get("patterns_extracted", 0) > 0:
-                logger.info(
-                    f"Distilled {dr['patterns_extracted']} patterns, "
-                    f"{dr['semantic_promoted']} promoted to semantic"
-                )
-        except Exception as e:
-            logger.warning(f"Distill hook error: {e}")
+        self._store_insights(result, task_text, category, success, insights, sender)
+        self._update_evolution(result, dispatch, dispatch_time, category, success)
+        self._broadcast_top_insight(result, insights, category, tags)
+        self._run_distill_hook(result, sender, task_text, content, success)
 
         return result
 

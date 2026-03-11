@@ -42,6 +42,9 @@ class ScreenMemoryDB:
                  encryption_key: Optional[str] = None,
                  embedding_dim: int = 768):
         self.db_path = db_path
+        # Validate embedding_dim to prevent SQL injection in CREATE VIRTUAL TABLE
+        if not isinstance(embedding_dim, int) or embedding_dim < 1 or embedding_dim > 10000:  # signed: alpha
+            raise ValueError(f"embedding_dim must be an integer between 1 and 10000, got {embedding_dim!r}")
         self.embedding_dim = embedding_dim
         self._encryption_key = encryption_key
 
@@ -60,7 +63,9 @@ class ScreenMemoryDB:
             try:
                 import pysqlcipher3.dbapi2 as sqlcipher
                 conn = sqlcipher.connect(db_path)
-                conn.execute(f"PRAGMA key = '{encryption_key}'")
+                # Sanitize key to prevent SQL injection in PRAGMA (which doesn't support parameters)
+                safe_key = encryption_key.replace("'", "''")
+                conn.execute(f"PRAGMA key = '{safe_key}'")
                 conn.execute("PRAGMA cipher_memory_security = ON")
                 logger.info("SQLCipher encryption enabled")
                 return conn

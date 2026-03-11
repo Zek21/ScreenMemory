@@ -45,71 +45,56 @@ class PersistentMemoryStore:
         self._conn: Optional[sqlite3.Connection] = None
         self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
+    def _get_conn(self) -> sqlite3.Connection:  # signed: alpha
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self.db_path), timeout=10)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA cache_size=-8192")  # 8MB cache
+            conn = sqlite3.connect(str(self.db_path), timeout=10)
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA cache_size=-8192")  # 8MB cache
+            except Exception:
+                conn.close()
+                raise
+            self._conn = conn
         return self._conn
+
+    _SCHEMA_SQL = """
+        CREATE TABLE IF NOT EXISTS episodes (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL,
+            context_json TEXT DEFAULT '{}', timestamp REAL NOT NULL,
+            last_accessed REAL NOT NULL, access_count INTEGER DEFAULT 1,
+            utility_score REAL DEFAULT 1.0, decay_rate REAL DEFAULT 0.05,
+            importance REAL DEFAULT 0.5, tags_json TEXT DEFAULT '[]',
+            created_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS semantics (
+            id TEXT PRIMARY KEY, content TEXT NOT NULL,
+            context_json TEXT DEFAULT '{}', timestamp REAL NOT NULL,
+            last_accessed REAL NOT NULL, access_count INTEGER DEFAULT 1,
+            utility_score REAL DEFAULT 1.0, decay_rate REAL DEFAULT 0.01,
+            importance REAL DEFAULT 0.7, tags_json TEXT DEFAULT '[]',
+            source_episode_ids TEXT DEFAULT '[]', created_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY, start_time REAL NOT NULL,
+            end_time REAL, episode_count INTEGER DEFAULT 0,
+            semantic_count INTEGER DEFAULT 0, metadata_json TEXT DEFAULT '{}'
+        );
+        CREATE TABLE IF NOT EXISTS consolidation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL NOT NULL,
+            source_episode_ids TEXT NOT NULL, created_semantic_id TEXT NOT NULL,
+            pattern_text TEXT NOT NULL, confidence REAL DEFAULT 0.5
+        );
+        CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id);
+        CREATE INDEX IF NOT EXISTS idx_episodes_utility ON episodes(utility_score DESC);
+        CREATE INDEX IF NOT EXISTS idx_episodes_timestamp ON episodes(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_semantics_utility ON semantics(utility_score DESC);
+        CREATE INDEX IF NOT EXISTS idx_semantics_timestamp ON semantics(timestamp DESC);
+    """
 
     def _init_db(self):
         conn = self._get_conn()
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS episodes (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                content TEXT NOT NULL,
-                context_json TEXT DEFAULT '{}',
-                timestamp REAL NOT NULL,
-                last_accessed REAL NOT NULL,
-                access_count INTEGER DEFAULT 1,
-                utility_score REAL DEFAULT 1.0,
-                decay_rate REAL DEFAULT 0.05,
-                importance REAL DEFAULT 0.5,
-                tags_json TEXT DEFAULT '[]',
-                created_at REAL NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS semantics (
-                id TEXT PRIMARY KEY,
-                content TEXT NOT NULL,
-                context_json TEXT DEFAULT '{}',
-                timestamp REAL NOT NULL,
-                last_accessed REAL NOT NULL,
-                access_count INTEGER DEFAULT 1,
-                utility_score REAL DEFAULT 1.0,
-                decay_rate REAL DEFAULT 0.01,
-                importance REAL DEFAULT 0.7,
-                tags_json TEXT DEFAULT '[]',
-                source_episode_ids TEXT DEFAULT '[]',
-                created_at REAL NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                session_id TEXT PRIMARY KEY,
-                start_time REAL NOT NULL,
-                end_time REAL,
-                episode_count INTEGER DEFAULT 0,
-                semantic_count INTEGER DEFAULT 0,
-                metadata_json TEXT DEFAULT '{}'
-            );
-
-            CREATE TABLE IF NOT EXISTS consolidation_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                source_episode_ids TEXT NOT NULL,
-                created_semantic_id TEXT NOT NULL,
-                pattern_text TEXT NOT NULL,
-                confidence REAL DEFAULT 0.5
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id);
-            CREATE INDEX IF NOT EXISTS idx_episodes_utility ON episodes(utility_score DESC);
-            CREATE INDEX IF NOT EXISTS idx_episodes_timestamp ON episodes(timestamp DESC);
-            CREATE INDEX IF NOT EXISTS idx_semantics_utility ON semantics(utility_score DESC);
-            CREATE INDEX IF NOT EXISTS idx_semantics_timestamp ON semantics(timestamp DESC);
-        """)
+        conn.executescript(self._SCHEMA_SQL)
         conn.commit()
 
     def close(self):
@@ -135,19 +120,26 @@ class PersistentMemoryStore:
         sem_count = 0
 
         # Save episodic memories (attribute may be _episodic or episodic_memory)
-        episodic_list = getattr(episodic_memory, "_episodic", None) or getattr(episodic_memory, "episodic_memory", [])
+        # Use `is None` check to avoid falsiness of empty lists  # signed: alpha
+        episodic_list = getattr(episodic_memory, "_episodic", None)
+        if episodic_list is None:
+            episodic_list = getattr(episodic_memory, "episodic_memory", [])
         for entry in episodic_list:
             self._upsert_episode(conn, session_id, entry)
             ep_count += 1
 
         # Save working memory as episodic (it's volatile but worth preserving)
-        working_list = getattr(episodic_memory, "_working", None) or getattr(episodic_memory, "working_memory", [])
+        working_list = getattr(episodic_memory, "_working", None)
+        if working_list is None:
+            working_list = getattr(episodic_memory, "working_memory", [])
         for entry in working_list:
             self._upsert_episode(conn, session_id, entry)
             ep_count += 1
 
         # Save semantic memories
-        semantic_list = getattr(episodic_memory, "_semantic", None) or getattr(episodic_memory, "semantic_memory", [])
+        semantic_list = getattr(episodic_memory, "_semantic", None)
+        if semantic_list is None:
+            semantic_list = getattr(episodic_memory, "semantic_memory", [])
         for entry in semantic_list:
             self._upsert_semantic(conn, entry)
             sem_count += 1
@@ -207,74 +199,56 @@ class PersistentMemoryStore:
         return memories[:top_k]
 
     def recall(self, query: str, top_k: int = 10) -> List[dict]:
-        """Search memories using BM25-style relevance scoring with time decay.
-
-        Args:
-            query: Natural language search query.
-            top_k: Maximum results to return.
-
-        Returns:
-            List of memory dicts ranked by (relevance * 0.6 + utility * 0.4).
-        """
+        """Search memories using BM25-style relevance scoring with time decay."""
         conn = self._get_conn()
         now = time.time()
         query_terms = set(query.lower().split())
-
         if not query_terms:
             return []
 
-        # Search episodes
         all_rows = conn.execute("SELECT * FROM episodes").fetchall()
         all_rows += conn.execute("SELECT * FROM semantics").fetchall()
 
         scored = []
         for row in all_rows:
-            content = row["content"].lower()
-            content_terms = content.split()
-
-            if not content_terms:
-                continue
-
-            # BM25-inspired scoring
-            match_count = sum(1 for t in query_terms if t in content)
-            if match_count == 0:
-                continue
-
-            tf = match_count / len(content_terms)
-            k1 = 1.5
-            relevance = (tf * (k1 + 1)) / (tf + k1)
-            coverage = match_count / len(query_terms)
-            relevance *= coverage
-
-            entry = self._row_to_dict(row, "episodic" if "session_id" in row.keys() else "semantic")
-            eff_util = self._compute_effective_utility(entry, now)
-
-            combined = relevance * 0.6 + eff_util * 0.4
-            entry["relevance_score"] = round(relevance, 4)
-            entry["effective_utility"] = round(eff_util, 4)
-            entry["combined_score"] = round(combined, 4)
-            scored.append(entry)
+            entry = self._score_memory_row(row, query_terms, now)
+            if entry:
+                scored.append(entry)
 
         scored.sort(key=lambda m: m["combined_score"], reverse=True)
         return scored[:top_k]
 
+    def _score_memory_row(self, row, query_terms, now):
+        """Score a single memory row against query terms. Returns dict or None."""
+        content = row["content"].lower()
+        content_terms = content.split()
+        if not content_terms:
+            return None
+
+        match_count = sum(1 for t in query_terms if t in content)
+        if match_count == 0:
+            return None
+
+        tf = match_count / len(content_terms)
+        k1 = 1.5
+        relevance = (tf * (k1 + 1)) / (tf + k1) * (match_count / len(query_terms))
+
+        entry = self._row_to_dict(row, "episodic" if "session_id" in row.keys() else "semantic")
+        eff_util = self._compute_effective_utility(entry, now)
+        combined = relevance * 0.6 + eff_util * 0.4
+        entry["relevance_score"] = round(relevance, 4)
+        entry["effective_utility"] = round(eff_util, 4)
+        entry["combined_score"] = round(combined, 4)
+        return entry
+
     def consolidate(self) -> dict:
-        """Promote repeated episodic patterns to semantic memories.
-
-        Scans episodes for content overlap. When 3+ episodes share 60%+ words,
-        creates a semantic memory synthesizing the pattern.
-
-        Returns:
-            Dict with consolidation stats.
-        """
+        """Promote repeated episodic patterns to semantic memories."""
         conn = self._get_conn()
         now = time.time()
-
         episodes = conn.execute(
             "SELECT * FROM episodes ORDER BY timestamp DESC LIMIT 500"
         ).fetchall()
 
-        # Group by word overlap
         promoted = 0
         seen_groups = []
 
@@ -282,53 +256,55 @@ class PersistentMemoryStore:
             words_i = set(ep["content"].lower().split())
             if len(words_i) < 3:
                 continue
-
-            group = [ep]
-            for j, other in enumerate(episodes):
-                if i == j:
-                    continue
-                words_j = set(other["content"].lower().split())
-                if len(words_j) < 3:
-                    continue
-                overlap = len(words_i & words_j) / max(len(words_i | words_j), 1)
-                if overlap >= 0.6:
-                    group.append(other)
-
-            if len(group) >= CONSOLIDATION_THRESHOLD:
-                group_ids = sorted(set(g["id"] for g in group))
-                group_key = ",".join(group_ids)
-                if group_key in seen_groups:
-                    continue
-                seen_groups.append(group_key)
-
-                # Create semantic memory from the pattern
-                semantic_id = str(uuid.uuid4())
-                combined_content = f"[Consolidated from {len(group)} episodes] {group[0]['content']}"
-
-                conn.execute("""
-                    INSERT OR IGNORE INTO semantics
-                    (id, content, context_json, timestamp, last_accessed, access_count,
-                     utility_score, decay_rate, importance, tags_json, source_episode_ids, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    semantic_id, combined_content, "{}",
-                    now, now, len(group),
-                    min(2.0, 0.5 + 0.2 * len(group)),  # higher utility for more evidence
-                    0.01, 0.8,  # slow decay, high importance
-                    json.dumps(["consolidated"]),
-                    json.dumps(group_ids),
-                    now,
-                ))
-
-                conn.execute("""
-                    INSERT INTO consolidation_log (timestamp, source_episode_ids, created_semantic_id, pattern_text, confidence)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (now, json.dumps(group_ids), semantic_id, combined_content[:200], min(1.0, 0.3 + 0.15 * len(group))))
-
-                promoted += 1
+            group = self._find_overlap_group(ep, words_i, episodes, i)
+            if len(group) < CONSOLIDATION_THRESHOLD:
+                continue
+            group_ids = sorted(set(g["id"] for g in group))
+            group_key = ",".join(group_ids)
+            if group_key in seen_groups:
+                continue
+            seen_groups.append(group_key)
+            self._promote_to_semantic(conn, group, group_ids, now)
+            promoted += 1
 
         conn.commit()
         return {"consolidated": promoted, "episodes_scanned": len(episodes)}
+
+    @staticmethod
+    def _find_overlap_group(ep, words_i, episodes, skip_idx):
+        """Find episodes with 60%+ word overlap with the given episode."""
+        group = [ep]
+        for j, other in enumerate(episodes):
+            if j == skip_idx:
+                continue
+            words_j = set(other["content"].lower().split())
+            if len(words_j) < 3:
+                continue
+            overlap = len(words_i & words_j) / max(len(words_i | words_j), 1)
+            if overlap >= 0.6:
+                group.append(other)
+        return group
+
+    @staticmethod
+    def _promote_to_semantic(conn, group, group_ids, now):
+        """Create a semantic memory from an overlapping episode group."""
+        semantic_id = str(uuid.uuid4())
+        combined_content = f"[Consolidated from {len(group)} episodes] {group[0]['content']}"
+        conn.execute("""
+            INSERT OR IGNORE INTO semantics
+            (id, content, context_json, timestamp, last_accessed, access_count,
+             utility_score, decay_rate, importance, tags_json, source_episode_ids, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            semantic_id, combined_content, "{}",
+            now, now, len(group),
+            min(2.0, 0.5 + 0.2 * len(group)), 0.01, 0.8,
+            json.dumps(["consolidated"]), json.dumps(group_ids), now,
+        ))
+        conn.execute("""
+            INSERT INTO consolidation_log (timestamp, source_episode_ids, created_semantic_id, pattern_text, confidence)
+            VALUES (?, ?, ?, ?, ?)
+        """, (now, json.dumps(group_ids), semantic_id, combined_content[:200], min(1.0, 0.3 + 0.15 * len(group))))
 
     def get_stats(self) -> dict:
         """Get statistics about the persistent memory store."""

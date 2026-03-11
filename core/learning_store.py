@@ -225,60 +225,64 @@ class LearningStore:
         new_fact_id = self.learn(correction, "correction", f"correction_of:{fact_id}")
         return new_fact_id
     
-    def recall(self, query: str, top_k: int = 5) -> List[LearnedFact]:
-        """BM25 search for relevant facts."""
-        query_tokens = self._tokenize(query)
-        
-        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
-            cursor = conn.execute("SELECT * FROM learned_facts")
-            rows = cursor.fetchall()
-        
-        if not rows:
-            return []
-        
-        # Build document corpus
+    def _row_to_fact(self, row) -> LearnedFact:
+        """Convert a database row to a LearnedFact."""
+        try:  # signed: alpha
+            tags = json.loads(row[9]) if row[9] else []
+        except (json.JSONDecodeError, TypeError, IndexError):
+            tags = []
+        return LearnedFact(
+            fact_id=row[0], content=row[1], category=row[2],
+            confidence=row[3], source=row[4], reinforcement_count=row[5],
+            contradiction_count=row[6], first_learned=row[7],
+            last_accessed=row[8], tags=tags
+        )
+
+    def _rank_and_select(self, query_tokens: List[str], rows: list, top_k: int) -> List[str]:
+        """Score documents via BM25 and return top-k fact IDs."""
         docs = []
         doc_ids = []
         for row in rows:
-            docs.append(self._tokenize(row[1]))  # content is at index 1
-            doc_ids.append(row[0])  # fact_id at index 0
-        
-        # Calculate BM25 scores
+            docs.append(self._tokenize(row[1]))
+            doc_ids.append(row[0])
+
         scores = self._bm25_score(query_tokens, docs)
-        
-        # Get top-k
-        scored_docs = list(zip(doc_ids, scores))
-        scored_docs.sort(key=lambda x: x[1], reverse=True)
-        top_doc_ids = [doc_id for doc_id, score in scored_docs[:top_k]]
-        
-        # Fetch full facts and update last_accessed
+        scored_docs = sorted(zip(doc_ids, scores), key=lambda x: x[1], reverse=True)
+        return [doc_id for doc_id, _ in scored_docs[:top_k]]
+
+    def _fetch_and_touch(self, fact_ids: List[str]) -> List[LearnedFact]:
+        """Fetch facts by IDs and update their last_accessed timestamp."""
         results = []
         with self.lock:
             with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
-                for fact_id in top_doc_ids:
+                for fact_id in fact_ids:
                     cursor = conn.execute(
                         "SELECT * FROM learned_facts WHERE fact_id = ?",
                         (fact_id,)
                     )
                     row = cursor.fetchone()
                     if row:
-                        tags = json.loads(row[9]) if row[9] else []
-                        fact = LearnedFact(
-                            fact_id=row[0], content=row[1], category=row[2],
-                            confidence=row[3], source=row[4], reinforcement_count=row[5],
-                            contradiction_count=row[6], first_learned=row[7],
-                            last_accessed=row[8], tags=tags
-                        )
-                        results.append(fact)
-                        
-                        # Update last_accessed
+                        results.append(self._row_to_fact(row))
                         conn.execute(
                             "UPDATE learned_facts SET last_accessed = ? WHERE fact_id = ?",
                             (datetime.now().isoformat(), fact_id)
                         )
                 conn.commit()
-        
         return results
+
+    def recall(self, query: str, top_k: int = 5) -> List[LearnedFact]:
+        """BM25 search for relevant facts."""
+        query_tokens = self._tokenize(query)
+
+        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
+            cursor = conn.execute("SELECT * FROM learned_facts")
+            rows = cursor.fetchall()
+
+        if not rows:
+            return []
+
+        top_doc_ids = self._rank_and_select(query_tokens, rows, top_k)
+        return self._fetch_and_touch(top_doc_ids)
     
     def recall_by_category(self, category: str, top_k: int = 10) -> List[LearnedFact]:
         """Retrieve facts by category, sorted by confidence."""
@@ -293,7 +297,10 @@ class LearningStore:
         
         results = []
         for row in rows:
-            tags = json.loads(row[9]) if row[9] else []
+            try:  # signed: alpha
+                tags = json.loads(row[9]) if row[9] else []
+            except (json.JSONDecodeError, TypeError, IndexError):
+                tags = []
             fact = LearnedFact(
                 fact_id=row[0], content=row[1], category=row[2],
                 confidence=row[3], source=row[4], reinforcement_count=row[5],
@@ -317,59 +324,55 @@ class LearningStore:
         
         return deleted
     
+    def _should_merge(self, row_a, row_b, threshold: float = 0.7) -> bool:
+        """Check if two facts have sufficient word overlap to merge."""
+        words_a = set(self._tokenize(row_a[1]))
+        words_b = set(self._tokenize(row_b[1]))
+        if not words_a or not words_b:
+            return False
+        overlap = len(words_a & words_b) / max(len(words_a), len(words_b))
+        return overlap > threshold
+
+    def _merge_fact_pair(self, row_a, row_b):
+        """Merge row_b into row_a: combine tags, average confidence, delete row_b."""
+        tags_a = json.loads(row_a[2]) if row_a[2] else []
+        tags_b = json.loads(row_b[2]) if row_b[2] else []
+        merged_tags = list(set(tags_a + tags_b))
+        avg_confidence = (row_a[3] + row_b[3]) / 2
+
+        with self.lock:
+            with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
+                conn.execute("""
+                    UPDATE learned_facts 
+                    SET tags = ?, confidence = ?
+                    WHERE fact_id = ?
+                """, (json.dumps(merged_tags), avg_confidence, row_a[0]))
+                conn.execute("DELETE FROM learned_facts WHERE fact_id = ?", (row_b[0],))
+                conn.commit()
+
     def consolidate(self):
         """Merge similar facts with high word overlap."""
         with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
             cursor = conn.execute("SELECT fact_id, content, tags, confidence FROM learned_facts")
             rows = cursor.fetchall()
-        
+
         if len(rows) < 2:
             return 0
-        
+
         merged_count = 0
         to_delete = set()
-        
+
         for i, row_a in enumerate(rows):
             if row_a[0] in to_delete:
                 continue
-                
             for row_b in rows[i+1:]:
                 if row_b[0] in to_delete:
                     continue
-                
-                # Calculate word overlap
-                words_a = set(self._tokenize(row_a[1]))
-                words_b = set(self._tokenize(row_b[1]))
-                
-                if not words_a or not words_b:
-                    continue
-                
-                overlap = len(words_a & words_b) / max(len(words_a), len(words_b))
-                
-                if overlap > 0.7:
-                    # Merge facts
-                    tags_a = json.loads(row_a[2]) if row_a[2] else []
-                    tags_b = json.loads(row_b[2]) if row_b[2] else []
-                    merged_tags = list(set(tags_a + tags_b))
-                    
-                    avg_confidence = (row_a[3] + row_b[3]) / 2
-                    
-                    with self.lock:
-                        with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
-                            # Update first fact
-                            conn.execute("""
-                                UPDATE learned_facts 
-                                SET tags = ?, confidence = ?
-                                WHERE fact_id = ?
-                            """, (json.dumps(merged_tags), avg_confidence, row_a[0]))
-                            
-                            # Delete second fact
-                            conn.execute("DELETE FROM learned_facts WHERE fact_id = ?", (row_b[0],))
-                            conn.commit()
-                    
+                if self._should_merge(row_a, row_b):
+                    self._merge_fact_pair(row_a, row_b)
                     to_delete.add(row_b[0])
                     merged_count += 1
-        
+
         return merged_count
     
     def export_knowledge(self, domain: Optional[str] = None) -> str:
@@ -432,7 +435,11 @@ class LearningStore:
     def _bm25_score(self, query_tokens: List[str], docs: List[List[str]], k1: float = 1.5, b: float = 0.75) -> List[float]:
         """Calculate BM25 scores for documents."""
         N = len(docs)
-        avgdl = sum(len(doc) for doc in docs) / N if N > 0 else 0
+        if N == 0:  # signed: alpha — guard against empty corpus
+            return []
+        avgdl = sum(len(doc) for doc in docs) / N
+        if avgdl == 0:  # All documents empty — return zero scores
+            return [0.0] * N
         
         # Calculate document frequencies
         df = Counter()
@@ -456,7 +463,8 @@ class LearningStore:
                     tf = term_freqs[term]
                     numerator = idf[term] * tf * (k1 + 1)
                     denominator = tf + k1 * (1 - b + b * doc_len / avgdl)
-                    score += numerator / denominator
+                    if denominator > 0:  # signed: alpha — guard against zero denominator
+                        score += numerator / denominator
             
             scores.append(score)
         

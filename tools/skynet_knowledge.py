@@ -32,9 +32,15 @@ KNOWLEDGE_TOPIC = "knowledge"
 # ─── Bus Helpers ───────────────────────────────────────
 
 def _bus_post(message: dict) -> bool:
-    """POST a message to the Skynet bus. Returns True on success."""
-    from tools.shared.bus import bus_post
-    return bus_post(message)
+    """POST a message to the Skynet bus via SpamGuard. Returns True on success."""
+    try:
+        from tools.skynet_spam_guard import guarded_publish
+        result = guarded_publish(message)
+        return bool(result and result.get("allowed", False))
+    except Exception:
+        from tools.shared.bus import bus_post
+        return bus_post(message)
+    # signed: beta
 
 
 def _bus_get(topic: Optional[str] = None, limit: int = 100) -> List[dict]:
@@ -703,6 +709,77 @@ def graph_stats() -> dict:
 
 # ─── CLI ───────────────────────────────────────────────
 
+def _handle_cli_command(args, parser):
+    """Dispatch CLI command based on parsed args. Returns True if handled."""
+    if args.incidents:
+        incidents = get_incidents()
+        if not incidents:
+            print("No incidents recorded.")
+        else:
+            for inc in incidents:
+                print(f"[{inc['id']}] {inc['timestamp']}")
+                print(f"  What: {inc['what_happened']}")
+                print(f"  Cause: {inc['root_cause']}")
+                print(f"  Fix: {inc['fix_applied']}")
+                print(f"  Rule: {inc['rule_created']}")
+                print()
+        return True
+
+    if args.status:
+        print(json.dumps(get_status(), indent=2, default=str))
+        return True
+
+    if args.absorb:
+        count = absorb_learnings(args.absorb)
+        print(f"Absorbed {count} new learnings for worker {args.absorb}")
+        return True
+
+    if args.share:
+        count = share_best_strategies(args.share)
+        print(f"Shared {count} strategies from worker {args.share}")
+        return True
+
+    if args.broadcast:
+        ok = broadcast_learning("cli", args.broadcast, args.category, args.tags)
+        print(f"Broadcast {'succeeded' if ok else 'FAILED'}: {args.broadcast}")
+        return True
+
+    if args.validate:
+        agrees = not args.disagree
+        ok = validate_fact(args.validate, args.validator, agrees)
+        print(f"Validation {'posted' if ok else 'FAILED'} for {args.validate} (agrees={agrees})")
+        return True
+
+    if args.suggest:
+        strategy = suggest_strategy(args.suggest)
+        if strategy:
+            print(json.dumps(strategy, indent=2, default=str))
+        else:
+            print(f"No strategies found for category: {args.suggest}")
+        return True
+
+    if args.propose:
+        sender = args.validator if args.validator != "cli" else "cli"
+        ok = propose_improvement(
+            sender=sender, title=args.propose,
+            description=args.propose_desc or args.propose,
+            target_files=args.propose_files, priority=args.propose_priority,
+        )
+        print(f"Proposal {'posted' if ok else 'FAILED'}: {args.propose}")
+        return True
+
+    if args.proposals:
+        props = list_proposals()
+        if not props:
+            print("No proposals found.")
+        else:
+            for p in props:
+                print(f"  [{p.get('priority','?').upper()}] [{p.get('status','?')}] {p.get('title','?')} (by {p.get('sender','?')}, {p.get('created_at','')})")
+        return True
+
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Skynet Knowledge Sharing Protocol")
     parser.add_argument("--absorb", type=str, metavar="WORKER", help="Absorb learnings from bus (exclude own)")
@@ -724,76 +801,8 @@ def main():
     parser.add_argument("--incidents", action="store_true", help="Show all recorded incidents")
     args = parser.parse_args()
 
-    if args.incidents:
-        incidents = get_incidents()
-        if not incidents:
-            print("No incidents recorded.")
-        else:
-            for inc in incidents:
-                print(f"[{inc['id']}] {inc['timestamp']}")
-                print(f"  What: {inc['what_happened']}")
-                print(f"  Cause: {inc['root_cause']}")
-                print(f"  Fix: {inc['fix_applied']}")
-                print(f"  Rule: {inc['rule_created']}")
-                print()
-        return
-
-    if args.status:
-        status = get_status()
-        print(json.dumps(status, indent=2, default=str))
-        return
-
-    if args.absorb:
-        count = absorb_learnings(args.absorb)
-        print(f"Absorbed {count} new learnings for worker {args.absorb}")
-        return
-
-    if args.share:
-        count = share_best_strategies(args.share)
-        print(f"Shared {count} strategies from worker {args.share}")
-        return
-
-    if args.broadcast:
-        ok = broadcast_learning("cli", args.broadcast, args.category, args.tags)
-        print(f"Broadcast {'succeeded' if ok else 'FAILED'}: {args.broadcast}")
-        return
-
-    if args.validate:
-        agrees = not args.disagree
-        ok = validate_fact(args.validate, args.validator, agrees)
-        print(f"Validation {'posted' if ok else 'FAILED'} for {args.validate} (agrees={agrees})")
-        return
-
-    if args.suggest:
-        strategy = suggest_strategy(args.suggest)
-        if strategy:
-            print(json.dumps(strategy, indent=2, default=str))
-        else:
-            print(f"No strategies found for category: {args.suggest}")
-        return
-
-    if args.propose:
-        sender = args.validator if args.validator != "cli" else "cli"
-        ok = propose_improvement(
-            sender=sender,
-            title=args.propose,
-            description=args.propose_desc or args.propose,
-            target_files=args.propose_files,
-            priority=args.propose_priority,
-        )
-        print(f"Proposal {'posted' if ok else 'FAILED'}: {args.propose}")
-        return
-
-    if args.proposals:
-        props = list_proposals()
-        if not props:
-            print("No proposals found.")
-        else:
-            for p in props:
-                print(f"  [{p.get('priority','?').upper()}] [{p.get('status','?')}] {p.get('title','?')} (by {p.get('sender','?')}, {p.get('created_at','')})")
-        return
-
-    parser.print_help()
+    if not _handle_cli_command(args, parser):
+        parser.print_help()
 
 
 if __name__ == "__main__":

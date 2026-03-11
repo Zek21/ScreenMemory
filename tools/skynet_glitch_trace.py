@@ -192,6 +192,42 @@ def _write_event(handle, trace_start: float, event_type: str, info: dict[str, ob
     handle.flush()
 
 
+_EMPTY_TRACE_INFO = {"hwnd": 0, "title": "", "class": "", "pid": 0, "process": "",
+                     "rect": {"x": 0, "y": 0, "w": 0, "h": 0}, "kind": "trace", "suspicious": False}
+
+
+def _trace_poll_cycle(handle, trace_start: float, visible: dict, first_seen: dict,
+                      last_foreground: int, next_enum: float, enum_s: float) -> tuple:
+    """Run one poll cycle: check foreground + enum windows. Returns updated state."""
+    now = time.perf_counter()
+    foreground = int(user32.GetForegroundWindow() or 0)
+    if foreground != last_foreground:
+        _write_event(handle, trace_start, "foreground_changed",
+                     _window_info(foreground), previous_hwnd=last_foreground)
+        last_foreground = foreground
+
+    if now >= next_enum:
+        current = _enum_visible_windows()
+        current_set = set(current)
+        visible_set = set(visible)
+
+        for hwnd in sorted(current_set - visible_set):
+            first_seen[hwnd] = now
+            _write_event(handle, trace_start, "window_shown", current[hwnd])
+
+        for hwnd in sorted(visible_set - current_set):
+            info = visible[hwnd]
+            shown_at = first_seen.get(hwnd, now)
+            _write_event(handle, trace_start, "window_hidden", info,
+                         lifetime_ms=round((now - shown_at) * 1000.0, 1))
+            first_seen.pop(hwnd, None)
+
+        visible = current
+        next_enum = now + enum_s
+
+    return visible, first_seen, last_foreground, next_enum
+
+
 def trace(seconds: float, poll_ms: int, enum_ms: int, output: Path) -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     trace_start = time.perf_counter()
@@ -201,74 +237,30 @@ def trace(seconds: float, poll_ms: int, enum_ms: int, output: Path) -> int:
     last_foreground = int(user32.GetForegroundWindow() or 0)
 
     with output.open("w", encoding="utf-8") as handle:
-        _write_event(
-            handle,
-            trace_start,
-            "trace_start",
-            {"hwnd": 0, "title": "", "class": "", "pid": 0, "process": "", "rect": {"x": 0, "y": 0, "w": 0, "h": 0}, "kind": "trace", "suspicious": False},
-            seconds=seconds,
-            poll_ms=poll_ms,
-            enum_ms=enum_ms,
-            initial_visible=len(visible),
-        )
+        _write_event(handle, trace_start, "trace_start", dict(_EMPTY_TRACE_INFO),
+                     seconds=seconds, poll_ms=poll_ms, enum_ms=enum_ms,
+                     initial_visible=len(visible))
         if last_foreground:
-            _write_event(handle, trace_start, "foreground_changed", _window_info(last_foreground), reason="initial")
+            _write_event(handle, trace_start, "foreground_changed",
+                         _window_info(last_foreground), reason="initial")
 
         next_enum = trace_start
         poll_s = max(poll_ms, 1) / 1000.0
         enum_s = max(enum_ms, 1) / 1000.0
 
-        while True:
-            now = time.perf_counter()
-            if now >= deadline:
-                break
-
-            foreground = int(user32.GetForegroundWindow() or 0)
-            if foreground != last_foreground:
-                _write_event(handle, trace_start, "foreground_changed", _window_info(foreground), previous_hwnd=last_foreground)
-                last_foreground = foreground
-
-            if now >= next_enum:
-                current = _enum_visible_windows()
-                current_set = set(current)
-                visible_set = set(visible)
-
-                for hwnd in sorted(current_set - visible_set):
-                    first_seen[hwnd] = now
-                    _write_event(handle, trace_start, "window_shown", current[hwnd])
-
-                for hwnd in sorted(visible_set - current_set):
-                    info = visible[hwnd]
-                    shown_at = first_seen.get(hwnd, now)
-                    _write_event(
-                        handle,
-                        trace_start,
-                        "window_hidden",
-                        info,
-                        lifetime_ms=round((now - shown_at) * 1000.0, 1),
-                    )
-                    first_seen.pop(hwnd, None)
-
-                visible = current
-                next_enum = now + enum_s
-
+        while time.perf_counter() < deadline:
+            visible, first_seen, last_foreground, next_enum = _trace_poll_cycle(
+                handle, trace_start, visible, first_seen,
+                last_foreground, next_enum, enum_s)
             time.sleep(poll_s)
 
-        _write_event(
-            handle,
-            trace_start,
-            "trace_end",
-            {"hwnd": 0, "title": "", "class": "", "pid": 0, "process": "", "rect": {"x": 0, "y": 0, "w": 0, "h": 0}, "kind": "trace", "suspicious": False},
-            final_visible=len(visible),
-        )
+        _write_event(handle, trace_start, "trace_end", dict(_EMPTY_TRACE_INFO),
+                     final_visible=len(visible))
     return 0
 
 
-def summary(input_path: Path) -> int:
-    if not input_path.exists():
-        print(f"Trace file not found: {input_path}")
-        return 1
-
+def _parse_trace_entries(input_path: Path) -> list:
+    """Load and parse all JSON entries from a trace file."""
     entries = []
     with input_path.open("r", encoding="utf-8") as handle:
         for line in handle:
@@ -279,11 +271,11 @@ def summary(input_path: Path) -> int:
                 entries.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
+    return entries
 
-    if not entries:
-        print("No trace entries found.")
-        return 1
 
+def _classify_trace_events(entries: list) -> tuple[dict, list, list]:
+    """Classify entries into event counts, suspicious events, and transient windows."""
     event_counts: dict[str, int] = {}
     suspicious = []
     transient = []
@@ -294,6 +286,20 @@ def summary(input_path: Path) -> int:
             suspicious.append(entry)
         if event == "window_hidden" and float(entry.get("lifetime_ms", 0) or 0) <= 1000:
             transient.append(entry)
+    return event_counts, suspicious, transient
+
+
+def summary(input_path: Path) -> int:
+    if not input_path.exists():
+        print(f"Trace file not found: {input_path}")
+        return 1
+
+    entries = _parse_trace_entries(input_path)
+    if not entries:
+        print("No trace entries found.")
+        return 1
+
+    event_counts, suspicious, transient = _classify_trace_events(entries)
 
     print(f"Trace file: {input_path}")
     print(f"Entries: {len(entries)}")

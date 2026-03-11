@@ -19,6 +19,7 @@ from typing import Any, Optional
 from uuid import uuid4
 import urllib.request
 import urllib.parse
+import urllib.error  # signed: gamma
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +85,8 @@ class ToolValidator:
             return True, "Syntax valid"
         except SyntaxError as e:
             return False, f"Syntax error: {e}"
-        except Exception as e:
-            return False, f"Parse error: {e}"
+        except (ValueError, TypeError) as e:
+            return False, f"Parse error: {e}"  # signed: gamma
     
     def validate_safety(self, code: str) -> tuple[bool, list[str]]:
         """Check for dangerous operations in code."""
@@ -112,8 +113,8 @@ class ToolValidator:
                 elif isinstance(node, ast.ImportFrom):
                     if node.module not in self.ALLOWED_IMPORTS:
                         issues.append(f"Disallowed import from: {node.module}")
-        except Exception as e:
-            logger.debug("AST validation parse error: %s", e)
+        except (SyntaxError, ValueError, TypeError) as e:
+            logger.warning("AST validation parse error: %s", e)  # signed: gamma
         
         return len(issues) == 0, issues
     
@@ -396,90 +397,77 @@ class ToolSynthesizer:
                 if not code:
                     continue
                 
-                # Validate
-                syntax_ok, syntax_msg = self.validator.validate_syntax(code)
-                if not syntax_ok:
-                    print(f"Attempt {attempt + 1}: Syntax error - {syntax_msg}")
-                    continue
-                
-                safety_ok, safety_issues = self.validator.validate_safety(code)
-                if not safety_ok:
-                    print(f"Attempt {attempt + 1}: Safety issues - {safety_issues}")
-                    continue
-                
-                # Extract metadata from code
-                metadata = self._extract_metadata(code, description)
-                
-                # Test execution if examples provided
-                if examples:
-                    exec_ok, exec_msg = self.validator.validate_execution(code, examples)
-                    if not exec_ok:
-                        print(f"Attempt {attempt + 1}: Execution error - {exec_msg}")
-                        continue
-                
-                # Compute safety score
-                safety_score = self.validator.compute_safety_score(code)
-                
-                if safety_score < 0.6:
-                    print(f"Attempt {attempt + 1}: Low safety score {safety_score}")
-                    continue
-                
-                # Create tool spec
-                spec = ToolSpec(
-                    tool_id=str(uuid4()),
-                    name=metadata['name'],
-                    description=metadata['description'],
-                    parameters=metadata['parameters'],
-                    return_type=metadata['return_type'],
-                    source_code=code,
-                    safety_score=safety_score,
-                    category=category
+                spec = self._validate_and_create_spec(
+                    code, description, examples, category, attempt
                 )
+                if spec:
+                    return spec
                 
-                # Save to registry
-                self.registry.save(spec)
-                print(f"✓ Tool synthesized: {spec.name} (safety: {safety_score:.2f})")
-                return spec
-                
-            except Exception as e:
-                print(f"Attempt {attempt + 1} failed: {e}")
+            except (RuntimeError, OSError, ValueError) as e:
+                logger.warning("Synthesis attempt %d failed: %s", attempt + 1, e)  # signed: gamma
                 continue
         
         print(f"Failed to synthesize tool after {max_retries} attempts")
         return None
     
+    def _validate_and_create_spec(
+        self,
+        code: str,
+        description: str,
+        examples: list[dict],
+        category: str,
+        attempt: int
+    ) -> Optional[ToolSpec]:
+        """Validate generated code and create a ToolSpec if all checks pass."""
+        syntax_ok, syntax_msg = self.validator.validate_syntax(code)
+        if not syntax_ok:
+            print(f"Attempt {attempt + 1}: Syntax error - {syntax_msg}")
+            return None
+        
+        safety_ok, safety_issues = self.validator.validate_safety(code)
+        if not safety_ok:
+            print(f"Attempt {attempt + 1}: Safety issues - {safety_issues}")
+            return None
+        
+        metadata = self._extract_metadata(code, description)
+        
+        if examples:
+            exec_ok, exec_msg = self.validator.validate_execution(code, examples)
+            if not exec_ok:
+                print(f"Attempt {attempt + 1}: Execution error - {exec_msg}")
+                return None
+        
+        safety_score = self.validator.compute_safety_score(code)
+        if safety_score < 0.6:
+            print(f"Attempt {attempt + 1}: Low safety score {safety_score}")
+            return None
+        
+        spec = ToolSpec(
+            tool_id=str(uuid4()),
+            name=metadata['name'],
+            description=metadata['description'],
+            parameters=metadata['parameters'],
+            return_type=metadata['return_type'],
+            source_code=code,
+            safety_score=safety_score,
+            category=category
+        )
+        
+        self.registry.save(spec)
+        print(f"✓ Tool synthesized: {spec.name} (safety: {safety_score:.2f})")
+        return spec
+    
     def _generate_code(self, description: str, examples: list[dict], attempt: int) -> Optional[str]:
         """Generate Python code using Ollama."""
+        prompt = self._build_generation_prompt(description, examples)
         
-        examples_str = ""
-        if examples:
-            examples_str = "\n\nExample usage:\n"
-            for i, ex in enumerate(examples, 1):
-                examples_str += f"Example {i}: {ex}\n"
-        
-        prompt = f"""Generate a Python function that implements the following:
-
-Description: {description}{examples_str}
-
-Requirements:
-1. Function MUST be named 'tool_function'
-2. Include complete docstring with parameter descriptions
-3. Use type hints
-4. Only use allowed imports: math, json, re, datetime, collections, itertools, hashlib, pathlib, typing, functools, operator, statistics
-5. NO file writes, NO network calls, NO dangerous operations
-6. Handle errors gracefully with try/except
-7. Return meaningful results
-
-Generate ONLY the Python function code, no explanations:"""
-
         try:
-            # Call Ollama API
             data = {
                 "model": self.model,
                 "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "temperature": 0.3 + (attempt * 0.1),  # Increase randomness on retries
+                    "temperature": 0.3 + (attempt * 0.1),
                     "top_p": 0.9,
                     "num_predict": 512
                 }
@@ -494,14 +482,34 @@ Generate ONLY the Python function code, no explanations:"""
             with urllib.request.urlopen(req, timeout=30) as response:
                 result = json.loads(response.read().decode('utf-8'))
                 code = result.get('response', '')
+                return self._extract_code_from_response(code)
                 
-                # Extract code from markdown if present
-                code = self._extract_code_from_response(code)
-                return code
-                
-        except Exception as e:
-            print(f"Code generation error: {e}")
+        except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError) as e:
+            logger.error("Code generation error: %s", e)  # signed: gamma
             return None
+    
+    def _build_generation_prompt(self, description: str, examples: list[dict]) -> str:
+        """Build the LLM prompt for code generation."""
+        examples_str = ""
+        if examples:
+            examples_str = "\n\nExample usage:\n"
+            for i, ex in enumerate(examples, 1):
+                examples_str += f"Example {i}: {ex}\n"
+        
+        return f"""Generate a Python function that implements the following:
+
+Description: {description}{examples_str}
+
+Requirements:
+1. Function MUST be named 'tool_function'
+2. Include complete docstring with parameter descriptions
+3. Use type hints
+4. Only use allowed imports: math, json, re, datetime, collections, itertools, hashlib, pathlib, typing, functools, operator, statistics
+5. NO file writes, NO network calls, NO dangerous operations
+6. Handle errors gracefully with try/except
+7. Return meaningful results
+
+Generate ONLY the Python function code, no explanations:"""
     
     def _extract_code_from_response(self, response: str) -> str:
         """Extract Python code from LLM response."""
@@ -560,8 +568,8 @@ Generate ONLY the Python function code, no explanations:"""
                         'parameters': params,
                         'return_type': return_type
                     }
-        except Exception as e:
-            logger.debug("Code spec extraction failed: %s", e)
+        except (SyntaxError, ValueError, TypeError, AttributeError) as e:
+            logger.warning("Code spec extraction failed: %s", e)  # signed: gamma
         
         # Fallback
         return {

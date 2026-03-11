@@ -292,6 +292,57 @@ def _find_processes() -> list:
     return procs
 
 
+def _match_window(w, known, processes, process_pids):
+    """Try to match a window to known HWNDs, title patterns, or process PIDs."""
+    hwnd = w["hwnd"]
+
+    # Known HWND match
+    if hwnd in known:
+        info = known[hwnd]
+        state = _get_window_state(hwnd)
+        rect = _get_window_rect(hwnd)
+        entry = {
+            "hwnd": hwnd, "role": info["role"], "name": info.get("name", ""),
+            "title": w["title"], "pid": w["pid"], "state": state,
+            "monitor": _get_monitor_index(rect["x"]), "position": rect,
+            "source": "known_hwnd",
+        }
+        if "expected_pos" in info:
+            ep = info["expected_pos"]
+            entry["position_drift"] = (
+                abs(rect["x"] - (ep.get("x") or 0)) > 5 or
+                abs(rect["y"] - (ep.get("y") or 0)) > 5
+            )
+        return entry
+
+    # Title pattern match
+    for pat in SKYNET_PATTERNS:
+        if pat["match"].lower() in w["title"].lower():
+            state = _get_window_state(hwnd)
+            rect = _get_window_rect(hwnd)
+            return {
+                "hwnd": hwnd, "role": pat["role"], "name": pat["role"],
+                "title": w["title"], "pid": w["pid"], "state": state,
+                "monitor": _get_monitor_index(rect["x"]), "position": rect,
+                "source": "pattern_match",
+            }
+
+    # Process PID match
+    if w["pid"] in process_pids:
+        state = _get_window_state(hwnd)
+        rect = _get_window_rect(hwnd)
+        svc = next((p for p in processes if p["pid"] == w["pid"]), {})
+        return {
+            "hwnd": hwnd, "role": svc.get("service", "skynet_process"),
+            "name": svc.get("service", "unknown"),
+            "title": w["title"], "pid": w["pid"], "state": state,
+            "monitor": _get_monitor_index(rect["x"]), "position": rect,
+            "source": "process_match",
+        }
+
+    return None
+
+
 def scan_windows() -> dict:
     """Full window scan: discover all Skynet-related windows and processes."""
     scan_start = time.time()
@@ -308,68 +359,7 @@ def scan_windows() -> dict:
     }
 
     for w in all_windows:
-        hwnd = w["hwnd"]
-        entry = None
-
-        # Check if it's a known HWND (worker/orchestrator)
-        if hwnd in known:
-            info = known[hwnd]
-            state = _get_window_state(hwnd)
-            rect = _get_window_rect(hwnd)
-            entry = {
-                "hwnd": hwnd,
-                "role": info["role"],
-                "name": info.get("name", ""),
-                "title": w["title"],
-                "pid": w["pid"],
-                "state": state,
-                "monitor": _get_monitor_index(rect["x"]),
-                "position": rect,
-                "source": "known_hwnd",
-            }
-            if "expected_pos" in info:
-                ep = info["expected_pos"]
-                entry["position_drift"] = (
-                    abs(rect["x"] - (ep.get("x") or 0)) > 5 or
-                    abs(rect["y"] - (ep.get("y") or 0)) > 5
-                )
-
-        # Check by title pattern
-        if not entry:
-            for pat in SKYNET_PATTERNS:
-                if pat["match"].lower() in w["title"].lower():
-                    state = _get_window_state(hwnd)
-                    rect = _get_window_rect(hwnd)
-                    entry = {
-                        "hwnd": hwnd,
-                        "role": pat["role"],
-                        "name": pat["role"],
-                        "title": w["title"],
-                        "pid": w["pid"],
-                        "state": state,
-                        "monitor": _get_monitor_index(rect["x"]),
-                        "position": rect,
-                        "source": "pattern_match",
-                    }
-                    break
-
-        # Check by process PID (background services)
-        if not entry and w["pid"] in process_pids:
-            state = _get_window_state(hwnd)
-            rect = _get_window_rect(hwnd)
-            svc = next((p for p in processes if p["pid"] == w["pid"]), {})
-            entry = {
-                "hwnd": hwnd,
-                "role": svc.get("service", "skynet_process"),
-                "name": svc.get("service", "unknown"),
-                "title": w["title"],
-                "pid": w["pid"],
-                "state": state,
-                "monitor": _get_monitor_index(rect["x"]),
-                "position": rect,
-                "source": "process_match",
-            }
-
+        entry = _match_window(w, known, processes, process_pids)
         if entry:
             registry["windows"].append(entry)
 

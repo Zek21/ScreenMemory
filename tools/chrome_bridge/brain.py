@@ -87,6 +87,26 @@ class LLMConnector:
         response = llm.decide(system_prompt, user_prompt)
     """
 
+    # Provider configuration tables
+    _ENV_KEYS = {
+        LLMProvider.OPENAI: 'OPENAI_API_KEY',
+        LLMProvider.CLAUDE: 'ANTHROPIC_API_KEY',
+        LLMProvider.GEMINI: 'GOOGLE_API_KEY',
+    }
+    _DEFAULT_MODELS = {
+        LLMProvider.OPENAI: 'gpt-4o-mini',
+        LLMProvider.CLAUDE: 'claude-sonnet-4-20250514',
+        LLMProvider.GEMINI: 'gemini-2.0-flash',
+        LLMProvider.OLLAMA: 'llama3.1',
+        LLMProvider.MOCK: 'mock',
+    }
+    _DEFAULT_URLS = {
+        LLMProvider.OPENAI: 'https://api.openai.com/v1',
+        LLMProvider.CLAUDE: 'https://api.anthropic.com/v1',
+        LLMProvider.GEMINI: 'https://generativelanguage.googleapis.com/v1beta',
+        LLMProvider.OLLAMA: 'http://localhost:11434',
+    }
+
     def __init__(self, provider: str = "mock", api_key: str = None,
                  model: str = None, base_url: str = None,
                  temperature: float = 0.1, max_tokens: int = 500,
@@ -113,37 +133,14 @@ class LLMConnector:
         self._call_count = 0
         self._total_tokens = 0
 
-        # Auto-detect API keys from environment
         if not self.api_key:
-            env_map = {
-                LLMProvider.OPENAI: 'OPENAI_API_KEY',
-                LLMProvider.CLAUDE: 'ANTHROPIC_API_KEY',
-                LLMProvider.GEMINI: 'GOOGLE_API_KEY',
-            }
-            env_var = env_map.get(self.provider)
+            env_var = self._ENV_KEYS.get(self.provider)
             if env_var:
                 self.api_key = os.environ.get(env_var, '')
-
-        # Default models
         if not self.model:
-            defaults = {
-                LLMProvider.OPENAI: 'gpt-4o-mini',
-                LLMProvider.CLAUDE: 'claude-sonnet-4-20250514',
-                LLMProvider.GEMINI: 'gemini-2.0-flash',
-                LLMProvider.OLLAMA: 'llama3.1',
-                LLMProvider.MOCK: 'mock',
-            }
-            self.model = defaults.get(self.provider, 'default')
-
-        # Default base URLs
+            self.model = self._DEFAULT_MODELS.get(self.provider, 'default')
         if not self.base_url:
-            url_map = {
-                LLMProvider.OPENAI: 'https://api.openai.com/v1',
-                LLMProvider.CLAUDE: 'https://api.anthropic.com/v1',
-                LLMProvider.GEMINI: 'https://generativelanguage.googleapis.com/v1beta',
-                LLMProvider.OLLAMA: 'http://localhost:11434',
-            }
-            self.base_url = url_map.get(self.provider, '')
+            self.base_url = self._DEFAULT_URLS.get(self.provider, '')
 
     def decide(self, system_prompt: str, user_prompt: str) -> str:
         """
@@ -350,24 +347,41 @@ class PageDiffer:
     """
 
     @staticmethod
+    def _fingerprint(el: Dict) -> str:
+        """Element fingerprint: role+name combo."""
+        return f"{el.get('role', '')}:{el.get('name', '')[:30]}"
+
+    @staticmethod
+    def _count_overlays(elements: List[Dict]) -> int:
+        return sum(1 for e in elements
+                   if e.get('inModal') or e.get('role') == 'dialog')
+
+    @staticmethod
+    def _build_change_summary(url_changed, after_url, added, removed,
+                               before_type, after_type, overlay_delta) -> str:
+        changes = []
+        if url_changed:
+            changes.append(f"navigated to {after_url}")
+        if added > 0:
+            changes.append(f"{added} new elements")
+        if removed > 0:
+            changes.append(f"{removed} removed")
+        if before_type != after_type:
+            changes.append(f"page type: {before_type}\u2192{after_type}")
+        if overlay_delta > 0:
+            changes.append("overlay appeared")
+        if overlay_delta < 0:
+            changes.append("overlay dismissed")
+        return '; '.join(changes) if changes else 'no visible changes'
+
+    @staticmethod
     def diff(before: Dict, after: Dict) -> Dict:
         """
         Compare two perception results (from god.see()).
 
-        Returns:
-            {
-                'url_changed': bool,
-                'new_url': str,
-                'elements_added': int,
-                'elements_removed': int,
-                'new_elements': List[Dict],
-                'page_type_changed': bool,
-                'new_page_type': str,
-                'overlay_appeared': bool,
-                'overlay_dismissed': bool,
-                'content_changed': bool,
-                'summary': str,  # One-line change summary
-            }
+        Returns dict with: url_changed, new_url, elements_added/removed,
+        new_elements, page_type_changed, overlay_appeared/dismissed,
+        content_changed, summary.
         """
         before_url = before.get('url', '')
         after_url = after.get('url', '')
@@ -376,41 +390,21 @@ class PageDiffer:
         before_els = before.get('elements', [])
         after_els = after.get('elements', [])
 
-        # Element fingerprinting: role+name combo
-        def fingerprint(el):
-            return f"{el.get('role', '')}:{el.get('name', '')[:30]}"
-
-        before_fps = set(fingerprint(e) for e in before_els)
-        after_fps = set(fingerprint(e) for e in after_els)
-
+        fp = PageDiffer._fingerprint
+        before_fps = set(fp(e) for e in before_els)
+        after_fps = set(fp(e) for e in after_els)
         added_fps = after_fps - before_fps
         removed_fps = before_fps - after_fps
-
-        new_elements = [e for e in after_els if fingerprint(e) in added_fps]
+        new_elements = [e for e in after_els if fp(e) in added_fps]
 
         before_type = before.get('page_type', '')
         after_type = after.get('page_type', '')
+        overlay_delta = (PageDiffer._count_overlays(after_els)
+                         - PageDiffer._count_overlays(before_els))
 
-        # Overlay detection
-        before_overlays = len([e for e in before_els
-                               if e.get('inModal') or e.get('role') == 'dialog'])
-        after_overlays = len([e for e in after_els
-                              if e.get('inModal') or e.get('role') == 'dialog'])
-
-        # Build summary
-        changes = []
-        if url_changed:
-            changes.append(f"navigated to {after_url}")
-        if len(added_fps) > 0:
-            changes.append(f"{len(added_fps)} new elements")
-        if len(removed_fps) > 0:
-            changes.append(f"{len(removed_fps)} removed")
-        if before_type != after_type:
-            changes.append(f"page type: {before_type}→{after_type}")
-        if after_overlays > before_overlays:
-            changes.append("overlay appeared")
-        if after_overlays < before_overlays:
-            changes.append("overlay dismissed")
+        summary = PageDiffer._build_change_summary(
+            url_changed, after_url, len(added_fps), len(removed_fps),
+            before_type, after_type, overlay_delta)
 
         return {
             'url_changed': url_changed,
@@ -420,10 +414,10 @@ class PageDiffer:
             'new_elements': new_elements[:10],
             'page_type_changed': before_type != after_type,
             'new_page_type': after_type,
-            'overlay_appeared': after_overlays > before_overlays,
-            'overlay_dismissed': after_overlays < before_overlays,
+            'overlay_appeared': overlay_delta > 0,
+            'overlay_dismissed': overlay_delta < 0,
             'content_changed': len(added_fps) > 0 or len(removed_fps) > 0,
-            'summary': '; '.join(changes) if changes else 'no visible changes',
+            'summary': summary,
         }
 
 
@@ -689,6 +683,39 @@ class ErrorRecovery:
         key = self._action_key(action)
         self._retry_counts[key] = self._retry_counts.get(key, 0) + 1
 
+    def _recovery_strategy(self, action: Action, error: str,
+                           attempt: int) -> Optional[Action]:
+        """Select recovery action based on error type and attempt count."""
+        error_lower = error.lower()
+
+        if 'not found' in error_lower:
+            if attempt <= 1:
+                logger.info(f"Recovery: scrolling to find '{action.target}'")
+                return Action(action='scroll', direction='down', amount=400)
+            if attempt == 2:
+                logger.info("Recovery: dismissing overlays")
+                return Action(action='dismiss')
+            if attempt == 3:
+                logger.info("Recovery: scrolling up to find element")
+                return Action(action='scroll', direction='up', amount=800)
+
+        if 'cdp error' in error_lower or 'timeout' in error_lower:
+            logger.info("Recovery: waiting 2s then retrying")
+            time.sleep(2)
+            return action
+
+        if action.target and attempt <= 2:
+            alt_targets = self._find_alternatives(action.target)
+            if alt_targets:
+                alt = alt_targets[attempt - 1] if attempt <= len(alt_targets) else None
+                if alt:
+                    logger.info(f"Recovery: trying alternative target '{alt}'")
+                    return Action(
+                        action=action.action, target=alt, value=action.value,
+                    )
+
+        return None
+
     def recover(self, action: Action, error: str,
                 tab_id: str = None) -> Optional[Action]:
         """
@@ -703,43 +730,7 @@ class ErrorRecovery:
             return None
 
         attempt = self._retry_counts[self._action_key(action)]
-        error_lower = error.lower()
-
-        # Strategy 1: Element not found → scroll to find it
-        if 'not found' in error_lower and attempt <= 1:
-            logger.info(f"Recovery: scrolling to find '{action.target}'")
-            return Action(action='scroll', direction='down', amount=400)
-
-        # Strategy 2: Element not found after scroll → try dismiss overlays
-        if 'not found' in error_lower and attempt == 2:
-            logger.info("Recovery: dismissing overlays")
-            return Action(action='dismiss')
-
-        # Strategy 3: Still not found → scroll up (maybe we scrolled past it)
-        if 'not found' in error_lower and attempt == 3:
-            logger.info("Recovery: scrolling up to find element")
-            return Action(action='scroll', direction='up', amount=800)
-
-        # Strategy 4: CDP error → wait and retry
-        if 'cdp error' in error_lower or 'timeout' in error_lower:
-            logger.info("Recovery: waiting 2s then retrying")
-            time.sleep(2)
-            return action  # Retry same action
-
-        # Strategy 5: Execution error → try alternative target text
-        if action.target and attempt <= 2:
-            alt_targets = self._find_alternatives(action.target)
-            if alt_targets:
-                alt = alt_targets[attempt - 1] if attempt <= len(alt_targets) else None
-                if alt:
-                    logger.info(f"Recovery: trying alternative target '{alt}'")
-                    return Action(
-                        action=action.action,
-                        target=alt,
-                        value=action.value,
-                    )
-
-        return None
+        return self._recovery_strategy(action, error, attempt)
 
     def _find_alternatives(self, target: str) -> List[str]:
         """Generate alternative target texts for common UI patterns."""
@@ -929,88 +920,108 @@ class BlockDetector:
     def __init__(self, god: GodMode):
         self.god = god
 
+    def _scan_url_signals(self, tab_id: str) -> Tuple[List[str], bool]:
+        """Check URL for captcha patterns. Returns (signals, captcha_found)."""
+        signals = []
+        url = self.god.cdp.eval(tab_id, 'window.location.href') or ''
+        for pattern in self.CAPTCHA_URL_PATTERNS:
+            if pattern in url.lower():
+                signals.append(f'url_pattern:{pattern}')
+        return signals, bool(signals)
+
+    def _scan_title_signals(self, tab_id: str) -> Tuple[List[str], bool]:
+        """Check page title for captcha patterns."""
+        signals = []
+        title = self.god.cdp.eval(tab_id, 'document.title') or ''
+        for pattern in self.CAPTCHA_TEXT_PATTERNS:
+            if pattern in title.lower():
+                signals.append(f'title:{pattern}')
+        return signals, bool(signals)
+
+    def _scan_body_signals(self, tab_id: str) -> Tuple[List[str], bool, bool, bool]:
+        """Check body text for captcha/block patterns.
+        Returns (signals, captcha, blocked, rate_limited)."""
+        signals = []
+        captcha = blocked = rate_limited = False
+        body_text = self.god.cdp.eval(
+            tab_id,
+            '(document.body && document.body.innerText || "").substring(0, 2000).toLowerCase()'
+        ) or ''
+        for pattern in self.CAPTCHA_TEXT_PATTERNS:
+            if pattern in body_text:
+                signals.append(f'text:{pattern}')
+                captcha = True
+        for pattern in self.BLOCK_TEXT_PATTERNS:
+            if pattern in body_text:
+                signals.append(f'block:{pattern}')
+                blocked = True
+                if 'rate limit' in pattern or '429' in pattern:
+                    rate_limited = True
+        return signals, captcha, blocked, rate_limited
+
+    def _scan_captcha_elements(self, tab_id: str) -> Tuple[List[str], bool]:
+        """Check for CAPTCHA DOM elements."""
+        raw = self.god.cdp.eval(tab_id, self.CAPTCHA_ELEMENT_JS)
+        if not raw:
+            return [], False
+        try:
+            elements = json.loads(raw) if isinstance(raw, str) else raw
+            return list(elements), bool(elements)
+        except (json.JSONDecodeError, TypeError):
+            return [], False
+
+    @staticmethod
+    def _determine_severity(captcha: bool, blocked: bool,
+                            rate_limited: bool) -> Tuple[str, str]:
+        """Return (severity, recommendation) based on detection results."""
+        if captcha:
+            return 'captcha', ('CAPTCHA detected. Options: wait and retry, '
+                               'switch profile, use different IP, or request '
+                               'human intervention.')
+        if blocked:
+            return 'blocked', ('Access blocked. Options: wait 30-60s, '
+                               'switch to different profile, or try via '
+                               'different URL.')
+        if rate_limited:
+            return 'rate_limited', ('Rate limited. Wait 30-60 seconds '
+                                    'before retrying.')
+        return 'none', 'No blocks detected.'
+
     def check(self, tab_id: str = None) -> Dict:
         """
         Run all detection checks.
 
-        Returns:
-            {
-                'blocked': bool,
-                'captcha': bool,
-                'rate_limited': bool,
-                'signals': List[str],
-                'severity': str,  # 'none', 'warning', 'blocked', 'captcha'
-                'recommendation': str,
-            }
+        Returns dict with: blocked, captcha, rate_limited, signals,
+        severity, recommendation.
         """
         tab_id = tab_id or self.god._get_active_tab()
         signals = []
-        captcha = False
-        blocked = False
-        rate_limited = False
+        captcha = blocked = rate_limited = False
 
         try:
-            # Check URL
-            url = self.god.cdp.eval(tab_id, 'window.location.href') or ''
-            url_lower = url.lower()
-            for pattern in self.CAPTCHA_URL_PATTERNS:
-                if pattern in url_lower:
-                    signals.append(f'url_pattern:{pattern}')
-                    captcha = True
+            url_sig, url_captcha = self._scan_url_signals(tab_id)
+            signals.extend(url_sig)
+            captcha |= url_captcha
 
-            # Check page title
-            title = self.god.cdp.eval(tab_id, 'document.title') or ''
-            title_lower = title.lower()
-            for pattern in self.CAPTCHA_TEXT_PATTERNS:
-                if pattern in title_lower:
-                    signals.append(f'title:{pattern}')
-                    captcha = True
+            title_sig, title_captcha = self._scan_title_signals(tab_id)
+            signals.extend(title_sig)
+            captcha |= title_captcha
 
-            # Check visible text (just first 2000 chars)
-            body_text = self.god.cdp.eval(
-                tab_id,
-                '(document.body && document.body.innerText || "").substring(0, 2000).toLowerCase()'
-            ) or ''
+            body_sig, body_captcha, body_blocked, body_rl = self._scan_body_signals(tab_id)
+            signals.extend(body_sig)
+            captcha |= body_captcha
+            blocked |= body_blocked
+            rate_limited |= body_rl
 
-            for pattern in self.CAPTCHA_TEXT_PATTERNS:
-                if pattern in body_text:
-                    signals.append(f'text:{pattern}')
-                    captcha = True
-
-            for pattern in self.BLOCK_TEXT_PATTERNS:
-                if pattern in body_text:
-                    signals.append(f'block:{pattern}')
-                    blocked = True
-                    if 'rate limit' in pattern or '429' in pattern:
-                        rate_limited = True
-
-            # Check for CAPTCHA elements
-            raw = self.god.cdp.eval(tab_id, self.CAPTCHA_ELEMENT_JS)
-            if raw:
-                try:
-                    elements = json.loads(raw) if isinstance(raw, str) else raw
-                    if elements:
-                        signals.extend(elements)
-                        captcha = True
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            el_sig, el_captcha = self._scan_captcha_elements(tab_id)
+            signals.extend(el_sig)
+            captcha |= el_captcha
 
         except Exception as e:
             signals.append(f'check_error:{e}')
 
-        # Determine severity
-        if captcha:
-            severity = 'captcha'
-            recommendation = 'CAPTCHA detected. Options: wait and retry, switch profile, use different IP, or request human intervention.'
-        elif blocked:
-            severity = 'blocked'
-            recommendation = 'Access blocked. Options: wait 30-60s, switch to different profile, or try via different URL.'
-        elif rate_limited:
-            severity = 'rate_limited'
-            recommendation = 'Rate limited. Wait 30-60 seconds before retrying.'
-        else:
-            severity = 'none'
-            recommendation = 'No blocks detected.'
+        severity, recommendation = self._determine_severity(
+            captcha, blocked, rate_limited)
 
         return {
             'blocked': blocked or captcha,
@@ -1169,6 +1180,26 @@ class Brain:
         print(data['tables'])
     """
 
+    def _launch_stealth_chrome(self, cdp_port: int, stealth_mode: str,
+                               chrome_profile: str) -> None:
+        """Launch Chrome in stealth mode with the given profile."""
+        try:
+            resolved = StealthLauncher.resolve_profile(chrome_profile)
+            profile_dir = resolved['directory']
+            self._chrome_profile = resolved['name']
+        except ValueError:
+            profile_dir = chrome_profile
+        self._launcher = StealthLauncher(port=cdp_port)
+        mode_map = {
+            'headless': StealthLauncher.Mode.HEADLESS,
+            'hidden': StealthLauncher.Mode.HIDDEN,
+            'offscreen': StealthLauncher.Mode.OFFSCREEN,
+        }
+        self._launcher.launch(
+            mode=mode_map.get(stealth_mode, StealthLauncher.Mode.HEADLESS),
+            profile=profile_dir,
+        )
+
     def __init__(self, cdp_port: int = 9222,
                  llm_provider: str = "mock",
                  llm_api_key: str = None,
@@ -1195,34 +1226,15 @@ class Brain:
         self._stealth_mode = stealth_mode
         self._chrome_profile = chrome_profile
 
-        # Launch stealth Chrome if requested
         if stealth_mode and chrome_profile:
-            # Resolve display name to directory
-            try:
-                resolved = StealthLauncher.resolve_profile(chrome_profile)
-                profile_dir = resolved['directory']
-                self._chrome_profile = resolved['name']  # Store display name
-            except ValueError:
-                profile_dir = chrome_profile
-            self._launcher = StealthLauncher(port=cdp_port)
-            mode_map = {
-                'headless': StealthLauncher.Mode.HEADLESS,
-                'hidden': StealthLauncher.Mode.HIDDEN,
-                'offscreen': StealthLauncher.Mode.OFFSCREEN,
-            }
-            self._launcher.launch(
-                mode=mode_map.get(stealth_mode, StealthLauncher.Mode.HEADLESS),
-                profile=profile_dir,
-            )
+            self._launch_stealth_chrome(cdp_port, stealth_mode, chrome_profile)
 
         # Core modules
         self.god = GodMode(cdp_port=cdp_port)
         self.agent = AutonomousAgent(god=self.god)
         self.llm = LLMConnector(
-            provider=llm_provider,
-            api_key=llm_api_key,
-            model=llm_model,
-            base_url=llm_base_url,
+            provider=llm_provider, api_key=llm_api_key,
+            model=llm_model, base_url=llm_base_url,
         )
 
         # Advanced modules
@@ -1232,6 +1244,31 @@ class Brain:
         self.blocks = BlockDetector(self.god)
         self.tabs = MultiTabOrchestrator(self.god)
         self.differ = PageDiffer()
+
+    def _make_enhanced_decide(self, check_blocks: bool) -> Callable:
+        """Build a decide function that adds block-checking and human delays."""
+        def enhanced_decide(system_prompt: str, user_prompt: str) -> str:
+            enriched_prompt = user_prompt
+            if check_blocks:
+                block_check = self.blocks.check()
+                if block_check['blocked']:
+                    logger.warning(f"Block detected: {block_check['severity']}")
+                    enriched_prompt += f"\n\nWARNING: {block_check['recommendation']}"
+                    if block_check['captcha']:
+                        return '{"action": "fail", "reason": "CAPTCHA detected -- requires human intervention"}'
+            time.sleep(self.human.delay_before_action('think'))
+            return self.llm.decide(system_prompt, enriched_prompt)
+        return enhanced_decide
+
+    def _make_step_callback(self, on_step: Callable = None) -> Callable:
+        """Build a step callback with human-like delays."""
+        def step_callback(step, action, observation):
+            time.sleep(self.human.delay_before_action(action.action))
+            if self.human.should_pause():
+                time.sleep(self.human.pause_duration())
+            if on_step:
+                on_step(step, action, observation)
+        return step_callback
 
     def execute_mission(self, objective: str, start_url: str = None,
                         max_steps: int = 30,
@@ -1254,50 +1291,13 @@ class Brain:
             self.god.navigate(start_url)
             time.sleep(self.human.delay_after_navigation())
 
-        # Enhanced decide function with recovery and block detection
-        last_perception = [None]  # Mutable container for closure
-
-        def enhanced_decide(system_prompt: str, user_prompt: str) -> str:
-            # Add content context if available
-            enriched_prompt = user_prompt
-
-            # Check for blocks
-            if check_blocks:
-                block_check = self.blocks.check()
-                if block_check['blocked']:
-                    logger.warning(f"Block detected: {block_check['severity']}")
-                    enriched_prompt += f"\n\nWARNING: {block_check['recommendation']}"
-                    if block_check['captcha']:
-                        return '{"action": "fail", "reason": "CAPTCHA detected — requires human intervention"}'
-
-            # Human-like delay before thinking
-            delay = self.human.delay_before_action('think')
-            time.sleep(delay)
-
-            return self.llm.decide(system_prompt, enriched_prompt)
-
-        def step_callback(step, action, observation):
-            # Human-like delay
-            delay = self.human.delay_before_action(action.action)
-            time.sleep(delay)
-
-            # Occasional reading pause
-            if self.human.should_pause():
-                time.sleep(self.human.pause_duration())
-
-            if on_step:
-                on_step(step, action, observation)
-
         result = self.agent.run(
             task=objective,
-            decide_fn=enhanced_decide,
+            decide_fn=self._make_enhanced_decide(check_blocks),
             max_steps=max_steps,
-            on_step=step_callback,
+            on_step=self._make_step_callback(on_step),
         )
-
-        # Add LLM stats to result
         result['llm_stats'] = self.llm.stats
-
         return result
 
     def execute_script(self, start_url: str, actions: List[Dict],
@@ -1395,13 +1395,70 @@ class Brain:
 # CLI
 # ═══════════════════════════════════════════════════════════════════════
 
+def _cmd_profiles():
+    for p in StealthLauncher.list_profiles():
+        print(f"  {p['directory']:20s} \u2192 {p['name']}")
+
+
+def _cmd_mission(args):
+    with Brain(
+        cdp_port=args.port,
+        llm_provider=args.provider,
+        llm_model=args.model,
+        llm_api_key=args.key,
+        stealth_mode=args.stealth,
+        chrome_profile=args.profile,
+    ) as brain:
+        result = brain.execute_mission(
+            args.objective,
+            start_url=args.url,
+            max_steps=args.max_steps,
+            on_step=lambda s, a, o: print(
+                f"  [{s}] {'\u2713' if o.success else '\u2717'} {a.action}: "
+                f"{o.action_result or o.error}"
+            ),
+        )
+        print(json.dumps(result, indent=2, default=str))
+
+
+def _cmd_extract(args):
+    god = GodMode(cdp_port=args.port)
+    extractor = ContentExtractor(god)
+    god.navigate(args.url)
+    time.sleep(2)
+
+    handlers = {
+        'all': lambda: print(json.dumps(
+            extractor.extract_all(), indent=2, default=str, ensure_ascii=False)),
+        'text': lambda: print(extractor.extract_text()),
+        'links': lambda: [print(f"  {l.get('text', '')[:60]:60s} \u2192 {l.get('href', '')}")
+                          for l in extractor.extract_links()],
+        'tables': lambda: [_print_table(t) for t in extractor.extract_tables()],
+        'forms': lambda: [print(f"  [{f['type']:10s}] {f['label'] or f['name']:30s} = {f.get('value', '')}")
+                          for f in extractor.extract_forms()],
+        'meta': lambda: print(json.dumps(extractor.extract_metadata(), indent=2)),
+    }
+    handlers[args.what]()
+
+
+def _print_table(table: Dict):
+    print(f"\n--- Table {table['index']} ---")
+    for row in table['rows']:
+        print(' | '.join(row))
+
+
+def _cmd_check(args):
+    god = GodMode(cdp_port=args.port)
+    result = BlockDetector(god).check()
+    print(json.dumps(result, indent=2))
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description='AI Brain — Cognitive layer for web automation')
+        description='AI Brain -- Cognitive layer for web automation')
     sub = parser.add_subparsers(dest='command')
 
-    # Mission command
     mission = sub.add_parser('mission', help='Execute an LLM-driven mission')
     mission.add_argument('objective', help='Mission objective')
     mission.add_argument('--url', help='Starting URL')
@@ -1409,82 +1466,34 @@ def main():
     mission.add_argument('--model', default=None, help='LLM model')
     mission.add_argument('--key', default=None, help='API key')
     mission.add_argument('--profile', default=None,
-                        help='Chrome profile directory or display name (e.g. "SOCIALS", "Mak")')
+                        help='Chrome profile directory or display name')
     mission.add_argument('--stealth', default=None, help='Stealth mode')
     mission.add_argument('--max-steps', type=int, default=30)
     mission.add_argument('--port', type=int, default=9222)
 
-    # Extract command
     extract = sub.add_parser('extract', help='Extract data from a page')
     extract.add_argument('url', help='URL to extract from')
     extract.add_argument('--what', default='all',
                          choices=['all', 'text', 'links', 'tables', 'forms', 'meta'])
     extract.add_argument('--port', type=int, default=9222)
 
-    # Check command
     check = sub.add_parser('check', help='Check for blocks/CAPTCHAs')
     check.add_argument('--port', type=int, default=9222)
 
-    # Profiles command
     sub.add_parser('profiles', help='List Chrome profiles')
 
     args = parser.parse_args()
 
-    if args.command == 'profiles':
-        for p in StealthLauncher.list_profiles():
-            print(f"  {p['directory']:20s} → {p['name']}")
+    dispatch = {
+        'profiles': lambda: _cmd_profiles(),
+        'mission': lambda: _cmd_mission(args),
+        'extract': lambda: _cmd_extract(args),
+        'check': lambda: _cmd_check(args),
+    }
 
-    elif args.command == 'mission':
-        with Brain(
-            cdp_port=args.port,
-            llm_provider=args.provider,
-            llm_model=args.model,
-            llm_api_key=args.key,
-            stealth_mode=args.stealth,
-            chrome_profile=args.profile,
-        ) as brain:
-            result = brain.execute_mission(
-                args.objective,
-                start_url=args.url,
-                max_steps=args.max_steps,
-                on_step=lambda s, a, o: print(
-                    f"  [{s}] {'✓' if o.success else '✗'} {a.action}: "
-                    f"{o.action_result or o.error}"
-                ),
-            )
-            print(json.dumps(result, indent=2, default=str))
-
-    elif args.command == 'extract':
-        god = GodMode(cdp_port=args.port)
-        extractor = ContentExtractor(god)
-        god.navigate(args.url)
-        time.sleep(2)
-
-        if args.what == 'all':
-            data = extractor.extract_all()
-            print(json.dumps(data, indent=2, default=str, ensure_ascii=False))
-        elif args.what == 'text':
-            print(extractor.extract_text())
-        elif args.what == 'links':
-            for link in extractor.extract_links():
-                print(f"  {link.get('text', '')[:60]:60s} → {link.get('href', '')}")
-        elif args.what == 'tables':
-            tables = extractor.extract_tables()
-            for t in tables:
-                print(f"\n--- Table {t['index']} ---")
-                for row in t['rows']:
-                    print(' | '.join(row))
-        elif args.what == 'forms':
-            for f in extractor.extract_forms():
-                print(f"  [{f['type']:10s}] {f['label'] or f['name']:30s} = {f.get('value', '')}")
-        elif args.what == 'meta':
-            print(json.dumps(extractor.extract_metadata(), indent=2))
-
-    elif args.command == 'check':
-        god = GodMode(cdp_port=args.port)
-        result = BlockDetector(god).check()
-        print(json.dumps(result, indent=2))
-
+    handler = dispatch.get(args.command)
+    if handler:
+        handler()
     else:
         parser.print_help()
 

@@ -77,106 +77,109 @@ class SkynetOrchestrator:
         self._idle_cache_ttl = 5  # seconds
 
     def decompose_task(self, prompt):
-        """Split a user prompt into worker-sized sub-tasks.
-
-        Uses SmartDecomposer (worker-built) for keyword analysis, complexity
-        estimation, and type classification. Falls back to heuristic rules
-        for explicit worker routing (alpha: X, beta: Y).
-        """
+        """Split a user prompt into worker-sized sub-tasks."""
         prompt_lower = prompt.lower()
 
-        # 1. Explicit worker routing: "alpha: do X, beta: do Y" — handle directly
-        explicit = re.findall(r'\b(alpha|beta|gamma|delta)\s*:\s*(.+?)(?=\b(?:alpha|beta|gamma|delta)\s*:|$)', prompt, re.IGNORECASE)
+        explicit = self._parse_explicit_worker_routing(prompt)
         if explicit:
-            subtasks = []
-            for worker, task in explicit:
-                subtasks.append({"worker": worker.lower(), "task": task.strip(), "priority": 5})
-            return subtasks
+            return explicit
 
-        # 2. Use SmartDecomposer for everything else
+        smart_result = self._try_smart_decompose(prompt)
+        if smart_result is not None:
+            return smart_result
+
+        return self._heuristic_decompose(prompt, prompt_lower)
+
+    @staticmethod
+    def _parse_explicit_worker_routing(prompt):
+        """Parse 'alpha: do X, beta: do Y' explicit routing."""
+        explicit = re.findall(r'\b(alpha|beta|gamma|delta)\s*:\s*(.+?)(?=\b(?:alpha|beta|gamma|delta)\s*:|$)', prompt, re.IGNORECASE)
+        if not explicit:
+            return None
+        return [{"worker": w.lower(), "task": t.strip(), "priority": 5} for w, t in explicit]
+
+    def _try_smart_decompose(self, prompt):
+        """Try SmartDecomposer; return None on failure."""
         try:
             from tools.skynet_smart_decompose import SmartDecomposer
             decomposer = SmartDecomposer()
-            # SmartDecomposer needs idle workers for assignment
             idle = self._get_idle_workers()
             subtasks = decomposer.decompose(prompt)
-            # Re-map workers to idle ones (SmartDecomposer may use static list)
             for i, st in enumerate(subtasks):
                 if st["worker"] not in idle and idle:
                     st["worker"] = idle[i % len(idle)]
             return subtasks
         except Exception as e:
             log(f"SmartDecomposer failed ({e}), using heuristic fallback", "WARN")
+            return None
 
-        # 3. Heuristic fallback (original logic)
+    def _heuristic_decompose(self, prompt, prompt_lower):
+        """Heuristic fallback decomposition."""
         subtasks = []
-        priority = 5
-        if any(kw in prompt_lower for kw in ["urgent", "critical", "asap", "now", "immediately"]):
-            priority = 1
-        elif any(kw in prompt_lower for kw in ["fix", "bug", "error", "broken", "crash"]):
-            priority = 3
-            return subtasks
+        priority = self._estimate_priority(prompt_lower)
 
-        # 2. Multiple directories or file paths → split by path
-        paths = re.findall(r'(?:core/|tools/|Skynet/|tests/|ui/|docs/)\S*', prompt)
-        if len(paths) >= 2:
-            available = self._get_idle_workers()
-            for i, path in enumerate(paths):
-                worker = available[i % len(available)]
-                subtasks.append({
-                    "worker": worker,
-                    "task": f"{prompt.split(paths[0])[0].strip()} {path}",
-                    "priority": 5,
-                })
-            return subtasks
+        by_path = self._decompose_by_paths(prompt, prompt_lower)
+        if by_path:
+            return by_path
 
-        # 3. Code review + test pattern
-        if ("review" in prompt_lower or "audit" in prompt_lower) and ("test" in prompt_lower or "validate" in prompt_lower):
-            available = self._get_idle_workers()
-            review_part = re.sub(r'\b(and\s+)?(test|validate|verify|run tests)\b', '', prompt, flags=re.IGNORECASE).strip()
-            test_part = f"Run tests and validate changes related to: {prompt}"
-            subtasks.append({"worker": available[0], "task": review_part, "priority": 5})
-            if len(available) >= 2:
-                subtasks.append({"worker": available[1], "task": test_part, "priority": 4})
-            return subtasks
+        by_review = self._decompose_review_and_test(prompt, prompt_lower, priority)
+        if by_review:
+            return by_review
 
-        # 4. "scan" or "audit" with multiple areas
-        if any(kw in prompt_lower for kw in ["scan", "audit", "check", "inspect"]):
-            areas = re.findall(r'\b(endpoints?|stubs?|imports?|security|performance|files?|modules?|functions?)\b', prompt_lower)
-            if len(areas) >= 2:
-                available = self._get_idle_workers()
-                for i, area in enumerate(set(areas)):
-                    worker = available[i % len(available)]
-                    subtasks.append({
-                        "worker": worker,
-                        "task": f"{prompt} — focus on: {area}",
-                        "priority": 5,
-                    })
-                return subtasks
+        by_scan = self._decompose_by_scan_areas(prompt, prompt_lower)
+        if by_scan:
+            return by_scan
 
-        # 5. Parallel keyword → broadcast to all idle workers
         if any(kw in prompt_lower for kw in ["all workers", "everyone", "broadcast"]):
-            available = self._get_idle_workers()
-            for worker in available:
-                subtasks.append({"worker": worker, "task": prompt, "priority": 5})
-            return subtasks
+            return [{"worker": w, "task": prompt, "priority": 5} for w in self._get_idle_workers()]
 
-        # 6. Default: size-based routing — short→1 worker, medium→2, long→up to 4
+        return self._decompose_by_size(prompt, priority)
+
+    @staticmethod
+    def _estimate_priority(prompt_lower):
+        if any(kw in prompt_lower for kw in ["urgent", "critical", "asap", "now", "immediately"]):
+            return 1
+        if any(kw in prompt_lower for kw in ["fix", "bug", "error", "broken", "crash"]):
+            return 3
+        return 5
+
+    def _decompose_by_paths(self, prompt, prompt_lower):
+        paths = re.findall(r'(?:core/|tools/|Skynet/|tests/|ui/|docs/)\S*', prompt)
+        if len(paths) < 2:
+            return None
         available = self._get_idle_workers()
-        prompt_len = len(prompt)
-        if prompt_len < 50:
-            n_workers = 1
-        elif prompt_len < 200:
-            n_workers = min(2, len(available))
-        else:
-            n_workers = min(4, len(available))
+        return [{"worker": available[i % len(available)],
+                 "task": f"{prompt.split(paths[0])[0].strip()} {p}", "priority": 5}
+                for i, p in enumerate(paths)]
 
-        if n_workers == 1 or len(available) == 1:
-            subtasks.append({"worker": available[0] if available else "alpha", "task": prompt, "priority": priority})
-        else:
-            for i in range(n_workers):
-                subtasks.append({"worker": available[i], "task": prompt, "priority": priority})
+    def _decompose_review_and_test(self, prompt, prompt_lower, priority):
+        if not (("review" in prompt_lower or "audit" in prompt_lower) and
+                ("test" in prompt_lower or "validate" in prompt_lower)):
+            return None
+        available = self._get_idle_workers()
+        review_part = re.sub(r'\b(and\s+)?(test|validate|verify|run tests)\b', '', prompt, flags=re.IGNORECASE).strip()
+        subtasks = [{"worker": available[0], "task": review_part, "priority": 5}]
+        if len(available) >= 2:
+            subtasks.append({"worker": available[1], "task": f"Run tests and validate changes related to: {prompt}", "priority": 4})
         return subtasks
+
+    def _decompose_by_scan_areas(self, prompt, prompt_lower):
+        if not any(kw in prompt_lower for kw in ["scan", "audit", "check", "inspect"]):
+            return None
+        areas = re.findall(r'\b(endpoints?|stubs?|imports?|security|performance|files?|modules?|functions?)\b', prompt_lower)
+        if len(areas) < 2:
+            return None
+        available = self._get_idle_workers()
+        return [{"worker": available[i % len(available)],
+                 "task": f"{prompt} -- focus on: {area}", "priority": 5}
+                for i, area in enumerate(set(areas))]
+
+    def _decompose_by_size(self, prompt, priority):
+        available = self._get_idle_workers()
+        n = 1 if len(prompt) < 50 else min(2, len(available)) if len(prompt) < 200 else min(4, len(available))
+        if n == 1 or len(available) == 1:
+            return [{"worker": available[0] if available else "alpha", "task": prompt, "priority": priority}]
+        return [{"worker": available[i], "task": prompt, "priority": priority} for i in range(n)]
 
     def _get_idle_workers(self):
         """Return list of idle worker names, ranked by reliability score."""
@@ -311,116 +314,99 @@ class SkynetOrchestrator:
         return "\n".join(lines)
 
     def run(self, prompt, timeout=120, realtime=True, auto_retry=True):
-        """Full pipeline: guard → decompose → snapshot → dispatch → collect → retry → synthesize.
-
-        v3 pipeline with identity guard:
-        - Identity guard rejects worker preambles at orchestrator entry
-        - Conversation fingerprinting (snapshot before dispatch, extract only NEW items)
-        - Auto-retry: stale/timeout workers get re-dispatched to idle workers
-        - Worker scoring: records outcomes for smart future routing
-        - Adaptive polling: 0.5s for first 5s, then 2s
-        """
+        """Full pipeline: guard -> decompose -> snapshot -> dispatch -> collect -> retry -> synthesize."""
         t0 = time.time()
 
-        # Identity Guard: reject worker preambles at orchestrator entry
+        guard_result = self._guard_identity(prompt)
+        if guard_result:
+            return guard_result
+
+        log(f"Orchestrating: {prompt[:100]}", "SYS")
+        self._preflight_recover_unknown()
+
+        self._idle_cache = None
+        subtasks = self.decompose_task(prompt)
+        log(f"Decomposed into {len(subtasks)} subtask(s):", "OK")
+        for st in subtasks:
+            log(f"  -> {st['worker'].upper()} [P{st.get('priority', 5)}]: {st['task'][:80]}", "SYS")
+
+        dispatched_workers = [st["worker"] for st in subtasks]
+        collector = RealtimeCollector(poll_interval=2.0)
+        if realtime:
+            log("Snapshotting conversation baselines...", "SYS")
+            collector.snapshot_baselines(dispatched_workers)
+
+        dispatched, failed = self._dispatch_and_log(subtasks)
+        if not dispatched:
+            log("No workers received tasks", "ERR")
+            return {"success": False, "error": "All dispatches failed", "elapsed_ms": (time.time() - t0) * 1000}
+
+        results = self._collect_results(dispatched, subtasks, collector, realtime, auto_retry, timeout)
+        report = self.synthesize(prompt, subtasks, results)
+        elapsed_ms = (time.time() - t0) * 1000
+
+        self._record_orchestration_metrics(dispatched, results, elapsed_ms, realtime)
+        bus_post("orchestrator", "orchestrator", "synthesis", report[:500])
+        log(f"Orchestration complete in {elapsed_ms:.0f}ms", "OK")
+        return {"success": True, "report": report, "subtasks": subtasks,
+                "results": results, "dispatched": dispatched, "elapsed_ms": elapsed_ms}
+
+    @staticmethod
+    def _guard_identity(prompt):
         guard = get_orchestrator_guard()
         safe, reason = guard.validate(prompt)
         if not safe:
             log(f"IDENTITY GUARD BLOCKED: {reason}", "ERR")
             bus_post("orchestrator", "security", "blocked", f"Rejected: {reason}")
             return {"success": False, "error": f"Identity guard: {reason}", "elapsed_ms": 0}
+        return None
 
-        log(f"Orchestrating: {prompt[:100]}", "SYS")
-
-        # Step 0: Pre-flight — recover any UNKNOWN workers
+    def _preflight_recover_unknown(self):
         states = scan_all_states(self.workers)
         for name, state in states.items():
             if state == "UNKNOWN":
-                log(f"Pre-flight: {name.upper()} is UNKNOWN — recovering", "WARN")
+                log(f"Pre-flight: {name.upper()} is UNKNOWN -- recovering", "WARN")
                 recover_worker(name, self.workers, self.orch_hwnd)
 
-        # Step 1: Decompose (uses worker scoring for smart routing)
-        self._idle_cache = None
-        subtasks = self.decompose_task(prompt)
-        log(f"Decomposed into {len(subtasks)} subtask(s):", "OK")
-        for st in subtasks:
-            log(f"  → {st['worker'].upper()} [P{st.get('priority', 5)}]: {st['task'][:80]}", "SYS")
-
-        dispatched_workers = [st["worker"] for st in subtasks]
-
-        # Step 2: Snapshot conversation baselines (v3 fingerprinting)
-        collector = RealtimeCollector(poll_interval=2.0)
-        if realtime:
-            log("Snapshotting conversation baselines...", "SYS")
-            collector.snapshot_baselines(dispatched_workers)
-
-        # Step 3: Dispatch
+    def _dispatch_and_log(self, subtasks):
         dispatch_results = self.dispatch_all(subtasks)
         dispatched = [name for name, ok in dispatch_results.items() if ok]
         failed = [name for name, ok in dispatch_results.items() if not ok]
         if failed:
             log(f"Dispatch failed for: {failed}", "WARN")
-        if not dispatched:
-            log("No workers received tasks", "ERR")
-            return {"success": False, "error": "All dispatches failed", "elapsed_ms": (time.time() - t0) * 1000}
+        return dispatched, failed
 
-        # Step 4: Collect results with fingerprinting + optional auto-retry
-        if realtime:
-            task_map = {st["worker"]: st["task"] for st in subtasks}
-            task_types = {st["worker"]: st.get("type", "general") for st in subtasks}
-
-            if auto_retry:
-                log("Collecting via REAL-TIME UIA + auto-retry...", "SYS")
-
-                def _retry_dispatch(worker_name, task_text):
-                    dispatch_to_worker(worker_name, task_text, self.workers, self.orch_hwnd)
-
-                results = collector.collect_with_retry(
-                    dispatched, task_map, timeout=timeout,
-                    max_retries=1, dispatch_fn=_retry_dispatch,
-                )
-            else:
-                log("Collecting via REAL-TIME UIA...", "SYS")
-                results = collector.collect(dispatched, timeout=timeout, task_types=task_types)
-        else:
+    def _collect_results(self, dispatched, subtasks, collector, realtime, auto_retry, timeout):
+        if not realtime:
             log("Collecting via bus polling (legacy)...", "SYS")
-            results = self.collect_results(dispatched, timeout=timeout)
+            return self.collect_results(dispatched, timeout=timeout)
 
-        # Step 4: Synthesize
-        report = self.synthesize(prompt, subtasks, results)
-        elapsed_ms = (time.time() - t0) * 1000
+        task_map = {st["worker"]: st["task"] for st in subtasks}
+        task_types = {st["worker"]: st.get("type", "general") for st in subtasks}
 
-        # Record metrics
+        if auto_retry:
+            log("Collecting via REAL-TIME UIA + auto-retry...", "SYS")
+            def _retry_dispatch(worker_name, task_text):
+                dispatch_to_worker(worker_name, task_text, self.workers, self.orch_hwnd)
+            return collector.collect_with_retry(dispatched, task_map, timeout=timeout,
+                                               max_retries=1, dispatch_fn=_retry_dispatch)
+        log("Collecting via REAL-TIME UIA...", "SYS")
+        return collector.collect(dispatched, timeout=timeout, task_types=task_types)
+
+    @staticmethod
+    def _record_orchestration_metrics(dispatched, results, elapsed_ms, realtime):
         try:
             from tools.skynet_metrics import SkynetMetrics
             m = SkynetMetrics()
             if realtime:
                 success_count = sum(1 for r in results.values()
-                                   if isinstance(r, dict) and r.get("status") == "complete")
+                                    if isinstance(r, dict) and r.get("status") == "complete")
             else:
                 success_count = sum(1 for r in results.values() if r is not None)
-            m.record_e2e_task(
-                f"orch_{int(time.time())}",
-                dispatched,
-                elapsed_ms,
-                success_count,
-                len(dispatched) - success_count,
-            )
+            m.record_e2e_task(f"orch_{int(time.time())}", dispatched, elapsed_ms,
+                             success_count, len(dispatched) - success_count)
         except Exception:
             pass
-
-        # Post synthesis to bus
-        bus_post("orchestrator", "orchestrator", "synthesis", report[:500])
-
-        log(f"Orchestration complete in {elapsed_ms:.0f}ms", "OK")
-        return {
-            "success": True,
-            "report": report,
-            "subtasks": subtasks,
-            "results": results,
-            "dispatched": dispatched,
-            "elapsed_ms": elapsed_ms,
-        }
 
     def convene(self, topic, context, n_workers=2, timeout=120):
         """Initiate a convene session — multiple workers coordinate on a sub-problem."""
@@ -457,61 +443,48 @@ class SkynetOrchestrator:
         return {"success": True, "session_id": session_id, "report": report, "results": collected}
 
     def reactive_run(self, prompt, timeout=180):
-        """Reactive pipeline — UIA real-time + bus monitoring for help/convene requests."""
+        """Reactive pipeline -- UIA real-time + bus monitoring for help/convene requests."""
         t0 = time.time()
         log(f"Reactive orchestrating: {prompt[:100]}", "SYS")
 
-        # Pre-flight recovery
-        states = scan_all_states(self.workers)
-        for name, state in states.items():
-            if state == "UNKNOWN":
-                log(f"Pre-flight: {name.upper()} is UNKNOWN — recovering", "WARN")
-                recover_worker(name, self.workers, self.orch_hwnd)
-
+        self._preflight_recover_unknown()
         self._idle_cache = None
         subtasks = self.decompose_task(prompt)
         log(f"Decomposed into {len(subtasks)} subtask(s)", "OK")
         for st in subtasks:
-            log(f"  → {st['worker'].upper()} [P{st.get('priority', 5)}]: {st['task'][:80]}", "SYS")
+            log(f"  -> {st['worker'].upper()} [P{st.get('priority', 5)}]: {st['task'][:80]}", "SYS")
 
-        dispatch_results = self.dispatch_all(subtasks)
-        dispatched = [name for name, ok in dispatch_results.items() if ok]
+        dispatched, _ = self._dispatch_and_log(subtasks)
         if not dispatched:
             return {"success": False, "error": "All dispatches failed"}
 
-        # Dual collection: UIA real-time + bus watch for help/convene
         collector = RealtimeCollector(poll_interval=2.0)
         collected = collector.collect(dispatched, timeout=timeout)
-
-        # Also check bus for any help/convene requests that came in during collection
-        try:
-            messages = bus_messages(limit=50)
-            for msg in messages:
-                msg_type = msg.get("type", "").lower()
-                sender = msg.get("sender", "")
-                if msg_type in ("request", "help"):
-                    log(f"Help request from {sender}: {msg.get('content', '')[:60]}", "WARN")
-                    idle = self._get_idle_workers()
-                    free = [w for w in idle if w not in dispatched]
-                    if free:
-                        helper_task = f"Help {sender} with: {msg.get('content', '')}"
-                        dispatch_to_worker(free[0], helper_task, self.workers, self.orch_hwnd)
-                        log(f"Routed help to {free[0].upper()}", "OK")
-        except Exception:
-            pass
+        self._route_help_requests(dispatched)
 
         report = self.synthesize(prompt, subtasks, collected)
         elapsed_ms = (time.time() - t0) * 1000
         bus_post("orchestrator", "orchestrator", "synthesis", report[:500])
         log(f"Reactive orchestration complete in {elapsed_ms:.0f}ms", "OK")
-        return {
-            "success": True,
-            "report": report,
-            "subtasks": subtasks,
-            "results": collected,
-            "dispatched": dispatched,
-            "elapsed_ms": elapsed_ms,
-        }
+        return {"success": True, "report": report, "subtasks": subtasks,
+                "results": collected, "dispatched": dispatched, "elapsed_ms": elapsed_ms}
+
+    def _route_help_requests(self, dispatched):
+        """Check bus for help/convene requests and route to idle workers."""
+        try:
+            messages = bus_messages(limit=50)
+            for msg in messages:
+                if msg.get("type", "").lower() in ("request", "help"):
+                    sender = msg.get("sender", "")
+                    log(f"Help request from {sender}: {msg.get('content', '')[:60]}", "WARN")
+                    idle = self._get_idle_workers()
+                    free = [w for w in idle if w not in dispatched]
+                    if free:
+                        dispatch_to_worker(free[0], f"Help {sender} with: {msg.get('content', '')}",
+                                           self.workers, self.orch_hwnd)
+                        log(f"Routed help to {free[0].upper()}", "OK")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
