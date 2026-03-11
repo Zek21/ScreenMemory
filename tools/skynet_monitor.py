@@ -812,7 +812,7 @@ def _record_health_trend(health: dict, productivity: dict, pending_work: int):
             "trend_count": len(_health_trend),
             "latest": snapshot,
             "productivity": productivity,
-            "trend": _health_trend[-20:],  # last 20 snapshots for dashboard
+            "trend": list(_health_trend)[-20:],  # last 20 snapshots for dashboard
         }
         with open(MONITOR_HEALTH_FILE, "w") as f:
             json.dump(trend_data, f, indent=2, default=str)
