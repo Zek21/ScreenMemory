@@ -532,66 +532,11 @@ for ($modelAttempt = 1; $modelAttempt -le 2; $modelAttempt++) {
 }
 
 # --- PERMISSION GUARD: Set Bypass Approvals ---
+# Uses shared guard_bypass.ps1 (single source of truth)
 
 Start-Sleep -Milliseconds 500
-$chatRootP = [System.Windows.Automation.AutomationElement]::FromHandle($newHwnd)
-$pButtons = $chatRootP.FindAll(
-    [System.Windows.Automation.TreeScope]::Descendants,
-    (New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Button
-    ))
-)
-$permBtn = $null
-foreach ($btn in $pButtons) {
-    $n = $btn.Current.Name
-    if ($n -eq 'Set Permissions - Bypass Approvals') {
-        # Already set to bypass
-        Write-Host "PERMISSION_GUARD: Already set to Bypass Approvals"
-        $permBtn = $null; break
-    }
-    if ($n -eq 'Set Permissions - Default Approvals') {
-        $permBtn = $btn
-    }
-}
-if ($permBtn) {
-    Write-Host "PERMISSION_GUARD: Found Default Approvals -- switching to Bypass"
-    $renderP = [Ghost]::FindRenderSurface($newHwnd)
-
-    # Step 1: Open dropdown via PostMessage ghost click (NOT ExpandCollapsePattern
-    # which lies -- it toggles UIA state without reliably opening the visual dropdown)
-    $pr = $permBtn.Current.BoundingRectangle
-    [Ghost]::Click($renderP, [int]($pr.X + $pr.Width/2), [int]($pr.Y + $pr.Height/2))
-    Write-Host "PERMISSION_GUARD: Dropdown opened via ghost click"
-    Start-Sleep -Milliseconds 1200
-
-    # Step 2: Select Bypass via PostMessage keyboard (Down+Enter)
-    # Dropdown highlights CURRENT selection (Default Approvals)
-    # Down moves to Bypass Approvals, Enter selects it
-    # Ghost DOWN key (VK=0x28, scan=0x50)
-    [Ghost]::PostMessage($renderP, 0x0100, [IntPtr]0x28, [IntPtr]0x00500001) | Out-Null
-    Start-Sleep -Milliseconds 50
-    [Ghost]::PostMessage($renderP, 0x0101, [IntPtr]0x28, [IntPtr]::new(0xC0500001L)) | Out-Null
-    Start-Sleep -Milliseconds 200
-    # Ghost ENTER key (VK=0x0D, scan=0x1C)
-    [Ghost]::PostMessage($renderP, 0x0100, [IntPtr]0x0D, [IntPtr]0x001C0001) | Out-Null
-    Start-Sleep -Milliseconds 50
-    [Ghost]::PostMessage($renderP, 0x0101, [IntPtr]0x0D, [IntPtr]::new(0xC01C0001L)) | Out-Null
-    Start-Sleep -Milliseconds 1500
-
-    # Step 3: Verify
-    $chatRootV = [System.Windows.Automation.AutomationElement]::FromHandle($newHwnd)
-    $vBtns = $chatRootV.FindAll([System.Windows.Automation.TreeScope]::Descendants,
-        (New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::Button)))
-    $verifyPerm = ($vBtns | Where-Object { $_.Current.Name -match 'Set Permissions' } | Select-Object -First 1).Current.Name
-    if ($verifyPerm -match 'Bypass') {
-        Write-Host "PERMISSION_GUARD: VERIFIED -- Bypass Approvals active"
-    } else {
-        Write-Host "PERMISSION_GUARD: WARNING -- still '$verifyPerm' after ghost attempt"
-    }
-}
+$guardScript = Join-Path $PSScriptRoot "guard_bypass.ps1"
+& $guardScript -Hwnd $newHwnd
 
 # --- Verify ---
 $chatRoot3 = [System.Windows.Automation.AutomationElement]::FromHandle($newHwnd)
