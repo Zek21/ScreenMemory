@@ -200,7 +200,25 @@ def _build_pulse_data():
     agents = raw_pulse.get("agents", {})
     alive = raw_pulse.get("alive", 0)
     total = raw_pulse.get("total", 5)
-    workers = {aid: {"status": status, "model": "opus-fast"} for aid, status in agents.items()}
+    # Read real model info from worker_health.json (UIA-probed truth)  # signed: beta
+    _wh = {}
+    try:
+        _wh_path = os.path.join(os.path.dirname(__file__), "data", "worker_health.json")
+        if os.path.exists(_wh_path):
+            with open(_wh_path, "r", encoding="utf-8") as _whf:
+                _wh = json.loads(_whf.read())
+    except Exception:
+        pass
+    workers = {}
+    for aid, status in agents.items():
+        real_model = "unknown"
+        if isinstance(_wh.get(aid), dict):
+            raw_model = _wh[aid].get("model", "")
+            if "opus" in raw_model.lower() and "fast" in raw_model.lower():
+                real_model = "opus-fast"
+            elif raw_model:
+                real_model = raw_model
+        workers[aid] = {"status": status, "model": real_model}  # signed: beta
     iq = _compute_display_iq(raw_pulse)
     iq_breakdown = _compute_iq_breakdown(alive, total, engines_online, engines_total)
     assessment = (
@@ -216,7 +234,7 @@ def _build_pulse_data():
         "engines_total": engines_total,
         "health": raw_pulse.get("health", "UNKNOWN"),
         "self_assessment": assessment,
-        "convene_sessions": [],
+        "convene_sessions": _load_convene_sessions(),  # signed: beta
         "workers": workers,
         "aware": alive > 0,
         "name": raw_pulse.get("name", "SKYNET"),
@@ -225,6 +243,32 @@ def _build_pulse_data():
         "total": total,
         "iq_trend": raw_pulse.get("iq_trend", "stable"),
     }
+
+
+def _load_convene_sessions():
+    """Load real convene sessions from data/convene_sessions.json.
+    Returns list of active session summaries. Never fabricate.
+    """  # signed: beta
+    try:
+        cs_path = os.path.join(os.path.dirname(__file__), "data", "convene_sessions.json")
+        if not os.path.exists(cs_path):
+            return []
+        with open(cs_path, "r", encoding="utf-8") as f:
+            raw = json.loads(f.read())
+        if isinstance(raw, dict):
+            sessions = []
+            for sid, sdata in raw.items():
+                if isinstance(sdata, dict) and sdata.get("status") != "resolved":
+                    sessions.append({
+                        "id": sid,
+                        "topic": sdata.get("topic", "unknown"),
+                        "participants": sdata.get("participants", []),
+                        "status": sdata.get("status", "unknown"),
+                    })
+            return sessions
+        return []
+    except Exception:
+        return []
 
 
 def _get_engine_counts():
