@@ -1200,7 +1200,9 @@ function _applyStatus(d){
       if(!seenOrchIds.has(th.id)){seenOrchIds.add(th.id);addOrchLine(th.text,th.type||'info');}
     }
   }
-  renderConsultants(d.consultants||{});
+  if(d.consultants!==undefined&&d.consultants!==null){
+    renderConsultants(d.consultants||{});
+  }
   updateGod(d.god_queue||[]);
   let tt=0;for(const s of Object.values(d.agents||{}))tt+=(s.tasks_completed||0);
   document.getElementById('sb-tasks').textContent=tt;
@@ -1333,10 +1335,15 @@ function drawTopology(){
 /* ═══ SMART FETCH ═══ */
 const GOD_PORT=8421;
 const BACKEND_PORT=8420;
+const CONSULTANT_BRIDGE_PORT=8422;
 async function smartFetch(path){
   try{const r=await fetch(path);if(r.ok)return await r.json();}catch(e){}
   try{const r2=await fetch('http://localhost:'+GOD_PORT+path);if(r2.ok)return await r2.json();}catch(e){}
   if(path.startsWith('/bus')){try{const r3=await fetch('http://localhost:'+BACKEND_PORT+path);if(r3.ok)return await r3.json();}catch(e){}}
+  return null;
+}
+async function smartFetchUrl(url){
+  try{const r=await fetch(url);if(r.ok)return await r.json();}catch(e){}
   return null;
 }
 
@@ -1352,6 +1359,27 @@ async function fetchDashboardData(){
 function getCachedStatus(){return _dashCache.status;}
 function getCachedPulse(){return _dashCache.pulse;}
 function getCachedBus(){return _dashCache.bus;}
+async function fetchConsultantsData(){
+  if(sseConnected&&sseData){
+    if(sseData.consultants)return sseData.consultants;
+    if(sseData.status&&sseData.status.consultants)return sseData.status.consultants;
+  }
+  if(_dashCache.status&&_dashCache.status.consultants)return _dashCache.status.consultants;
+  const fromConsole=await smartFetch('/consultants');
+  if(fromConsole)return fromConsole;
+  const fromBridge=await smartFetchUrl('http://localhost:'+CONSULTANT_BRIDGE_PORT+'/consultants');
+  if(fromBridge&&fromBridge.consultant){
+    const c=fromBridge.consultant;
+    const age=Number(c.heartbeat_age_s);
+    const staleAfter=Number(c.stale_after_s||8);
+    if(Number.isFinite(age)&&Number.isFinite(staleAfter)&&age<=staleAfter){
+      c.live=true;
+      c.status='LIVE';
+      c.pid_alive=true;
+    }
+  }
+  return fromBridge;
+}
 // Master combined poll -- replaces individual status+pulse+bus fetches
 async function masterPoll(){
   if(_wsConnected) return; // WebSocket handles updates when connected
@@ -1571,6 +1599,16 @@ async function pollBus(){
 }
 pollBus();
 setInterval(pollBus,5000);
+
+/* ═══ CONSULTANT PRESENCE ═══ */
+async function pollConsultants(){
+  try{
+    const data=await fetchConsultantsData();
+    renderConsultants(data||{});
+  }catch(e){}
+}
+pollConsultants();
+setInterval(pollConsultants,2500);
 
 /* ═══ TASK QUEUE ═══ */
 async function pollTaskQueue(){

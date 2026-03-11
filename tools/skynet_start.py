@@ -27,6 +27,7 @@ import os
 import sys
 import time
 import socket
+import urllib.request
 import subprocess
 import ctypes
 import ctypes.wintypes
@@ -1503,10 +1504,69 @@ def _is_daemon_running(pid_file):
         return False, None
     try:
         pid = int(pid_file.read_text().strip())
+    except ValueError:
+        return False, None
+    if pid == os.getpid():
+        return True, pid
+    if os.name == "nt":
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True, pid
+        return False, None
+    try:
         os.kill(pid, 0)  # check alive
         return True, pid
-    except (OSError, ValueError):
+    except OSError:
         return False, None
+
+
+def _process_commandline(pid):
+    """Best-effort process command line lookup for PID ownership checks."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return ""
+    if pid <= 0:
+        return ""
+    if os.name == "nt":
+        try:
+            r = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    f'$p = Get-CimInstance Win32_Process -Filter "ProcessId = {pid}" -ErrorAction SilentlyContinue; if ($p) {{ $p.CommandLine }}',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            return (r.stdout or "").strip()
+        except Exception:
+            return ""
+    try:
+        r = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _pid_matches_script(pid, script_path):
+    """Confirm the PID still belongs to the expected daemon script."""
+    cmdline = _process_commandline(pid)
+    if not cmdline:
+        return False
+    cmd_norm = cmdline.lower().replace("\\", "/")
+    script_name = Path(script_path).name.lower()
+    script_norm = str(Path(script_path).resolve()).lower().replace("\\", "/")
+    return script_norm in cmd_norm or script_name in cmd_norm
 
 
 def _start_daemon_safe(script_path, pid_file, label, extra_args=None):
@@ -1514,8 +1574,14 @@ def _start_daemon_safe(script_path, pid_file, label, extra_args=None):
     Returns the Popen object or None if already running / failed."""
     running, pid = _is_daemon_running(pid_file)
     if running:
-        log(f"{label} already running (PID {pid}) -- skipping", "OK")
-        return None
+        if _pid_matches_script(pid, script_path):
+            log(f"{label} already running (PID {pid}) -- skipping", "OK")
+            return None
+        log(f"{label} PID file points to a different process (PID {pid}) -- repairing", "WARN")
+        try:
+            pid_file.unlink()
+        except Exception:
+            pass
 
     if not os.path.exists(script_path):
         log(f"{label} script not found: {script_path}", "WARN")
@@ -1540,6 +1606,70 @@ def _start_daemon_safe(script_path, pid_file, label, extra_args=None):
         return None
 
 
+def _json_get(url, timeout=2):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def _consultant_endpoint_live(api_port):
+    data = _json_get(f"http://localhost:{api_port}/consultants", timeout=2)
+    if not isinstance(data, dict):
+        return False
+    consultant = data.get("consultant")
+    if not isinstance(consultant, dict):
+        return False
+    return bool(consultant.get("live")) or str(consultant.get("status", "")).upper() == "LIVE"
+
+
+def _ensure_consultant_bridge():
+    primary_script = str(ROOT / "tools" / "skynet_consultant_bridge.py")
+    primary_pid = DATA_DIR / "consultant_bridge.pid"
+    fallback_pid = DATA_DIR / "consultant_bridge_8424.pid"
+
+    _start_daemon_safe(
+        primary_script,
+        primary_pid,
+        "Codex Consultant bridge",
+    )
+
+    if _consultant_endpoint_live(8422):
+        return
+
+    log("Consultant bridge on port 8422 is not reporting live — starting fallback bridge on 8424", "WARN")
+    _start_daemon_safe(
+        primary_script,
+        fallback_pid,
+        "Codex Consultant bridge fallback",
+        extra_args=["--api-port", "8424", "--pid-file", str(fallback_pid)],
+    )
+
+
+def _ensure_gemini_consultant_bridge():
+    primary_script = str(ROOT / "tools" / "skynet_consultant_bridge.py")
+    primary_pid = DATA_DIR / "gemini_consultant_bridge.pid"
+
+    _start_daemon_safe(
+        primary_script,
+        primary_pid,
+        "Gemini Consultant bridge",
+        extra_args=[
+            "--id", "gemini_consultant",
+            "--display-name", "Gemini Consultant",
+            "--model", "Gemini 3 Pro",
+            "--source", "GC-Start",
+            "--api-port", "8425",
+        ],
+    )
+
+    if _consultant_endpoint_live(8425):
+        return
+
+    log("Gemini Consultant bridge on port 8425 is not reporting live", "WARN")
+
+
 def _start_post_boot_daemons():
     """Ensure the daemon set used by CC-Start is running."""
     _start_daemon_safe(
@@ -1559,11 +1689,8 @@ def _start_post_boot_daemons():
         DATA_DIR / "bus_relay.pid",
         "Bus relay daemon",
     )
-    _start_daemon_safe(
-        str(ROOT / "tools" / "skynet_consultant_bridge.py"),
-        DATA_DIR / "consultant_bridge.pid",
-        "Codex Consultant bridge",
-    )
+    _ensure_consultant_bridge()
+    _ensure_gemini_consultant_bridge()
 
 
 # ─── Main ─────────────────────────────────────────────
