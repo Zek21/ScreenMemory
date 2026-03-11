@@ -143,18 +143,14 @@ def _log_and_broadcast_heals(actions: list[dict]):
     _save_json(HEAL_LOG, log_data[-100:])
 
     try:
-        import requests
+        from tools.skynet_spam_guard import guarded_publish
         summary = "; ".join(f"{a['worker']}:{a['action']}" for a in actions)
-        requests.post(
-            "http://localhost:8420/bus/publish",
-            json={
-                "sender": "self_heal",
-                "topic": "orchestrator",
-                "type": "alert",
-                "content": f"AUTO-HEAL: {summary}",
-            },
-            timeout=3,
-        )
+        guarded_publish({  # signed: gamma
+            "sender": "self_heal",
+            "topic": "orchestrator",
+            "type": "alert",
+            "content": f"AUTO-HEAL: {summary}",
+        })
     except Exception:
         pass
 

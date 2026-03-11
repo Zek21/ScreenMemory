@@ -30,6 +30,7 @@ DATA_DIR = ROOT / "data"
 PID_FILE = DATA_DIR / "convene_gate.pid"
 
 import requests
+from tools.skynet_spam_guard import guarded_publish  # signed: gamma
 
 SKYNET = "http://localhost:8420"
 BUS_PUBLISH = f"{SKYNET}/bus/publish"
@@ -61,18 +62,15 @@ def _init_pid_guard(pid_file: Path) -> bool:
 
 
 def _bus_post(sender, topic, msg_type, content):
-    """Post to bus with retry."""
-    for attempt in range(3):
-        try:
-            r = requests.post(BUS_PUBLISH, json={
-                "sender": sender, "topic": topic,
-                "type": msg_type, "content": content,
-            }, timeout=3)
-            return r.ok
-        except Exception:
-            if attempt < 2:
-                time.sleep(0.5)
-    return False
+    """Post to bus via SpamGuard."""
+    try:
+        result = guarded_publish({  # signed: gamma
+            "sender": sender, "topic": topic,
+            "type": msg_type, "content": content,
+        })
+        return result.get("allowed", False)
+    except Exception:
+        return False
 
 
 def _bus_poll(limit=30):

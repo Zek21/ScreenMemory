@@ -166,13 +166,15 @@ def _post_bus(topic, msg_type, content):
 
 
 def _get_skynet_version():
+    """Return Skynet version string, or None if unavailable (Truth: never fabricate)."""
     try:
         from tools.skynet_version import current_version
         cur = current_version() or {}
         version = cur.get("version")
-        return str(version) if version else "unknown"
+        return str(version) if version else None
     except Exception:
-        return "unknown"
+        return None
+    # signed: delta
 
 
 def _versioned_signal(prefix, text):
@@ -386,19 +388,21 @@ class WorkerCognitiveModel:
     def effectiveness_score(self):
         total = self.tasks_completed + self.tasks_failed
         if total == 0:
-            return 0.5
+            return None  # Truth: unknown, not fabricated 0.5 # signed: delta
         return self.tasks_completed / total
 
     def to_dict(self):
+        eff = self.effectiveness_score()
         return {
             "name": self.name, "state": self.state,
             "idle_s": round(self.idle_duration()),
             "tasks": self.tasks_completed, "fails": self.tasks_failed,
             "avg_proc_s": round(self.avg_processing_time()),
             "load": round(self.cognitive_load, 2),
-            "effectiveness": round(self.effectiveness_score(), 2),
+            "effectiveness": round(eff, 2) if eff is not None else None,
             "stalls": self.stall_count,
         }
+        # signed: delta
 
 
 class ChainOfThought:
@@ -1248,14 +1252,38 @@ class SelfPromptDaemon:
         return " ".join(parts)
 
     def _collect_daemon_health(self, alerts):
-        """Check daemon health from watchdog status, monitor file, and alert messages."""
+        """Check daemon health via live probes, not just file reads.
+        Truth principle: verify each daemon is actually responsive."""
         daemon_issues = []
+
+        # --- Live HTTP probes for critical daemons (Truth: verify, don't trust files) ---
+        def _http_probe(url, timeout=2):
+            """Return True if HTTP endpoint responds with 2xx."""
+            try:
+                req = urllib.request.Request(url, method="GET")
+                resp = urllib.request.urlopen(req, timeout=timeout)
+                return 200 <= resp.status < 300
+            except Exception:
+                return False
+
+        # Skynet backend (port 8420)
+        if not _http_probe("http://localhost:8420/status"):
+            daemon_issues.append("skynet=unresponsive")
+
+        # GOD Console (port 8421)
+        if not _http_probe("http://localhost:8421/health"):
+            # Fallback: try root endpoint
+            if not _http_probe("http://localhost:8421/"):
+                daemon_issues.append("god_console=unresponsive")
+
+        # Watchdog file as supplementary signal (not primary truth source)
         watchdog_status = _load_json(DATA_DIR / "watchdog_status.json")
         if watchdog_status and isinstance(watchdog_status, dict):
-            for svc in ("skynet", "god_console", "sse_daemon"):
+            for svc in ("sse_daemon",):  # skynet/god_console verified by HTTP above
                 svc_status = watchdog_status.get(svc, "unknown")
                 if svc_status not in ("ok", "unknown"):
                     daemon_issues.append(f"{svc}={svc_status}")
+        # signed: delta
 
         # Check monitor health: content timestamp > file mtime > PID liveness.
         # Threshold 300s accounts for adaptive slowdown (monitor runs at 60s
@@ -1325,7 +1353,8 @@ class SelfPromptDaemon:
                 daemon_issues.append("alert")
                 break
 
-        return ",".join(daemon_issues) if daemon_issues else "OK"
+        return ",".join(daemon_issues) if daemon_issues else "verified_ok"
+        # signed: delta
 
     def _build_status_line(self, perception, new_results, new_alerts, pending_todos, orch_todos, daemon_status):
         """Assemble the status line from components."""
@@ -1528,7 +1557,7 @@ class SelfPromptDaemon:
         return {
             "daemon": DAEMON_NAME,
             "daemon_version": DAEMON_VERSION,
-            "skynet_version": _get_skynet_version(),
+            "skynet_version": _get_skynet_version() or "unavailable",
             "cycles": self.cycles,
             "sent": self.prompts_sent,
             "failed": self.prompts_failed,
@@ -1899,7 +1928,7 @@ class SelfPromptDaemon:
         _post_bus("orchestrator", "monitor_alert",
                   _versioned_signal(
                       "SELF_PROMPT_ONLINE",
-                      f"Orchestrator heartbeat daemon started (status-based polling, skynet_v={_get_skynet_version()})"
+                      f"Orchestrator heartbeat daemon started (status-based polling, skynet_v={_get_skynet_version() or 'unavailable'})"
                   ))
 
         self._wait_for_boot_completion()
@@ -1976,7 +2005,7 @@ def _action_status():
     log_data = _load_json(LOG_FILE)
     health = _load_json(HEALTH_FILE) or {}
     print(f"{DAEMON_NAME} v{health.get('daemon_version', DAEMON_VERSION)}")
-    print(f"Skynet version: {health.get('skynet_version', _get_skynet_version())}")
+    print(f"Skynet version: {health.get('skynet_version') or _get_skynet_version() or 'unavailable'}")
     if log_data and isinstance(log_data, list) and len(log_data) > 0:
         print(json.dumps(log_data[-1], indent=2))
         print(f"\nTotal prompts logged: {len(log_data)}")
@@ -1987,7 +2016,7 @@ def _action_status():
 
 
 def _action_version():
-    print(f"{DAEMON_NAME} v{DAEMON_VERSION} (Skynet v{_get_skynet_version()})")
+    print(f"{DAEMON_NAME} v{DAEMON_VERSION} (Skynet v{_get_skynet_version() or 'unavailable'})")
 
 
 def _action_start():
