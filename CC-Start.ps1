@@ -120,7 +120,7 @@ if ($godUp) {
     }
 }
 
-# ── Phase 3: Worker health check ────────────────────────
+# ── Phase 3: Worker visibility snapshot ─────────────────
 
 $workersFile   = Join-Path $dataDir "workers.json"
 $workersAlive  = 0
@@ -147,6 +147,11 @@ if (Test-Path $workersFile) {
 # ── Decision: what needs to happen? ─────────────────────
 
 $action = "none"
+$backendWorkers = @()
+if ($status -and $status.agents) {
+    $backendWorkers = @($status.agents.PSObject.Properties.Name | Where-Object { $_ -ne "orchestrator" })
+}
+$backendWorkerCount = $backendWorkers.Count
 
 if ($Fresh) {
     $action = "fresh"
@@ -154,14 +159,19 @@ if ($Fresh) {
 } elseif (-not $skynetUp) {
     $action = "full"
     Write-Status "Backend was down -- full boot needed" "SYS"
-} elseif ($workersAlive -eq 0) {
-    $action = "full"
-    Write-Status "No live workers -- full boot needed" "SYS"
 } elseif ($workersDead -gt 0) {
-    $action = "reconnect"
-    Write-Status "$workersDead dead worker(s) -- reconnect needed" "SYS"
+    Write-Status "$workersDead worker window(s) not visible; consultant bootstrap will not auto-recover worker windows" "WARN"
+    if ($backendWorkerCount -gt 0) {
+        Write-Status "Backend still reports worker agents: $($backendWorkers -join ', ')" "WARN"
+    }
+} elseif ($workersAlive -eq 0) {
+    if ($backendWorkerCount -gt 0) {
+        Write-Status "No visible worker windows, but backend reports worker agents ($($backendWorkers -join ', ')); consultant bootstrap will not escalate into worker boot" "WARN"
+    } else {
+        Write-Status "No visible worker windows; consultant bootstrap is leaving worker recovery to Orch-Start" "WARN"
+    }
 } else {
-    Write-Status "System fully operational -- nothing to start" "OK"
+    Write-Status "Shared infrastructure operational -- consultant bootstrap needs no worker action" "OK"
 }
 
 # ── Execute startup with timeout protection ──────────────
@@ -322,6 +332,7 @@ Write-Host "  You are the CODEX CONSULTANT (sender: consultant)."
 Write-Host "  You are a CO-EQUAL ADVISORY PEER to the Skynet orchestrator."
 Write-Host "  You are NOT the orchestrator. You do NOT manage workers."
 Write-Host "  You do NOT dispatch tasks via skynet_dispatch.py."
+Write-Host "  You own startup integrity for GOD: if startup is degraded, diagnose it and address it."
 Write-Host ""
 Write-Host "  Your capabilities:"
 Write-Host "    - Direct implementation and code editing"
@@ -340,6 +351,7 @@ Write-Host "  Failure corrections you must obey:"
 Write-Host "    - CC-Start always means Codex Consultant, never orchestrator."
 Write-Host "    - Report model truth as GPT-5 Codex."
 Write-Host "    - Bring up bridge 8422 before claiming LIVE or routable transport."
+Write-Host "    - Any startup issue must be addressed by the consultant for GOD: verify it, fix it directly when safe, or publish an alert plus remediation artifact if blocked."
 Write-Host "    - If you fail or drift: write an artifact, post it to Skynet, and verify delivery."
 Write-Host "    - Keep bus payloads schema-safe unless endpoint support is verified."
 Write-Host "    - Do not claim success without a live endpoint check or sender-filtered bus confirmation."

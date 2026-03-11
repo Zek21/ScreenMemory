@@ -8,6 +8,38 @@
 - Prefer decisive action over tentative exploration. If one valid approach fails, immediately try the next one.
 - Maximize local capability before stopping: reuse existing scripts, CLI entry points, MCP servers, and workspace tooling instead of leaving the task half-finished.
 
+## IMPACT ANALYSIS RULE — Rule #0.01 (Pre-Change, Mandatory)
+
+**Before ANY code change to protocol files, boot scripts, dispatch scripts, or copilot instructions, the orchestrator MUST investigate the full implications of the change.**
+
+### What This Means
+Every change to a critical system file can have cascading consequences. A "simple fix" to a boot script can disable worker opening. A default parameter change can invert behavior. A protocol update can create contradictions with other rules. The orchestrator MUST think through second and third-order effects BEFORE committing.
+
+### Mandatory Pre-Change Checklist
+Before modifying any file in this list, complete ALL checks:
+
+1. **Read the ENTIRE file** being changed — understand its full behavior, not just the section being edited
+2. **Trace all callers** — grep for every script, function, and protocol that references the file being changed
+3. **Identify default behavior changes** — if changing defaults (e.g., a parameter default value), verify the NEW default produces the SAME behavior as the OLD default for all existing callers
+4. **Test the change mentally** — walk through the boot sequence / dispatch flow / protocol with the proposed change applied. Does every path still work?
+5. **Check for contradictions** — does the change conflict with any rule in `AGENTS.md`, `copilot-instructions.md`, or the `.github/agents/` files?
+6. **Verify rollback path** — can this change be safely reverted if it breaks something?
+
+### Critical Files (Impact Analysis MANDATORY)
+| File | Risk | Why |
+|------|------|-----|
+| `Orch-Start.ps1` | **CRITICAL** | Changing defaults breaks ALL boot sequences |
+| `tools/skynet_start.py` | **CRITICAL** | Worker window opening, UIA, model guard |
+| `tools/new_chat.ps1` | **CRITICAL** | Only way to open worker windows |
+| `tools/skynet_dispatch.py` | **HIGH** | All worker communication flows through this |
+| `.github/copilot-instructions.md` | **CRITICAL** | Governs ALL agent behavior |
+| `AGENTS.md` | **CRITICAL** | Governs ALL agent behavior |
+| `tools/skynet_monitor.py` | **HIGH** | Health monitoring, model drift correction |
+| `data/brain_config.json` | **HIGH** | Operational parameters for all agents |
+
+### Incident That Created This Rule
+**2026-03-11:** Orchestrator changed `Orch-Start.ps1` to default `-SkipWorkers=$true`, which silently disabled worker window opening for ALL boot sequences. The "fix" to separate boot phases made the startup protocol unable to open workers at all. Root cause: no impact analysis was performed — the orchestrator changed a default parameter without tracing how all callers (including the boot protocol itself) would be affected. The change was committed and deployed before the cascading failure was discovered.
+
 ## Session Boot Protocol (MANDATORY — Execute BEFORE any other work)
 
 **When a new session starts, OR the user says "skynet-start" / "orchestrator-start" / "Orch-Start" / "CC-Start" / "GC-Start", execute this protocol in order. Determine role from the trigger first; no other work may proceed until the matching boot sequence completes successfully.**

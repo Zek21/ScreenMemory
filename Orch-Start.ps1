@@ -2,23 +2,18 @@
 # Smart, non-blocking startup: checks what's running, starts only what's missing.
 # If everything is already live, opens the dashboard instantly (<2s).
 #
-# IMPORTANT: skynet-start and orchestrator-start are TWO SEPARATE PHASES.
-# Phase 1 (infrastructure): backend, GOD Console, daemons -- fast, no UIA
-# Phase 2 (orchestrator role): identity, knowledge acquisition, report
-# Worker windows are opened separately AFTER the orchestrator is online.
-#
 # Flags:
 #   -Fresh         Force a full fresh boot (kills existing and restarts)
 #   -Workers N     Number of workers to open (default: 4)
 #   -Timeout N     Max wait for skynet_start.py (default: 120)
-#   -SkipInfra     Skip Phase 1, go straight to worker windows
-#   -SkipWorkers   Skip worker window opening (default: true -- workers opened separately)
+#   -SkipInfra     Skip infrastructure checks, go straight to worker windows only
+#   -SkipWorkers   Skip worker window opening (infrastructure + daemons only)
 param(
     [switch]$Fresh,
     [int]$Workers = 4,
     [int]$Timeout = 120,
     [switch]$SkipInfra,
-    [switch]$SkipWorkers = $true
+    [switch]$SkipWorkers
 )
 
 $ErrorActionPreference = "Continue"
@@ -174,11 +169,7 @@ if ($SkipInfra) {
         Write-Status "SkipInfra mode -- all workers alive, nothing to do" "OK"
     }
 } elseif ($SkipWorkers) {
-    # Default mode: infrastructure only, skip worker windows (they're opened separately)
-    if (-not $skynetUp) {
-        # Backend should already be up (Phase 1 runs before Orch-Start in the new protocol)
-        Write-Status "Backend not running -- should have been started in Phase 1 (skynet-start)" "WARN"
-    }
+    # Infrastructure only, skip worker windows
     Write-Status "SkipWorkers mode -- worker windows will be opened separately" "OK"
     $action = "none"
 } elseif ($Fresh) {

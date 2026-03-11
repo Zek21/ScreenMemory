@@ -25,50 +25,60 @@ Any agent (Worker, Orchestrator, or Consultant) that makes a mistake, experience
 2. **Draft a comprehensive, lengthy Markdown proposal** documenting the root cause, what was learned, and specific architectural/systemic improvements to make Skynet smarter, more capable, and aggressively immune to recurrence.
 3. Submit this structural improvement proposal to the repo root and notify the Orchestrator. Omitting documentation or quietly moving past an error is treated as a secondary Truth violation.
 
+## IMPACT ANALYSIS RULE — Rule #0.01 (Pre-Change, Mandatory)
+
+**Before ANY code change to protocol files, boot scripts, dispatch scripts, or copilot instructions, the agent MUST investigate the full implications of the change.**
+
+1. **Read the ENTIRE file** — understand full behavior, not just the section being edited
+2. **Trace all callers** — grep for every script, function, and protocol that references the file
+3. **Verify default behavior preservation** — if changing defaults, confirm NEW defaults produce SAME behavior for ALL existing callers
+4. **Walk the critical paths** — mentally trace boot sequence / dispatch flow / protocol with the change applied
+5. **Check for contradictions** — does the change conflict with any rule in AGENTS.md or copilot-instructions.md?
+6. **Verify rollback path** — can this change be safely reverted?
+
+**Critical files requiring impact analysis:** `Orch-Start.ps1`, `tools/skynet_start.py`, `tools/new_chat.ps1`, `tools/skynet_dispatch.py`, `.github/copilot-instructions.md`, `AGENTS.md`, `tools/skynet_monitor.py`, `data/brain_config.json`.
+
+**Incident 006 — Orchestrator Broke Boot Protocol (2026-03-11):** Orchestrator changed `Orch-Start.ps1` to default `-SkipWorkers=$true` without tracing callers. This silently disabled worker window opening for ALL boot sequences. The "fix" to separate boot phases made the system unable to open workers at all. No impact analysis was performed before committing.
+
 ## SESSION BOOT PROTOCOL — Rule #0.05 (Mandatory, Pre-Operational)
 
 **On EVERY new session start, determine role from the trigger BEFORE any other work.**
 
-**CRITICAL: `skynet-start` and `orchestrator-start` are SEPARATE PHASES, not aliases.**
-
-- `skynet-start` = **Phase 1 (infrastructure) + Phase 2 (orchestrator role).** Full cold-start. Boots backend, GOD Console, daemons first (fast, <15s, no UIA), THEN assumes orchestrator role.
-- `orchestrator-start` / `Orch-Start` = **Phase 2 only (orchestrator role).** Assumes infrastructure is already running. Self-identifies, absorbs context, enters CEO mode. If infrastructure is dead, warns and attempts Phase 1 first.
+- `skynet-start` = **Full boot.** Run `.\Orch-Start.ps1` which handles everything: backend, GOD Console, daemons, worker windows (via `skynet_start.py` with timeout protection), identity announcement, dashboard. This is the canonical cold-start entry point.
+- `orchestrator-start` / `Orch-Start` = **Role assumption only.** Assumes Skynet infrastructure and workers are already running. Self-identifies, absorbs context (bus, status, TODOs, profiles), and enters CEO mode. If infrastructure is dead, run `.\Orch-Start.ps1` to bootstrap it first.
 - `CC-Start` = execute Codex Consultant bootstrap, announce `sender=consultant`, and stay in consultant role
 - `GC-Start` = execute Gemini Consultant bootstrap, announce `sender=gemini_consultant`, and stay in consultant role
 - Consultant starts may ensure shared Skynet infrastructure is reachable, but they do NOT assume orchestrator authority
 
-### Phase 1: Infrastructure Boot (`skynet-start` only)
-**Fast, reliable, NO UIA. Must complete before Phase 2.**
+### skynet-start Boot Sequence:
 
-1. **Start backend** — If port 8420 is closed, start `Skynet\skynet.exe` hidden. Wait up to 15s.
-2. **Start GOD Console** — If port 8421 is closed, start `god_console.py` hidden. Wait up to 10s.
-3. **Start daemons** — Check PID files, start any that are dead: self-prompt, self-improve, bus-relay, learner.
-4. **Announce infra online** — POST `{sender: "system", topic: "system", type: "infra_boot"}` to bus.
-
-**Phase 1 does NOT open worker windows.** Worker windows are UIA-heavy and can hang. They are opened separately AFTER the orchestrator is online.
-
-### Phase 2: Orchestrator Role Assumption (`orchestrator-start` / `Orch-Start`)
-**Establishes orchestrator identity and operational awareness.**
-
-1. **Self-Identify** — Detect current VS Code HWND → read and update `data/orchestrator.json`
-2. **Health Check** — `Invoke-RestMethod http://localhost:8420/status` → if dead and trigger was `orchestrator-start`, warn and attempt Phase 1
-3. **Announce identity** — POST `{sender: "orchestrator", topic: "orchestrator", type: "identity_ack"}` to bus
-4. **Open dashboard** — `Start-Process "http://localhost:8421/dashboard"`
-5. **Knowledge Acquisition** — Absorb ALL context:
+1. **Self-Identify** — Detect current VS Code HWND, update `data/orchestrator.json`
+2. **Run `.\Orch-Start.ps1`** — Smart wrapper that:
+   - Checks backend (port 8420), starts if dead
+   - Checks GOD Console (port 8421), starts if dead
+   - Checks worker window liveness via Win32 `IsWindowVisible`
+   - Opens worker windows via `skynet_start.py` if needed (with timeout protection)
+   - Starts daemons (self-prompt, self-improve, bus-relay, learner)
+   - Announces orchestrator identity on bus
+   - Opens dashboard
+3. **Knowledge Acquisition** — After boot completes, absorb ALL context:
    - Poll bus: `Invoke-RestMethod http://localhost:8420/bus/messages?limit=30`
    - Worker states: `Invoke-RestMethod http://localhost:8420/status`
    - Agent profiles: `data/agent_profiles.json`
    - Brain config: `data/brain_config.json`
    - Pending TODOs: `data/todos.json`
    - Worker registry: `data/workers.json`
-6. **Check consultants** — `GET http://localhost:8422/health` (Codex), `GET http://localhost:8425/health` (Gemini)
-7. **Report Ready** — Skynet version, worker count + states, engine count, pending alerts, pending TODOs, consultant status, warnings
+4. **Check consultants** — `GET http://localhost:8422/health` (Codex), `GET http://localhost:8425/health` (Gemini)
+5. **Report Ready** — Skynet version, worker count + states, engine count, pending alerts, pending TODOs, consultant status, warnings
 
-### Worker Window Management (Post-Boot, Separate)
-Worker windows are opened AFTER Phase 2 completes, never during infrastructure boot:
-- Run `.\Orch-Start.ps1 -SkipInfra` for managed worker window opening with timeout protection
-- Or use `tools/new_chat.ps1` for individual workers
-- Worker window opening is UIA-heavy and may hang — it MUST NOT block infrastructure or orchestrator boot
+### orchestrator-start / Orch-Start Sequence (Phase 2 only):
+
+1. **Self-Identify** — HWND detection, update orchestrator.json
+2. **Health Check** — `GET http://localhost:8420/status`. If dead, warn and run `.\Orch-Start.ps1` first
+3. **Announce identity** — POST identity_ack to bus
+4. **Open dashboard**
+5. **Knowledge Acquisition** — same as above (bus, status, profiles, config, TODOs, workers)
+6. **Report Ready**
 
 ### Consultant Boot Sequence
 
@@ -283,6 +293,13 @@ Institutional memory for Skynet. Every incident is stored in `data/incidents.jso
 - **Root cause:** Orchestrator did not use `skynet_start.py` and violated one-at-a-time rule. Manual `ctypes MoveWindow` stole focus from the orchestrator. Direct `fix_model` calls opened model pickers in all windows simultaneously, causing UIA race conditions. Blast dispatch without cooldown corrupted the clipboard shared across paste operations.
 - **Fix:** Boot protocol encoded in `data/boot_protocol.json`, mandatory use of `skynet_start.py`, `fix_model` banned from orchestrator context. Boot Protocol section added to AGENTS.md.
 - **Rule:** Always use `skynet_start.py` for worker bootstrap. Never steal focus manually.
+
+### INCIDENT 006 -- Orchestrator Broke Boot Protocol With Untested Default Change
+- **What:** Orchestrator changed `Orch-Start.ps1` parameter `-SkipWorkers` from an opt-in switch to a default-true parameter (`$SkipWorkers=$true`). This silently disabled worker window opening for ALL boot sequences. No caller ever passed `-SkipWorkers:$false`, so workers could never be opened via the normal boot flow.
+- **Root cause:** No impact analysis performed. The orchestrator changed a default parameter value without (1) reading the entire file, (2) tracing all callers, (3) verifying the new default preserved existing behavior. The change was committed immediately without testing.
+- **Secondary violation:** Orchestrator performed the code edit directly instead of delegating to workers (governance violation). However, 0 workers were available (boot was broken), creating a catch-22.
+- **Fix:** Reverted `-SkipWorkers=$true` back to `[switch]$SkipWorkers` (opt-in). Added IMPACT ANALYSIS RULE (Rule #0.01) to AGENTS.md and copilot-instructions.md mandating pre-change investigation for all critical infrastructure files.
+- **Rule:** Before ANY change to boot scripts, dispatch scripts, or protocol files, complete the full Impact Analysis checklist. Never change defaults without tracing all callers.
 
 ### Forbidden Commands (Workers)
 
