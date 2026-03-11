@@ -45,6 +45,17 @@ except ImportError:
 DASHBOARD_HTML = ROOT / "dashboard.html"
 DEFAULT_PORT = 8421
 WS_PORT = 8423
+
+def _real_version():
+    """Return real version/level from skynet_version history, not hardcoded."""  # signed: gamma
+    try:
+        from skynet_version import current_version
+        cur = current_version()
+        if cur:
+            return str(cur.get("version", "unknown")), cur.get("level", 0)
+    except Exception:
+        pass
+    return "unknown", 0
 ACCESS_LOG = ROOT / "data" / "console_access.log"
 TODOS_FILE = ROOT / "data" / "todos.json"
 _SERVER_START = _time.time()
@@ -199,7 +210,7 @@ def _build_pulse_data():
     engines_online, engines_total, engine_names = _get_engine_counts()
     agents = raw_pulse.get("agents", {})
     alive = raw_pulse.get("alive", 0)
-    total = raw_pulse.get("total", 5)
+    total = raw_pulse.get("total", 0)  # Truth: 0 if unknown, never hardcode worker count  # signed: gamma
     # Read real model info from worker_health.json (UIA-probed truth)  # signed: beta
     _wh = {}
     try:
@@ -568,8 +579,9 @@ def _precompute_loop():
             if assess_stale and reflection:
                 sky = _get_skynet_self()
                 text = sky._self_assessment(reflection)
+                _ver, _lvl = _real_version()  # signed: gamma
                 data = {"assessment": text, "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "version": "3.0", "level": 3}
+                        "version": _ver, "level": _lvl}
                 with _cache_lock:
                     _cache["assess"] = data
                     _cache["assess_t"] = _time.time()
@@ -868,7 +880,8 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             self.send_header("Cache-Control", "public, max-age=3600")
             self.end_headers()
         elif self.path == "/version":
-            self._json_response({"version": "3.0", "level": 3, "codename": "Level 3", "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")})  # signed: delta
+            _ver, _lvl = _real_version()  # signed: gamma
+            self._json_response({"version": _ver, "level": _lvl, "codename": f"Level {_lvl}", "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")})
         elif self.path == "/health":
             endpoints = ["/", "/dashboard", "/engines", "/version", "/health",
                          "/skynet/self/pulse", "/skynet/self/status",
@@ -978,8 +991,9 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                     if not reflection:
                         reflection = sky.introspection.reflect()
                     text = sky._self_assessment(reflection)
+                    _ver, _lvl = _real_version()  # signed: gamma
                     data = {"assessment": text, "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            "version": "3.0", "level": 3}
+                            "version": _ver, "level": _lvl}
                     with _cache_lock:
                         _cache["assess"] = data
                         _cache["assess_t"] = _time.time()
@@ -992,13 +1006,15 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 health = pulse.get("health", "UNKNOWN")
                 iq = pulse.get("intelligence_score", 0)
                 alive = pulse.get("alive", 0)
-                total = pulse.get("total", 5)
+                total = pulse.get("total", 0)  # Truth: 0 if unknown  # signed: gamma
                 eng_on = pulse.get("engines_online", 0)
                 eng_tot = pulse.get("engines_total", 0)
-                line = f"SKYNET v3.0 Level 3 | {health} | IQ {iq} | {alive}/{total} workers | {eng_on}/{eng_tot} engines"
-                data = {"status_line": line, "health": health, "iq": iq, "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")}  # signed: delta
+                _ver, _lvl = _real_version()  # signed: gamma
+                line = f"SKYNET v{_ver} Level {_lvl} | {health} | IQ {iq} | {alive}/{total} workers | {eng_on}/{eng_tot} engines"
+                data = {"status_line": line, "health": health, "iq": iq, "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")}
             except Exception as e:
-                data = {"status_line": f"SKYNET v3.0 Level 3 | ERROR: {e}", "health": "ERROR", "iq": 0, "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")}
+                _ver, _lvl = _real_version()  # signed: gamma
+                data = {"status_line": f"SKYNET v{_ver} Level {_lvl} | ERROR: {e}", "health": "ERROR", "iq": 0, "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")}
             self._json_response(data)
         elif self.path == "/status":
             try:
@@ -1481,16 +1497,22 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 payload[key] = fetcher()
             except Exception:
                 payload[key] = None
-        # Include engine summary counts for real-time dashboard  # signed: beta
+        # Include engine summary counts for real-time dashboard  # signed: gamma
         try:
             eng = _cached_engines()
             summary = eng.get("summary", {})
+            eng_map = eng.get("engines", {})
+            # Truth: count statuses from real probed engine data, not derived math  # signed: gamma
+            on = sum(1 for e in eng_map.values() if e.get("status") == "online")
+            av = sum(1 for e in eng_map.values() if e.get("status") == "available")
+            off = sum(1 for e in eng_map.values() if e.get("status") == "offline")
+            tot = len(eng_map) if eng_map else summary.get("total", 0)
             payload["engines"] = {
-                "online": summary.get("online", 0),
-                "available": summary.get("available", 0),
-                "offline": summary.get("offline", summary.get("total", 0) - summary.get("online", 0) - summary.get("available", 0)),
-                "total": summary.get("total", 0),
-                "health_pct": summary.get("health_pct", 0),
+                "online": on if eng_map else summary.get("online", 0),
+                "available": av if eng_map else summary.get("available", 0),
+                "offline": off if eng_map else summary.get("offline", 0),
+                "total": tot,
+                "health_pct": round(on / max(1, tot) * 100) if eng_map else summary.get("health_pct", 0),
             }
         except Exception:
             payload["engines"] = None

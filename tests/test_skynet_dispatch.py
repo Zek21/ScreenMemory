@@ -699,6 +699,12 @@ class TestGhostTypeToWorker:
     All subprocess and file I/O is mocked — no real windows or clipboard touched.
     """  # signed: beta
 
+    @pytest.fixture(autouse=True)
+    def _mock_is_window(self):
+        """Mock user32.IsWindow so fake HWNDs pass validation."""
+        with patch.object(dispatch.user32, "IsWindow", return_value=True):
+            yield
+
     @patch.object(dispatch, "_execute_ghost_dispatch", return_value=True)
     @patch.object(dispatch, "_build_ghost_type_ps", return_value="fake-ps")
     def test_success_returns_true(self, mock_ps, mock_exec):
@@ -735,11 +741,11 @@ class TestGhostTypeToWorker:
         assert result is True  # signed: beta
 
     @patch.object(dispatch, "_build_ghost_type_ps", return_value="fake-ps")
-    def test_file_write_failure_propagates(self, mock_ps):
-        """If temp file write fails, exception propagates."""
+    def test_file_write_failure_returns_false(self, mock_ps):
+        """If temp file write fails, ghost_type returns False (caught internally)."""
         with patch.object(Path, "write_text", side_effect=OSError("disk full")):
-            with pytest.raises(OSError, match="disk full"):
-                dispatch.ghost_type_to_worker(12345, "test", None)  # signed: beta
+            result = dispatch.ghost_type_to_worker(12345, "test", None)
+        assert result is False  # signed: beta — OSError now caught, returns False
 
     @patch.object(dispatch, "_execute_ghost_dispatch", return_value=True)
     @patch.object(dispatch, "_build_ghost_type_ps", return_value="fake-ps")

@@ -232,8 +232,12 @@ class TestGhostTypeTruthfulness(unittest.TestCase):
         self.lock_file = Path(self.tmpdir.name) / "dispatch.lock"
         self.old_lock_file = dispatch.DISPATCH_LOCK_FILE
         dispatch.DISPATCH_LOCK_FILE = self.lock_file
+        # Mock IsWindow so fake HWNDs pass validation
+        self._is_window_patcher = patch.object(dispatch.user32, "IsWindow", return_value=True)
+        self._is_window_patcher.start()
 
     def tearDown(self):
+        self._is_window_patcher.stop()
         self.dispatch.DISPATCH_LOCK_FILE = self.old_lock_file
         self.tmpdir.cleanup()
 
