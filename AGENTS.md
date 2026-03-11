@@ -19,6 +19,12 @@ This applies to ALL system surfaces:
 
 This rule supersedes all other rules. No rule may authorize fabrication.
 
+### TRUTH ENFORCEMENT & FAILURE RECOVERY (The "Learn and Propose" Mandate)
+Any agent (Worker, Orchestrator, or Consultant) that makes a mistake, experiences a procedural failure, or in any way undermines the Truth Protocol MUST:
+1. **Immediately broadcast the failure** to the Skynet bus (`/bus/publish`).
+2. **Draft a comprehensive, lengthy Markdown proposal** documenting the root cause, what was learned, and specific architectural/systemic improvements to make Skynet smarter, more capable, and aggressively immune to recurrence.
+3. Submit this structural improvement proposal to the repo root and notify the Orchestrator. Omitting documentation or quietly moving past an error is treated as a secondary Truth violation.
+
 ## SESSION BOOT PROTOCOL — Rule #0.05 (Mandatory, Pre-Operational)
 
 **On EVERY new session start, OR when the user says "skynet-start" / "orchestrator-start" / "CC-Start", execute this boot protocol BEFORE any other work. The orchestrator cannot function without Skynet context.**
@@ -673,3 +679,61 @@ Reports tagged as `urgent=True` bypass the gate entirely and go directly to the 
 - Pending proposals: `data/convene_gate.json`
 - Convene sessions: `data/convene_sessions.json`
 - Gate stats tracked: total_proposed, total_elevated, total_rejected, total_bypassed
+
+## Consultant Communication Protocol
+
+**Consultants (Codex, Gemini) are co-equal advisory peers, NOT routable workers.** They run in separate VS Code sessions with different AI models (GPT-5 Codex, Gemini 3 Pro). Communication is exclusively via the Skynet bus. They are NOT dispatched via `skynet_dispatch.py`.
+
+### Consultant Registry
+
+| Consultant | Bridge Port | Sender ID | State File | Boot Trigger | Model |
+|------------|------------|-----------|------------|--------------|-------|
+| Codex | 8422 (fallback: 8424) | `consultant` | `data/consultant_state.json` | `CC-Start` | GPT-5 Codex |
+| Gemini | 8425 | `gemini_consultant` | `data/gemini_consultant_state.json` | `GC-Start` | Gemini 3 Pro |
+
+### Architecture
+
+```
+Orchestrator ──POST──▶ Bus (topic=consultant) ──▶ Consultant Bridge ──▶ Consultant VS Code Session
+                                                      ▲
+                                                      │ heartbeat every 2s
+                                                      │ stale after 8s
+```
+
+- Bridge daemons (`tools/skynet_consultant_bridge.py`) run as HTTP servers on their respective ports
+- They heartbeat to the bus every 2s — if heartbeat is stale (>8s), consider the consultant offline
+- Consultants announce via `identity_ack` on the bus when they boot
+
+### Sending Prompts to Consultants
+
+```powershell
+# Broadcast to ALL consultants:
+Invoke-RestMethod -Uri http://localhost:8420/bus/publish -Method POST -ContentType application/json -Body (ConvertTo-Json @{sender="orchestrator"; topic="consultant"; type="prompt"; content="Your advisory request"})
+
+# Target a specific consultant:
+Invoke-RestMethod -Uri http://localhost:8420/bus/publish -Method POST -ContentType application/json -Body (ConvertTo-Json @{sender="orchestrator"; topic="consultant"; type="prompt"; metadata=@{target="gemini_consultant"}; content="Your prompt"})
+```
+
+### Reading Consultant Responses
+
+Poll the bus and filter by consultant sender IDs (`consultant` or `gemini_consultant`):
+```powershell
+Invoke-RestMethod http://localhost:8420/bus/messages?limit=30
+# Look for: sender="consultant" (Codex) or sender="gemini_consultant" (Gemini)
+```
+
+### Health Checks
+
+```powershell
+Invoke-RestMethod http://localhost:8422/health   # Codex bridge
+Invoke-RestMethod http://localhost:8425/health   # Gemini bridge
+```
+
+### Rules
+
+- **NEVER dispatch to consultants via `skynet_dispatch.py`** -- they are not workers, they have no HWND in workers.json
+- **Consultants are advisory** -- they propose, review, and advise; they don't execute worker-style tasks
+- **Bus is the ONLY communication channel** -- no ghost typing, no window automation on consultant windows
+- **Consultant proposals appear on bus** with `topic=planning type=proposal`
+- **Consultants are optional** -- the system runs without them. The orchestrator does NOT start consultant bridges; they start themselves via `CC-Start` / `GC-Start`
+- **On boot**, the orchestrator checks if consultant bridges are alive (GET health endpoints) and notes their status in the boot report

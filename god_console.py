@@ -610,7 +610,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                          "/status", "/god_state", "/bus", "/bus/tasks", "/bus/convene", "/bus/stats",
                          "/windows", "/workers/health", "/dashboard/data", "/ws/info", "/todos", "/consultants",
                          "/processes", "/overseer", "/stream/dashboard",
-                         "/kill/pending", "/kill/log"]
+                         "/kill/pending", "/kill/log", "/learner/health"]
             self._json_response({
                 "status": "ok",
                 "uptime_s": round(_time.time() - _SERVER_START, 1),
@@ -769,6 +769,116 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 data = {"error": str(e), "workers": {}}
             self._json_response(data)
+        elif self.path == "/learner/health":
+            try:
+                pid_file = Path(__file__).resolve().parent / "data" / "learner.pid"
+                if pid_file.exists():
+                    pid = int(pid_file.read_text().strip())
+                    import os as _os
+                    _os.kill(pid, 0)  # check alive
+                    state_file = Path(__file__).resolve().parent / "data" / "learner_state.json"
+                    state = json.loads(state_file.read_text()) if state_file.exists() else {}
+                    data = {
+                        "status": "running",
+                        "pid": pid,
+                        "episodes_processed": state.get("total_processed", 0),
+                        "total_learnings": state.get("total_learnings", 0),
+                        "last_run": state.get("last_run"),
+                        "started_at": state.get("started_at"),
+                    }
+                else:
+                    data = {"status": "stopped", "pid": None}
+            except (OSError, ValueError):
+                data = {"status": "stopped", "pid": None}
+            except Exception as e:
+                data = {"status": "error", "error": str(e)}
+            self._json_response(data)
+        elif self.path == "/learner/metrics":
+            # Learning Telemetry — real data only (Truth Principle)
+            try:
+                base = Path(__file__).resolve().parent
+                metrics = {"timestamp": _time.time()}
+
+                # 1. Episodes from learning_episodes.json
+                ep_file = base / "data" / "learning_episodes.json"
+                episodes = []
+                if ep_file.exists():
+                    try:
+                        raw = json.loads(ep_file.read_text(encoding="utf-8"))
+                        if isinstance(raw, list):
+                            episodes = raw
+                    except Exception:
+                        pass
+                metrics["total_episodes"] = len(episodes)
+
+                # Outcome breakdown
+                outcomes = {"success": 0, "failure": 0, "unknown": 0}
+                for ep in episodes:
+                    o = ep.get("outcome", "unknown")
+                    if o in outcomes:
+                        outcomes[o] += 1
+                    else:
+                        outcomes["unknown"] += 1
+                metrics["by_outcome"] = outcomes
+
+                # Last episode timestamp
+                if episodes:
+                    last = episodes[-1]
+                    metrics["last_episode_ts"] = last.get("timestamp_iso") or last.get("timestamp")
+                    metrics["last_episode_worker"] = last.get("worker")
+                else:
+                    metrics["last_episode_ts"] = None
+                    metrics["last_episode_worker"] = None
+
+                # Episode rate buckets (hourly, last 24 entries max)
+                rate_buckets = []
+                if episodes:
+                    now = _time.time()
+                    bucket_size = 3600  # 1 hour
+                    for ep in episodes:
+                        ts = ep.get("timestamp", 0)
+                        bucket_idx = int((now - ts) / bucket_size)
+                        rate_buckets.append(bucket_idx)
+                    from collections import Counter as _Counter
+                    bucket_counts = _Counter(rate_buckets)
+                    max_bucket = max(bucket_counts.keys()) if bucket_counts else 0
+                    sparkline = []
+                    for i in range(min(max_bucket + 1, 24)):
+                        sparkline.append(bucket_counts.get(i, 0))
+                    sparkline.reverse()  # oldest first
+                    metrics["sparkline_hourly"] = sparkline
+                else:
+                    metrics["sparkline_hourly"] = []
+
+                # 2. LearningStore stats (facts from SQLite)
+                try:
+                    from core.learning_store import LearningStore
+                    store = LearningStore()
+                    store_stats = store.stats()
+                    metrics["total_facts"] = store_stats.get("total_facts", 0)
+                    metrics["avg_confidence"] = round(store_stats.get("average_confidence", 0.0), 3)
+                    metrics["by_category"] = store_stats.get("by_category", {})
+                except Exception:
+                    metrics["total_facts"] = 0
+                    metrics["avg_confidence"] = 0.0
+                    metrics["by_category"] = {}
+
+                # 3. Learner daemon status
+                pid_file = base / "data" / "learner.pid"
+                daemon_status = "stopped"
+                try:
+                    if pid_file.exists():
+                        pid = int(pid_file.read_text().strip())
+                        import os as _os2
+                        _os2.kill(pid, 0)
+                        daemon_status = "running"
+                except (OSError, ValueError):
+                    daemon_status = "stopped"
+                metrics["daemon_status"] = daemon_status
+
+                self._json_response(metrics)
+            except Exception as e:
+                self._json_response({"error": str(e), "total_episodes": 0, "by_outcome": {"success": 0, "failure": 0, "unknown": 0}, "sparkline_hourly": [], "total_facts": 0, "daemon_status": "error", "timestamp": _time.time()}, status=200)
         elif self.path == "/ws/info":
             self._json_response({"ws_url": f"ws://localhost:{WS_PORT}", "protocol": "websocket", "fallback": "polling"})
         elif self.path == "/todos":

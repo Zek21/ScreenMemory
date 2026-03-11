@@ -170,6 +170,7 @@ def _log_dispatch(worker_name, task, state, success, target_hwnd=0):
             "target_hwnd": target_hwnd,
             "result_received": False,
             "strategy": os.environ.get("SKYNET_STRATEGY", "direct"),
+            "strategy_id": os.environ.get("SKYNET_STRATEGY_ID", ""),
         })
         # Keep last 200 entries
         if len(log_data) > 200:
@@ -260,16 +261,27 @@ def build_context_preamble(worker_name, task, context=None):
     - relevant_context: past solutions from HybridRetriever
     - difficulty: assessed complexity level
     - reasoning: why this worker was chosen
+    - strategy_id: unique identifier for this dispatch plan
     """
     base = build_preamble(worker_name)
 
     if not context:
+        # Still inject strategy_id from env if available
+        sid = os.environ.get("SKYNET_STRATEGY_ID", "")
+        if sid:
+            return base + f"\n[STRATEGY_ID: {sid}] " + task
         return base + task
 
     enrichment = ""
+
+    # Strategy ID for result correlation
+    sid = context.get("strategy_id") or os.environ.get("SKYNET_STRATEGY_ID", "")
+    if sid:
+        enrichment += f"\n[STRATEGY_ID: {sid}] Include this ID in your bus result for tracking.\n"
+
     if context.get("relevant_learnings"):
         facts = context["relevant_learnings"][:3]
-        enrichment += "\n\nRELEVANT PAST LEARNINGS (use these to avoid past mistakes):\n"
+        enrichment += "\nRELEVANT PAST LEARNINGS (use these to avoid past mistakes):\n"
         for f in facts:
             content = f if isinstance(f, str) else f.get("content", str(f))
             enrichment += f"- {content[:200]}\n"

@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -28,6 +29,8 @@ sys.path.insert(0, str(ROOT / "tools" / "chrome_bridge"))
 BUS_URL = "http://localhost:8420"
 STATE_FILE = ROOT / "data" / "realtime_sse.json"
 STATE_FILE_ALT = ROOT / "data" / "realtime.json"
+EPISODES_DIR = ROOT / "data" / "episodes"
+EPISODES_INDEX = ROOT / "data" / "learning_episodes.json"
 WORKER_NAMES = ["alpha", "beta", "gamma", "delta"]
 
 
@@ -42,6 +45,12 @@ class Subtask:
     index: int = 0
 
 
+def _generate_strategy_id(goal: str) -> str:
+    """Generate a unique strategy_id from goal text + current timestamp."""
+    raw = f"{goal}:{time.time()}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
 @dataclass
 class BrainPlan:
     goal: str
@@ -51,6 +60,7 @@ class BrainPlan:
     relevant_learnings: List[str] = field(default_factory=list)
     operator: str = ""
     domain_tags: List[str] = field(default_factory=list)
+    strategy_id: str = ""
 
 
 # ─── Helpers ───────────────────────────────────────────
@@ -77,6 +87,77 @@ def _bus_post(message: dict) -> bool:
     """POST a message to the Skynet bus. Returns True on success."""
     from tools.shared.bus import bus_post
     return bus_post(message)
+
+
+def _save_episode(plan, results: dict, success: bool):
+    """Persist an episode JSON file in data/episodes/ and update the index."""
+    strategy_id = getattr(plan, "strategy_id", "") or _generate_strategy_id(plan.goal)
+    ts = time.time()
+    episode = {
+        "id": f"ep_{int(ts * 1000)}_{strategy_id[:8]}",
+        "strategy_id": strategy_id,
+        "goal": plan.goal[:300],
+        "difficulty": plan.difficulty,
+        "worker_count": len(plan.subtasks),
+        "workers": [st.assigned_worker if hasattr(st, "assigned_worker") else st.get("worker", "?")
+                     for st in (plan.subtasks if not hasattr(plan.subtasks[0], "assigned_worker")
+                                else plan.subtasks)]
+                   if plan.subtasks else [],
+        "outcome": "success" if success else "failure",
+        "timestamp": ts,
+        "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)),
+    }
+    # Normalize workers list from dataclass or dict subtasks
+    workers = []
+    for st in plan.subtasks:
+        if hasattr(st, "assigned_worker"):
+            workers.append(st.assigned_worker)
+        elif isinstance(st, dict):
+            workers.append(st.get("worker", "?"))
+    episode["workers"] = workers
+
+    # Write individual episode file
+    EPISODES_DIR.mkdir(parents=True, exist_ok=True)
+    ep_file = EPISODES_DIR / f"{episode['id']}.json"
+    try:
+        ep_file.write_text(json.dumps(episode, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+    # Update index
+    try:
+        if EPISODES_INDEX.exists():
+            index = json.loads(EPISODES_INDEX.read_text(encoding="utf-8"))
+        else:
+            index = []
+        index.append(episode)
+        if len(index) > 500:
+            index = index[-500:]
+        EPISODES_INDEX.write_text(json.dumps(index, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def query_episodes_by_strategy(strategy_id: str) -> List[dict]:
+    """Return all episodes that match a given strategy_id."""
+    results = []
+    # Check index first
+    try:
+        if EPISODES_INDEX.exists():
+            index = json.loads(EPISODES_INDEX.read_text(encoding="utf-8"))
+            results = [ep for ep in index if ep.get("strategy_id") == strategy_id]
+    except Exception:
+        pass
+    # Fallback: scan individual files
+    if not results and EPISODES_DIR.exists():
+        for f in EPISODES_DIR.glob("*.json"):
+            try:
+                ep = json.loads(f.read_text(encoding="utf-8"))
+                if ep.get("strategy_id") == strategy_id:
+                    results.append(ep)
+            except Exception:
+                continue
+    return results
 
 
 def _get_idle_workers() -> List[str]:
@@ -535,6 +616,7 @@ class SkynetBrain:
             relevant_learnings=learnings[:5],
             operator=operator,
             domain_tags=domain_tags,
+            strategy_id=_generate_strategy_id(goal),
         )
 
     @staticmethod
@@ -890,6 +972,8 @@ class SkynetBrain:
 
     def learn(self, plan: BrainPlan, results: dict, success: bool):
         """Store learnings from completed task execution."""
+        strategy_id = getattr(plan, "strategy_id", "") or ""
+
         # Store in LearningStore
         if self.learning_store:
             try:
@@ -903,10 +987,14 @@ class SkynetBrain:
                     content=summary,
                     category=plan.domain_tags[0] if plan.domain_tags else "general",
                     source="skynet_brain",
-                    tags=["brain", plan.difficulty.lower()] + plan.domain_tags,
+                    tags=["brain", plan.difficulty.lower()] + plan.domain_tags
+                         + ([f"strategy:{strategy_id}"] if strategy_id else []),
                 )
             except Exception:
                 pass
+
+        # Save episode to data/episodes/
+        _save_episode(plan, results, success)
 
         # Feed back to router
         if self.router and success is not None:

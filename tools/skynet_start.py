@@ -1622,6 +1622,12 @@ def _start_post_boot_daemons():
         DATA_DIR / "bus_relay.pid",
         "Bus relay daemon",
     )
+    _start_daemon_safe(
+        str(ROOT / "tools" / "skynet_learner.py"),
+        DATA_DIR / "learner.pid",
+        "Learner daemon",
+        extra_args=["--daemon"],
+    )
     _ensure_consultant_bridge()
     _ensure_gemini_consultant_bridge()
 

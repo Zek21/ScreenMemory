@@ -872,6 +872,43 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         </div>
       </div>
     </div>
+    <!-- LEARNING TELEMETRY -->
+    <div class="ops-card">
+      <div class="ops-head">
+        <span style="font-size:11px;">🧠</span>
+        <span class="ops-title" style="color:var(--cyan);">Learning</span>
+        <span class="ops-badge" id="learningEpCount">0</span>
+      </div>
+      <div class="ops-body" id="learningBody">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 12px;margin-bottom:8px;">
+          <div style="font-size:8px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;">Episodes</div>
+          <div style="font-size:10px;font-weight:700;color:var(--text);text-align:right;" id="ltEpTotal">0</div>
+          <div style="font-size:8px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;">Facts</div>
+          <div style="font-size:10px;font-weight:700;color:var(--text);text-align:right;" id="ltFactTotal">0</div>
+          <div style="font-size:8px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;">Confidence</div>
+          <div style="font-size:10px;font-weight:700;color:var(--text);text-align:right;" id="ltAvgConf">--</div>
+          <div style="font-size:8px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;">Daemon</div>
+          <div style="font-size:10px;font-weight:700;text-align:right;" id="ltDaemonStatus"><span style="color:var(--dim);">--</span></div>
+        </div>
+        <div style="margin-bottom:6px;">
+          <div style="font-size:8px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;margin-bottom:3px;">Outcomes</div>
+          <div style="display:flex;gap:8px;font-size:9px;">
+            <span style="color:var(--green);" id="ltSuccess">✓ 0</span>
+            <span style="color:var(--red);" id="ltFailure">✗ 0</span>
+            <span style="color:var(--dim);" id="ltUnknown">? 0</span>
+          </div>
+          <div style="display:flex;gap:1px;height:6px;border-radius:2px;overflow:hidden;margin-top:4px;background:rgba(255,255,255,0.02);border:1px solid var(--border);" id="ltOutcomeBar"></div>
+        </div>
+        <div style="margin-bottom:6px;">
+          <div style="font-size:8px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;margin-bottom:3px;">Rate <span style="font-size:7px;color:var(--dim);">(hourly)</span></div>
+          <canvas id="ltSparkline" width="200" height="28" style="width:100%;height:28px;border-radius:2px;"></canvas>
+        </div>
+        <div>
+          <div style="font-size:8px;color:var(--text2);letter-spacing:1px;text-transform:uppercase;margin-bottom:3px;">Last Episode</div>
+          <div style="font-size:9px;color:var(--dim);" id="ltLastEp">No episodes</div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- DISPATCH PANEL -->
@@ -2054,6 +2091,72 @@ function openEngModal(eng){
 }
 function closeEngModal(){document.getElementById('engModalOverlay').classList.remove('open');}
 document.addEventListener('keydown',function(e){if(e.key==='Escape')closeEngModal();});
+
+/* ═══ LEARNING TELEMETRY POLLING ═══ */
+function drawSparkline(canvasId,data,color){
+  const c=document.getElementById(canvasId);if(!c)return;
+  const ctx=c.getContext('2d');
+  const dpr=window.devicePixelRatio||1;
+  c.width=c.offsetWidth*dpr;c.height=c.offsetHeight*dpr;
+  ctx.scale(dpr,dpr);
+  const w=c.offsetWidth,h=c.offsetHeight;
+  ctx.clearRect(0,0,w,h);
+  if(!data||data.length===0){
+    ctx.fillStyle='rgba(255,255,255,0.03)';ctx.fillRect(0,0,w,h);
+    ctx.fillStyle='rgba(255,255,255,0.15)';ctx.font='8px sans-serif';ctx.textAlign='center';
+    ctx.fillText('No data',w/2,h/2+3);return;
+  }
+  const max=Math.max(...data,1);
+  const barW=Math.max(1,(w-data.length+1)/data.length);
+  ctx.fillStyle='rgba(255,255,255,0.02)';ctx.fillRect(0,0,w,h);
+  for(let i=0;i<data.length;i++){
+    const v=data[i];const barH=Math.max(1,(v/max)*(h-4));
+    const x=i*(barW+1);const y=h-barH-2;
+    ctx.fillStyle=v>0?color:'rgba(255,255,255,0.04)';
+    ctx.fillRect(x,y,barW,barH);
+  }
+}
+async function pollLearningTelemetry(){
+  try{
+    const m=await smartFetch('/learner/metrics');if(!m)return;
+    const badge=document.getElementById('learningEpCount');
+    if(badge)badge.textContent=m.total_episodes||0;
+    const epT=document.getElementById('ltEpTotal');if(epT)epT.textContent=m.total_episodes||0;
+    const fT=document.getElementById('ltFactTotal');if(fT)fT.textContent=m.total_facts||0;
+    const conf=document.getElementById('ltAvgConf');
+    if(conf)conf.textContent=m.avg_confidence?Math.round(m.avg_confidence*100)+'%':'--';
+    const ds=document.getElementById('ltDaemonStatus');
+    if(ds){
+      if(m.daemon_status==='running')ds.innerHTML='<span style="color:var(--green);">● Running</span>';
+      else ds.innerHTML='<span style="color:var(--red);">○ Stopped</span>';
+    }
+    const o=m.by_outcome||{success:0,failure:0,unknown:0};
+    const s=document.getElementById('ltSuccess');if(s)s.textContent='✓ '+o.success;
+    const f=document.getElementById('ltFailure');if(f)f.textContent='✗ '+o.failure;
+    const u=document.getElementById('ltUnknown');if(u)u.textContent='? '+o.unknown;
+    const total=o.success+o.failure+o.unknown;
+    const bar=document.getElementById('ltOutcomeBar');
+    if(bar){
+      if(total>0){
+        const parts=[];
+        if(o.success)parts.push('<div style="flex:'+o.success+';background:var(--green);opacity:0.7;"></div>');
+        if(o.failure)parts.push('<div style="flex:'+o.failure+';background:var(--red);opacity:0.7;"></div>');
+        if(o.unknown)parts.push('<div style="flex:'+o.unknown+';background:var(--dim);opacity:0.5;"></div>');
+        bar.innerHTML=parts.join('');
+      }else{bar.innerHTML='<div style="flex:1;background:rgba(255,255,255,0.03);"></div>';}
+    }
+    drawSparkline('ltSparkline',m.sparkline_hourly||[],'rgba(0,240,255,0.5)');
+    const le=document.getElementById('ltLastEp');
+    if(le){
+      if(m.last_episode_ts){
+        const ago=typeof m.last_episode_ts==='number'?Math.round((Date.now()/1000-m.last_episode_ts)/60)+'m ago':m.last_episode_ts;
+        le.innerHTML='<span style="color:var(--text);">'+esc(String(ago))+'</span> <span style="color:var(--dim);">by '+(m.last_episode_worker||'?')+'</span>';
+      }else{le.textContent='No episodes';}
+    }
+  }catch(e){console.warn('[LearningTelemetry]',e);}
+}
+setInterval(pollLearningTelemetry,8000);
+pollLearningTelemetry();
 </script>
 </body>
 </html>

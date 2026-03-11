@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -231,6 +232,9 @@ def _brain_think(goal: str) -> dict:
     # Check for dependencies
     has_deps = any(k in goal_lower for k in ["then", "after that", "once done", "followed by"])
 
+    # Generate unique strategy_id for this plan
+    strategy_id = hashlib.sha256(f"{goal}:{time.time()}".encode()).hexdigest()[:16]
+
     return {
         "goal": goal,
         "difficulty": difficulty,
@@ -238,6 +242,7 @@ def _brain_think(goal: str) -> dict:
         "has_dependencies": has_deps,
         "reasoning": f"Rule-based: {difficulty} task, {len(subtasks)} subtask(s), {len(idle)} idle workers",
         "worker_count": len(subtasks),
+        "strategy_id": strategy_id,
     }
 
 
@@ -284,8 +289,25 @@ def _brain_learn(plan: dict, results: dict, success: bool):
     difficulty = plan.get("difficulty", "?")
     n_workers = len(plan.get("subtasks", []))
     goal_short = plan.get("goal", "")[:80]
+    strategy_id = plan.get("strategy_id", "")
     _bus_post("brain_dispatch", "knowledge", "learning",
-             f"{'SUCCESS' if success else 'FAILURE'}: {difficulty} task ({n_workers} workers) -- {goal_short}")
+             f"{'SUCCESS' if success else 'FAILURE'}: {difficulty} task ({n_workers} workers) "
+             f"[strategy:{strategy_id}] -- {goal_short}")
+
+    # Save episode to data/episodes/ via brain module
+    try:
+        from skynet_brain import _save_episode as _brain_save_episode
+        # Create a lightweight plan-like object for _save_episode
+        class _PlanProxy:
+            pass
+        proxy = _PlanProxy()
+        proxy.goal = plan.get("goal", "")
+        proxy.difficulty = plan.get("difficulty", "?")
+        proxy.strategy_id = strategy_id
+        proxy.subtasks = plan.get("subtasks", [])
+        _brain_save_episode(proxy, results, success)
+    except Exception as e:
+        log(f"Episode save error: {e}", "WARN")
 
     # Level 4: Auto-distill each worker result through KnowledgeDistiller
     try:
@@ -322,12 +344,14 @@ def smart_dispatch(goal: str, wait_timeout: int = 120) -> dict:
     subtasks = plan.get("subtasks", [])
     difficulty = plan.get("difficulty", "?")
     reasoning = plan.get("reasoning", "")
+    strategy_id = plan.get("strategy_id", "")
 
     print(f"\n{C_GOLD}{C_BOLD}PLAN{C_RESET}")
     print(f"  Difficulty:  {C_BOLD}{difficulty}{C_RESET}")
     print(f"  Subtasks:    {len(subtasks)}")
     print(f"  Workers:     {', '.join(st['worker'] for st in subtasks)}")
     print(f"  Dependencies:{' yes' if plan.get('has_dependencies') else ' none'}")
+    print(f"  Strategy ID: {C_DIM}{strategy_id}{C_RESET}")
     # Show cognitive strategy if present
     cog_strategy = plan.get("cognitive_strategy") or "direct"
     if cog_strategy != "direct":
@@ -350,8 +374,9 @@ def smart_dispatch(goal: str, wait_timeout: int = 120) -> dict:
     # Step 4: Dispatch
     from skynet_dispatch import dispatch_to_worker, dispatch_parallel
 
-    # Wire cognitive strategy into dispatch context for learner correlation
+    # Wire cognitive strategy and strategy_id into dispatch context for learner correlation
     os.environ["SKYNET_STRATEGY"] = cog_strategy
+    os.environ["SKYNET_STRATEGY_ID"] = strategy_id
 
     dispatch_results = {}
     if len(subtasks) == 1:
@@ -413,6 +438,7 @@ def smart_dispatch(goal: str, wait_timeout: int = 120) -> dict:
     return {
         "success": success,
         "plan": plan,
+        "strategy_id": strategy_id,
         "dispatch_results": dispatch_results,
         "results": {k: (v.get("content", "") if isinstance(v, dict) else str(v)) for k, v in results.items()},
         "synthesis": synthesis,

@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import re
+import signal
 import sys
 import time
 import uuid
@@ -308,6 +309,10 @@ class SkynetLearner:
         self._evolution_system = None
         self._last_health_report = 0
         self._cycle_count = 0
+        self._start_time = time.time()
+        self._last_episode_time = time.time()
+        self._shutting_down = False
+        self._stale_alerted = False
 
     @property
     def learning_system(self):
@@ -372,6 +377,7 @@ class SkynetLearner:
             "insights": insights,
             "timestamp": timestamp,
             "dispatch_timestamp": dispatch_time,
+            "strategy_id": dispatch.get("strategy_id", "") if dispatch else "",
             "stored": 0,
             "broadcast": 0,
             "evolution_updated": False,
@@ -408,7 +414,7 @@ class SkynetLearner:
                 task_result = {
                     "task_id": str(uuid.uuid4()),
                     "category": category,
-                    "strategy_id": dispatch.get("strategy", f"default_{category}") if dispatch else f"default_{category}",
+                    "strategy_id": dispatch.get("strategy_id") or dispatch.get("strategy", f"default_{category}") if dispatch else f"default_{category}",
                     "success": success,
                     "latency_ms": min(latency_ms, 3600000),  # cap at 1 hour
                     "quality_score": 0.8 if success else 0.3,
@@ -529,6 +535,39 @@ class SkynetLearner:
         _save_state(self.state)
         return results
 
+    def _handle_signal(self, signum, frame):
+        """Graceful shutdown on SIGTERM/SIGINT."""
+        sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+        logger.info(f"Received {sig_name} -- shutting down gracefully")
+        self._shutting_down = True
+
+    def _check_stale(self):
+        """Post LEARNER_STALE alert if no new episodes for >300s."""
+        STALE_THRESHOLD = 300
+        elapsed = time.time() - self._last_episode_time
+        if elapsed > STALE_THRESHOLD and not self._stale_alerted:
+            self._stale_alerted = True
+            bus_post("learner", "orchestrator", "alert",
+                     f"LEARNER_STALE: no new episodes for {int(elapsed)}s")
+            logger.warning(f"Stale alert: no new episodes for {int(elapsed)}s")
+        elif elapsed <= STALE_THRESHOLD and self._stale_alerted:
+            self._stale_alerted = False
+
+    def get_health(self) -> dict:
+        """Return health info for the /learner/health endpoint."""
+        import os
+        return {
+            "status": "running" if not self._shutting_down else "shutting_down",
+            "pid": os.getpid(),
+            "uptime_s": round(time.time() - self._start_time, 1),
+            "cycles": self._cycle_count,
+            "episodes_processed": self.state.get("total_processed", 0),
+            "total_learnings": self.state.get("total_learnings", 0),
+            "last_activity": datetime.fromtimestamp(self._last_episode_time).isoformat(),
+            "stale": self._stale_alerted,
+            "stale_seconds": round(time.time() - self._last_episode_time, 1),
+        }
+
     def run_daemon(self, interval: int = DEFAULT_LOOP_INTERVAL):
         """Run as a continuous daemon."""
         # PID file singleton
@@ -551,11 +590,18 @@ class SkynetLearner:
         PID_FILE.write_text(str(os.getpid()))
         logger.info(f"Learner daemon started (PID {os.getpid()}, interval={interval}s)")
 
+        # Register signal handlers for graceful shutdown
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+
         try:
-            while True:
+            while not self._shutting_down:
                 self._cycle_count += 1
                 try:
                     results = self.run_once()
+                    if results:
+                        self._last_episode_time = time.time()
+                    self._check_stale()
                     self.report_health()
                 except Exception as e:
                     logger.error(f"Cycle error: {e}")
@@ -563,6 +609,7 @@ class SkynetLearner:
         except KeyboardInterrupt:
             logger.info("Learner daemon stopped by keyboard interrupt")
         finally:
+            logger.info("Learner daemon shutting down")
             if PID_FILE.exists():
                 try:
                     PID_FILE.unlink()
@@ -643,10 +690,25 @@ def main():
     parser.add_argument("--once", action="store_true", help="Single pass scan")
     parser.add_argument("--stats", action="store_true", help="Show learner statistics")
     parser.add_argument("--extract", type=str, metavar="TEXT", help="Extract learnings from text")
+    parser.add_argument("--strategy", type=str, metavar="ID", help="Query episodes by strategy_id")
     parser.add_argument("--interval", type=int, default=DEFAULT_LOOP_INTERVAL, help="Daemon loop interval (seconds)")
     args = parser.parse_args()
 
     learner = SkynetLearner()
+
+    if args.strategy:
+        try:
+            from skynet_brain import query_episodes_by_strategy
+            episodes = query_episodes_by_strategy(args.strategy)
+            if episodes:
+                print(f"Found {len(episodes)} episode(s) for strategy {args.strategy}:")
+                for ep in episodes:
+                    print(json.dumps(ep, indent=2))
+            else:
+                print(f"No episodes found for strategy_id: {args.strategy}")
+        except Exception as e:
+            print(f"Error querying episodes: {e}")
+        return
 
     if args.stats:
         stats = learner.get_stats()

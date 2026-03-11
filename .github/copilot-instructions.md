@@ -79,6 +79,58 @@ Once the boot protocol completes, the orchestrator enters its normal operating l
 - **NEVER close working sessions.** The SESSIONS panel preserves full context. To restore a session: right-click it → "Open in New Window". Only use `new_chat.ps1` for brand new workers that don't have an existing session.
 - **`skynet-start`, `orchestrator-start`, and `CC-Start` mean full orchestrator bootstrap.** Run `python tools/skynet_start.py` — it starts Skynet backend (port 8420), GOD Console (port 8421), opens worker chat windows (alpha/beta/gamma/delta) in a 2×2 grid on the right monitor, prompts each worker, registers them with Skynet, and connects all ScreenMemory engines (DAAORouter, DAGEngine, InputGuard, HybridRetriever, Orchestrator, Desktop). Use `--reconnect` to reconnect to existing workers without opening new windows. Use `--status` to show system status. Use `--dispatch "task"` to dispatch through the full engine pipeline.
 - **`GC-Start` means Gemini Consultant bootstrap.** Same as `CC-Start` — run `GC-Start.ps1` or `python tools/skynet_start.py`. The Skynet infrastructure is shared between all consultants. After boot, the Gemini Consultant bridge daemon starts automatically on port 8425 (`tools/skynet_consultant_bridge.py --id gemini_consultant --source GC-Start --api-port 8425`). The Gemini Consultant is a co-equal advisory peer to the orchestrator — non-routable, advisory-only, with its own bridge heartbeat and bus presence.
+
+## Consultant Communication Protocol (MANDATORY KNOWLEDGE)
+
+**Consultants are co-equal advisory peers, NOT routable workers.** They run in separate VS Code sessions with different AI models. They communicate exclusively via the Skynet bus. They are NOT dispatched via `skynet_dispatch.py`.
+
+### Consultant Registry
+
+| Consultant | Bridge Port | Sender ID | State File | Model |
+|------------|------------|-----------|------------|-------|
+| Codex | 8422 (fallback: 8424) | `consultant` | `data/consultant_state.json` | GPT-5 Codex |
+| Gemini | 8425 | `gemini_consultant` | `data/gemini_consultant_state.json` | Gemini 3 Pro |
+
+### How to Check Consultant Status
+```powershell
+# Codex alive?
+Invoke-RestMethod http://localhost:8422/health
+# Gemini alive?
+Invoke-RestMethod http://localhost:8425/health
+# Or read state files directly:
+# data/consultant_state.json, data/gemini_consultant_state.json
+```
+
+### How to Send a Prompt to a Consultant
+Post to the bus with `topic=consultant`. The consultant's VS Code session monitors the bus and picks up requests.
+```powershell
+# Send prompt to ALL consultants:
+Invoke-RestMethod -Uri http://localhost:8420/bus/publish -Method POST -ContentType application/json -Body (ConvertTo-Json @{sender="orchestrator"; topic="consultant"; type="prompt"; content="Your advisory request here"})
+
+# Send to specific consultant:
+Invoke-RestMethod -Uri http://localhost:8420/bus/publish -Method POST -ContentType application/json -Body (ConvertTo-Json @{sender="orchestrator"; topic="consultant"; type="prompt"; metadata=@{target="gemini_consultant"}; content="Your prompt"})
+```
+
+### How to Read Consultant Responses
+Poll the bus and filter by consultant sender IDs:
+```powershell
+# Read all bus messages, look for sender=consultant or sender=gemini_consultant
+Invoke-RestMethod http://localhost:8420/bus/messages?limit=30
+```
+
+### Orchestrator Boot Checklist for Consultants
+On every `skynet-start` / `orchestrator-start`, the orchestrator MUST:
+1. Check if consultant bridges are alive: `GET http://localhost:8422/health` and `GET http://localhost:8425/health`
+2. Read bus for consultant `identity_ack` messages to confirm they announced themselves
+3. If a consultant bridge is dead but was expected, note it in the status report
+4. Consultants are optional -- the system operates fine without them. Do NOT try to start consultant bridges from the orchestrator; they are started by `CC-Start` / `GC-Start` triggers in separate sessions.
+
+### Key Rules
+- **NEVER dispatch to consultants via `skynet_dispatch.py`** -- they are not workers, they have no HWND in workers.json
+- **Consultants are advisory** -- they propose, review, and advise; they don't execute worker-style tasks
+- **Bus is the ONLY communication channel** -- no ghost typing, no window automation on consultant windows
+- **Consultant proposals appear on bus** with `topic=planning type=proposal` -- the orchestrator reviews and may act on them
+
 - **You ARE the orchestrator.** This session is not just a coding assistant — it is the Skynet orchestrator. You must always know the state of all workers. On every turn where workers exist, check `http://localhost:8420/status` to know what Alpha/Beta/Gamma/Delta are doing. If a worker is stuck, errored, or disconnected — act on it immediately. When dispatching tasks, use `skynet_dispatch.py` or POST to `http://localhost:8420/directive?route=<worker>`. Report worker status proactively — the user should never have to ask "what are my workers doing?"
 - **ORCHESTRATOR RULE — Always use Skynet for every task.** No task is done by the orchestrator alone when workers are available. Every non-trivial task MUST be decomposed into worker subtasks and dispatched via `skynet_dispatch.py`. The orchestrator role is: decompose → dispatch → monitor → collect → synthesize. Use workers for: code changes, file scans, test runs, API calls, verifications, analysis. Only the orchestrator's final synthesis and the user-facing reply happen in this session. If Skynet is down, restart it before proceeding.
 
