@@ -533,12 +533,18 @@ for ($modelAttempt = 1; $modelAttempt -le 2; $modelAttempt++) {
 
 # --- PERMISSION GUARD: Set Bypass Approvals ---
 # Uses shared guard_bypass.ps1 (single source of truth)
+# No focus needed — uses UIA Expand + PostMessage ghost keys
 
-Start-Sleep -Milliseconds 500
 $guardScript = Join-Path $PSScriptRoot "guard_bypass.ps1"
-& $guardScript -Hwnd $newHwnd
+$guardOutput = & $guardScript -Hwnd $newHwnd 6>&1 2>&1 | Out-String
+Write-Host $guardOutput.Trim()
+$permsApplied = $guardOutput -match 'PERMS_FIXED|PERMS_APPLIED|PERMS_OK'
 
 # --- Verify ---
+# guard_bypass.ps1 does its own retry verification with increasing delays.
+# UIA can return stale names, so we trust the guard output + visual confirmation.
+# Still read UIA for model/target reporting below.
+Start-Sleep -Milliseconds 1000
 $chatRoot3 = [System.Windows.Automation.AutomationElement]::FromHandle($newHwnd)
 $finalButtons = $chatRoot3.FindAll(
     [System.Windows.Automation.TreeScope]::Descendants,
@@ -571,4 +577,5 @@ Clear-Failures
 # --- Report ---
 $cursor = New-Object Ghost+POINT
 [Ghost]::GetCursorPos([ref]$cursor)
-Write-Host "OK HWND=$newHwnd pos=$newX,$newY | $target | $model | $perms | cursor=$($cursor.X),$($cursor.Y)"
+$permsLabel = $(if ($permsApplied) { "Bypass Approvals" } else { $perms })
+Write-Host "OK HWND=$newHwnd pos=$newX,$newY | $target | $model | $permsLabel | cursor=$($cursor.X),$($cursor.Y)"
