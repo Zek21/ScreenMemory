@@ -1020,11 +1020,17 @@ def _run_monitor(args):
                     _run_monitor_cycle(workers, orch_hwnd, args, cycle, now, last_model_check, last_orch_check)
 
                 # Adaptive interval: slow down when all workers IDLE
-                all_idle = all(
-                    w.get("state", "").upper() == "IDLE"
-                    for w in health.get("workers", {}).values()
-                    if isinstance(w, dict)
-                )
+                # health is flat: {worker_name: {status, alive, ...}, ...}
+                # Filter to worker entries (dicts with 'alive' key) to skip
+                # non-worker keys like 'intelligence', 'realtime_daemon', etc.
+                worker_entries = [
+                    v for v in health.values()
+                    if isinstance(v, dict) and "alive" in v
+                ]
+                all_idle = bool(worker_entries) and all(
+                    w.get("status", "").upper() == "IDLE"
+                    for w in worker_entries
+                )  # signed: alpha
                 if all_idle:
                     consecutive_idle += 1
                     if consecutive_idle >= IDLE_STREAK_THRESHOLD and current_interval < HWND_IDLE_INTERVAL:
