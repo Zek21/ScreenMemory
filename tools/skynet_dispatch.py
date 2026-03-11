@@ -57,8 +57,8 @@ def _load_critical_processes():
     if CRITICAL_PROCS_FILE.exists():
         try:
             return json.loads(CRITICAL_PROCS_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            print(f"[dispatch] Failed to load critical_processes.json: {e}", file=sys.stderr)  # signed: beta
     return {"protected_names": [], "protected_roles": [], "processes": []}
 
 
@@ -111,8 +111,8 @@ def guard_process_kill(pid=None, name=None, caller="unknown"):
                 {"Content-Type": "application/json"}
             )
             urllib.request.urlopen(req, timeout=3)
-        except Exception:
-            pass
+        except (OSError, ValueError) as e:
+            print(f"[GUARD] Bus alert failed: {e}", file=sys.stderr)  # signed: beta
         print(f"\033[91m[GUARD] {alert}\033[0m", file=sys.stderr)
         return False  # NOT safe to kill
     return True  # safe to kill
@@ -127,8 +127,8 @@ def metrics():
         try:
             from tools.skynet_metrics import SkynetMetrics
             _metrics = SkynetMetrics()
-        except Exception:
-            pass
+        except (ImportError, OSError, RuntimeError) as e:
+            print(f"[dispatch] SkynetMetrics init failed: {e}", file=sys.stderr)  # signed: beta
     return _metrics
 
 # DEPRECATED: Use build_preamble(worker_name) instead for full worker awareness.
@@ -181,8 +181,8 @@ def _log_dispatch(worker_name, task, state, success, target_hwnd=0):
                 log_data = log_data[-200:]
             return log_data
         atomic_update_json(DISPATCH_LOG, _append_entry, default=[])
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[dispatch] _log_dispatch failed for {worker_name}: {e}", file=sys.stderr)  # signed: beta
 
 
 def mark_dispatch_received(worker_name):
@@ -379,7 +379,7 @@ def _enrich_difficulty(task):
             f"[DIFFICULTY] {level} (score={signal.complexity_score:.2f}, "
             f"domains={domains}, confidence={signal.confidence:.2f})"
         )
-    except Exception:
+    except (ImportError, OSError, AttributeError, TypeError, ValueError):
         return None
 
 
@@ -396,7 +396,7 @@ def _enrich_learnings(task):
                 conf = f.confidence if hasattr(f, 'confidence') else 0
                 lines.append(f"{i}. {content[:150]} (confidence: {conf:.2f})")
             return "[LEARNINGS] " + "; ".join(lines)
-    except Exception:
+    except (ImportError, OSError, AttributeError, TypeError, ValueError):  # signed: beta
         pass
     return None
 
@@ -414,7 +414,7 @@ def _enrich_context(task):
                 score = r.score if hasattr(r, 'score') else 0
                 lines.append(f"{i}. {content[:150]} (relevance: {score:.2f})")
             return "[CONTEXT] " + "; ".join(lines)
-    except Exception:
+    except (ImportError, OSError, AttributeError, TypeError, ValueError):  # signed: beta
         pass
     return None
 
@@ -442,7 +442,7 @@ def _enrich_worker_states(worker_name):
                     states.append(f"{name}={st}({task_short})" if task_short else f"{name}={st}")
         if states:
             return f"[WORKERS] {', '.join(states)}"
-    except Exception:
+    except (ImportError, OSError, AttributeError, TypeError, ValueError, KeyError):  # signed: beta
         pass
     return None
 
@@ -456,7 +456,7 @@ def _enrich_last_result(worker_name):
                 if m.get("sender") == worker_name and m.get("type") == "result":
                     content = str(m.get("content", ""))[:100]
                     return f"[LAST_RESULT] {content}"
-    except Exception:
+    except (ImportError, OSError, AttributeError, TypeError, ValueError, KeyError):  # signed: beta
         pass
     return None
 
@@ -646,8 +646,8 @@ def clear_steering_and_send(hwnd, task, orch_hwnd):
             time.sleep(0.8)
             user32.SetForegroundWindow(orch_hwnd)
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"UIA steering cancel failed, falling back to PS: {e}", "WARN")  # signed: beta
 
     ps = _build_steering_cancel_ps(hwnd, orch_hwnd)
     try:
@@ -662,7 +662,6 @@ def clear_steering_and_send(hwnd, task, orch_hwnd):
     except Exception as e:
         log(f"Steer-bypass failed: {e}", "ERR")
         return False
-        return False
 
 
 def log(msg, level="INFO"):
@@ -675,13 +674,21 @@ def load_workers():
     if not WORKERS_FILE.exists():
         log("No workers.json", "ERR")
         return []
-    data = json.loads(WORKERS_FILE.read_text())
+    try:
+        data = json.loads(WORKERS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        log(f"Failed to parse workers.json: {e}", "ERR")  # signed: beta
+        return []
     return data.get("workers", [])
 
 
 def load_orch_hwnd():
     if ORCH_FILE.exists():
-        data = json.loads(ORCH_FILE.read_text())
+        try:
+            data = json.loads(ORCH_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            log(f"Failed to parse orchestrator.json: {e}", "ERR")  # signed: beta
+            return None
         return data.get("orchestrator_hwnd")
     return None
 
@@ -870,8 +877,18 @@ def ghost_type_to_worker(hwnd, text, orch_hwnd):
     - Minimized sleep durations (~200ms vs old 500ms)
     - CREATE_NO_WINDOW flag on subprocess (no console flash)
     """
+    if not hwnd or not user32.IsWindow(hwnd):
+        log(f"ghost_type: invalid target HWND={hwnd}", "ERR")  # signed: beta
+        return False
+    if not orch_hwnd or not user32.IsWindow(orch_hwnd):
+        log(f"ghost_type: invalid orchestrator HWND={orch_hwnd}, proceeding without focus restore", "WARN")  # signed: beta
+
     dispatch_file = Path(ROOT) / "data" / f".dispatch_tmp_{hwnd}.txt"
-    dispatch_file.write_text(text.replace("\n", " "), encoding="utf-8")
+    try:
+        dispatch_file.write_text(text.replace("\n", " "), encoding="utf-8")
+    except OSError as e:
+        log(f"ghost_type: failed to write dispatch temp file: {e}", "ERR")  # signed: beta
+        return False
     dispatch_file_path = str(dispatch_file).replace("\\", "\\\\")
     ps = _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path)
     return _execute_ghost_dispatch(ps, hwnd, orch_hwnd)
@@ -927,8 +944,9 @@ def _validate_target_hwnd(hwnd, worker_name):
             if not ctypes.windll.user32.IsWindow(hwnd):
                 log(f"✗ HWND {hwnd} is not a valid window for {worker_name}", "SECURITY")
                 return False
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"✗ HWND validation error for {worker_name}: {e}", "SECURITY")  # signed: beta
+            return False
     return True
 
 
@@ -1197,7 +1215,7 @@ def _load_routing_config():
         bc = json.loads((DATA_DIR / "brain_config.json").read_text(encoding="utf-8"))
         routing = bc.get("routing", {})
         return routing.get("expertise_weight", 0.6), routing.get("load_weight", 0.4)
-    except Exception:
+    except (json.JSONDecodeError, OSError, KeyError, UnicodeDecodeError):  # signed: beta
         return 0.6, 0.4
 
 
@@ -1207,7 +1225,7 @@ def _load_worker_profiles():
         pdata = json.loads((DATA_DIR / "agent_profiles.json").read_text(encoding="utf-8"))
         return {k: v for k, v in pdata.items()
                 if isinstance(v, dict) and k not in ("version", "updated_at", "updated_by")}
-    except Exception:
+    except (json.JSONDecodeError, OSError, KeyError, UnicodeDecodeError):  # signed: beta
         return {}
 
 
@@ -1305,8 +1323,8 @@ def _wait_via_realtime_file(key_lower, seen_ids, deadline, realtime_path):
             match = _scan_bus_messages_for_key(msgs, key_lower, seen_ids)
             if match:
                 return match
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError, ValueError, TypeError) as e:
+            pass  # Transient file read errors during polling — retry next cycle  # signed: beta
         time.sleep(0.5)
     return None
 
@@ -1321,8 +1339,8 @@ def _wait_via_http_polling(key_lower, seen_ids, deadline, poll, skynet_url):
             match = _scan_bus_messages_for_key(msgs, key_lower, seen_ids)
             if match:
                 return match
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            log(f"HTTP poll error (will retry): {e}", "WARN")  # signed: beta
         time.sleep(poll)
     return None
 
@@ -1336,6 +1354,10 @@ def wait_for_bus_result(key, timeout=90, poll=2.0, skynet_url="http://localhost:
     falls back to HTTP polling (2.0s resolution) if realtime daemon is not running.
     If auto_recover=True and timeout is reached, cancels stuck workers and retries once.
     """
+    if not key or not key.strip():
+        log("wait_for_bus_result called with empty key — returning None", "ERR")  # signed: beta
+        return None
+
     deadline = time.time() + timeout
     seen_ids = set()
     key_lower = key.lower()

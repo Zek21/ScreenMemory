@@ -49,6 +49,7 @@ sys.path.insert(0, str(ROOT / "tools" / "chrome_bridge"))
 # ─── Win32 Constants ───────────────────────────────────
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP   = 0x0202
+WM_CLOSE       = 0x0010  # signed: delta — was missing, caused NameError in close_non_essential_windows
 MK_LBUTTON     = 0x0001
 
 user32 = ctypes.windll.user32
@@ -137,6 +138,7 @@ def _clear_boot_phase():
 
 def port_open(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(2)  # signed: delta — prevent indefinite hang on connect
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
@@ -501,7 +503,7 @@ if(-not $modelOk) {{
             [MG]::Click($render,[int]($r.X+$r.Width/2),[int]($r.Y+$r.Height/2))
             Start-Sleep -Milliseconds 1500
             Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-            [System.Windows.Forms.SendKeys]::SendWait("opus")
+            [System.Windows.Forms.SendKeys]::SendWait("fast")
             Start-Sleep -Milliseconds 1000
             [System.Windows.Forms.SendKeys]::SendWait("{{DOWN}}{{ENTER}}")
             Start-Sleep -Milliseconds 800
@@ -962,8 +964,20 @@ def _try_restore_saved_workers(orch_hwnd, num_workers):
     return None
 
 
+def _wait_for_window_ready(hwnd, timeout_s=5):
+    """Wait for a window to be fully loaded (render widget present). Returns True if ready."""
+    for _ in range(timeout_s):
+        render = ctypes.windll.user32.FindWindowExW(hwnd, None, "Chrome_RenderWidgetHostHWND", None)
+        if render:
+            return True
+        time.sleep(1)
+    return False  # signed: delta
+
+
 def _guard_restored_session(hwnd, orch_hwnd):
     """Apply model guard + permissions for a restored (non-fresh) worker window."""
+    if not _wait_for_window_ready(hwnd):  # signed: delta — wait for window UI to load
+        log(f"Window HWND={hwnd} render widget not ready after 5s, proceeding anyway", "WARN")
     guard_model(hwnd, orch_hwnd)
     time.sleep(0.5)
     guard_permissions(hwnd, orch_hwnd)
@@ -971,15 +985,19 @@ def _guard_restored_session(hwnd, orch_hwnd):
 
 
 def _prompt_and_wait(hwnd, worker_name, orch_hwnd, boot_memories):
-    """Prompt a worker and wait briefly for its response."""
+    """Prompt a worker and wait briefly for its response. Returns True if responded."""
     log(f"Prompting {worker_name.upper()}...", "SYS")
     ok = prompt_worker(hwnd, worker_name, orch_hwnd, boot_memories=boot_memories)
     log(f"Worker {worker_name.upper()} {'prompted' if ok else 'prompt may have failed'}", "OK" if ok else "WARN")
+    if not ok:
+        return False  # signed: delta — propagate prompt failure to caller
     for _ in range(6):
         time.sleep(1)
         if chat_has_messages(hwnd):
             log(f"Worker {worker_name.upper()} responded", "OK")
-            break
+            return True  # signed: delta
+    log(f"Worker {worker_name.upper()} did not respond within 6s", "WARN")  # signed: delta
+    return False  # signed: delta
 
 
 def _open_single_worker(worker_idx, orch_hwnd, fresh, boot_memories, existing_chats):
@@ -1006,6 +1024,11 @@ def _open_single_worker(worker_idx, orch_hwnd, fresh, boot_memories, existing_ch
 
     if not opened_fresh:
         _guard_restored_session(new_hwnd, orch_hwnd)
+    else:
+        # Fresh windows: new_chat.ps1 runs its own model guard, but verify
+        # after a brief settle delay in case that guard failed silently.  # signed: delta
+        time.sleep(1.5)
+        guard_model(new_hwnd, orch_hwnd)
 
     _prompt_and_wait(new_hwnd, worker_name, orch_hwnd, boot_memories)
 
