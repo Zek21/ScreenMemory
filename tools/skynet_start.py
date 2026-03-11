@@ -568,22 +568,43 @@ if($modelOk -and $targetOk) {{ Write-Host "GUARD_OK" }}
 def guard_permissions(hwnd, orch_hwnd):
     """Ensure a chat window has Bypass Approvals set.
     
-    Uses the same PostMessage ghost keyboard approach as new_chat.ps1:
-    1. SetForegroundWindow(hwnd) to give the target window OS focus
-    2. UIA ExpandCollapsePattern to open the permissions dropdown
-    3. PostMessage ghost DOWN+ENTER to Chrome_RenderWidgetHostHWND
-       (dropdown highlights current=Default, Down moves to Bypass, Enter selects)
-    4. SetForegroundWindow(orch_hwnd) to restore orchestrator focus
+    Root-cause fix: SetForegroundWindow MUST be called from the orchestrator
+    process (which owns the foreground). Subprocess PowerShell cannot call
+    SetForegroundWindow successfully — Windows restricts it to the foreground
+    process. Without real OS focus, Chromium ignores PostMessage ghost keys.
     
-    No mouse, no SendKeys. Pure PostMessage ghost keyboard.
+    Also: ExpandCollapsePattern.Expand() lies — it toggles UIA state without
+    reliably opening the visual dropdown in Chromium. Use PostMessage ghost
+    click instead (same approach as guard_model's MG.Click).
+    
+    Flow:
+    1. Python (foreground process): SetForegroundWindow(hwnd) — WORKS
+    2. Subprocess PS: UIA scan for button, ghost click to open dropdown,
+       PostMessage DOWN+ENTER to select Bypass
+    3. Python (foreground process): SetForegroundWindow(orch_hwnd) — WORKS
     """
+    import ctypes
+    # Step 1: Give the worker window REAL OS focus from the orchestrator
+    # process (which is the foreground process and CAN call SetForegroundWindow)
+    ctypes.windll.user32.SetForegroundWindow(hwnd)
+    time.sleep(0.4)
+
     ps = f'''
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 Add-Type @"
 using System; using System.Runtime.InteropServices; using System.Text;
 public class PG {{
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref POINT p);
+    [StructLayout(LayoutKind.Sequential)] public struct POINT {{ public int X, Y; }}
+    public static void Click(IntPtr rh, int sx, int sy) {{
+        POINT pt; pt.X=sx; pt.Y=sy;
+        ScreenToClient(rh, ref pt);
+        IntPtr lp = (IntPtr)((pt.Y << 16) | (pt.X & 0xFFFF));
+        PostMessage(rh, 0x0201, (IntPtr)1, lp);
+        System.Threading.Thread.Sleep(50);
+        PostMessage(rh, 0x0202, IntPtr.Zero, lp);
+    }}
     public delegate bool EnumChildWP(IntPtr h, IntPtr l);
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr p, EnumChildWP cb, IntPtr l);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int n);
@@ -602,7 +623,6 @@ public class PG {{
 }}
 "@
 $hwnd=[IntPtr]{hwnd}
-$orchHwnd=[IntPtr]{orch_hwnd}
 $root=[System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
 $btns=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
     (New-Object System.Windows.Automation.PropertyCondition(
@@ -618,18 +638,9 @@ foreach($b in $btns) {{
 if($alreadyBypass) {{ Write-Host "PERMS_OK"; exit 0 }}
 if($defaultBtn) {{
     $render=[PG]::FindRenderSurface($hwnd)
-    # Give the window OS focus so PostMessage ghost keys work
-    [PG]::SetForegroundWindow($hwnd) | Out-Null
-    Start-Sleep -Milliseconds 300
-    # Open dropdown via ExpandCollapsePattern (pure UIA, no mouse)
-    try {{
-        $exp=$defaultBtn.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-        $exp.Expand()
-    }} catch {{
-        Write-Host "PERMS_EXPAND_FAILED:$($_.Exception.Message)"
-        if($orchHwnd -ne [IntPtr]::Zero) {{ [PG]::SetForegroundWindow($orchHwnd) | Out-Null }}
-        exit 1
-    }}
+    # Open dropdown via PostMessage ghost click (NOT ExpandCollapsePattern which lies)
+    $r=$defaultBtn.Current.BoundingRectangle
+    [PG]::Click($render, [int]($r.X + $r.Width/2), [int]($r.Y + $r.Height/2))
     Start-Sleep -Milliseconds 1200
     # Ghost DOWN key (VK=0x28, scan=0x50) -- moves from Default to Bypass
     [PG]::PostMessage($render, 0x0100, [IntPtr]0x28, [IntPtr]0x00500001) | Out-Null
@@ -641,10 +652,7 @@ if($defaultBtn) {{
     Start-Sleep -Milliseconds 50
     [PG]::PostMessage($render, 0x0101, [IntPtr]0x0D, [IntPtr]::new(0xC01C0001L)) | Out-Null
     Start-Sleep -Milliseconds 1500
-    # Restore orchestrator focus
-    if($orchHwnd -ne [IntPtr]::Zero) {{ [PG]::SetForegroundWindow($orchHwnd) | Out-Null }}
-    Start-Sleep -Milliseconds 300
-    # Verify
+    # Verify (re-read fresh UIA tree)
     $root2=[System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
     $btns2=$root2.FindAll([System.Windows.Automation.TreeScope]::Descendants,
         (New-Object System.Windows.Automation.PropertyCondition(
@@ -668,12 +676,14 @@ if($defaultBtn) {{
         elif "PERMS_FAILED" in r.stdout:
             perm_state = r.stdout.split("PERMS_FAILED:")[-1].strip() if "PERMS_FAILED:" in r.stdout else "unknown"
             log(f"Permissions: FAILED to set Bypass for HWND={hwnd} (still '{perm_state}')", "WARN")
-        elif "PERMS_EXPAND_FAILED" in r.stdout:
-            log(f"Permissions: ExpandCollapse failed for HWND={hwnd}", "WARN")
         else:
             log(f"Permissions: Unexpected result for HWND={hwnd}: {r.stdout.strip()[:100]}", "WARN")
     except Exception as e:
         log(f"Permissions guard failed for HWND={hwnd}: {e}", "WARN")
+    finally:
+        # Step 3: Restore orchestrator focus from Python (foreground process)
+        ctypes.windll.user32.SetForegroundWindow(orch_hwnd)
+        time.sleep(0.2)
 
 
 def prompt_worker(hwnd, worker_name, orch_hwnd, boot_memories=None):

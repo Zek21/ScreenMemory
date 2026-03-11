@@ -66,6 +66,9 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .hdr-clock{font-family:var(--mono);font-size:13px;color:var(--text2);font-weight:500;letter-spacing:1px;}
 .hdr-iq{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--cyan);
   text-shadow:0 0 12px rgba(0,240,255,0.3);}
+.hdr-consultant-live{color:var(--cyan)!important;}
+.hdr-consultant-waiting{color:var(--amber)!important;}
+.hdr-consultant-offline{color:var(--red)!important;}
 
 /* Connection banner */
 .conn-banner{position:fixed;top:48px;left:0;right:0;height:0;overflow:hidden;z-index:200;
@@ -615,6 +618,8 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   <span class="hdr-sep"></span>
   <span class="hdr-stat">Agents <span class="val" id="sb-agents">4</span></span>
   <span class="hdr-sep"></span>
+  <span class="hdr-stat">Consultant <span class="val hdr-consultant-waiting" id="sb-consultant">0/0</span></span>
+  <span class="hdr-sep"></span>
   <span class="hdr-stat">Tasks <span class="val" id="sb-tasks">0</span></span>
   <span class="hdr-sep"></span>
   <span class="hdr-stat">IQ <span class="val hdr-iq" id="sb-iq">--</span></span>
@@ -1131,11 +1136,17 @@ function updateGod(items){
 function renderConsultants(consultants){
   const body=document.getElementById('consultantBody');
   const badge=document.getElementById('consultantBadge');
+  const topStat=document.getElementById('sb-consultant');
   if(!body)return;
   const entries=consultants&&typeof consultants==='object'&&!Array.isArray(consultants)
     ? Object.values(consultants).filter(v=>v&&typeof v==='object'&&!v.error)
     : [];
-  if(badge)badge.textContent=entries.length?entries.filter(c=>c.live).length+'/'+entries.length:'0';
+  const liveCount=entries.filter(c=>c.live).length;
+  if(badge)badge.textContent=entries.length?liveCount+'/'+entries.length:'0/0';
+  if(topStat){
+    topStat.textContent=entries.length?liveCount+'/'+entries.length:'0/0';
+    topStat.className='val '+(liveCount?'hdr-consultant-live':entries.length?'hdr-consultant-offline':'hdr-consultant-waiting');
+  }
   if(!entries.length){
     body.innerHTML='<div class="task-empty">No consultant identity exposed yet</div>';
     return;
@@ -1335,7 +1346,7 @@ function drawTopology(){
 /* ═══ SMART FETCH ═══ */
 const GOD_PORT=8421;
 const BACKEND_PORT=8420;
-const CONSULTANT_BRIDGE_PORT=8422;
+const CONSULTANT_BRIDGE_PORTS=[8422,8424];
 async function smartFetch(path){
   try{const r=await fetch(path);if(r.ok)return await r.json();}catch(e){}
   try{const r2=await fetch('http://localhost:'+GOD_PORT+path);if(r2.ok)return await r2.json();}catch(e){}
@@ -1361,24 +1372,32 @@ function getCachedPulse(){return _dashCache.pulse;}
 function getCachedBus(){return _dashCache.bus;}
 async function fetchConsultantsData(){
   if(sseConnected&&sseData){
-    if(sseData.consultants)return sseData.consultants;
-    if(sseData.status&&sseData.status.consultants)return sseData.status.consultants;
+    if(sseData.consultants&&!(sseData.consultants.error))return sseData.consultants;
+    if(sseData.status&&sseData.status.consultants&&!(sseData.status.consultants.error))return sseData.status.consultants;
   }
-  if(_dashCache.status&&_dashCache.status.consultants)return _dashCache.status.consultants;
+  if(_dashCache.status&&_dashCache.status.consultants&&!(_dashCache.status.consultants.error))return _dashCache.status.consultants;
   const fromConsole=await smartFetch('/consultants');
-  if(fromConsole)return fromConsole;
-  const fromBridge=await smartFetchUrl('http://localhost:'+CONSULTANT_BRIDGE_PORT+'/consultants');
-  if(fromBridge&&fromBridge.consultant){
+  const consoleEntries=fromConsole&&typeof fromConsole==='object'&&!Array.isArray(fromConsole)
+    ? Object.values(fromConsole).filter(v=>v&&typeof v==='object'&&!v.error)
+    : [];
+  if(consoleEntries.length)return fromConsole;
+  let best=null;
+  for(const port of CONSULTANT_BRIDGE_PORTS){
+    const fromBridge=await smartFetchUrl('http://localhost:'+port+'/consultants');
+    if(!fromBridge||!fromBridge.consultant)continue;
     const c=fromBridge.consultant;
     const age=Number(c.heartbeat_age_s);
     const staleAfter=Number(c.stale_after_s||8);
-    if(Number.isFinite(age)&&Number.isFinite(staleAfter)&&age<=staleAfter){
+    const fresh=Number.isFinite(age)&&Number.isFinite(staleAfter)&&age<=staleAfter;
+    if(fresh){
       c.live=true;
       c.status='LIVE';
       c.pid_alive=true;
+      return fromBridge;
     }
+    if(!best)best=fromBridge;
   }
-  return fromBridge;
+  return best;
 }
 // Master combined poll -- replaces individual status+pulse+bus fetches
 async function masterPoll(){

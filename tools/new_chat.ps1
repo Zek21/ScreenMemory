@@ -558,20 +558,11 @@ if ($permBtn) {
     Write-Host "PERMISSION_GUARD: Found Default Approvals -- switching to Bypass"
     $renderP = [Ghost]::FindRenderSurface($newHwnd)
 
-    # Step 1: Open dropdown via ExpandCollapsePattern (pure UIA, no mouse)
-    $expanded = $false
-    try {
-        $expP = $permBtn.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-        $expP.Expand()
-        $expanded = $true
-        Write-Host "PERMISSION_GUARD: Dropdown opened via ExpandCollapse"
-    } catch {
-        # Fallback: ghost click on the button (PostMessage, no real mouse)
-        $pr = $permBtn.Current.BoundingRectangle
-        [Ghost]::Click($renderP, [int]($pr.X + $pr.Width/2), [int]($pr.Y + $pr.Height/2))
-        $expanded = $true
-        Write-Host "PERMISSION_GUARD: Dropdown opened via ghost click"
-    }
+    # Step 1: Open dropdown via PostMessage ghost click (NOT ExpandCollapsePattern
+    # which lies -- it toggles UIA state without reliably opening the visual dropdown)
+    $pr = $permBtn.Current.BoundingRectangle
+    [Ghost]::Click($renderP, [int]($pr.X + $pr.Width/2), [int]($pr.Y + $pr.Height/2))
+    Write-Host "PERMISSION_GUARD: Dropdown opened via ghost click"
     Start-Sleep -Milliseconds 1200
 
     # Step 2: Select Bypass via PostMessage keyboard (Down+Enter)

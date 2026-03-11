@@ -38,7 +38,6 @@ try:
 except ImportError:
     def _dumps(obj): return json.dumps(obj, default=str)
 
-CONSOLE_HTML = ROOT / "god_console.html"
 DASHBOARD_HTML = ROOT / "dashboard.html"
 DEFAULT_PORT = 8421
 WS_PORT = 8423
@@ -80,6 +79,7 @@ _STATUS_TTL = 10
 _INTROSPECT_TTL = 30
 _BACKEND_TTL = 3     # backend status cached 3s
 _CONSULTANT_TTL = 2  # consultant bridge state cached 2s
+_CONSULTANT_PORTS = (8422, 8424)
 _BUS_TTL = 2         # bus messages cached 2s
 _ENGINES_TTL = 30    # engine probes are expensive; 30s cache
 _DASHBOARD_TTL = 3   # combined dashboard data
@@ -199,9 +199,32 @@ def _cached_consultants():
         if _cache["consultants"] and (now - _cache["consultants_t"]) < _CONSULTANT_TTL:
             return _cache["consultants"]
     try:
-        from skynet_consultant_bridge import get_consultant_view
-        consultant = get_consultant_view()
-        data = {"consultant": consultant} if consultant else {}
+        data = None
+        for port in _CONSULTANT_PORTS:
+            payload = _fetch_backend(f"http://localhost:{port}/consultants", timeout=2, retries=0)
+            consultant = payload.get("consultant") if isinstance(payload, dict) else None
+            if not isinstance(consultant, dict):
+                continue
+            age = consultant.get("heartbeat_age_s")
+            stale_after = consultant.get("stale_after_s", 8)
+            try:
+                age_f = float(age)
+                stale_f = float(stale_after)
+            except Exception:
+                age_f = None
+                stale_f = None
+            if age_f is not None and stale_f is not None and age_f <= stale_f:
+                consultant["live"] = True
+                consultant["status"] = "LIVE"
+                consultant["pid_alive"] = True
+                data = {"consultant": consultant}
+                break
+            if data is None:
+                data = {"consultant": consultant}
+        if data is None:
+            from skynet_consultant_bridge import get_consultant_view
+            consultant = get_consultant_view()
+            data = {"consultant": consultant} if consultant else {}
     except Exception as e:
         data = {"error": str(e)}
     with _cache_lock:
@@ -572,12 +595,11 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         self._log_access(self.path, status_code, elapsed_ms)
 
     def _route(self, t0):
-        if self.path in ("/", "/index.html", "/god"):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+        if self.path in ("/", "/index.html", "/god", "/god_console.html"):
+            self.send_response(302)
+            self.send_header("Location", "/dashboard")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            self.wfile.write(CONSOLE_HTML.read_bytes())
         elif self.path == "/version":
             self._json_response({"version": "3.0", "level": 3, "codename": "Level 3"})
         elif self.path == "/health":
@@ -1192,7 +1214,7 @@ def main():
     server = ThreadedHTTPServer(("", args.port), ConsoleHandler)
 
     if args.open:
-        threading.Timer(0.5, lambda: webbrowser.open(f"http://localhost:{args.port}")).start()
+        threading.Timer(0.5, lambda: webbrowser.open(f"http://localhost:{args.port}/dashboard")).start()
 
     try:
         server.serve_forever()
