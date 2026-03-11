@@ -40,6 +40,7 @@ STATE_FILE = DATA_DIR / "consultant_state.json"
 PID_FILE = DATA_DIR / "consultant_bridge.pid"
 PROMPT_FILE = DATA_DIR / "consultant_prompt_queue.json"
 TASK_FILE = DATA_DIR / "consultant_task_state.json"
+SCORES_FILE = DATA_DIR / "worker_scores.json"
 SKYNET_URL = "http://localhost:8420"
 CONSULTANT_ID = "consultant"
 DISPLAY_NAME = "Codex Consultant"
@@ -93,6 +94,37 @@ def _read_json(path: Path) -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _signature_token() -> str:
+    return f"signed:{CONSULTANT_ID}"  # signed: consultant
+
+
+def _signed_content(content: str) -> str:
+    text = str(content or "").strip()
+    signature = _signature_token()
+    if signature.lower() in text.lower():
+        return text
+    if not text:
+        return signature
+    return f"{text} {signature}"  # signed: consultant
+
+
+def _load_score_summary(actor_id: str) -> Dict[str, Any]:
+    raw = _read_json(SCORES_FILE)
+    scores = raw.get("scores", {}) if isinstance(raw, dict) else {}
+    entry = scores.get(actor_id, {}) if isinstance(scores, dict) else {}
+    if not isinstance(entry, dict):
+        entry = {}
+    return {
+        "total": round(float(entry.get("total") or 0.0), 6),
+        "awards": int(entry.get("awards") or 0),
+        "deductions": int(entry.get("deductions") or 0),
+        "proactive_ticket_clears": int(entry.get("proactive_ticket_clears") or 0),
+        "bug_reports_filed": int(entry.get("bug_reports_filed") or 0),
+        "bug_cross_validations": int(entry.get("bug_cross_validations") or 0),
+        "zero_ticket_bonus_awards": int(entry.get("zero_ticket_bonus_awards") or 0),
+    }  # signed: consultant
 
 
 def _parse_time(value: Any) -> Optional[float]:
@@ -261,20 +293,22 @@ def _publish_consultant_event(event_type: str, content: str,
             clean_metadata[str(key)] = str(value)
         else:
             clean_metadata[str(key)] = json.dumps(value, default=str)
+    clean_metadata.setdefault("score_actor", CONSULTANT_ID)
+    clean_metadata.setdefault("signature", _signature_token())
     payload = {
         "sender": CONSULTANT_ID,
         "topic": "orchestrator",
         "type": event_type,
-        "content": content,
+        "content": _signed_content(content),
         "metadata": clean_metadata,
     }
     try:
         try:
-            from shared.bus import bus_post
+            from tools.skynet_spam_guard import guarded_publish
         except ImportError:
-            from tools.shared.bus import bus_post
-        if bus_post(payload):
-            return True
+            from skynet_spam_guard import guarded_publish
+        result = guarded_publish(payload)
+        return bool(result.get("allowed") and result.get("published", True))
     except Exception:
         pass
     return _http_post("/bus/publish", payload, timeout=2.0)
@@ -737,6 +771,7 @@ def build_live_state(interval_s: float = DEFAULT_INTERVAL_S,
     prompt_stats = _prompt_stats()
     task_state = _load_task_state()
     workers = _load_worker_snapshot()
+    score_summary = _load_score_summary(CONSULTANT_ID)
     return {
         "id": CONSULTANT_ID,
         "display_name": profile["display_name"],
@@ -764,6 +799,8 @@ def build_live_state(interval_s: float = DEFAULT_INTERVAL_S,
         "prompt_queue": prompt_stats,
         "task_state": task_state,
         "worker_snapshot": workers,
+        "score": score_summary.get("total", 0.0),
+        "score_summary": score_summary,
     }
 
 
@@ -776,6 +813,8 @@ def get_consultant_view() -> Dict[str, Any]:
 
 
 def _build_base_consultant_view(profile: dict, raw: dict) -> dict:
+    source_name = str(raw.get("source") or SOURCE_NAME)
+    raw_score_summary = raw.get("score_summary") if isinstance(raw.get("score_summary"), dict) else _load_score_summary(CONSULTANT_ID)
     return {
         "id": CONSULTANT_ID,
         "display_name": profile["display_name"],
@@ -786,9 +825,9 @@ def _build_base_consultant_view(profile: dict, raw: dict) -> dict:
         "routable": bool(raw.get("accepts_prompts", False)),
         "accepts_prompts": bool(raw.get("accepts_prompts", False)),
         "requires_hwnd": False,
-        "transport": f"{SOURCE_NAME.lower()}-bridge",
+        "transport": f"{source_name.lower()}-bridge",
         "prompt_transport": raw.get("prompt_transport", "bridge_queue"),
-        "source": raw.get("source", SOURCE_NAME),
+        "source": source_name,
         "declared": True,
         "declared_status": profile["declared_status"],
         "live": False,
@@ -807,6 +846,8 @@ def _build_base_consultant_view(profile: dict, raw: dict) -> dict:
         "prompt_queue": raw.get("prompt_queue", _prompt_stats()),
         "task_state": raw.get("task_state", _load_task_state()),
         "worker_snapshot": raw.get("worker_snapshot", _load_worker_snapshot()),
+        "score": raw.get("score", raw_score_summary.get("total", 0.0)),
+        "score_summary": raw_score_summary,
     }
 
 
@@ -831,23 +872,21 @@ def _apply_liveness_status(view: dict, raw: dict) -> None:
 
 
 def _announce_presence() -> None:
-    _http_post("/bus/publish", {
-        "sender": CONSULTANT_ID,
-        "topic": "orchestrator",
-        "type": "identity_ack",
-        "content": (
+    _publish_consultant_event(
+        "identity_ack",
+        (
             f"{DISPLAY_NAME.upper()} LIVE -- {SOURCE_NAME} bridge active. "
             "Advisory peer is visible in consultant live surfaces. "
             "Prompt transport=bridge_queue."
         ),
-        "metadata": {
+        metadata={
             "display_name": DISPLAY_NAME,
             "kind": "advisor",
             "transport": f"{SOURCE_NAME.lower()}-bridge",
             "routable": "true",
             "prompt_transport": "bridge_queue",
         },
-    }, timeout=2.0)
+    )  # signed: consultant
 
 
 def relay_consultant_result(content: str, consultant_id: str = None) -> dict:

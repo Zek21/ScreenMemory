@@ -114,8 +114,8 @@ class ExpertiseProfile:
             cursor = conn.execute(
                 "SELECT SUM(successes + failures) FROM expertise_profile"
             )
-            result = cursor.fetchone()[0]
-            return result if result else 0
+            result = cursor.fetchone()
+            return result[0] if result and result[0] else 0  # signed: gamma
     
     def get_score(self, domain: str) -> float:
         """Get score for a specific domain."""
