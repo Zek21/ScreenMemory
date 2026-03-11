@@ -2,7 +2,7 @@
 """
 Skynet Start — Unified orchestrator bootstrap.
 
-Trigger words: "skynet-start", "orchestrator-start", "CC-Start"
+Trigger words: "skynet-start", "orchestrator-start", "Orch-Start"
 
 Starts Skynet backend, GOD Console, opens worker chat windows (ghost mouse),
 prompts each, registers with Skynet, and connects ScreenMemory engines.
@@ -1620,7 +1620,7 @@ def _ensure_gemini_consultant_bridge():
 
 
 def _start_post_boot_daemons():
-    """Ensure the daemon set used by CC-Start is running."""
+    """Ensure the shared post-boot daemon set is running."""
     _start_daemon_safe(
         str(ROOT / "tools" / "skynet_self_prompt.py"),
         DATA_DIR / "self_prompt.pid",

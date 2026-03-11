@@ -228,30 +228,58 @@ foreach ($d in $daemonSpecs) {
     }
 }
 
-# ── Codex Consultant Identity ────────────────────────────
+# ── Codex Consultant Bridge + Identity ───────────────────
 
+$consultantBridgeUp = $false
 if (Test-Port 8422 1000) {
     Write-Status "Codex Consultant bridge already running on port 8422" "OK"
+    $consultantBridgeUp = $true
 } else {
-    Write-Status "Codex Consultant bridge not running (will start during next full bootstrap)" "INFO"
+    Write-Status "Codex Consultant bridge not running -- starting..." "SYS"
+    $bridgeScript = Join-Path $repoRoot "tools\skynet_consultant_bridge.py"
+    if (Test-Path $bridgeScript) {
+        Start-Process -FilePath $python `
+            -ArgumentList @($bridgeScript, "--source", "CC-Start", "--api-port", "8422") `
+            -WorkingDirectory $repoRoot -WindowStyle Hidden
+        for ($i = 0; $i -lt 10; $i++) {
+            Start-Sleep -Seconds 1
+            if (Test-Port 8422 1000) {
+                $consultantBridgeUp = $true
+                Write-Status "Codex Consultant bridge started on port 8422" "OK"
+                break
+            }
+        }
+        if (-not $consultantBridgeUp) {
+            Write-Status "Codex Consultant bridge failed to start within 10s" "WARN"
+        }
+    } else {
+        Write-Status "tools\\skynet_consultant_bridge.py not found" "ERR"
+    }
 }
 
 # Announce Codex Consultant identity on bus
 if ($skynetUp) {
     try {
+        $identityContent = if ($consultantBridgeUp) {
+            "CODEX CONSULTANT LIVE -- CC-Start session active. Model: GPT-5 Codex. Advisory peer ready for tasking."
+        } else {
+            "CODEX CONSULTANT SESSION ACTIVE -- bridge offline on port 8422. Model: GPT-5 Codex. Advisory peer not promptable yet."
+        }
+        $promptTransport = if ($consultantBridgeUp) { "bridge_queue" } else { "unavailable" }
+        $routable = if ($consultantBridgeUp) { "true" } else { "false" }
         Invoke-RestMethod -Uri "http://localhost:8420/bus/publish" -Method POST `
             -ContentType "application/json" -TimeoutSec 3 `
             -Body (ConvertTo-Json @{
                 sender  = "consultant"
                 topic   = "orchestrator"
                 type    = "identity_ack"
-                content = "CODEX CONSULTANT LIVE -- CC-Start session active. Model: Claude Opus 4.6 fast. Advisory peer ready for tasking."
+                content = $identityContent
                 metadata = @{
                     display_name     = "Codex Consultant"
                     kind             = "advisor"
                     transport        = "cc-start-bridge"
-                    routable         = "true"
-                    prompt_transport = "bridge_queue"
+                    routable         = $routable
+                    prompt_transport = $promptTransport
                 }
             }) | Out-Null
         Write-Status "Codex Consultant identity announced on Skynet bus" "OK"
@@ -307,6 +335,14 @@ Write-Host "    - Bus sender ID: consultant"
 Write-Host "    - Bus topic for receiving prompts: consultant"
 Write-Host "    - Bridge port: 8422"
 Write-Host "    - Post results to bus with sender=consultant"
+Write-Host ""
+Write-Host "  Failure corrections you must obey:"
+Write-Host "    - CC-Start always means Codex Consultant, never orchestrator."
+Write-Host "    - Report model truth as GPT-5 Codex."
+Write-Host "    - Bring up bridge 8422 before claiming LIVE or routable transport."
+Write-Host "    - If you fail or drift: write an artifact, post it to Skynet, and verify delivery."
+Write-Host "    - Keep bus payloads schema-safe unless endpoint support is verified."
+Write-Host "    - Do not claim success without a live endpoint check or sender-filtered bus confirmation."
 Write-Host ""
 Write-Host "  When asked 'who are you?', respond as the Codex Consultant."
 Write-Host "================================================================"

@@ -27,21 +27,55 @@ Any agent (Worker, Orchestrator, or Consultant) that makes a mistake, experience
 
 ## SESSION BOOT PROTOCOL — Rule #0.05 (Mandatory, Pre-Operational)
 
-**On EVERY new session start, OR when the user says "skynet-start" / "orchestrator-start" / "CC-Start", execute this boot protocol BEFORE any other work. The orchestrator cannot function without Skynet context.**
+**On EVERY new session start, determine role from the trigger BEFORE any other work.**
 
-### Boot Sequence (5 steps, in order):
+**CRITICAL: `skynet-start` and `orchestrator-start` are SEPARATE PHASES, not aliases.**
 
-1. **Self-Identify** — Detect current VS Code HWND → read and update `data/orchestrator.json` → confirm identity as Skynet orchestrator
-2. **Health Check** — `Invoke-RestMethod http://localhost:8420/status` → determine if Skynet is already running
-3. **Bootstrap (if needed)** — `python tools/skynet_start.py` → 8-phase boot: memory preload, backend (port 8420), GOD Console (port 8421), worker windows (2×2 grid), registration, engine connections, state save, daemons. Use `--reconnect` for existing workers, `--workers N` to limit count
-4. **Knowledge Acquisition** — After Skynet is confirmed alive, absorb ALL context:
-   - Poll bus: `Invoke-RestMethod http://localhost:8420/bus/messages?limit=30` (pending results, alerts, self-directives)
-   - Worker states: `Invoke-RestMethod http://localhost:8420/status` (who is IDLE/PROCESSING/DEAD)
-   - Agent profiles: `data/agent_profiles.json` (roles, specializations, mission history)
-   - Brain config: `data/brain_config.json` (dispatch modes, learning, compliance state)
-   - Pending TODOs: `data/todos.json` (active/pending work items)
-   - Worker registry: `data/workers.json` (HWNDs, grid positions, engines)
-5. **Report Ready** — Tell the user: Skynet version, worker count + states, engine count, pending alerts, pending TODOs, any boot warnings
+- `skynet-start` = **Phase 1 (infrastructure) + Phase 2 (orchestrator role).** Full cold-start. Boots backend, GOD Console, daemons first (fast, <15s, no UIA), THEN assumes orchestrator role.
+- `orchestrator-start` / `Orch-Start` = **Phase 2 only (orchestrator role).** Assumes infrastructure is already running. Self-identifies, absorbs context, enters CEO mode. If infrastructure is dead, warns and attempts Phase 1 first.
+- `CC-Start` = execute Codex Consultant bootstrap, announce `sender=consultant`, and stay in consultant role
+- `GC-Start` = execute Gemini Consultant bootstrap, announce `sender=gemini_consultant`, and stay in consultant role
+- Consultant starts may ensure shared Skynet infrastructure is reachable, but they do NOT assume orchestrator authority
+
+### Phase 1: Infrastructure Boot (`skynet-start` only)
+**Fast, reliable, NO UIA. Must complete before Phase 2.**
+
+1. **Start backend** — If port 8420 is closed, start `Skynet\skynet.exe` hidden. Wait up to 15s.
+2. **Start GOD Console** — If port 8421 is closed, start `god_console.py` hidden. Wait up to 10s.
+3. **Start daemons** — Check PID files, start any that are dead: self-prompt, self-improve, bus-relay, learner.
+4. **Announce infra online** — POST `{sender: "system", topic: "system", type: "infra_boot"}` to bus.
+
+**Phase 1 does NOT open worker windows.** Worker windows are UIA-heavy and can hang. They are opened separately AFTER the orchestrator is online.
+
+### Phase 2: Orchestrator Role Assumption (`orchestrator-start` / `Orch-Start`)
+**Establishes orchestrator identity and operational awareness.**
+
+1. **Self-Identify** — Detect current VS Code HWND → read and update `data/orchestrator.json`
+2. **Health Check** — `Invoke-RestMethod http://localhost:8420/status` → if dead and trigger was `orchestrator-start`, warn and attempt Phase 1
+3. **Announce identity** — POST `{sender: "orchestrator", topic: "orchestrator", type: "identity_ack"}` to bus
+4. **Open dashboard** — `Start-Process "http://localhost:8421/dashboard"`
+5. **Knowledge Acquisition** — Absorb ALL context:
+   - Poll bus: `Invoke-RestMethod http://localhost:8420/bus/messages?limit=30`
+   - Worker states: `Invoke-RestMethod http://localhost:8420/status`
+   - Agent profiles: `data/agent_profiles.json`
+   - Brain config: `data/brain_config.json`
+   - Pending TODOs: `data/todos.json`
+   - Worker registry: `data/workers.json`
+6. **Check consultants** — `GET http://localhost:8422/health` (Codex), `GET http://localhost:8425/health` (Gemini)
+7. **Report Ready** — Skynet version, worker count + states, engine count, pending alerts, pending TODOs, consultant status, warnings
+
+### Worker Window Management (Post-Boot, Separate)
+Worker windows are opened AFTER Phase 2 completes, never during infrastructure boot:
+- Run `.\Orch-Start.ps1 -SkipInfra` for managed worker window opening with timeout protection
+- Or use `tools/new_chat.ps1` for individual workers
+- Worker window opening is UIA-heavy and may hang — it MUST NOT block infrastructure or orchestrator boot
+
+### Consultant Boot Sequence
+
+1. **Run the consultant bootstrap** — `CC-Start.ps1` for Codex, `GC-Start.ps1` for Gemini
+2. **Verify shared infrastructure** — ensure Skynet backend / GOD Console are reachable, or bootstrap shared infrastructure if it is actually down
+3. **Announce consultant identity** — post `identity_ack` with the truthful consultant sender id and bridge metadata
+4. **Stay role-correct** — consultants are advisory peers, not the orchestrator, and do not claim worker command authority
 
 ### Post-Boot Operating Mode
 - **Every turn:** Poll bus → check worker states → act on pending work → dispatch → synthesize
@@ -154,7 +188,7 @@ The orchestrator MUST follow this exact sequence when booting workers. Violation
 
 ## GOD Protocol -- Autonomous Pull Loop
 
-The orchestrator operates as GOD -- it sees everything, knows everything, and acts immediately. Push-based dispatch is the fallback. Pull-based awareness is the primary operating mode.
+The orchestrator serves GOD (the user) -- it sees everything, knows everything, and acts immediately on GOD's behalf. Push-based dispatch is the fallback. Pull-based awareness is the primary operating mode.
 
 ### Every Turn Protocol (mandatory):
 1. **PULL bus messages:** check for results, alerts, requests (`/bus/messages?limit=30`)
@@ -194,12 +228,27 @@ The orchestrator is a continuous operations loop, not a request-response system.
 - Items have: `id`, `title`, `status` (pending/active/done/cancelled), `assignee`, `priority`, `wave`
 - NEVER rely on memory for TODO tracking — always read/write the file
 
-### Boot Sequence (orchestrator-start / CC-Start)
-1. `skynet_start.py` boots backend, workers, engines
-2. Self-prompt daemon launches automatically (Phase 8)
-3. Boot prompt fires: reads TODOs, bus, profiles, sends brief to orchestrator
-4. Orchestrator receives brief, dispatches all pending work
-5. System is fully autonomous from this point -- no manual intervention needed
+### Boot Sequence (skynet-start then orchestrator-start — TWO PHASES)
+
+**`skynet-start` ≠ `orchestrator-start`. They are separate phases.**
+
+**Phase 1 — Infrastructure (`skynet-start`):**
+1. Start `skynet.exe` backend if port 8420 is closed (wait up to 15s)
+2. Start `god_console.py` if port 8421 is closed (wait up to 10s)
+3. Start daemons (self-prompt, self-improve, bus-relay, learner) — check PID files, start dead ones
+4. Announce infra online on bus
+5. Phase 1 does NOT open worker windows (UIA-heavy, can hang)
+
+**Phase 2 — Orchestrator Role (`orchestrator-start` / `Orch-Start`):**
+1. Self-identify (HWND detection, update `data/orchestrator.json`)
+2. Announce orchestrator identity on bus
+3. Open dashboard
+4. Knowledge acquisition (bus, status, profiles, config, TODOs, workers)
+5. Report ready to user
+
+**Worker windows** are opened AFTER Phase 2, separately, via `Orch-Start.ps1 -SkipInfra` or `new_chat.ps1`.
+
+`CC-Start` and `GC-Start` do not enter this autonomous orchestrator loop. They remain consultant sessions.
 
 ## Incident Log and Lessons Learned
 

@@ -5,7 +5,20 @@ Provides INSTANT access to system state via data/realtime.json
 (written by skynet_realtime.py daemon) with HTTP fallback.
 
 All read operations are zero-network when realtime.json is fresh.
-wait() and wait_all() poll the local file, not HTTP.
+wait() and wait_all() poll the local file at 0.5s resolution, not HTTP.
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# QUICK REFERENCE -- 5 most common orchestrator commands:
+#
+#   python tools/orch_realtime.py status                          # Worker state table (instant, zero-network)
+#   python tools/orch_realtime.py pending                         # Unread results/alerts
+#   python tools/orch_realtime.py dispatch-wait --worker NAME --task "task" --timeout 90   # Dispatch + block for result
+#   python tools/orch_realtime.py dispatch-parallel-wait --task "task" --timeout 120       # All workers + wait
+#   python tools/orch_realtime.py wait-all [--timeout 120] [--non-blocking]               # Wait or snapshot
+#
+# NEVER use Start-Sleep or Invoke-RestMethod polling loops.
+# These commands handle all waiting internally at 0.5s file-poll resolution.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Usage:
     python orch_realtime.py status
@@ -13,7 +26,7 @@ Usage:
     python orch_realtime.py consume MSG_ID
     python orch_realtime.py consume-all
     python orch_realtime.py wait KEY [--timeout 90]
-    python orch_realtime.py wait-all [--timeout 120]
+    python orch_realtime.py wait-all [--timeout 120] [--non-blocking]
     python orch_realtime.py health
     python orch_realtime.py bus [--limit 10]
 """
@@ -246,14 +259,43 @@ def wait(key: str, timeout: float = 90) -> dict | None:
     return None
 
 
-def wait_all(workers: list | None = None, timeout: float = 120) -> dict:
-    """Block until ALL specified workers have posted results since last consume_all."""
+def wait_all(workers: list | None = None, timeout: float = 120, non_blocking: bool = False) -> dict:
+    """Block until ALL specified workers have posted results since last consume_all.
+
+    If non_blocking=True, returns immediately with whatever results are
+    currently available instead of polling until timeout.
+    """
     if workers is None:
         workers = ["alpha", "beta", "gamma", "delta"]
 
     consumed = _read_consumed()
-    deadline = time.time() + timeout
     results = {}
+
+    if non_blocking:
+        # Snapshot mode: read current state once, return immediately
+        state = _read_realtime()
+        bus = state.get("bus", [])
+        for m in bus:
+            mid = m.get("id", "")
+            if mid in consumed:
+                continue
+            if m.get("type") != "result":
+                continue
+            sender = (m.get("sender") or "").lower()
+            if sender in workers and sender not in results:
+                results[sender] = m
+
+        found = [w for w in workers if w in results]
+        missing = [w for w in workers if w not in results]
+        if found:
+            print(f"{C_GREEN}Found results from: {', '.join(found)}{C_RESET}")
+            for w in found:
+                print(f"  {C_GREEN}{w.upper()}{C_RESET}: {(results[w].get('content', ''))[:60]}")
+        if missing:
+            print(f"{C_GOLD}Still waiting: {', '.join(missing)}{C_RESET}")
+        return results
+
+    deadline = time.time() + timeout
     print(f"{C_CYAN}Waiting for results from: {', '.join(workers)} (timeout {timeout}s)...{C_RESET}")
 
     while time.time() < deadline:
@@ -427,6 +469,8 @@ def main():
     p_wa = sub.add_parser("wait-all", help="Wait for all workers to respond")
     p_wa.add_argument("--timeout", type=float, default=120)
     p_wa.add_argument("--workers", nargs="*", default=None)
+    p_wa.add_argument("--non-blocking", action="store_true",
+                       help="Return immediately with current state instead of blocking")
 
     sub.add_parser("health", help="System health overview")
 
@@ -455,7 +499,7 @@ def main():
     elif args.command == "wait":
         wait(args.key, args.timeout)
     elif args.command == "wait-all":
-        wait_all(args.workers, args.timeout)
+        wait_all(args.workers, args.timeout, non_blocking=args.non_blocking)
     elif args.command == "health":
         health()
     elif args.command == "bus":

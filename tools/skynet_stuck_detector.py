@@ -42,6 +42,7 @@ HISTORY_FILE = DATA_DIR / "worker_stuck_history.json"
 WORKERS_FILE = DATA_DIR / "workers.json"
 BRAIN_CONFIG = DATA_DIR / "brain_config.json"
 SKYNET_URL = "http://localhost:8420"
+ORCH_FILE = DATA_DIR / "orchestrator.json"
 
 # Thresholds
 PROCESSING_LONG_S = 900    # 15 minutes in PROCESSING = worth alerting (INFO only)
@@ -75,6 +76,294 @@ def bus_post(sender, topic, msg_type, content):
         }, timeout=3)
     except Exception:
         pass
+
+
+def _get_orch_hwnd():
+    """Load orchestrator HWND from data/orchestrator.json."""
+    try:
+        data = json.loads(ORCH_FILE.read_text(encoding="utf-8"))
+        return data.get("hwnd", 0)
+    except Exception:
+        return 0
+
+
+def prompt_orchestrator(message):
+    """Type a prompt into the orchestrator's SIDEBAR chat input via UIA.
+
+    The orchestrator window has multiple Edit controls:
+      - Terminal input (y=922, x=543) -- DO NOT target
+      - Terminal input (y=835, x=347) -- DO NOT target
+      - Sidebar chat input (y=844, x=24, w=265) -- TARGET THIS ONE
+
+    ghost_type_to_worker targets the bottommost Edit (highest Y) which hits the
+    terminal. This function instead targets the sidebar Edit (x < 320) which is
+    the Copilot CLI chat input where the orchestrator conversation lives.
+
+    Layout reference: data/orch_layout.json
+    """
+    orch_hwnd = _get_orch_hwnd()
+    if not orch_hwnd:
+        log("Cannot prompt orchestrator: no HWND found", "ERROR")
+        return False
+
+    # Flatten message to single line for clipboard paste
+    flat_msg = message.replace("\n", " ").replace("\r", " ")
+
+    # Write to temp file to avoid escaping issues in PowerShell
+    dispatch_file = DATA_DIR / ".orch_wake_dispatch.txt"
+    dispatch_file.write_text(flat_msg, encoding="utf-8")
+    dispatch_path = str(dispatch_file).replace("\\", "\\\\")
+
+    # PowerShell script that targets the SIDEBAR Edit (x < 320)
+    ps = f'''
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
+Add-Type @"
+using System; using System.Runtime.InteropServices;
+public class WakeHelper {{
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);
+    [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
+    public static bool FocusViaAttach(IntPtr target) {{
+        uint pid; uint tid = GetWindowThreadProcessId(target, out pid);
+        uint myTid = GetCurrentThreadId();
+        if (tid == 0) return false;
+        AttachThreadInput(myTid, tid, true);
+        SetFocus(target);
+        return true;
+    }}
+    public static void Detach(IntPtr target) {{
+        uint pid; uint tid = GetWindowThreadProcessId(target, out pid);
+        uint myTid = GetCurrentThreadId();
+        AttachThreadInput(myTid, tid, false);
+    }}
+}}
+"@
+
+$hwnd = [IntPtr]{orch_hwnd}
+$dispatchText = [System.IO.File]::ReadAllText("{dispatch_path}", [System.Text.Encoding]::UTF8)
+
+# Find the SIDEBAR chat Edit (x < 320, highest Y)
+$wnd = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+$allEdits = $wnd.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    (New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit
+    ))
+)
+$sidebarEdit = $null
+$maxY = -1
+foreach ($e in $allEdits) {{
+    try {{
+        $r = $e.Current.BoundingRectangle
+        # Sidebar is x < 320; skip terminal/editor Edits (x >= 320)
+        if ($r.X -lt 320 -and $r.Y -gt $maxY -and $r.Width -gt 50) {{
+            $maxY = $r.Y
+            $sidebarEdit = $e
+        }}
+    }} catch {{}}
+}}
+
+if (-not $sidebarEdit) {{
+    Write-Host "NO_SIDEBAR_EDIT"
+    exit 1
+}}
+
+$savedClip = $null
+try {{ $savedClip = [System.Windows.Forms.Clipboard]::GetText() }} catch {{}}
+
+[System.Windows.Forms.Clipboard]::SetText($dispatchText)
+Start-Sleep -Milliseconds 100
+
+$attached = [WakeHelper]::FocusViaAttach($hwnd)
+try {{ $sidebarEdit.SetFocus() }} catch {{}}
+Start-Sleep -Milliseconds 200
+
+[System.Windows.Forms.SendKeys]::SendWait("^a")
+Start-Sleep -Milliseconds 50
+[System.Windows.Forms.SendKeys]::SendWait("{{DELETE}}")
+Start-Sleep -Milliseconds 50
+[System.Windows.Forms.SendKeys]::SendWait("^v")
+Start-Sleep -Milliseconds 200
+[System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+
+if ($attached) {{ [WakeHelper]::Detach($hwnd) }}
+
+if ($savedClip -and $savedClip.Length -gt 0) {{
+    Start-Sleep -Milliseconds 100
+    try {{ [System.Windows.Forms.Clipboard]::SetText($savedClip) }} catch {{}}
+}}
+
+try {{ Remove-Item "{dispatch_path}" -Force -ErrorAction SilentlyContinue }} catch {{}}
+Write-Host "OK_SIDEBAR"
+exit 0
+'''
+
+    try:
+        import subprocess
+        log(f"Sidebar-targeting HWND={orch_hwnd}")
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=20,
+            creationflags=0x08000000  # CREATE_NO_WINDOW
+        )
+        ok = r.returncode == 0 and "OK_SIDEBAR" in r.stdout
+        if not ok:
+            out = (r.stdout or "").strip()[:200]
+            err = (r.stderr or "").strip()[:200]
+            log(f"Sidebar delivery result: {out} | {err}", "WARN")
+        else:
+            log("Prompt delivered to orchestrator sidebar chat")
+        return ok
+    except Exception as e:
+        log(f"Prompt delivery failed: {e}", "ERROR")
+        return False
+
+
+def _gather_system_state():
+    """Gather full Skynet system state for rich orchestrator prompts."""
+    state = {
+        "workers": {},
+        "pending_todos": 0,
+        "todo_items": [],
+        "bus_results": [],
+        "bus_alerts": [],
+        "engines": {},
+        "iq": None,
+    }
+
+    # Worker states from /status
+    try:
+        import urllib.request
+        data = json.loads(urllib.request.urlopen(f"{SKYNET_URL}/status", timeout=3).read())
+        agents = data.get("agents", {})
+        for name in ("alpha", "beta", "gamma", "delta"):
+            agent = agents.get(name, {})
+            state["workers"][name] = {
+                "status": agent.get("status", "UNKNOWN"),
+                "tasks_completed": agent.get("tasks_completed", 0),
+                "current_task": agent.get("current_task", ""),
+                "queue_depth": agent.get("queue_depth", 0),
+            }
+    except Exception:
+        pass
+
+    # Pending TODOs
+    try:
+        todos_file = DATA_DIR / "todos.json"
+        if todos_file.exists():
+            td = json.loads(todos_file.read_text(encoding="utf-8"))
+            todo_list = td if isinstance(td, list) else td.get("todos", [])
+            pending = [t for t in todo_list
+                       if isinstance(t, dict) and t.get("status") in ("pending", "active")]
+            state["pending_todos"] = len(pending)
+            # Top 5 by priority
+            priority_rank = {"critical": 0, "high": 1, "medium": 2, "normal": 3, "low": 4}
+            pending.sort(key=lambda t: priority_rank.get(
+                str(t.get("priority", "normal")).lower(), 9))
+            state["todo_items"] = [
+                f"[{t.get('priority','normal')}] {t.get('task','?')[:80]}"
+                for t in pending[:5]
+            ]
+    except Exception:
+        pass
+
+    # Recent bus messages (results and alerts for orchestrator)
+    try:
+        import urllib.request
+        msgs = json.loads(urllib.request.urlopen(
+            f"{SKYNET_URL}/bus/messages?limit=20", timeout=3).read())
+        if isinstance(msgs, list):
+            for m in msgs:
+                if m.get("topic") == "orchestrator":
+                    if m.get("type") == "result":
+                        state["bus_results"].append(
+                            f"{m.get('sender','?')}: {str(m.get('content',''))[:80]}")
+                    elif m.get("type") in ("alert", "urgent"):
+                        state["bus_alerts"].append(
+                            f"{m.get('sender','?')}: {str(m.get('content',''))[:80]}")
+    except Exception:
+        pass
+
+    # Engine status
+    try:
+        import urllib.request
+        engines = json.loads(urllib.request.urlopen(
+            "http://localhost:8421/engines", timeout=3).read())
+        if isinstance(engines, dict):
+            for name, info in engines.get("engines", {}).items():
+                if isinstance(info, dict):
+                    state["engines"][name] = info.get("status", "unknown")
+    except Exception:
+        pass
+
+    # IQ
+    try:
+        iq_file = DATA_DIR / "iq_history.json"
+        if iq_file.exists():
+            iq_data = json.loads(iq_file.read_text(encoding="utf-8"))
+            h = iq_data.get("history", [])
+            if h:
+                latest = h[-1]
+                state["iq"] = round(latest.get("composite", 0), 4)
+    except Exception:
+        pass
+
+    return state
+
+
+def _compose_wake_prompt(cycle_label, worker_states_line, system_state):
+    """Compose a rich actionable prompt from gathered system state."""
+    parts = [f"[SKYNET WAKE-UP {cycle_label}]"]
+
+    # Worker overview
+    parts.append(f"Workers: {worker_states_line}")
+
+    # IQ
+    if system_state.get("iq"):
+        parts.append(f"System IQ: {system_state['iq']}")
+
+    # Engines
+    if system_state.get("engines"):
+        online = sum(1 for s in system_state["engines"].values() if s == "online")
+        total = len(system_state["engines"])
+        parts.append(f"Engines: {online}/{total} online")
+
+    # Pending TODOs
+    n_todos = system_state.get("pending_todos", 0)
+    if n_todos > 0:
+        parts.append(f"PENDING TODOs: {n_todos}")
+        for item in system_state.get("todo_items", []):
+            parts.append(f"  - {item}")
+    else:
+        parts.append("No pending TODOs")
+
+    # Bus alerts
+    alerts = system_state.get("bus_alerts", [])
+    if alerts:
+        parts.append(f"ALERTS ({len(alerts)}):")
+        for a in alerts[:3]:
+            parts.append(f"  ! {a}")
+
+    # Bus results
+    results = system_state.get("bus_results", [])
+    if results:
+        parts.append(f"RESULTS ({len(results)}):")
+        for r in results[:3]:
+            parts.append(f"  > {r}")
+
+    # Action directive
+    if n_todos > 0:
+        parts.append("ACTION: All workers are IDLE with pending work. Decompose and dispatch TODOs to workers NOW.")
+    elif alerts:
+        parts.append("ACTION: Address pending alerts. Check worker health and system integrity.")
+    else:
+        parts.append("ACTION: System healthy. All workers IDLE. Generate improvement tasks or dispatch pending work from the bus.")
+
+    return " | ".join(parts)
 
 
 def load_workers():
@@ -341,26 +630,77 @@ class StuckDetector:
         HISTORY_FILE.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
     def monitor(self, interval=15, max_cycles=None):
-        """Continuous monitoring loop."""
+        """Continuous monitoring loop.
+        
+        Qualification: all 4 workers IDLE.
+        On each interval where all workers are IDLE, increment counter.
+        On the Nth interval (max_cycles, default 3), force-type a rich
+        wake-up prompt into the orchestrator window regardless of its state.
+        Then stop.
+        """
         ctrl_c = _load_ctrl_c_enabled()
         log(f"Stuck detector started (interval={interval}s, "
-            f"info_threshold={PROCESSING_INFO_S}s, "
-            f"long_threshold={PROCESSING_LONG_S}s, "
-            f"ctrl_c_enabled={ctrl_c})")
+            f"wake_after={max_cycles or 'unlimited'} idle intervals)")
         log(f"Tracking {len(self.trackers)} workers: {list(self.trackers.keys())}")
-        log(f"POLICY: NEVER interrupt PROCESSING workers. IDLE workers are ignored.")
 
         cycle = 0
+        idle_count = 0
+        bus_post("stuck-detector", "orchestrator", "monitor_alert",
+                 f"WORKER_MONITOR_ONLINE: tracking {list(self.trackers.keys())}, "
+                 f"interval={interval}s, wake_after={max_cycles or 'unlimited'} idle intervals")
         try:
-            while max_cycles is None or cycle < max_cycles:
+            while True:
+                cycle += 1
                 issues = self.check_all()
+
+                # Build per-worker status summary
+                states = []
+                all_idle = True
+                for name, tracker in self.trackers.items():
+                    st = tracker.last_state or "UNKNOWN"
+                    states.append(f"{name.upper()}={st}")
+                    if st != "IDLE":
+                        all_idle = False
+                status_line = ", ".join(states)
+
+                if all_idle:
+                    idle_count += 1
+                    log(f"Cycle {cycle}: ALL WORKERS IDLE (consecutive idle: {idle_count})")
+                else:
+                    idle_count = 0
+                    log(f"Cycle {cycle}: Workers busy ({status_line}) -- idle counter reset")
+
                 if issues:
                     for issue in issues:
                         log(f"  {issue['worker'].upper()}: {issue['condition']} "
                             f"(severity={issue['severity']})", "WARN")
+
+                # Check if we've hit the wake-up threshold
+                if max_cycles is not None and idle_count >= max_cycles:
+                    log(f"Workers IDLE for {idle_count} consecutive intervals -- WAKING ORCHESTRATOR")
+
+                    system_state = _gather_system_state()
+                    prompt = _compose_wake_prompt(
+                        f"IDLE x{idle_count}", status_line, system_state)
+
+                    log(f"Force-typing wake-up prompt ({len(prompt)} chars)")
+                    delivered = prompt_orchestrator(prompt)
+                    if delivered:
+                        log(f"Wake-up prompt DELIVERED to orchestrator")
+                        bus_post("stuck-detector", "orchestrator", "heartbeat",
+                                 f"WAKE_UP_DELIVERED after {idle_count} idle intervals: {status_line}")
+                    else:
+                        log(f"Wake-up delivery FAILED", "ERROR")
+                        bus_post("stuck-detector", "orchestrator", "alert",
+                                 f"WAKE_UP_FAILED after {idle_count} idle intervals")
+
+                    log(f"Mission complete -- stopping")
+                    bus_post("stuck-detector", "orchestrator", "monitor_alert",
+                             f"WORKER_MONITOR_STOPPED: woke orchestrator after {idle_count} idle intervals")
+                    break
+
                 self.save_history()
                 time.sleep(interval)
-                cycle += 1
         except KeyboardInterrupt:
             log("Stuck detector stopped")
         self.save_history()
@@ -437,14 +777,15 @@ def main():
     parser.add_argument("--monitor", action="store_true", help="Continuous monitoring")
     parser.add_argument("--history", action="store_true", help="Show state history")
     parser.add_argument("--health", action="store_true", help="Output health JSON")
-    parser.add_argument("--interval", type=int, default=15, help="Monitor interval (seconds)")
+    parser.add_argument("--interval", type=int, default=60, help="Monitor interval (seconds)")
+    parser.add_argument("--max-cycles", type=int, default=None, help="Stop after N cycles (default: unlimited)")
     args = parser.parse_args()
 
     if args.check:
         one_shot_check()
     elif args.monitor:
         detector = StuckDetector()
-        detector.monitor(interval=args.interval)
+        detector.monitor(interval=args.interval, max_cycles=args.max_cycles)
     elif args.history:
         show_history()
     elif args.health:

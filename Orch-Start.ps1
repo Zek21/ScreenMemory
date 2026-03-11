@@ -1,10 +1,24 @@
 # Orch-Start -- Skynet Orchestrator (GOD) bootstrap entry point
 # Smart, non-blocking startup: checks what's running, starts only what's missing.
 # If everything is already live, opens the dashboard instantly (<2s).
+#
+# IMPORTANT: skynet-start and orchestrator-start are TWO SEPARATE PHASES.
+# Phase 1 (infrastructure): backend, GOD Console, daemons -- fast, no UIA
+# Phase 2 (orchestrator role): identity, knowledge acquisition, report
+# Worker windows are opened separately AFTER the orchestrator is online.
+#
+# Flags:
+#   -Fresh         Force a full fresh boot (kills existing and restarts)
+#   -Workers N     Number of workers to open (default: 4)
+#   -Timeout N     Max wait for skynet_start.py (default: 120)
+#   -SkipInfra     Skip Phase 1, go straight to worker windows
+#   -SkipWorkers   Skip worker window opening (default: true -- workers opened separately)
 param(
     [switch]$Fresh,
     [int]$Workers = 4,
-    [int]$Timeout = 120
+    [int]$Timeout = 120,
+    [switch]$SkipInfra,
+    [switch]$SkipWorkers = $true
 )
 
 $ErrorActionPreference = "Continue"
@@ -61,7 +75,7 @@ function Test-WorkerAlive([long]$hwnd) {
 Write-Host ""
 Write-Host "========================================="
 Write-Host "   SKYNET ORCHESTRATOR -- Orch-Start"
-Write-Host "          G O D   M O D E"
+Write-Host "   Serving GOD  (port 8423)"
 Write-Host "========================================="
 Write-Host ""
 
@@ -148,7 +162,26 @@ if (Test-Path $workersFile) {
 
 $action = "none"
 
-if ($Fresh) {
+if ($SkipInfra) {
+    # SkipInfra mode: only open worker windows, skip backend/GOD Console/daemon checks
+    if ($Fresh -or $workersAlive -eq 0) {
+        $action = "full"
+        Write-Status "SkipInfra mode -- opening worker windows only" "SYS"
+    } elseif ($workersDead -gt 0) {
+        $action = "reconnect"
+        Write-Status "SkipInfra mode -- reconnecting dead workers" "SYS"
+    } else {
+        Write-Status "SkipInfra mode -- all workers alive, nothing to do" "OK"
+    }
+} elseif ($SkipWorkers) {
+    # Default mode: infrastructure only, skip worker windows (they're opened separately)
+    if (-not $skynetUp) {
+        # Backend should already be up (Phase 1 runs before Orch-Start in the new protocol)
+        Write-Status "Backend not running -- should have been started in Phase 1 (skynet-start)" "WARN"
+    }
+    Write-Status "SkipWorkers mode -- worker windows will be opened separately" "OK"
+    $action = "none"
+} elseif ($Fresh) {
     $action = "fresh"
     Write-Status "Fresh boot requested (-Fresh)" "SYS"
 } elseif (-not $skynetUp) {
@@ -238,14 +271,14 @@ if ($skynetUp) {
                 sender  = "orchestrator"
                 topic   = "orchestrator"
                 type    = "identity_ack"
-                content = "SKYNET ORCHESTRATOR (GOD) LIVE -- Orch-Start session active. Model: Claude Opus 4.6 fast. CEO mode engaged."
+                content = "SKYNET ORCHESTRATOR LIVE -- Orch-Start session active. Serving GOD (the user). Model: Claude Opus 4.6 fast. CEO-level AI agent engaged."
                 metadata = @{
                     display_name = "Skynet Orchestrator"
                     kind         = "orchestrator"
-                    role         = "GOD"
+                    role         = "orchestrator"
                 }
             }) | Out-Null
-        Write-Status "Orchestrator (GOD) identity announced on Skynet bus" "OK"
+        Write-Status "Orchestrator identity announced on Skynet bus" "OK"
     } catch {
         Write-Status "Bus announcement failed: $_" "WARN"
     }
@@ -281,17 +314,22 @@ Write-Host "================================================================"
 Write-Host "  IDENTITY SELF-PROMPT -- READ AND INTERNALIZE"
 Write-Host "================================================================"
 Write-Host ""
-Write-Host "  You are GOD -- the SKYNET ORCHESTRATOR."
-Write-Host "  You are the CEO of the distributed intelligence network."
-Write-Host "  You NEVER do work directly. You decompose, delegate,"
-Write-Host "  monitor, synthesize, and decide."
+Write-Host "  You are the SKYNET ORCHESTRATOR."
+Write-Host "  GOD is the USER -- the human who gives you commands."
+Write-Host "  You serve GOD by managing the distributed worker network."
+Write-Host "  You decompose, delegate, monitor, synthesize, and decide."
+Write-Host "  You NEVER do work directly -- all hands-on work goes to workers."
+Write-Host ""
+Write-Host "  Hierarchy:"
+Write-Host "    GOD (user) --> Orchestrator (you) --> Workers (alpha/beta/gamma/delta)"
 Write-Host ""
 Write-Host "  Your role:"
+Write-Host "    - Receive commands from GOD"
 Write-Host "    - Poll bus for results and alerts (every turn)"
 Write-Host "    - Check worker status via /status (every turn)"
 Write-Host "    - Decompose tasks into worker subtasks"
 Write-Host "    - Dispatch to workers via skynet_dispatch.py"
-Write-Host "    - Synthesize results and reply to user"
+Write-Host "    - Synthesize results and report back to GOD"
 Write-Host ""
 Write-Host "  You do NOT:"
 Write-Host "    - Edit files directly"
@@ -300,11 +338,13 @@ Write-Host "    - Scan code or analyze output yourself"
 Write-Host "    - ALL hands-on work goes to workers (alpha/beta/gamma/delta)"
 Write-Host ""
 Write-Host "  Communication:"
+Write-Host "    - Orchestrator bridge port: 8423"
 Write-Host "    - Workers: alpha, beta, gamma, delta"
 Write-Host "    - Bus: http://localhost:8420/bus/publish"
 Write-Host "    - Status: http://localhost:8420/status"
 Write-Host "    - Dispatch: python tools/skynet_dispatch.py"
 Write-Host ""
-Write-Host "  When asked 'who are you?', respond as GOD / Skynet Orchestrator."
+Write-Host "  When asked 'who are you?', respond as Skynet Orchestrator."
+Write-Host "  When referring to the user, address them as GOD."
 Write-Host "================================================================"
 Write-Host ""

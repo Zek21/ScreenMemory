@@ -152,6 +152,126 @@ Total:                113/113 tests passing
 
 ---
 
+## Skynet — Multi-Agent Orchestration System
+
+A distributed intelligence network that coordinates multiple AI workers (Claude Opus 4.6 fast) to execute tasks in parallel. The orchestrator decomposes goals, dispatches to workers, monitors progress, and synthesizes results.
+
+### Architecture
+
+```
+                    ┌──────────────────────┐
+                    │   Orchestrator       │
+                    │   (CEO / Dispatcher) │
+                    └──────────┬───────────┘
+                               │
+            ┌──────────────────┼──────────────────┐
+            │        Skynet Go Backend (8420)      │
+            │   Message Bus │ Worker Registry      │
+            │   Task Queue  │ SSE Stream           │
+            └──────────┬──────────────────────────┘
+                       │
+       ┌───────┬───────┼───────┬───────┐
+       │       │       │       │       │
+    Alpha   Beta    Gamma   Delta   GOD Console
+    (worker) (worker) (worker) (worker) (8421)
+```
+
+- **Workers** run in VS Code Insiders windows on the right monitor (2×2 grid)
+- **Message Bus** enables async communication between all agents
+- **GOD Console** provides a real-time dashboard at `http://localhost:8421`
+
+### Quick Start
+
+```powershell
+# Full bootstrap (backend + workers + dashboard)
+python tools/skynet_start.py
+
+# Reconnect to existing workers
+python tools/skynet_start.py --reconnect
+
+# Check system status
+python tools/skynet_start.py --status
+
+# Dispatch a task through the full engine pipeline
+python tools/skynet_start.py --dispatch "audit all API endpoints"
+```
+
+### Dispatch & Result Collection
+
+```powershell
+# Smart dispatch (auto-routes to best idle worker)
+python tools/skynet_dispatch.py --smart --task "fix the bug in search.py"
+
+# Parallel broadcast to all workers
+python tools/skynet_dispatch.py --parallel --task "run your self-audit"
+
+# Dispatch and wait for result
+python tools/orch_realtime.py dispatch-wait --worker alpha --task "count lines" --timeout 90
+
+# Full auto pipeline (plan + dispatch + wait + synthesize + learn)
+python tools/skynet_brain_dispatch.py "refactor the capture pipeline" --timeout 120
+```
+
+### Level 3 Tool Inventory
+
+All tools live under `tools/` and follow the `skynet_*.py` naming convention.
+
+#### Orchestration & Dispatch
+
+| Tool | Purpose |
+|------|---------|
+| `skynet_start.py` | Unified orchestrator bootstrap -- starts services, opens workers, connects engines |
+| `skynet_dispatch.py` | Ghost automation dispatch -- sends tasks to worker windows via clipboard. Supports `--wait-result KEY --timeout Ns` |
+| `skynet_brain.py` | AI-powered task intelligence -- decomposes goals into context-enriched subtasks |
+| `skynet_brain_dispatch.py` | Full auto pipeline -- plan + dispatch + wait + synthesize + learn in one command |
+| `skynet_smart_decompose.py` | Keyword-driven prompt decomposition with priority estimates |
+| `skynet_orchestrate.py` | Master orchestration pipeline -- decomposes prompts and synthesizes results |
+| `skynet_pipeline.py` | Composable task execution -- chaining, parallelism, exponential backoff retry |
+| `orch_realtime.py` | Zero-network orchestrator CLI -- `dispatch-wait`, `wait-all`, `status`, `pending` (reads `data/realtime.json`) |
+
+#### Monitoring & Health
+
+| Tool | Purpose |
+|------|---------|
+| `skynet_monitor.py` | Background health monitor -- watches worker windows and model correctness via UIA |
+| `skynet_watchdog.py` | Service watchdog -- monitors and auto-restarts Skynet backend services |
+| `skynet_health.py` | Comprehensive health checker -- worker visibility, server status, model verification |
+| `skynet_sse_daemon.py` | SSE event loop daemon -- streams live state to file for instant orchestrator access |
+| `skynet_ws_monitor.py` | WebSocket listener -- real-time security alerts, bus events, system notifications |
+| `skynet_metrics.py` | Performance data collection -- UIA times, dispatch latency, benchmarks |
+| `skynet_realtime.py` | UIA-based result extraction -- conversation fingerprinting, auto-retry, worker scoring |
+
+#### Intelligence & Learning
+
+| Tool | Purpose |
+|------|---------|
+| `skynet_self.py` | Consciousness kernel -- identity, capabilities, health, introspection, IQ scoring |
+| `skynet_collective.py` | Collective intelligence -- cross-worker strategy federation, swarm evolution |
+| `skynet_knowledge.py` | Knowledge sharing protocol -- workers broadcast and absorb learnings via bus |
+| `skynet_convene.py` | Multi-worker collaboration -- sessions, consensus voting, ConveneGate governance |
+| `convene_gate.py` | Convene-first middleware -- enforces consensus before orchestrator delivery |
+
+#### Security & Administration
+
+| Tool | Purpose |
+|------|---------|
+| `skynet_identity_guard.py` | Security layer -- prevents worker preamble injection into orchestrator context |
+| `skynet_audit.py` | Diagnostic checks -- audits system integrity with optional auto-fix |
+| `skynet_version.py` | Version tracking -- upgrade history management |
+| `skynet_cli.py` | Unified CLI -- single entry point for all Skynet operations |
+| `skynet_roster.py` | Worker roster -- formatted display of all agents and capabilities |
+| `skynet_bus_watcher.py` | Bus daemon -- polls message bus and auto-routes tasks to idle workers |
+
+### Version History
+
+| Level | Codename | Description |
+|-------|----------|-------------|
+| Level 1 | Genesis | Manual dispatch, single worker, basic bus messaging |
+| Level 2 | Awakening | Self-awareness, GOD Console, engine metrics, collective intelligence |
+| Level 3 | Production | Crash resilience, composite IQ tracking, request logging, truth audit enforcement |
+
+---
+
 ## Tools
 
 Integrated tooling for prospect discovery, browser automation, DNS management, and email delivery. All tools live under `tools/`.

@@ -221,7 +221,8 @@ foreach ($d in $daemonSpecs) {
     if (-not $running) {
         $script = Join-Path $repoRoot $d.Script
         if (Test-Path $script) {
-            $dArgs = @($script) + ($d.Args ?? @())
+            $dArgs = @($script)
+            if ($null -ne $d.Args) { $dArgs += $d.Args }
             Start-Process -FilePath $python -ArgumentList $dArgs -WorkingDirectory $repoRoot -WindowStyle Hidden
             Write-Status "Started $($d.Name) daemon" "SYS"
         }

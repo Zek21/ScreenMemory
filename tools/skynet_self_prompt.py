@@ -213,7 +213,9 @@ def _get_pending_todo_items(worker=None, limit=None):
     data = _load_json(TODOS_FILE)
     if not data:
         return []
-    items = [t for t in data.get("todos", []) if t.get("status") in ("pending", "active")]
+    # Handle both list format and dict-with-todos-key format
+    todo_list = data if isinstance(data, list) else data.get("todos", [])
+    items = [t for t in todo_list if isinstance(t, dict) and t.get("status") in ("pending", "active")]
     if worker:
         items = [t for t in items if t.get("worker") == worker]
     priority_rank = {"critical": 0, "high": 1, "normal": 2, "low": 3}
@@ -1336,21 +1338,36 @@ class SelfPromptDaemon:
             pass
         return False
 
+    def _write_health_file(self):
+        """Write daemon health to persistent file EVERY cycle.
+
+        This persists independently of the bus ring buffer so the orchestrator
+        can always check daemon health via data/self_prompt_health.json.
+        """
+        now = time.time()
+        orch_hwnd = _get_orch_hwnd()
+        health = {
+            "daemon": "self_prompt",
+            "cycles": self.cycles,
+            "sent": self.prompts_sent,
+            "failed": self.prompts_failed,
+            "last_sent_timestamp": getattr(self, 'last_prompt_time', 0.0),
+            "orchestrator_hwnd": orch_hwnd,
+            "pid": os.getpid(),
+            "uptime_s": int(now - getattr(self, '_start_time', now)),
+            "timestamp": datetime.now().isoformat(),
+        }
+        try:
+            _save_json(HEALTH_FILE, health)
+        except Exception:
+            pass  # never crash the daemon for a health write
+
     def _report_health(self):
-        """Post health status to bus periodically."""
+        """Post health status to bus periodically (separate from per-cycle file write)."""
         now = time.time()
         if now - self.last_health_report < HEALTH_REPORT_INTERVAL:
             return
         self.last_health_report = now
-        health = {
-            "daemon": "self_prompt",
-            "cycles": self.cycles,
-            "prompts_sent": self.prompts_sent,
-            "prompts_failed": self.prompts_failed,
-            "uptime_s": int(now - getattr(self, '_start_time', now)),
-            "timestamp": datetime.now().isoformat(),
-        }
-        _save_json(HEALTH_FILE, health)
         _post_bus("orchestrator", "daemon_health",
                   f"SELF_PROMPT_HEALTH: cycles={self.cycles} sent={self.prompts_sent} failed={self.prompts_failed}")
         log(f"Health report posted (cycles={self.cycles}, sent={self.prompts_sent})")
@@ -1663,6 +1680,9 @@ class SelfPromptDaemon:
                 try:
                     # Hot-reload config every cycle (file read is cheap, ~0.1ms)
                     _load_config_overrides()
+
+                    # Persist health to file EVERY cycle (survives bus ring buffer rotation)
+                    self._write_health_file()
 
                     # Always deliver queued directives, even mid-wave.
                     queued_delivered = self._deliver_queued_directives()

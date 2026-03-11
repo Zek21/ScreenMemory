@@ -43,6 +43,75 @@ EDIT_PATTERNS = ["Edited", "Created", "Deleted"]
 RESULT_PATTERNS = ["Posted to bus", "COMPLETE", "DONE", "PASS", "FAIL"]
 
 
+# ---------------------------------------------------------------------------
+# Robust PID singleton (Windows-compatible)
+# ---------------------------------------------------------------------------
+
+def _pid_alive(pid: int) -> bool:
+    """Check if a PID is alive using Win32 API (cross-platform fallback)."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            PROCESS_QUERY_LIMITED = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            return False
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _is_activity_feed_process(pid: int) -> bool:
+    """Verify the PID is actually an activity_feed process, not a recycled PID."""
+    if not _pid_alive(pid):
+        return False
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["wmic", "process", "where", f"ProcessId={pid}", "get", "CommandLine"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return "skynet_activity_feed" in result.stdout
+    except Exception:
+        return _pid_alive(pid)  # fallback: trust alive check
+
+
+def _acquire_singleton() -> bool:
+    """Acquire PID file lock. Returns True if we are the sole instance."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+            if _is_activity_feed_process(old_pid):
+                log(f"Activity feed already running (PID {old_pid}) -- exiting")
+                return False
+            else:
+                log(f"Stale PID file (PID {old_pid} is dead or recycled) -- taking over")
+        except (ValueError, OSError):
+            log("Corrupt PID file -- overwriting")
+    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    atexit.register(_release_singleton)
+    return True
+
+
+def _release_singleton():
+    """Clean up PID file on exit (only if it's ours)."""
+    try:
+        if PID_FILE.exists():
+            stored = int(PID_FILE.read_text(encoding="utf-8").strip())
+            if stored == os.getpid():
+                PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def log(msg, level="INFO"):
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     line = f"[{ts}] [{level}] {msg}"
@@ -212,23 +281,8 @@ def _get_worker_state(hwnd):
 
 def run_daemon():
     """Main daemon loop: scan workers, diff, post deltas."""
-    if PID_FILE.exists():
-        try:
-            old_pid = int(PID_FILE.read_text().strip())
-            os.kill(old_pid, 0)
-            log(f"Activity feed already running (PID {old_pid}) -- exiting")
-            return
-        except (OSError, ValueError):
-            pass  # stale PID
-
-    PID_FILE.write_text(str(os.getpid()))
-
-    def _cleanup_pid():
-        try:
-            PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
-    atexit.register(_cleanup_pid)
+    if not _acquire_singleton():
+        return
 
     workers = _load_workers()
     if not workers:
@@ -349,11 +403,13 @@ def show_status():
     # PID check
     if PID_FILE.exists():
         try:
-            pid = int(PID_FILE.read_text().strip())
-            os.kill(pid, 0)
-            print(f"\n  Daemon: RUNNING (PID {pid})")
-        except (OSError, ValueError):
-            print("\n  Daemon: STOPPED (stale PID file)")
+            pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+            if _is_activity_feed_process(pid):
+                print(f"\n  Daemon: RUNNING (PID {pid})")
+            else:
+                print("\n  Daemon: STOPPED (stale PID file)")
+        except (ValueError, OSError):
+            print("\n  Daemon: STOPPED (corrupt PID file)")
     else:
         print("\n  Daemon: NOT RUNNING")
 

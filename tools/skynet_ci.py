@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """skynet_ci.py -- Continuous integration runner for ScreenMemory/Skynet.
 
-Discovers and runs test suites, collects results, generates reports,
-and stores run history in data/ci/.
+Discovers and runs test suites, security audits, and codebase health scans.
+Collects results, generates unified JSON reports, and stores run history
+in data/ci/.  Works standalone without Skynet backend.
 
 Usage:
     python tools/skynet_ci.py run                  # run all tests
     python tools/skynet_ci.py run --pattern test_missions  # run matching tests
+    python tools/skynet_ci.py run --full            # tests + security audit + health scan
     python tools/skynet_ci.py report               # show latest report
     python tools/skynet_ci.py report --run-id RUN_ID
     python tools/skynet_ci.py status               # quick pass/fail summary
@@ -25,6 +27,8 @@ from typing import Optional
 
 ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = ROOT / "tests"
+CORE_DIR = ROOT / "core"
+TOOLS_DIR = ROOT / "tools"
 CI_DIR = ROOT / "data" / "ci"
 MAX_RUNS = 50
 CI_DEPTH_ENV = "SKYNET_CI_DEPTH"
@@ -142,29 +146,134 @@ def _parse_summary(output: str) -> tuple[int, int, int, int]:
     return passed, failed, errors, skipped
 
 
+def run_security_audit() -> dict:
+    """Run security audit if skynet_security_audit.py exists. Standalone-safe."""
+    audit_path = TOOLS_DIR / "skynet_security_audit.py"
+    if not audit_path.exists():
+        return {"status": "SKIP", "reason": "skynet_security_audit.py not found",
+                "passed": 0, "failed": 0, "warnings": 0, "critical": 0}
+    try:
+        if str(TOOLS_DIR) not in sys.path:
+            sys.path.insert(0, str(TOOLS_DIR))
+        from skynet_security_audit import audit_dispatch_pipeline, audit_config_files
+        combined_passed = combined_failed = combined_warnings = combined_critical = 0
+        details = []
+        components = {}
+        for name, fn in [("dispatch", audit_dispatch_pipeline), ("config", audit_config_files)]:
+            try:
+                result = fn()
+                d = result.to_dict()
+                components[name] = d
+                combined_passed += d["passed"]
+                combined_failed += d["failed"]
+                combined_warnings += d["warnings"]
+                combined_critical += d.get("critical", 0)
+                details.extend(d["details"])
+            except Exception as e:
+                components[name] = {"error": str(e)}
+                combined_failed += 1
+                details.append({"status": "FAIL", "check": f"{name}_error", "detail": str(e)})
+        status = "PASS" if combined_failed == 0 and combined_critical == 0 else "FAIL"
+        return {
+            "status": status, "passed": combined_passed, "failed": combined_failed,
+            "warnings": combined_warnings, "critical": combined_critical,
+            "components": components, "details": details,
+        }
+    except Exception as e:
+        return {"status": "FAIL", "error": str(e),
+                "passed": 0, "failed": 1, "warnings": 0, "critical": 0}
+
+
+def run_health_scan() -> dict:
+    """Syntax-check all core/ and tools/ modules via py_compile. Standalone-safe."""
+    import py_compile
+    results = {"core": {}, "tools": {}}
+    total_ok = total_fail = 0
+
+    for label, scan_dir in [("core", CORE_DIR), ("tools", TOOLS_DIR)]:
+        if not scan_dir.is_dir():
+            continue
+        for py_file in sorted(scan_dir.rglob("*.py")):
+            if py_file.name.startswith("_") and py_file.name != "__init__.py":
+                continue
+            if "__pycache__" in str(py_file):
+                continue
+            rel = str(py_file.relative_to(ROOT))
+            try:
+                py_compile.compile(str(py_file), doraise=True)
+                results[label][rel] = "ok"
+                total_ok += 1
+            except py_compile.PyCompileError as e:
+                results[label][rel] = f"FAIL: {str(e)[:120]}"
+                total_fail += 1
+            except Exception as e:
+                results[label][rel] = f"FAIL: {type(e).__name__}: {str(e)[:120]}"
+                total_fail += 1
+
+    return {
+        "status": "PASS" if total_fail == 0 else "FAIL",
+        "modules_ok": total_ok,
+        "modules_failed": total_fail,
+        "details": results,
+    }
+
+
 def run_ci(
     pattern: Optional[str] = None,
     timeout: int = 300,
     save: bool = True,
+    full: bool = False,
 ) -> dict:
-    """Full CI run: discover tests, execute, generate report, save."""
+    """Full CI run: discover tests, execute, generate report, save.
+
+    When full=True, also runs security audit and codebase health scan.
+    """
     run_id = datetime.now(timezone.utc).strftime("ci-%Y%m%d-%H%M%S")
     test_files = discover_test_files(pattern)
 
     results = run_pytest(test_files, timeout=timeout)
 
+    overall_status = "PASS" if results["exit_code"] == 0 else "FAIL"
+    categories = {"tests": {"status": "PASS" if results["exit_code"] == 0 else "FAIL",
+                            "passed": results["passed"], "failed": results["failed"],
+                            "errors": results["errors"]}}
+
+    security_result = None
+    health_result = None
+
+    if full:
+        security_result = run_security_audit()
+        categories["security"] = {"status": security_result["status"],
+                                   "passed": security_result.get("passed", 0),
+                                   "failed": security_result.get("failed", 0)}
+        if security_result["status"] == "FAIL":
+            overall_status = "FAIL"
+
+        health_result = run_health_scan()
+        categories["health"] = {"status": health_result["status"],
+                                 "modules_ok": health_result["modules_ok"],
+                                 "modules_failed": health_result["modules_failed"]}
+        if health_result["status"] == "FAIL":
+            overall_status = "FAIL"
+
     report = {
         "run_id": run_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "pattern": pattern,
+        "full": full,
         "test_count": len(test_files),
         "results": results,
-        "status": "PASS" if results["exit_code"] == 0 else "FAIL",
+        "categories": categories,
+        "status": overall_status,
         "summary": (
             f"{results['passed']} passed, {results['failed']} failed, "
             f"{results['errors']} errors in {results['duration_s']}s"
         ),
     }
+    if security_result:
+        report["security"] = security_result
+    if health_result:
+        report["health"] = health_result
 
     if save:
         _save_run(run_id, report)
@@ -247,14 +356,37 @@ def generate_report(run: Optional[dict] = None) -> str:
         f"  Status:    {run.get('status', '?')}",
         f"  Timestamp: {run.get('timestamp', '?')}",
         f"  Pattern:   {run.get('pattern') or 'all'}",
+        f"  Full:      {run.get('full', False)}",
         f"  Files:     {run.get('test_count', 0)}",
         f"  Passed:    {r.get('passed', 0)}",
         f"  Failed:    {r.get('failed', 0)}",
         f"  Errors:    {r.get('errors', 0)}",
         f"  Skipped:   {r.get('skipped', 0)}",
         f"  Duration:  {r.get('duration_s', 0)}s",
-        f"{'='*60}",
     ]
+
+    cats = run.get("categories", {})
+    if cats:
+        lines.append(f"  {'─'*40}")
+        lines.append("  Categories:")
+        for cat, info in cats.items():
+            lines.append(f"    {cat}: {info.get('status', '?')}")
+
+    lines.append(f"{'='*60}")
+
+    # Security details
+    sec = run.get("security")
+    if sec:
+        lines.append(f"\n  Security Audit: {sec.get('status', '?')}  "
+                      f"(pass={sec.get('passed',0)} fail={sec.get('failed',0)} "
+                      f"warn={sec.get('warnings',0)} crit={sec.get('critical',0)})")
+
+    # Health details
+    hlth = run.get("health")
+    if hlth:
+        lines.append(f"  Health Scan:    {hlth.get('status', '?')}  "
+                      f"(ok={hlth.get('modules_ok',0)} fail={hlth.get('modules_failed',0)})")
+
     if r.get("files"):
         lines.append("  Test files:")
         for f in r["files"]:
@@ -291,6 +423,8 @@ def main() -> int:
     p_run = sub.add_parser("run", help="Run CI tests")
     p_run.add_argument("--pattern", help="Filter test files by pattern")
     p_run.add_argument("--timeout", type=int, default=300)
+    p_run.add_argument("--full", action="store_true",
+                       help="Run tests + security audit + health scan")
 
     p_report = sub.add_parser("report", help="Show CI report")
     p_report.add_argument("--run-id", help="Specific run ID")
@@ -303,8 +437,10 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "run":
-        report = run_ci(pattern=args.pattern, timeout=args.timeout)
+        report = run_ci(pattern=args.pattern, timeout=args.timeout, full=args.full)
         print(generate_report(report))
+        if args.full:
+            print(json.dumps(report.get("categories", {}), indent=2))
         return 0 if report["status"] == "PASS" else 1
 
     if args.command == "report":
