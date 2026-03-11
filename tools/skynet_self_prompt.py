@@ -1257,15 +1257,67 @@ class SelfPromptDaemon:
                 if svc_status not in ("ok", "unknown"):
                     daemon_issues.append(f"{svc}={svc_status}")
 
+        # Check monitor health: content timestamp > file mtime > PID liveness.
+        # Threshold 300s accounts for adaptive slowdown (monitor runs at 60s
+        # when all workers idle). PID check prevents false stale when monitor
+        # process is alive but health file hasn't been updated yet.
         monitor_health_file = DATA_DIR / "monitor_health.json"
-        if monitor_health_file.exists():
+        monitor_pid_file = DATA_DIR / "monitor.pid"
+        MONITOR_STALE_THRESHOLD = 300  # 5 min -- monitor writes every 30-60s
+
+        def _monitor_pid_alive():
+            """Check if monitor.pid process is actually running."""
             try:
-                if time.time() - monitor_health_file.stat().st_mtime > 120:
-                    daemon_issues.append("monitor=stale")
+                if monitor_pid_file.exists():
+                    pid = int(monitor_pid_file.read_text().strip())
+                    import psutil
+                    proc = psutil.Process(pid)
+                    return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
             except Exception:
                 pass
-        elif (DATA_DIR / "monitor.pid").exists():
-            daemon_issues.append("monitor=no_health")
+            return False
+
+        if monitor_health_file.exists():
+            try:
+                mdata = _load_json(monitor_health_file)
+                content_age = None
+                if mdata and isinstance(mdata, dict):
+                    # Try content "updated" field first (more reliable than mtime)
+                    updated_str = mdata.get("updated", "")
+                    if updated_str:
+                        try:
+                            from datetime import datetime as _dt
+                            updated_dt = _dt.fromisoformat(
+                                updated_str.replace("Z", "+00:00"))
+                            content_age = time.time() - updated_dt.timestamp()
+                        except Exception:
+                            pass
+                    # Fall back to "latest.epoch" field
+                    if content_age is None:
+                        epoch = (mdata.get("latest") or {}).get("epoch")
+                        if epoch:
+                            content_age = time.time() - float(epoch)
+
+                age = content_age
+                if age is None:
+                    age = time.time() - monitor_health_file.stat().st_mtime
+
+                if age > MONITOR_STALE_THRESHOLD:
+                    # File is stale -- but is the process still alive?
+                    if _monitor_pid_alive():
+                        # Process alive but file stale: likely just started or
+                        # slow cycle. Don't raise full alarm.
+                        daemon_issues.append("monitor=pid_alive_file_stale")
+                    else:
+                        daemon_issues.append("monitor=stale")
+            except Exception:
+                pass
+        elif monitor_pid_file.exists():
+            if _monitor_pid_alive():
+                pass  # PID alive, health file not yet created -- normal at startup
+            else:
+                daemon_issues.append("monitor=no_health")
+        # signed: delta
 
         for a in alerts:
             content = str(a.get("content", "")).lower()

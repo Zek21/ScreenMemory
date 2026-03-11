@@ -128,12 +128,10 @@ in a sandboxed subprocess. Failed scripts trigger Reflexion for iterative debugg
 ## Test Results
 
 ```
-Core Pipeline:           6/6  tests passing (capture, change, VLM, DB, search)
-Cognitive Layer:        41/41 tests passing (logger, SoM, memory, planner, navigator)
-Advanced Architecture:  66/66 tests passing (GoT, MCTS, Reflexion, DynaAct, CodeGen)
-                       ─────
-Total:                113/113 tests passing
+Test files:              30 test files in tests/
+Status:                  Run `pytest tests/` for current results
 ```
+<!-- signed: gamma -->
 
 ## Hardware
 

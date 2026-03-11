@@ -100,8 +100,11 @@ class OCREngine:
                 self._tesseract_available = True
                 self._engine_name = "tesseract"
                 logger.info("Using Tesseract OCR fallback")
-            except Exception:
-                logger.warning("No OCR engine available (install rapidocr-onnxruntime)")
+            except Exception as e:
+                logger.warning("Tesseract not available: %s", e)  # signed: gamma
+
+        if not self.is_available:
+            logger.warning("No OCR engine available (install rapidocr-onnxruntime)")  # signed: gamma
 
     @property
     def is_available(self) -> bool:

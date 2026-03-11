@@ -244,8 +244,8 @@ class ScreenAnalyzer:
                     parsed.get("active_app", ""),
                     parsed.get("activity_type", "other"),
                 )
-        except (json.JSONDecodeError, ValueError):
-            pass
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("VLM JSON parse failed: %s", e)  # signed: gamma
         return "", "", "", "other"
 
     def _fallback_analyze(self, image: Image.Image) -> AnalysisResult:

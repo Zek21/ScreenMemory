@@ -86,7 +86,7 @@ HWND_IDLE_INTERVAL = 60     # interval when all workers IDLE for 3+ consecutive 
 IDLE_STREAK_THRESHOLD = 3   # consecutive all-IDLE scans before slowing down
 MODEL_CHECK_INTERVAL = 60   # seconds between model checks
 ORCH_MODEL_CHECK_INTERVAL = 30  # orchestrator checked more frequently (security-critical)
-STUCK_PROCESSING_THRESHOLD = 180  # seconds in PROCESSING before auto-recovery attempt
+STUCK_PROCESSING_THRESHOLD = 600  # seconds in PROCESSING before auto-recovery attempt (increased from 180 to avoid killing workers mid-task)
 STUCK_DEDUP_WINDOW = 300          # suppress duplicate stuck alerts for 5 minutes
 
 user32 = ctypes.windll.user32

@@ -246,14 +246,25 @@ def _compute_display_iq(raw_pulse):
 
 
 def _compute_iq_breakdown(alive, total, engines_online, engines_total):
-    """Build lightweight IQ breakdown from available counts."""
+    """Build lightweight IQ breakdown from available counts.
+    TRUTH: All scores derived from real metrics only. No hardcoded values.
+    """  # signed: alpha
     worker_pct = alive / max(1, total)
     engine_pct = engines_online / max(1, engines_total)
+    # Probe bus status truthfully instead of hardcoding
+    bus_ok = False
+    try:
+        import urllib.request as _ur
+        r = _ur.urlopen("http://localhost:8420/health", timeout=1)
+        bus_ok = r.getcode() == 200
+    except Exception:
+        bus_ok = False
+    uptime_s = _time.time() - _SERVER_START
     return {
         "workers": {"score": round(worker_pct * 25, 1), "detail": f"{alive}/{total} alive"},
         "engines": {"score": round(engine_pct * 25, 1), "detail": f"{engines_online}/{engines_total} online"},
-        "uptime": {"score": min(10, round((_time.time() - _SERVER_START) / 3600 * 2.5, 1)), "detail": f"{(_time.time() - _SERVER_START)/60:.0f}min"},
-        "bus": {"score": 10, "detail": "connected"},
+        "uptime": {"score": min(10, round(min(uptime_s / 86400, 1.0) * 10, 1)), "detail": f"{uptime_s/60:.0f}min"},
+        "bus": {"score": 10 if bus_ok else 0, "detail": "connected" if bus_ok else "unreachable"},
     }
 
 def _cached_status():
