@@ -79,11 +79,24 @@ _STATUS_TTL = 10
 _INTROSPECT_TTL = 30
 _BACKEND_TTL = 3     # backend status cached 3s
 _CONSULTANT_TTL = 2  # consultant bridge state cached 2s
-_CONSULTANT_PORTS = (8422, 8424)
+_CONSULTANT_PORTS = (8422, 8424, 8425)
 _BUS_TTL = 2         # bus messages cached 2s
 _ENGINES_TTL = 30    # engine probes are expensive; 30s cache
 _DASHBOARD_TTL = 3   # combined dashboard data
 _WINDOWS_TTL = 5     # window scan cached 5s
+
+# Learner endpoint caches
+_LEARNER_HEALTH_TTL = 3   # health cached 3s
+_LEARNER_METRICS_TTL = 5  # metrics cached 5s (sparkline is expensive)
+_ACTIVITY_TTL = 2         # worker activity cached 2s (changes fast)
+_learner_cache = {
+    "health": None, "health_t": 0, "health_hits": 0, "health_misses": 0,
+    "metrics": None, "metrics_t": 0, "metrics_hits": 0, "metrics_misses": 0,
+}
+_activity_cache = {}      # in-memory store for POST /api/worker/{name}/activity
+_activity_file_cache = None
+_activity_file_cache_t = 0
+
 _cache_lock = threading.Lock()
 _pulse_compute_lock = threading.Lock()   # prevents stampeding herd on pulse
 _skynet_self_instance = None
@@ -104,6 +117,53 @@ def _pid_alive(pid: int) -> bool:
         return True
     except Exception:
         return False
+
+
+def _claim_pid(label: str) -> bool:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            fd = os.open(str(PID_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                old_pid = int(PID_FILE.read_text().strip())
+            except Exception:
+                old_pid = 0
+            if _pid_alive(old_pid):
+                print(f"[{label}] Already running (PID {old_pid}) -- exiting to prevent duplicate")
+                return False
+            try:
+                PID_FILE.unlink()
+            except FileNotFoundError:
+                continue
+            except Exception:
+                print(f"[{label}] Stale PID file could not be cleared: {PID_FILE}")
+                return False
+            continue
+        try:
+            with os.fdopen(fd, "w") as handle:
+                handle.write(str(os.getpid()))
+            return True
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            try:
+                if PID_FILE.exists():
+                    PID_FILE.unlink()
+            except Exception:
+                pass
+            raise
+
+
+def _cleanup_pid() -> None:
+    try:
+        if PID_FILE.exists() and PID_FILE.read_text().strip() == str(os.getpid()):
+            PID_FILE.unlink()
+    except Exception:
+        pass
+
 
 def _get_skynet_self():
     global _skynet_self_instance
@@ -199,12 +259,18 @@ def _cached_consultants():
         if _cache["consultants"] and (now - _cache["consultants_t"]) < _CONSULTANT_TTL:
             return _cache["consultants"]
     try:
-        data = None
-        for port in _CONSULTANT_PORTS:
-            payload = _fetch_backend(f"http://localhost:{port}/consultants", timeout=2, retries=0)
+        data = {}
+        data_lock = threading.Lock()
+
+        def _probe(port):
+            try:
+                payload = _fetch_backend(f"http://localhost:{port}/consultants", timeout=0.8, retries=0)
+            except Exception:
+                return
             consultant = payload.get("consultant") if isinstance(payload, dict) else None
             if not isinstance(consultant, dict):
-                continue
+                return
+            cid = str(consultant.get("id") or f"consultant_{port}")
             age = consultant.get("heartbeat_age_s")
             stale_after = consultant.get("stale_after_s", 8)
             try:
@@ -217,14 +283,22 @@ def _cached_consultants():
                 consultant["live"] = True
                 consultant["status"] = "LIVE"
                 consultant["pid_alive"] = True
-                data = {"consultant": consultant}
-                break
-            if data is None:
-                data = {"consultant": consultant}
-        if data is None:
+            with data_lock:
+                existing = data.get(cid)
+                if existing is None or (consultant.get("live") and not existing.get("live")):
+                    data[cid] = consultant
+
+        threads = [threading.Thread(target=_probe, args=(port,), daemon=True) for port in _CONSULTANT_PORTS]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=1.2)
+
+        if not data:
             from skynet_consultant_bridge import get_consultant_view
             consultant = get_consultant_view()
-            data = {"consultant": consultant} if consultant else {}
+            if consultant:
+                data = {str(consultant.get("id") or "consultant"): consultant}
     except Exception as e:
         data = {"error": str(e)}
     with _cache_lock:
@@ -242,7 +316,25 @@ def _cached_backend_status():
     # Enrich per-worker data
     agents = backend.get("agents", {})
     bus_msgs = backend.get("bus", [])
+    # Read true UI states from worker_health.json
+    try:
+        if os.path.exists("data/worker_health.json"):
+            with open("data/worker_health.json", "r") as f:
+                import json as json
+                hw = json.load(f)
+        else:
+            hw = {}
+    except Exception:
+        hw = {}
+        
     for wname, wdata in agents.items():
+        if wname in hw and "status" in hw[wname]:
+            wdata["status"] = hw[wname]["status"]
+        if "agent" in hw.get(wname, {}):
+            wdata["agent"] = hw[wname]["agent"]
+        if "model" in hw.get(wname, {}):
+            wdata["model"] = hw[wname]["model"]
+            
         task = wdata.get("current_task", "")
         wdata["current_task_short"] = task[:80] + ("..." if len(task) > 80 else "") if task else ""
         # Count missions from bus
@@ -279,12 +371,10 @@ def _cached_engines():
     t0 = _time.time()
     data = collect_engine_metrics()
     total_ms = (_time.time() - t0) * 1000
-    # Add response_time_ms per engine
-    engines = data.get("engines", {})
-    per_engine_ms = total_ms / max(1, len(engines))
-    for ename, edata in engines.items():
-        edata["response_time_ms"] = round(per_engine_ms, 1)
     data["total_probe_ms"] = round(total_ms, 1)
+    # Use real per-engine probe_ms from engine_metrics (not fabricated average)
+    for ename, edata in data.get("engines", {}).items():
+        edata["response_time_ms"] = edata.get("probe_ms", 0)
     with _cache_lock:
         _cache["engines"] = data
         _cache["engines_t"] = _time.time()
@@ -336,7 +426,8 @@ def _build_dashboard_data():
         _cache["dashboard_data_t"] = _time.time()
     return data
 
-
+
+
 # --------------- Background Precomputation ---------------
 # Warms heavy caches (pulse, introspect, engines) so endpoints serve instantly.
 _precompute_running = False
@@ -600,6 +691,11 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             self.send_header("Location", "/dashboard")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
+        elif self.path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
         elif self.path == "/version":
             self._json_response({"version": "3.0", "level": 3, "codename": "Level 3"})
         elif self.path == "/health":
@@ -770,46 +866,100 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 data = {"error": str(e), "workers": {}}
             self._json_response(data)
         elif self.path == "/learner/health":
+            now = _time.time()
+            with _cache_lock:
+                if _learner_cache["health"] and (now - _learner_cache["health_t"]) < _LEARNER_HEALTH_TTL:
+                    _learner_cache["health_hits"] += 1
+                    data = dict(_learner_cache["health"])
+                    data["cache_age_ms"] = int((now - _learner_cache["health_t"]) * 1000)
+                    data["cache_hit"] = True
+                    data["cache_hits"] = _learner_cache["health_hits"]
+                    data["cache_misses"] = _learner_cache["health_misses"]
+                    self._json_response(data)
+                    return
+                _learner_cache["health_misses"] += 1
+                cache_hits = _learner_cache["health_hits"]
+                cache_misses = _learner_cache["health_misses"]
             try:
                 pid_file = Path(__file__).resolve().parent / "data" / "learner.pid"
                 if pid_file.exists():
                     pid = int(pid_file.read_text().strip())
-                    import os as _os
-                    _os.kill(pid, 0)  # check alive
+                    if not _pid_alive(pid):
+                        raise OSError(f"learner pid {pid} is not alive")
                     state_file = Path(__file__).resolve().parent / "data" / "learner_state.json"
                     state = json.loads(state_file.read_text()) if state_file.exists() else {}
+                    last_run = state.get("last_run")
+                    stale = False
+                    stale_seconds = 0
+                    if last_run:
+                        try:
+                            from datetime import datetime as _dt, timezone as _tz
+                            lr_ts = _dt.fromisoformat(last_run).replace(tzinfo=_tz.utc).timestamp()
+                            stale_seconds = int(now - lr_ts)
+                        except (ValueError, TypeError):
+                            stale_seconds = -1
+                        stale = stale_seconds > 300
+                    else:
+                        stale = True
+                        stale_seconds = -1
                     data = {
                         "status": "running",
                         "pid": pid,
                         "episodes_processed": state.get("total_processed", 0),
                         "total_learnings": state.get("total_learnings", 0),
-                        "last_run": state.get("last_run"),
+                        "last_run": last_run,
                         "started_at": state.get("started_at"),
+                        "stale": stale,
+                        "stale_seconds": stale_seconds,
                     }
                 else:
-                    data = {"status": "stopped", "pid": None}
+                    data = {"status": "stopped", "pid": None, "stale": True, "stale_seconds": -1}
             except (OSError, ValueError):
-                data = {"status": "stopped", "pid": None}
+                data = {"status": "stopped", "pid": None, "stale": True, "stale_seconds": -1}
             except Exception as e:
-                data = {"status": "error", "error": str(e)}
+                data = {"status": "error", "error": str(e), "stale": True, "stale_seconds": -1}
+            with _cache_lock:
+                _learner_cache["health"] = data
+                _learner_cache["health_t"] = now
+            data["cache_age_ms"] = 0
+            data["cache_hit"] = False
+            data["cache_hits"] = cache_hits
+            data["cache_misses"] = cache_misses
             self._json_response(data)
         elif self.path == "/learner/metrics":
-            # Learning Telemetry — real data only (Truth Principle)
+            # Learning Telemetry — real data only (Truth Principle), cached 5s
+            now = _time.time()
+            with _cache_lock:
+                if _learner_cache["metrics"] and (now - _learner_cache["metrics_t"]) < _LEARNER_METRICS_TTL:
+                    _learner_cache["metrics_hits"] += 1
+                    data = dict(_learner_cache["metrics"])
+                    data["cache_age_ms"] = int((now - _learner_cache["metrics_t"]) * 1000)
+                    data["cache_hit"] = True
+                    data["cache_hits"] = _learner_cache["metrics_hits"]
+                    data["cache_misses"] = _learner_cache["metrics_misses"]
+                    self._json_response(data)
+                    return
+                _learner_cache["metrics_misses"] += 1
+                cache_hits = _learner_cache["metrics_hits"]
+                cache_misses = _learner_cache["metrics_misses"]
             try:
                 base = Path(__file__).resolve().parent
-                metrics = {"timestamp": _time.time()}
+                metrics = {"timestamp": now}
 
                 # 1. Episodes from learning_episodes.json
                 ep_file = base / "data" / "learning_episodes.json"
                 episodes = []
+                total_ep_count = 0
                 if ep_file.exists():
                     try:
                         raw = json.loads(ep_file.read_text(encoding="utf-8"))
                         if isinstance(raw, list):
-                            episodes = raw
+                            total_ep_count = len(raw)
+                            episodes = raw[-500:]  # cap to last 500 to avoid RAM bloat
+                            del raw  # free full list immediately
                     except Exception:
                         pass
-                metrics["total_episodes"] = len(episodes)
+                metrics["total_episodes"] = total_ep_count
 
                 # Outcome breakdown
                 outcomes = {"success": 0, "failure": 0, "unknown": 0}
@@ -833,7 +983,6 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 # Episode rate buckets (hourly, last 24 entries max)
                 rate_buckets = []
                 if episodes:
-                    now = _time.time()
                     bucket_size = 3600  # 1 hour
                     for ep in episodes:
                         ts = ep.get("timestamp", 0)
@@ -869,18 +1018,51 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 try:
                     if pid_file.exists():
                         pid = int(pid_file.read_text().strip())
-                        import os as _os2
-                        _os2.kill(pid, 0)
-                        daemon_status = "running"
+                        daemon_status = "running" if _pid_alive(pid) else "stopped"
                 except (OSError, ValueError):
                     daemon_status = "stopped"
                 metrics["daemon_status"] = daemon_status
 
+                with _cache_lock:
+                    _learner_cache["metrics"] = metrics
+                    _learner_cache["metrics_t"] = now
+                metrics["cache_age_ms"] = 0
+                metrics["cache_hit"] = False
+                metrics["cache_hits"] = cache_hits
+                metrics["cache_misses"] = cache_misses
                 self._json_response(metrics)
             except Exception as e:
-                self._json_response({"error": str(e), "total_episodes": 0, "by_outcome": {"success": 0, "failure": 0, "unknown": 0}, "sparkline_hourly": [], "total_facts": 0, "daemon_status": "error", "timestamp": _time.time()}, status=200)
+                self._json_response({"error": str(e), "total_episodes": 0, "by_outcome": {"success": 0, "failure": 0, "unknown": 0}, "sparkline_hourly": [], "total_facts": 0, "daemon_status": "error", "timestamp": now, "cache_age_ms": 0, "cache_hit": False}, status=200)
         elif self.path == "/ws/info":
             self._json_response({"ws_url": f"ws://localhost:{WS_PORT}", "protocol": "websocket", "fallback": "polling"})
+        elif self.path == "/missions/active":
+            try:
+                sys.path.insert(0, str(Path(__file__).parent / "tools"))
+                from skynet_missions import MissionControl
+                mc = MissionControl()
+                active = mc.active_missions()
+                self._json_response({
+                    "missions": mc.to_dict_list(active),
+                    "count": len(active),
+                    "stats": mc.stats(),
+                    "timeline": mc.get_mission_timeline(),
+                })
+            except Exception as e:
+                self._json_response({"error": str(e), "missions": [], "count": 0})
+        elif self.path == "/system/health":
+            try:
+                sys.path.insert(0, str(Path(__file__).parent / "tools"))
+                from skynet_observability import system_health
+                self._json_response(system_health())
+            except Exception as e:
+                self._json_response({"status": "error", "error": str(e), "issues": [str(e)]})
+        elif self.path == "/metrics/throughput":
+            try:
+                sys.path.insert(0, str(Path(__file__).parent / "tools"))
+                from skynet_observability import throughput_metrics
+                self._json_response(throughput_metrics())
+            except Exception as e:
+                self._json_response({"error": str(e), "total_dispatches": 0})
         elif self.path == "/todos":
             data = _load_todos()
             self._json_response(data)
@@ -1054,7 +1236,8 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                     try:
                         sf = os.path.join(os.path.dirname(__file__), "data", "overseer_status.json")
                         if os.path.exists(sf):
-                            payload["overseer"] = json.loads(open(sf, encoding="utf-8").read())
+                            with open(sf, encoding="utf-8") as _f:
+                                payload["overseer"] = json.loads(_f.read())
                     except Exception:
                         pass
                     line = f"data: {json.dumps(payload, default=str)}\n\n"
@@ -1064,6 +1247,119 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
             return
+        elif self.path.startswith("/worker/") and self.path.endswith("/performance"):
+            # GET /worker/{name}/performance
+            parts = self.path.split("/")
+            worker_name = parts[2] if len(parts) >= 4 else ""
+            try:
+                sys.path.insert(0, str(Path(__file__).parent / "tools"))
+                from skynet_smart_router import get_worker_performance
+                data = get_worker_performance(worker_name)
+                if data:
+                    self._json_response(data)
+                else:
+                    self._json_response({"error": f"no data for worker {worker_name}"}, status=404)
+            except Exception as e:
+                self._json_response({"error": str(e)}, status=500)
+        elif self.path == "/performance/leaderboard":
+            try:
+                sys.path.insert(0, str(Path(__file__).parent / "tools"))
+                from skynet_smart_router import get_leaderboard
+                board = get_leaderboard()
+                self._json_response({"leaderboard": board, "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S")})
+            except Exception as e:
+                self._json_response({"error": str(e)}, status=500)
+        elif self.path == "/api/workers/performance":
+            try:
+                sys.path.insert(0, str(Path(__file__).parent / "tools"))
+                from skynet_smart_router import get_leaderboard, get_worker_performance
+                board = get_leaderboard()
+                detailed = {}
+                for entry in board:
+                    wp = get_worker_performance(entry["worker"])
+                    if wp:
+                        detailed[entry["worker"]] = wp
+                self._json_response({
+                    "leaderboard": board,
+                    "workers": detailed,
+                    "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+                })
+            except Exception as e:
+                self._json_response({"error": str(e)}, status=500)
+        elif self.path == "/api/ci/latest":
+            try:
+                ci_path = Path(__file__).parent / "data" / "ci_report.json"
+                if ci_path.exists():
+                    ci_data = json.loads(ci_path.read_text(encoding="utf-8"))
+                    self._json_response(ci_data)
+                else:
+                    self._json_response({
+                        "status": "no_data",
+                        "message": "No CI report found at data/ci_report.json",
+                        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    })
+            except Exception as e:
+                self._json_response({"error": str(e)}, status=500)
+        elif self.path == "/api/worker/activity":
+            # GET /api/worker/activity -- all worker activity (cached 2s)
+            global _activity_file_cache, _activity_file_cache_t
+            now = _time.time()
+            with _cache_lock:
+                if _activity_file_cache and (now - _activity_file_cache_t) < _ACTIVITY_TTL:
+                    self._json_response(_activity_file_cache)
+                    return
+            activity_file = Path(__file__).parent / "data" / "worker_activity.json"
+            workers = ("alpha", "beta", "gamma", "delta")
+            unknown = {"state": "unknown", "current_activity": None, "last_tool": None,
+                        "last_file": None, "timestamp": None, "recent_activities": []}
+            try:
+                if activity_file.exists():
+                    data = json.loads(activity_file.read_text(encoding="utf-8"))
+                else:
+                    data = {}
+                # Merge with in-memory POST cache
+                for wn, wdata in _activity_cache.items():
+                    if wn not in data or (wdata.get("timestamp", "") > (data.get(wn, {}).get("timestamp", "") or "")):
+                        data[wn] = wdata
+                for wn in workers:
+                    if wn not in data:
+                        data[wn] = dict(unknown)
+                with _cache_lock:
+                    _activity_file_cache = data
+                    _activity_file_cache_t = _time.time()
+                self._json_response(data)
+            except Exception as e:
+                fallback = {wn: dict(unknown) for wn in workers}
+                self._json_response(fallback)
+        elif self.path.startswith("/api/worker/") and self.path.endswith("/thinking"):
+            # GET /api/worker/{name}/thinking
+            parts = self.path.split("/")
+            worker_name = parts[3] if len(parts) >= 5 else ""
+            if worker_name not in ("alpha", "beta", "gamma", "delta"):
+                self._json_response({"error": f"unknown worker: {worker_name}"}, status=400)
+            else:
+                activity_file = Path(__file__).parent / "data" / "worker_activity.json"
+                try:
+                    wdata = {}
+                    if activity_file.exists():
+                        all_data = json.loads(activity_file.read_text(encoding="utf-8"))
+                        wdata = all_data.get(worker_name, {})
+                    # Merge with in-memory POST cache if fresher
+                    mem = _activity_cache.get(worker_name, {})
+                    if mem.get("timestamp", "") > (wdata.get("timestamp", "") or ""):
+                        wdata = mem
+                    now_ts = _time.time()
+                    last_ts = wdata.get("epoch", 0)
+                    self._json_response({
+                        "worker": worker_name,
+                        "state": wdata.get("state", "unknown"),
+                        "thinking": wdata.get("thinking", wdata.get("thinking_summary", None)),
+                        "current_tool": wdata.get("last_tool", wdata.get("current_tool", None)),
+                        "last_activity_ago_s": round(now_ts - last_ts, 1) if last_ts else None,
+                        "recent": (wdata.get("recent_activities") or [])[-10:],
+                    })
+                except Exception as e:
+                    self._json_response({"error": str(e)}, status=500)
         else:
             self.send_error(404)
 
@@ -1231,6 +1527,50 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 except Exception as e:
                     self._json_response({"error": str(e)}, status=500)
                     status_code = 500
+            elif self.path.startswith("/worker/") and self.path.endswith("/metrics"):
+                # POST /worker/{name}/metrics
+                parts = self.path.split("/")
+                worker_name = parts[2] if len(parts) >= 4 else ""
+                if worker_name not in ("alpha", "beta", "gamma", "delta"):
+                    self._json_response({"error": f"unknown worker: {worker_name}"}, status=400)
+                    status_code = 400
+                else:
+                    try:
+                        sys.path.insert(0, str(Path(__file__).parent / "tools"))
+                        from skynet_smart_router import record_metrics
+                        duration_ms = float(data.get("duration_ms", 0))
+                        outcome = data.get("outcome", "success")
+                        task_summary = data.get("task", data.get("task_summary", ""))
+                        result = record_metrics(worker_name, duration_ms, outcome, task_summary)
+                        self._json_response({"ok": True, "metrics": result})
+                    except Exception as e:
+                        self._json_response({"error": str(e)}, status=500)
+                        status_code = 500
+            elif self.path.startswith("/api/worker/") and self.path.endswith("/activity"):
+                # POST /api/worker/{name}/activity
+                parts = self.path.split("/")
+                worker_name = parts[3] if len(parts) >= 5 else ""
+                if worker_name not in ("alpha", "beta", "gamma", "delta"):
+                    self._json_response({"error": f"unknown worker: {worker_name}"}, status=400)
+                    status_code = 400
+                else:
+                    data["timestamp"] = data.get("timestamp", _time.strftime("%Y-%m-%dT%H:%M:%S"))
+                    data["epoch"] = data.get("epoch", _time.time())
+                    _activity_cache[worker_name] = data
+                    # Forward to Go backend
+                    try:
+                        import urllib.request as _ur2
+                        fwd = json.dumps({"current_task": data.get("current_activity", data.get("doing", ""))}).encode()
+                        req = _ur2.Request(
+                            f"http://localhost:8420/worker/{worker_name}/task",
+                            data=fwd,
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        _ur2.urlopen(req, timeout=2)
+                    except Exception:
+                        pass
+                    self._json_response({"ok": True, "worker": worker_name})
             else:
                 self._json_response({"error": "not found"}, status=404)
                 status_code = 404
@@ -1264,12 +1604,14 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
     def _json_response(self, data, status=200):
         text = _dumps(data)
         body = text.encode() if isinstance(text, str) else text
+        del data, text  # free source objects before sending
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        del body
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -1294,16 +1636,8 @@ def main():
     args = parser.parse_args()
 
     # ── PID guard: prevent duplicate GOD Console instances ──
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if PID_FILE.exists():
-        try:
-            old_pid = int(PID_FILE.read_text().strip())
-            os.kill(old_pid, 0)
-            print(f"[god-console] Already running (PID {old_pid}) -- exiting to prevent duplicate")
-            return
-        except (OSError, ValueError):
-            pass  # Stale PID file -- proceed
-    PID_FILE.write_text(str(os.getpid()))
+    if not _claim_pid("god-console"):
+        return
 
     print(f"\033[93m GOD Console v3 Level 3\033[0m")
     print(f"   HTTP on http://localhost:{args.port}")
@@ -1332,10 +1666,7 @@ def main():
         print("\n\033[93m⚡ GOD Console offline.\033[0m")
         server.server_close()
     finally:
-        try:
-            PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
+        _cleanup_pid()
 
 
 if __name__ == "__main__":

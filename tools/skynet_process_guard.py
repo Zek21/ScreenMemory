@@ -37,6 +37,11 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    import psutil
+except Exception:
+    psutil = None
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 REGISTRY_FILE = DATA_DIR / "critical_processes.json"
@@ -94,7 +99,7 @@ def _find_python_processes(script_name):
                 except ValueError:
                     pass
         if pids:
-            return pids
+            return _collapse_wrapper_pids(pids)
     except Exception:
         pass
     # Fallback: wmic (legacy)
@@ -120,7 +125,53 @@ def _find_python_processes(script_name):
                         pass
     except Exception:
         pass
-    return pids
+    return _collapse_wrapper_pids(pids)
+
+
+def _collapse_wrapper_pids(pids):
+    """Drop virtualenv launcher parents when a child interpreter runs the same command."""
+    unique = []
+    seen = set()
+    for pid in pids:
+        try:
+            pid_i = int(pid)
+        except Exception:
+            continue
+        if pid_i > 0 and pid_i not in seen:
+            seen.add(pid_i)
+            unique.append(pid_i)
+    if psutil is None or not unique:
+        return unique
+
+    dropped = set()
+    for pid in unique:
+        if pid in dropped:
+            continue
+        try:
+            parent = psutil.Process(pid)
+            parent_cmd = tuple(parent.cmdline())
+            parent_exe = (parent.exe() or "").lower()
+            children = parent.children(recursive=False)
+        except Exception:
+            continue
+        if not parent_cmd:
+            continue
+        for child in children:
+            if child.pid not in seen:
+                continue
+            try:
+                child_cmd = tuple(child.cmdline())
+                child_exe = (child.exe() or "").lower()
+            except Exception:
+                continue
+            if child_cmd != parent_cmd:
+                continue
+            if child_exe == parent_exe:
+                continue
+            dropped.add(pid)
+            break
+
+    return [pid for pid in unique if pid not in dropped]
 
 
 def _find_process_by_name(exe_name):

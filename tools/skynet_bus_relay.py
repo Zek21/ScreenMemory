@@ -17,8 +17,11 @@ Usage:
     python tools/skynet_bus_relay.py --dry-run    # Show what would be delivered
 """
 
+import atexit
+import ctypes
 import json
 import os
+import signal
 import sys
 import time
 import urllib.request
@@ -35,7 +38,8 @@ ORCH_FILE = DATA_DIR / "orchestrator.json"
 sys.path.insert(0, str(ROOT / "tools"))
 
 SKYNET_URL = "http://localhost:8420"
-POLL_INTERVAL = 3.0
+POLL_INTERVAL = 3.0  # Must be >= 2.0s to prevent CPU spin
+MIN_POLL_INTERVAL = 2.0
 WORKER_NAMES = {"alpha", "beta", "gamma", "delta"}
 # Topics that should be delivered to workers
 RELAY_TOPICS = {"workers", "convene"} | WORKER_NAMES
@@ -226,9 +230,66 @@ def poll_and_relay(dry_run=False):
     return new_deliveries
 
 
+def _pid_is_bus_relay(pid: int) -> bool:
+    """Check if a PID is actually a bus_relay process (not a recycled PID)."""
+    try:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            buf = ctypes.create_unicode_buffer(260)
+            size = ctypes.wintypes.DWORD(260)
+            ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                handle, 0, buf, ctypes.byref(size))
+            if ok and "python" in buf.value.lower():
+                return True
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+    # Fallback: just check if process exists
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _acquire_singleton():
+    """Acquire PID file lock. Returns True if we're the sole instance."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            if _pid_is_bus_relay(old_pid):
+                log(f"Bus Relay already running (PID {old_pid}) -- exiting", "WARN")
+                return False
+            else:
+                log(f"Stale PID file (PID {old_pid} dead) -- taking over", "INFO")
+        except (ValueError, OSError):
+            log("Corrupt PID file -- overwriting", "WARN")
+    PID_FILE.write_text(str(os.getpid()))
+    atexit.register(_release_singleton)
+    return True
+
+
+def _release_singleton():
+    """Clean up PID file on exit."""
+    try:
+        if PID_FILE.exists():
+            stored = int(PID_FILE.read_text().strip())
+            if stored == os.getpid():
+                PID_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def run_daemon():
     """Main relay loop."""
-    log(f"Bus Relay daemon started -- polling every {POLL_INTERVAL}s")
+    effective_interval = max(POLL_INTERVAL, MIN_POLL_INTERVAL)
+    log(f"Bus Relay daemon started -- polling every {effective_interval}s")
     log(f"Relay topics: {RELAY_TOPICS}")
     log(f"Relay types: {RELAY_TYPES}")
 
@@ -242,7 +303,7 @@ def run_daemon():
             break
         except Exception as e:
             log(f"Relay error: {e}", "ERR")
-        time.sleep(POLL_INTERVAL)
+        time.sleep(effective_interval)
 
 
 def print_status():
@@ -278,22 +339,11 @@ if __name__ == "__main__":
         log(f"{'Dry-run' if args.dry_run else 'Delivered'}: {n} messages")
         sys.exit(0)
 
-    # PID guard
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if PID_FILE.exists():
-        try:
-            old_pid = int(PID_FILE.read_text().strip())
-            os.kill(old_pid, 0)
-            log(f"Bus Relay already running (PID {old_pid}) -- exiting", "WARN")
-            sys.exit(0)
-        except (OSError, ValueError):
-            pass
-    PID_FILE.write_text(str(os.getpid()))
+    # Singleton enforcement
+    if not _acquire_singleton():
+        sys.exit(0)
 
     try:
         run_daemon()
     finally:
-        try:
-            PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
+        _release_singleton()

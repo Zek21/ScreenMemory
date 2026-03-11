@@ -139,6 +139,7 @@ func (s *SkynetServer) Handler() http.Handler {
 	mux.HandleFunc("/worker/", s.handleWorkerRoute)
 	mux.HandleFunc("/dashboard", s.handleDashboard)
 	mux.HandleFunc("/stream", s.handleSSEStream)
+	mux.HandleFunc("/activity/stream", s.handleActivityStream)
 	mux.HandleFunc("/bus/publish", s.handleBusPublish)
 	mux.HandleFunc("/bus/messages", s.handleBusMessages)
 	mux.HandleFunc("/bus/clear", s.handleBusClear)
@@ -153,6 +154,15 @@ func (s *SkynetServer) Handler() http.Handler {
 	mux.HandleFunc("/security/blocked", s.handleSecurityBlocked)
 	mux.HandleFunc("/ws", s.handleWebSocket)
 	mux.HandleFunc("/ws/stats", s.handleWSStats)
+	mux.HandleFunc("/task/complete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			atomic.AddInt64(&s.tasksCompleted, 1)
+			w.WriteHeader(200)
+			w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		http.Error(w, "Method not allowed", 405)
+	})
 	return s.rateLimitMiddleware(s.middleware(mux))
 }
 
@@ -223,7 +233,7 @@ func (s *SkynetServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		if wk.extHBReceived {
 			hb = wk.lastExtHB
 		}
-		if time.Since(hb) < 30*time.Second {
+		if time.Since(hb) < 120*time.Second {
 			alive++
 		}
 		wk.mu.RUnlock()
@@ -661,8 +671,14 @@ func (s *SkynetServer) handleWorkerRoute(w http.ResponseWriter, r *http.Request)
 		s.handleWorkerHeartbeat(w, r, workerName)
 	case "status":
 		s.handleWorkerStatus(w, r, workerName)
+	case "activity":
+		if r.Method == http.MethodPost {
+			s.handleWorkerActivityPost(w, r, workerName)
+		} else {
+			s.handleWorkerActivityGet(w, r, workerName)
+		}
 	default:
-		http.Error(w, "unknown action, use tasks, result, heartbeat, or status", http.StatusBadRequest)
+		http.Error(w, "unknown action, use tasks, result, heartbeat, status, or activity", http.StatusBadRequest)
 	}
 }
 
@@ -789,37 +805,41 @@ func (s *SkynetServer) handleWorkerHeartbeat(w http.ResponseWriter, r *http.Requ
 		Visible   bool   `json:"visible"`
 		Model     string `json:"model"`
 		GridSlot  string `json:"grid_slot"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Bad JSON: "+err.Error(), http.StatusBadRequest)
-		return
-	}
+                State     string `json:"state"`
+        }
+        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+                http.Error(w, "Bad JSON: "+err.Error(), http.StatusBadRequest)
+                return
+        }
 
-	// Find the internal worker and bump heartbeat
-	var wk *Worker
-	for _, w2 := range s.workers {
-		if strings.ToLower(w2.Name) == workerName {
-			wk = w2
-			break
-		}
-	}
-	if wk == nil {
-		http.Error(w, "worker not found: "+workerName, http.StatusNotFound)
-		return
-	}
+        // Find the internal worker and bump heartbeat
+        var wk *Worker
+        for _, w2 := range s.workers {
+                if strings.ToLower(w2.Name) == workerName {
+                        wk = w2
+                        break
+                }
+        }
+        if wk == nil {
+                http.Error(w, "worker not found: "+workerName, http.StatusNotFound)
+                return
+        }
 
-	wk.mu.Lock()
-	wk.lastHeartbeat = time.Now()
-	wk.lastExtHB = time.Now()
-	wk.extHBReceived = true
-	if req.Model != "" {
-		wk.model = req.Model
-	}
-	wk.mu.Unlock()
+        wk.mu.Lock()
+        wk.lastHeartbeat = time.Now()
+        wk.lastExtHB = time.Now()
+        wk.extHBReceived = true
+        if req.Model != "" {
+                wk.model = req.Model
+        }
+        if req.State != "" {
+                wk.Status = req.State
+        }
+        wk.mu.Unlock()
 
-	if !req.HWNDAlive || !req.Visible {
+	if !req.HWNDAlive {
 		s.bus.Post("monitor", "orchestrator", "alert",
-			fmt.Sprintf("WORKER %s DEAD — hwnd_alive=%v visible=%v", strings.ToUpper(workerName), req.HWNDAlive, req.Visible),
+			fmt.Sprintf("WORKER %s DEAD -- hwnd_alive=%v visible=%v", strings.ToUpper(workerName), req.HWNDAlive, req.Visible),
 			map[string]string{"worker": workerName, "severity": "critical"})
 	}
 
@@ -869,7 +889,7 @@ func (s *SkynetServer) handleWorkerStatus(w http.ResponseWriter, r *http.Request
 	}
 	s.wtMu.RUnlock()
 
-	alive := time.Since(lastHB) < 30*time.Second
+	alive := time.Since(lastHB) < 120*time.Second
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"worker":         workerName,
@@ -879,6 +899,146 @@ func (s *SkynetServer) handleWorkerStatus(w http.ResponseWriter, r *http.Request
 		"running_tasks":  len(running),
 		"tasks":          append(running, pending...),
 	})
+}
+
+// ─── POST /worker/{name}/activity ────────────────────────────────
+
+func (s *SkynetServer) handleWorkerActivityPost(w http.ResponseWriter, r *http.Request, workerName string) {
+	var req struct {
+		CurrentTask  string `json:"current_task"`
+		ActivityType string `json:"activity_type"`
+		Detail       string `json:"detail"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Bad JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var wk *Worker
+	for _, w2 := range s.workers {
+		if strings.ToLower(w2.Name) == workerName {
+			wk = w2
+			break
+		}
+	}
+	if wk == nil {
+		http.Error(w, "worker not found: "+workerName, http.StatusNotFound)
+		return
+	}
+
+	wk.mu.Lock()
+	if req.CurrentTask != "" {
+		wk.CurrentTask = req.CurrentTask
+	}
+	logEntry := fmt.Sprintf("[%s] %s: %s", time.Now().Format("15:04:05"), req.ActivityType, req.Detail)
+	wk.recentLogs = append(wk.recentLogs, logEntry)
+	if len(wk.recentLogs) > wk.maxLogs {
+		wk.recentLogs = wk.recentLogs[len(wk.recentLogs)-wk.maxLogs:]
+	}
+	wk.lastHeartbeat = time.Now()
+	wk.mu.Unlock()
+
+	// Broadcast activity to WebSocket clients
+	wsMsg, _ := json.Marshal(map[string]interface{}{
+		"type": "worker_activity", "worker": workerName,
+		"current_task": req.CurrentTask, "activity_type": req.ActivityType,
+		"detail": req.Detail,
+	})
+	s.broadcastWS(wsMsg)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "worker": workerName})
+}
+
+// ─── GET /worker/{name}/activity ─────────────────────────────────
+
+func (s *SkynetServer) handleWorkerActivityGet(w http.ResponseWriter, r *http.Request, workerName string) {
+	var wk *Worker
+	for _, w2 := range s.workers {
+		if strings.ToLower(w2.Name) == workerName {
+			wk = w2
+			break
+		}
+	}
+	if wk == nil {
+		http.Error(w, "worker not found: "+workerName, http.StatusNotFound)
+		return
+	}
+
+	wk.mu.RLock()
+	state := wk.Status
+	currentTask := wk.CurrentTask
+	completed := int(atomic.LoadInt32(&wk.tasksCompleted))
+	avgMs := float64(0)
+	if completed > 0 {
+		avgMs = wk.totalDurationMs / float64(completed)
+	}
+	hbTime := wk.lastHeartbeat
+	if wk.extHBReceived {
+		hbTime = wk.lastExtHB
+	}
+	// Return last 20 logs
+	logCount := len(wk.recentLogs)
+	start := 0
+	if logCount > 20 {
+		start = logCount - 20
+	}
+	logs := make([]string, logCount-start)
+	copy(logs, wk.recentLogs[start:])
+	wk.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"name":            workerName,
+		"state":           state,
+		"current_task":    currentTask,
+		"recent_logs":     logs,
+		"tasks_completed": completed,
+		"avg_task_ms":     avgMs,
+		"last_heartbeat":  hbTime.Format(time.RFC3339),
+	})
+}
+
+// ─── GET /activity/stream (SSE) ──────────────────────────────────
+// Lightweight SSE that streams only worker activity every 2 seconds.
+
+func (s *SkynetServer) handleActivityStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			workers := make(map[string]interface{})
+			for _, wk := range s.workers {
+				wk.mu.RLock()
+				workers[wk.Name] = map[string]interface{}{
+					"state":        wk.Status,
+					"current_task": wk.CurrentTask,
+				}
+				wk.mu.RUnlock()
+			}
+			data, _ := json.Marshal(map[string]interface{}{
+				"workers":   workers,
+				"timestamp": time.Now().UnixNano(),
+			})
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
+	}
 }
 
 func min(a, b int) int {

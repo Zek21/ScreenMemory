@@ -36,6 +36,30 @@ PID_FILE = DATA_DIR / "watchdog.pid"
 
 SKYNET_URL = "http://localhost:8420"
 GOD_CONSOLE_URL = "http://localhost:8421"
+CONSULTANT_BRIDGES = (
+    {
+        "service_name": "consultant_bridge",
+        "label": "Codex Consultant bridge",
+        "consultant_id": "consultant",
+        "api_port": 8422,
+        "pid_file": DATA_DIR / "consultant_bridge.pid",
+        "extra_args": [],
+    },
+    {
+        "service_name": "gemini_consultant_bridge",
+        "label": "Gemini Consultant bridge",
+        "consultant_id": "gemini_consultant",
+        "api_port": 8425,
+        "pid_file": DATA_DIR / "gemini_consultant_bridge.pid",
+        "extra_args": [
+            "--id", "gemini_consultant",
+            "--display-name", "Gemini Consultant",
+            "--model", "Gemini 3 Pro",
+            "--source", "GC-Start",
+            "--api-port", "8425",
+        ],
+    },
+)
 
 # Resolve real Python interpreter to avoid venv trampoline double-process.
 # On Python 3.13+ Windows, the venv python.exe is a launcher that spawns
@@ -65,8 +89,23 @@ def _resolve_real_python():
 
 PYTHON, _DAEMON_ENV = _resolve_real_python()
 
-GOD_CHECK_INTERVAL = 30
-SKYNET_CHECK_INTERVAL = 60
+def _load_watchdog_config():
+    """Load watchdog intervals from brain_config.json, with sane defaults."""
+    cfg_path = ROOT / "data" / "brain_config.json"
+    defaults = {"watchdog_interval": 30, "god_check_interval": 30, "skynet_check_interval": 60}
+    try:
+        if cfg_path.exists():
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            wd = data.get("watchdog", {})
+            return {k: wd.get(k, defaults[k]) for k in defaults}
+    except Exception:
+        pass
+    return defaults
+
+_WD_CFG = _load_watchdog_config()
+WATCHDOG_INTERVAL = _WD_CFG["watchdog_interval"]
+GOD_CHECK_INTERVAL = _WD_CFG["god_check_interval"]
+SKYNET_CHECK_INTERVAL = _WD_CFG["skynet_check_interval"]
 
 
 def _hidden_subprocess_kwargs(**kwargs):
@@ -121,11 +160,20 @@ def _read_state_timestamp_age(path: Path, *keys: str) -> tuple[object | None, fl
         return raw_value, None
 
 
+MAX_LOG_SIZE = 1_000_000  # 1MB -- rotate log file to prevent unbounded growth
+
 def log(msg: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
     DATA_DIR.mkdir(exist_ok=True)
+    try:
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > MAX_LOG_SIZE:
+            # Keep last 500KB
+            content = LOG_FILE.read_text(encoding="utf-8", errors="replace")
+            LOG_FILE.write_text(content[-500_000:], encoding="utf-8")
+    except Exception:
+        pass
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
 
@@ -136,6 +184,68 @@ def check_url(url: str, timeout: int = 5) -> bool:
             return r.status == 200
     except Exception:
         return False
+
+
+def _pid_alive(pid):
+    try:
+        pid_i = int(pid)
+    except Exception:
+        return False
+    if pid_i <= 0:
+        return False
+    if psutil is not None:
+        try:
+            proc = psutil.Process(pid_i)
+            return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+        except Exception:
+            return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid_i)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+        except Exception:
+            return False
+        return False
+    try:
+        import os
+        os.kill(pid_i, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _read_pid_file(pid_file: Path) -> int:
+    try:
+        return int(pid_file.read_text(encoding="utf-8").strip())
+    except Exception:
+        return 0
+
+
+def _consultant_endpoint_payload(api_port: int, timeout: float = 3.0):
+    try:
+        with urllib.request.urlopen(f"http://localhost:{api_port}/consultants", timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def _consultant_bridge_is_healthy(config: dict) -> bool:
+    pid_file = config["pid_file"]
+    pid = _read_pid_file(pid_file) if pid_file.exists() else 0
+    if pid and not _pid_alive(pid):
+        return False
+    payload = _consultant_endpoint_payload(config["api_port"], timeout=3.0)
+    if not isinstance(payload, dict):
+        return False
+    consultant = payload.get("consultant")
+    if not isinstance(consultant, dict):
+        return False
+    if str(consultant.get("id") or "").lower() != str(config["consultant_id"]).lower():
+        return False
+    return bool(consultant.get("live")) or str(consultant.get("status") or "").upper() == "LIVE"
 
 
 def restart_god_console():
@@ -283,6 +393,41 @@ def restart_learner():
         return True
     except Exception as e:
         log(f"Learner daemon restart error: {e}")
+        return False
+
+
+def restart_consultant_bridge(config: dict):
+    """Restart a consultant bridge and verify its live /consultants surface."""
+    pid_file = config["pid_file"]
+    old_pid = _read_pid_file(pid_file) if pid_file.exists() else 0
+    if old_pid and _pid_alive(old_pid):
+        if _consultant_bridge_is_healthy(config):
+            log(f"{config['label']} already running (PID {old_pid}) -- skipping restart")
+            return True
+
+    log(f"{config['label']} DOWN -- attempting restart")
+    try:
+        cmd = [PYTHON, str(ROOT / "tools" / "skynet_consultant_bridge.py"), *config.get("extra_args", [])]
+        subprocess.Popen(
+            cmd,
+            cwd=str(ROOT),
+            env=_DAEMON_ENV,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+        )
+        time.sleep(3)
+        if _consultant_bridge_is_healthy(config):
+            new_pid = _read_pid_file(pid_file) if pid_file.exists() else _port_to_pid(config["api_port"])
+            log(f"{config['label']} restarted (old={old_pid}, new={new_pid})")
+            _post_restart_alert(f"{config['service_name']}.py", old_pid, new_pid)
+            _refresh_protected_registry()
+            _log_incident(f"{config['service_name']}_restart", old_pid, new_pid)
+            return True
+        log(f"{config['label']} restart FAILED -- bridge still not live")
+        return False
+    except Exception as e:
+        log(f"{config['label']} restart error: {e}")
         return False
 
 
@@ -449,24 +594,22 @@ def _check_worker_hwnds():
 
 HEARTBEAT_FILE = DATA_DIR / "service_heartbeats.json"
 HEARTBEAT_TIMEOUT = 60  # seconds before a service is considered dead
+_heartbeat_cache = {}  # in-memory cache to avoid constant file reads
 
 def _update_heartbeat(service_name, is_alive):
     """Update the heartbeat timestamp for a service."""
     try:
-        heartbeats = {}
-        if HEARTBEAT_FILE.exists():
-            heartbeats = json.loads(HEARTBEAT_FILE.read_text(encoding="utf-8"))
         if is_alive:
-            heartbeats[service_name] = {
+            _heartbeat_cache[service_name] = {
                 "last_seen": time.time(),
                 "last_seen_ts": datetime.now().isoformat(),
                 "status": "alive",
             }
         else:
-            entry = heartbeats.get(service_name, {})
+            entry = _heartbeat_cache.get(service_name, {})
             entry["status"] = "dead"
-            heartbeats[service_name] = entry
-        HEARTBEAT_FILE.write_text(json.dumps(heartbeats, indent=2), encoding="utf-8")
+            _heartbeat_cache[service_name] = entry
+        HEARTBEAT_FILE.write_text(json.dumps(_heartbeat_cache, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -474,12 +617,10 @@ def _update_heartbeat(service_name, is_alive):
 def _is_service_stale(service_name):
     """Check if a service heartbeat is stale (>HEARTBEAT_TIMEOUT seconds old)."""
     try:
-        if HEARTBEAT_FILE.exists():
-            heartbeats = json.loads(HEARTBEAT_FILE.read_text(encoding="utf-8"))
-            entry = heartbeats.get(service_name, {})
-            last_seen = entry.get("last_seen", 0)
-            if last_seen and (time.time() - last_seen) > HEARTBEAT_TIMEOUT:
-                return True
+        entry = _heartbeat_cache.get(service_name, {})
+        last_seen = entry.get("last_seen", 0)
+        if last_seen and (time.time() - last_seen) > HEARTBEAT_TIMEOUT:
+            return True
     except Exception:
         pass
     return False
@@ -527,6 +668,7 @@ def run_daemon(args=None):
     last_guard_refresh = 0.0
     last_hwnd_check = 0.0
     last_learner_check = 0.0
+    last_consultant_check = 0.0
     AWARENESS_INTERVAL = 60
     WINDOW_SCAN_INTERVAL = 30
     STUCK_CHECK_INTERVAL = 30
@@ -534,8 +676,17 @@ def run_daemon(args=None):
     SSE_CHECK_INTERVAL = 30
     HWND_CHECK_INTERVAL = 30
     LEARNER_CHECK_INTERVAL = 60
+    CONSULTANT_CHECK_INTERVAL = 30
     stuck_detector = None
-    status = {"god_console": "unknown", "skynet": "unknown", "sse_daemon": "unknown", "learner": "unknown"}
+    skynet_self_cached = None  # reuse to avoid re-loading large files each cycle
+    status = {
+        "god_console": "unknown",
+        "skynet": "unknown",
+        "sse_daemon": "unknown",
+        "learner": "unknown",
+    }
+    for config in CONSULTANT_BRIDGES:
+        status[config["service_name"]] = "unknown"
 
     try:
         while True:
@@ -627,6 +778,19 @@ def run_daemon(args=None):
                 status["learner_last_check"] = datetime.now().isoformat()
                 last_learner_check = now
 
+            # ── Consultant bridge checks + auto-restart ──
+            if now - last_consultant_check >= CONSULTANT_CHECK_INTERVAL:
+                for config in CONSULTANT_BRIDGES:
+                    bridge_ok = _consultant_bridge_is_healthy(config)
+                    _update_heartbeat(config["service_name"], bridge_ok)
+                    if bridge_ok:
+                        status[config["service_name"]] = "ok"
+                    else:
+                        restarted = restart_consultant_bridge(config)
+                        status[config["service_name"]] = "restarted" if restarted else "down"
+                status["consultant_last_check"] = datetime.now().isoformat()
+                last_consultant_check = now
+
             # ── Worker HWND health check ──
             if now - last_hwnd_check >= HWND_CHECK_INTERVAL:
                 try:
@@ -690,10 +854,10 @@ def run_daemon(args=None):
             # Periodic self-awareness broadcast
             if now - last_awareness >= AWARENESS_INTERVAL:
                 try:
-                    # Direct import since we added ROOT to sys.path at module level
                     from tools.skynet_self import SkynetSelf
-                    skynet_self = SkynetSelf()
-                    pulse = skynet_self.broadcast_awareness()
+                    if skynet_self_cached is None:
+                        skynet_self_cached = SkynetSelf()
+                    pulse = skynet_self_cached.broadcast_awareness()
                     status["last_awareness"] = datetime.now().isoformat()
                     status["iq"] = pulse.get("iq", 0)
                     log(f"Awareness broadcast OK (IQ={pulse.get('iq', 0):.3f})")
@@ -739,7 +903,16 @@ def run_daemon(args=None):
                 try:
                     dispatch_log = DATA_DIR / "dispatch_log.json"
                     if dispatch_log.exists():
-                        entries = json.loads(dispatch_log.read_text(encoding="utf-8"))
+                        all_entries = json.loads(dispatch_log.read_text(encoding="utf-8"))
+                        # Only scan last 100 entries to cap memory
+                        entries = all_entries[-100:] if len(all_entries) > 100 else all_entries
+                        # Trim file on disk if bloated (>500 entries)
+                        if len(all_entries) > 500:
+                            try:
+                                dispatch_log.write_text(json.dumps(all_entries[-200:], indent=2), encoding="utf-8")
+                            except Exception:
+                                pass
+                        del all_entries  # free full list immediately
                         stale = []
                         for e in entries:
                             if e.get("success") and not e.get("result_received"):
@@ -767,7 +940,7 @@ def run_daemon(args=None):
                     log(f"Dispatch timeout check failed: {e}")
 
             write_status(status)
-            time.sleep(10)
+            time.sleep(WATCHDOG_INTERVAL)
     except KeyboardInterrupt:
         log("Watchdog shutting down (Ctrl+C)")
         try:

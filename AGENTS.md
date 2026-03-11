@@ -703,7 +703,7 @@ Reports tagged as `urgent=True` bypass the gate entirely and go directly to the 
 
 ## Consultant Communication Protocol
 
-**Consultants (Codex, Gemini) are co-equal advisory peers, NOT routable workers.** They run in separate VS Code sessions with different AI models (GPT-5 Codex, Gemini 3 Pro). Communication is exclusively via the Skynet bus. They are NOT dispatched via `skynet_dispatch.py`.
+**Consultants (Codex, Gemini) are co-equal advisory peers with bridge-queue transport.** They are not worker HWNDs, but they are routable when their live bridge reports `accepts_prompts=true`. Communication must stay truthful: no consultant is considered promptable unless its bridge is actually live and accepting prompts.
 
 ### Consultant Registry
 
@@ -715,32 +715,36 @@ Reports tagged as `urgent=True` bypass the gate entirely and go directly to the 
 ### Architecture
 
 ```
-Orchestrator ──POST──▶ Bus (topic=consultant) ──▶ Consultant Bridge ──▶ Consultant VS Code Session
-                                                      ▲
-                                                      │ heartbeat every 2s
-                                                      │ stale after 8s
+Orchestrator / Protocol ──▶ Consultant Bridge Queue ──▶ Consultant Consumer
+          │                          ▲
+          │                          │ heartbeat every 2s
+          └──────▶ Bus audit trail ──┘ stale after 8s
 ```
 
 - Bridge daemons (`tools/skynet_consultant_bridge.py`) run as HTTP servers on their respective ports
-- They heartbeat to the bus every 2s — if heartbeat is stale (>8s), consider the consultant offline
+- They heartbeat every 2s — if heartbeat is stale (>8s), consider the consultant offline
 - Consultants announce via `identity_ack` on the bus when they boot
+- `skynet_dispatch.py --worker consultant` and `--worker gemini_consultant` are valid only when the target bridge is live and promptable
+- Bus messages remain the durable audit trail even when direct bridge queueing succeeds
 
 ### Sending Prompts to Consultants
 
 ```powershell
-# Broadcast to ALL consultants:
-Invoke-RestMethod -Uri http://localhost:8420/bus/publish -Method POST -ContentType application/json -Body (ConvertTo-Json @{sender="orchestrator"; topic="consultant"; type="prompt"; content="Your advisory request"})
+# Direct queue via dispatch layer:
+python tools/skynet_dispatch.py --worker consultant --task "Your advisory request"
+python tools/skynet_dispatch.py --worker gemini_consultant --task "Your advisory request"
 
-# Target a specific consultant:
-Invoke-RestMethod -Uri http://localhost:8420/bus/publish -Method POST -ContentType application/json -Body (ConvertTo-Json @{sender="orchestrator"; topic="consultant"; type="prompt"; metadata=@{target="gemini_consultant"}; content="Your prompt"})
+# Or explicit bridge POST:
+Invoke-RestMethod -Uri http://localhost:8425/consultants/prompt -Method POST -ContentType application/json -Body (ConvertTo-Json @{sender="orchestrator"; type="directive"; content="Your prompt"})
 ```
 
 ### Reading Consultant Responses
 
-Poll the bus and filter by consultant sender IDs (`consultant` or `gemini_consultant`):
+Poll the bus and filter by consultant sender IDs (`consultant` or `gemini_consultant`) and consultant bridge state:
 ```powershell
 Invoke-RestMethod http://localhost:8420/bus/messages?limit=30
-# Look for: sender="consultant" (Codex) or sender="gemini_consultant" (Gemini)
+Invoke-RestMethod http://localhost:8425/consultants
+# Look for: task_claim, result, delegation, and live task_state
 ```
 
 ### Health Checks
@@ -752,9 +756,28 @@ Invoke-RestMethod http://localhost:8425/health   # Gemini bridge
 
 ### Rules
 
-- **NEVER dispatch to consultants via `skynet_dispatch.py`** -- they are not workers, they have no HWND in workers.json
 - **Consultants are advisory** -- they propose, review, and advise; they don't execute worker-style tasks
-- **Bus is the ONLY communication channel** -- no ghost typing, no window automation on consultant windows
+- **No consultant promptability without live bridge truth** -- `accepts_prompts=true` is mandatory
+- **Bridge queue + bus audit trail is the correct transport** -- no ghost typing or fake HWND routing on consultant windows
 - **Consultant proposals appear on bus** with `topic=planning type=proposal`
 - **Consultants are optional** -- the system runs without them. The orchestrator does NOT start consultant bridges; they start themselves via `CC-Start` / `GC-Start`
 - **On boot**, the orchestrator checks if consultant bridges are alive (GET health endpoints) and notes their status in the boot report
+
+## Consultant Plan Cross-Validation Protocol
+
+**Any consultant-originated or consultant-claimed plan that could change code, config, routing, processes, or policy MUST be cross-validated by workers before execution.**
+
+### Mandatory Flow
+
+1. Queue the plan packet to the target consultant bridge.
+2. Publish the plan packet to `topic=planning type=consultant_plan`.
+3. Dispatch at least 3 distinct workers to review it independently.
+4. Require worker verdicts before execution (`approve`, `revise`, `reject`).
+5. If worker verdicts materially disagree, convene instead of executing.
+
+### Rules
+
+- **Consultant advice is never auto-executable** -- it becomes actionable only after worker review.
+- **Workers are independent critics** -- they must challenge assumptions, not rubber-stamp.
+- **Cross-validation must be durable** -- bus record + artifact path + review dispatch must all exist.
+- **Truth over convenience** -- if a consultant bridge is queued but no real consumer is attached, report the plan as queued, not accepted.

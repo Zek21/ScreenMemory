@@ -3,8 +3,14 @@
 Each episode captures a task dispatch, its result, outcome classification,
 and metadata. Episodes are persisted as individual JSON files under
 data/episodes/ for post-hoc analysis and learning-store ingestion.
+
+Deduplication: Every episode gets a SHA256 fingerprint derived from
+worker + task + outcome + result content. Before writing, the logger
+checks for an existing episode with the same fingerprint. Retried
+deliveries that produce identical content are silently deduplicated.
 """
 
+import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -22,6 +28,34 @@ class Outcome(str, Enum):
     UNKNOWN = "unknown"
 
 
+def compute_fingerprint(worker: str, task: str, outcome: str, result: str) -> str:
+    """Generate a SHA256 fingerprint from episode content fields.
+
+    The fingerprint uniquely identifies the semantic content of an episode,
+    regardless of timestamp or filename. Two episodes with identical
+    worker+task+outcome+result will produce the same fingerprint.
+    """
+    blob = f"{worker or ''}|{task or ''}|{outcome or ''}|{result or ''}"
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _find_existing_by_fingerprint(fingerprint: str) -> Optional[Path]:
+    """Scan data/episodes/ for an episode matching the given fingerprint.
+
+    Returns the Path of the first match, or None if no duplicate exists.
+    """
+    if not EPISODES_DIR.exists():
+        return None
+    for fp in EPISODES_DIR.glob("*.json"):
+        try:
+            ep = json.loads(fp.read_text(encoding="utf-8"))
+            if ep.get("fingerprint") == fingerprint:
+                return fp
+        except (json.JSONDecodeError, OSError):
+            continue
+    return None
+
+
 def log_episode(
     task: str,
     result: str,
@@ -31,6 +65,10 @@ def log_episode(
     metadata: Optional[dict] = None,
 ) -> dict:
     """Write an episode record to data/episodes/.
+
+    Deduplication: If an episode with the same fingerprint already exists,
+    the write is skipped and the existing episode is returned with
+    ``deduplicated=True``.
 
     Args:
         task: The task description that was dispatched.
@@ -42,15 +80,29 @@ def log_episode(
 
     Returns:
         The episode dict that was persisted (includes ``filepath``).
+        If deduplicated, includes ``deduplicated: True``.
     """
     if isinstance(outcome, Outcome):
         outcome_val = outcome.value
     else:
         outcome_val = Outcome(outcome).value
 
+    worker_tag = worker or "unknown"
+    fingerprint = compute_fingerprint(worker_tag, task, outcome_val, result)
+
+    # Dedup check: skip if an episode with this fingerprint already exists
+    existing = _find_existing_by_fingerprint(fingerprint)
+    if existing is not None:
+        try:
+            ep = json.loads(existing.read_text(encoding="utf-8"))
+            ep["filepath"] = str(existing)
+            ep["deduplicated"] = True
+            return ep
+        except Exception:
+            pass  # Fall through to write if read fails
+
     now = datetime.now(timezone.utc)
     ts = now.strftime("%Y-%m-%d_%H-%M-%S")
-    worker_tag = worker or "unknown"
 
     episode = {
         "timestamp": now.isoformat(),
@@ -59,6 +111,7 @@ def log_episode(
         "outcome": outcome_val,
         "strategy_id": strategy_id,
         "worker": worker_tag,
+        "fingerprint": fingerprint,
         "metadata": metadata or {},
     }
 
@@ -84,6 +137,22 @@ def load_episode(filepath: str) -> dict:
     """Load a single episode from disk."""
     with open(filepath, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def query_by_fingerprint(fingerprint: str) -> Optional[dict]:
+    """Find an episode by its fingerprint hash.
+
+    Returns the episode dict with ``filepath`` set, or None if not found.
+    """
+    match = _find_existing_by_fingerprint(fingerprint)
+    if match is not None:
+        try:
+            ep = json.loads(match.read_text(encoding="utf-8"))
+            ep["filepath"] = str(match)
+            return ep
+        except Exception:
+            pass
+    return None
 
 
 def list_episodes(worker: Optional[str] = None, limit: int = 50) -> list[dict]:
@@ -117,5 +186,15 @@ if __name__ == "__main__":
         worker_filter = sys.argv[2] if len(sys.argv) > 2 else None
         for ep in list_episodes(worker=worker_filter, limit=20):
             print(f"[{ep['outcome']}] {ep['worker']}: {ep['task'][:80]}")
+    elif len(sys.argv) > 1 and sys.argv[1] == "query-fp":
+        if len(sys.argv) < 3:
+            print("Usage: python skynet_episode.py query-fp <fingerprint>")
+        else:
+            ep = query_by_fingerprint(sys.argv[2])
+            if ep:
+                print(json.dumps(ep, indent=2))
+            else:
+                print("No episode found with that fingerprint.")
     else:
         print("Usage: python skynet_episode.py list [worker]")
+        print("       python skynet_episode.py query-fp <fingerprint>")

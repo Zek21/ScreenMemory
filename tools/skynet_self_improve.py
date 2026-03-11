@@ -36,7 +36,14 @@ IQ_HISTORY_FILE = DATA_DIR / "iq_history.json"
 BUS_URL = "http://localhost:8420"
 GOD_URL = "http://localhost:8421"
 
-SCAN_INTERVAL = 60  # seconds between scans
+# Load SCAN_INTERVAL from brain_config.json, enforce 120s minimum
+_DEFAULT_SCAN_INTERVAL = 120
+try:
+    _brain_cfg = json.loads((DATA_DIR / "brain_config.json").read_text(encoding="utf-8"))
+    SCAN_INTERVAL = max(_brain_cfg.get("self_improve_interval", _DEFAULT_SCAN_INTERVAL), 120)
+except Exception:
+    SCAN_INTERVAL = _DEFAULT_SCAN_INTERVAL
+
 MAX_PROPOSALS = 50  # max stored proposals
 
 

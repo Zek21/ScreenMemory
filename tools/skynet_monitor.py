@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import collections
 import ctypes
 import ctypes.wintypes
 import json
@@ -69,7 +70,9 @@ def metrics():
     _metrics = _metrics or SkynetMetrics()
     return _metrics
 
-HWND_CHECK_INTERVAL = 10    # seconds between window alive checks
+HWND_CHECK_INTERVAL = 30    # seconds between window alive checks (was 10s -- CPU fix)
+HWND_IDLE_INTERVAL = 60     # interval when all workers IDLE for 3+ consecutive scans
+IDLE_STREAK_THRESHOLD = 3   # consecutive all-IDLE scans before slowing down
 MODEL_CHECK_INTERVAL = 60   # seconds between model checks
 ORCH_MODEL_CHECK_INTERVAL = 30  # orchestrator checked more frequently (security-critical)
 STUCK_PROCESSING_THRESHOLD = 180  # seconds in PROCESSING before auto-recovery attempt
@@ -315,12 +318,11 @@ def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_or
             h["model"] = model_name
             h["agent"] = agent_name
 
+
             if not model_ok:
                 issues = []
-                if not is_model_correct(model_name):
-                    issues.append(f"model='{model_name}'")
-                if not is_agent_cli(agent_name):
-                    issues.append(f"agent='{agent_name}'")
+                if not is_model_correct(model_name): issues.append(f"model='{model_name}'")
+                if not is_agent_cli(agent_name): issues.append(f"agent='{agent_name}'")
                 log(f"{name.upper()}: DRIFT detected {'; '.join(issues)} -- auto-correcting", "FIX")
                 skynet_post("/bus/publish", {"sender": "monitor", "topic": "orchestrator", "type": "alert",
                     "content": f"WORKER {name.upper()} drift: {'; '.join(issues)} -- auto-correcting to Opus fast"})
@@ -340,6 +342,16 @@ def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_or
             h["agent"] = "unchecked"
 
         h["status"] = "OK" if model_ok else "MODEL_WRONG"
+        
+        try:
+            from tools.uia_engine import get_engine
+            true_state = get_engine().get_state(hwnd)
+            if true_state in ("IDLE", "PROCESSING", "STEERING", "TYPING"):
+                h["status"] = true_state
+            else:
+                log(f"DEBUG: {name} truestate was {true_state}", "DEBUG")
+        except Exception as e:
+            log(f"Exception in get_state: {e}", "WARN")
         if model_ok:
             log(f"{name.upper()}: OK (hwnd={hwnd} model={'checked' if check_model else 'skip'})", "OK")
         else:
@@ -509,9 +521,26 @@ _workers_mtime: float = 0.0  # last known mtime of workers.json
 # ─── Productivity tracking state ────────────────────────────────────────────
 _worker_productivity: dict = {}  # name -> {tasks_completed, first_seen, last_result_time}
 _idle_since: dict = {}           # name -> epoch when IDLE streak started
-_health_trend: list = []         # list of periodic snapshots for trend analysis
+_health_trend: collections.deque = collections.deque(maxlen=200)  # bounded trend snapshots
 _IDLE_UNPRODUCTIVE_THRESHOLD = 300  # 5 minutes idle with pending work = unproductive
-_MAX_HEALTH_TREND = 200            # keep last 200 snapshots (~33 min at 10s intervals)
+_MAX_HEALTH_TREND = 200            # kept for reference; deque maxlen enforces this
+
+
+def _cleanup_stale_workers():
+    """Remove entries from tracking dicts for workers no longer in workers.json.
+    Prevents unbounded growth of _worker_productivity, _idle_since, _dead_consecutive, _last_alert."""
+    try:
+        if not WORKERS_FILE.exists():
+            return
+        data = json.loads(WORKERS_FILE.read_text(encoding="utf-8"))
+        current_names = {w.get("name") for w in data.get("workers", []) if w.get("name")}
+    except Exception:
+        return
+
+    for tracking_dict in (_worker_productivity, _idle_since, _dead_consecutive, _last_alert):
+        stale_keys = [k for k in tracking_dict if k not in current_names]
+        for k in stale_keys:
+            del tracking_dict[k]
 
 
 def _reload_workers_if_changed() -> tuple:
@@ -758,7 +787,6 @@ def _auto_restart_stale_daemons():
 
 def _record_health_trend(health: dict, productivity: dict, pending_work: int):
     """Append a health snapshot to the trend log and write to data/monitor_health.json."""
-    global _health_trend
     now = time.time()
 
     snapshot = {
@@ -787,8 +815,7 @@ def _record_health_trend(health: dict, productivity: dict, pending_work: int):
             snapshot["total_ok"] += 1
 
     _health_trend.append(snapshot)
-    if len(_health_trend) > _MAX_HEALTH_TREND:
-        _health_trend = _health_trend[-_MAX_HEALTH_TREND:]
+    # deque(maxlen=200) auto-evicts old entries -- no manual trim needed
 
     # Write full trend to disk for dashboard consumption
     try:
@@ -931,6 +958,8 @@ def _run_monitor(args):
     last_orch_check = 0.0
     last_daemon_restart_check = 0.0
     cycle = 0
+    consecutive_idle = 0       # tracks consecutive all-IDLE scans for adaptive interval
+    current_interval = args.hwnd_interval  # adaptive: starts at base, may increase
     DAEMON_CHECK_INTERVAL = 120  # check daemon health every 2 minutes
 
     try:
@@ -945,6 +974,10 @@ def _run_monitor(args):
                 cycle += 1
                 now = time.time()
 
+                # ── Cleanup stale tracking entries every 10 cycles ──────
+                if cycle % 10 == 0:
+                    _cleanup_stale_workers()
+
                 # ── AUTO-RELOAD workers.json if changed ────────────────────
                 new_workers, new_orch, changed = _reload_workers_if_changed()
                 if changed and new_workers is not None:
@@ -957,6 +990,23 @@ def _run_monitor(args):
 
                 health = run_check(workers, orch_hwnd, check_model=do_model, check_orch=do_orch)
                 write_health(health)
+
+                # ── Adaptive interval: slow down when all workers IDLE ───
+                all_idle = all(
+                    w.get("state", "").upper() == "IDLE"
+                    for w in health.get("workers", {}).values()
+                    if isinstance(w, dict)
+                )
+                if all_idle:
+                    consecutive_idle += 1
+                    if consecutive_idle >= IDLE_STREAK_THRESHOLD and current_interval < HWND_IDLE_INTERVAL:
+                        current_interval = HWND_IDLE_INTERVAL
+                        log(f"All workers IDLE for {consecutive_idle} scans -- slowing to {current_interval}s", "INFO")
+                else:
+                    if consecutive_idle >= IDLE_STREAK_THRESHOLD:
+                        log(f"Worker state change detected -- resetting interval to {args.hwnd_interval}s", "INFO")
+                    consecutive_idle = 0
+                    current_interval = args.hwnd_interval
 
                 # ── Stuck worker detection with auto-recovery ───────────────
                 _check_stuck_workers(workers)
@@ -1014,7 +1064,7 @@ def _run_monitor(args):
             except Exception as e:
                 log(f"Monitor cycle error: {e}", "ERR")
 
-            time.sleep(args.hwnd_interval)
+            time.sleep(current_interval)
     except KeyboardInterrupt:
         log("Monitor shutting down (Ctrl+C)", "INFO")
         skynet_post("/bus/publish", {"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",

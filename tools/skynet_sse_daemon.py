@@ -243,7 +243,7 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
     atexit.register(_cleanup_pid)
 
     update_count = 0
-    backoff = 3.0
+    backoff = 2.0
     max_backoff = 30.0
     last_status_print = 0
 
@@ -254,7 +254,7 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
         conn = None
         try:
             conn, resp = _sse_connect(host, port)
-            backoff = 3.0
+            backoff = 2.0
             print(f"[sse-daemon] SSE connected, streaming...", flush=True)
 
             buf = ""

@@ -56,10 +56,13 @@ MAX_LOG_ENTRIES = 50
 HEALTH_REPORT_INTERVAL = 300  # report health to bus every 5 min
 MAX_CONSECUTIVE_PROMPTS = 3   # stop after N prompts without orchestrator action
 
+ALL_IDLE_INTERVAL = 60  # faster prompting when all workers idle
+
 def _load_config_overrides():
-    """Load self_prompt thresholds from brain_config.json if present."""
+    """Load self_prompt thresholds from brain_config.json. Called on startup AND each cycle (hot-reload)."""
     global LOOP_INTERVAL, MIN_PROMPT_GAP, IDLE_WORKER_THRESHOLD
     global ORCH_INACTIVE_THRESHOLD, HEALTH_REPORT_INTERVAL, PROMPT_THRESHOLD, MAX_CONSECUTIVE_PROMPTS
+    global ALL_IDLE_INTERVAL
     try:
         cfg = json.loads(BRAIN_CONFIG_FILE.read_text(encoding="utf-8"))
         sp = cfg.get("self_prompt", {})
@@ -77,6 +80,8 @@ def _load_config_overrides():
             HEALTH_REPORT_INTERVAL = sp["health_report_interval"]
         if sp.get("max_consecutive"):
             MAX_CONSECUTIVE_PROMPTS = sp["max_consecutive"]
+        if sp.get("all_idle_interval"):
+            ALL_IDLE_INTERVAL = sp["all_idle_interval"]
     except Exception:
         pass
 
@@ -1506,8 +1511,11 @@ class SelfPromptDaemon:
                 log(f"Delivered {queued_delivered} queued directive(s)")
                 return True
 
-        # Rate limit
-        if now - self.last_prompt_time < MIN_PROMPT_GAP:
+        # Rate limit — use shorter gap when all workers idle
+        effective_gap = MIN_PROMPT_GAP
+        if self._all_workers_idle():
+            effective_gap = min(ALL_IDLE_INTERVAL, MIN_PROMPT_GAP)
+        if now - self.last_prompt_time < effective_gap:
             return False
 
         # Consecutive prompt limiter: reset if orchestrator acted independently
@@ -1585,7 +1593,22 @@ class SelfPromptDaemon:
     def _all_workers_idle(self):
         """Check if ALL 4 workers (alpha/beta/gamma/delta) report IDLE via /status endpoint.
         Returns True only when every registered worker is IDLE. If any is busy, returns False.
+        Uses a 30-second cache to avoid expensive HTTP calls every 5s cycle.
         """
+        now = time.time()
+        cache_ttl = 30.0
+        if (hasattr(self, '_worker_state_cache') and
+                hasattr(self, '_worker_state_cache_ts') and
+                now - self._worker_state_cache_ts < cache_ttl):
+            return self._worker_state_cache
+
+        result = self._fetch_all_workers_idle()
+        self._worker_state_cache = result
+        self._worker_state_cache_ts = now
+        return result
+
+    def _fetch_all_workers_idle(self):
+        """Actual HTTP call to check worker idle status."""
         try:
             data = _fetch_json(f"{BUS_URL}/status")
             if not data:
@@ -1638,6 +1661,9 @@ class SelfPromptDaemon:
         try:
             while True:
                 try:
+                    # Hot-reload config every cycle (file read is cheap, ~0.1ms)
+                    _load_config_overrides()
+
                     # Always deliver queued directives, even mid-wave.
                     queued_delivered = self._deliver_queued_directives()
                     if queued_delivered > 0:

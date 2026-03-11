@@ -7,6 +7,8 @@ Uses clipboard paste via PostMessage — zero cursor movement.
 
 Usage:
     python tools/skynet_dispatch.py --worker alpha --task "List all Python files in core/"
+    python tools/skynet_dispatch.py --worker orchestrator --task "Review the elevated convene report"
+    python tools/skynet_dispatch.py --worker consultant --task "Advisory request: analyze the queue design"
     python tools/skynet_dispatch.py --all --task "Run health check"
     python tools/skynet_dispatch.py --parallel --task "Run health check"   # all workers simultaneously
     python tools/skynet_dispatch.py --smart --task "Analyse D:\\ML"         # auto-route to best worker
@@ -430,6 +432,58 @@ def enrich_task(worker_name, task):
     return context_block + task
 
 
+def pre_dispatch_visual_check(hwnd, worker_name):
+    """Screenshot worker window before dispatch — visual verification for debugging.
+    
+    Saves screenshot to data/dispatch_screenshots/{worker}_{timestamp}.png.
+    Returns (ok: bool, state: str, screenshot_path: str|None).
+    """
+    screenshot_dir = DATA_DIR / "dispatch_screenshots"
+    screenshot_dir.mkdir(exist_ok=True)
+    
+    try:
+        from tools.uia_engine import get_engine
+        engine = get_engine()
+        scan = engine.scan(hwnd)
+        state = scan.state
+        model_ok = scan.model_ok
+        agent_ok = scan.agent_ok
+    except Exception as ex:
+        log(f"UIA scan failed for {worker_name}: {ex}", "WARN")
+        state, model_ok, agent_ok = "UNKNOWN", None, None
+
+    # Take screenshot via Desktop
+    ss_path = None
+    try:
+        from tools.chrome_bridge.winctl import Desktop
+        d = Desktop()
+        ts = datetime.now().strftime("%H%M%S")
+        ss_path = str(screenshot_dir / f"{worker_name}_{ts}.png")
+        d.screenshot(path=ss_path, window=hwnd)
+    except Exception as ex:
+        log(f"Screenshot failed for {worker_name}: {ex}", "WARN")
+        ss_path = None
+
+    # Log visual check results
+    log(f"👁 VISUAL CHECK {worker_name.upper()}: state={state} model_ok={model_ok} agent_ok={agent_ok}" +
+        (f" ss={ss_path}" if ss_path else ""), "SYS")
+    
+    # Block dispatch if model is wrong (security)
+    if model_ok is False:
+        log(f"✗ {worker_name.upper()} model_ok=False — blocking dispatch", "SECURITY")
+        return False, state, ss_path
+    
+    # Cleanup old screenshots (keep last 20 per worker)
+    try:
+        existing = sorted(screenshot_dir.glob(f"{worker_name}_*.png"))
+        for old in existing[:-20]:
+            old.unlink(missing_ok=True)
+    except Exception:
+        pass
+    
+    return True, state, ss_path
+
+
 def detect_steering(hwnd):
     """Return True if the worker window is showing a STEERING panel — UIA-based, no screenshot."""
     state = get_worker_state_uia(hwnd)
@@ -574,15 +628,21 @@ def load_orch_hwnd():
 def ghost_type_to_worker(hwnd, text, orch_hwnd):
     """Type text into a worker chat window via clipboard paste.
 
-    Level 4.1 -- CMD glitch elimination:
+    Level 4.2 -- File-based dispatch (no clipboard truncation):
+    - Text written to temp file, PowerShell reads from file (unlimited length)
     - Clipboard save/restore (user clipboard never lost)
     - AttachThreadInput for less-visible focus transfer (no Z-order flash)
     - Minimized sleep durations (~200ms vs old 500ms)
     - CREATE_NO_WINDOW flag on subprocess (no console flash)
     """
-    safe_text = text.replace("'", "''").replace('"', '`"').replace("\n", " ")
+    import tempfile
+    # Write dispatch text to temp file -- eliminates PS string literal escaping/truncation
+    dispatch_file = Path(ROOT) / "data" / f".dispatch_tmp_{hwnd}.txt"
+    dispatch_file.write_text(text.replace("\n", " "), encoding="utf-8")
+    dispatch_file_path = str(dispatch_file).replace("\\", "\\\\")
 
     ps = f'''
+$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
 Add-Type @"
 using System; using System.Runtime.InteropServices; using System.Text;
@@ -605,7 +665,8 @@ public class GhostType {{
         return IntPtr.Zero;
     }}
     public static bool FocusViaAttach(IntPtr target) {{
-        uint targetTid = GetWindowThreadProcessId(target, out _);
+        uint targetPid;
+        uint targetTid = GetWindowThreadProcessId(target, out targetPid);
         uint myTid = GetCurrentThreadId();
         if (targetTid == 0) return false;
         AttachThreadInput(myTid, targetTid, true);
@@ -613,7 +674,8 @@ public class GhostType {{
         return true;
     }}
     public static void DetachThread(IntPtr target) {{
-        uint targetTid = GetWindowThreadProcessId(target, out _);
+        uint targetPid;
+        uint targetTid = GetWindowThreadProcessId(target, out targetPid);
         uint myTid = GetCurrentThreadId();
         AttachThreadInput(myTid, targetTid, false);
     }}
@@ -622,6 +684,9 @@ public class GhostType {{
 
 $hwnd = [IntPtr]{hwnd}
 $orchHwnd = [IntPtr]{orch_hwnd}
+
+# Read dispatch text from temp file (unlimited length, no escaping issues)
+$dispatchText = [System.IO.File]::ReadAllText("{dispatch_file_path}", [System.Text.Encoding]::UTF8)
 
 # Auto-cancel STEERING if present (UIA InvokePattern -- no focus needed)
 $wnd = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
@@ -656,10 +721,11 @@ foreach ($e in $allEdits) {{
 if ($edit) {{
     # Save user clipboard before overwriting
     $savedClip = $null
+    $deliveryStatus = "FAILED"
     try {{ $savedClip = [System.Windows.Forms.Clipboard]::GetText() }} catch {{}}
 
-    # Set dispatch text to clipboard
-    [System.Windows.Forms.Clipboard]::SetText("{safe_text}")
+    # Set dispatch text to clipboard from file content
+    [System.Windows.Forms.Clipboard]::SetText($dispatchText)
     Start-Sleep -Milliseconds 50
 
     # PRIMARY: AttachThreadInput -- transfers keyboard focus without changing
@@ -672,7 +738,7 @@ if ($edit) {{
         Start-Sleep -Milliseconds 80
         [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
         [GhostType]::DetachThread($hwnd)
-        Write-Host "OK_ATTACHED"
+        $deliveryStatus = "OK_ATTACHED"
     }} else {{
         # FALLBACK: Brief SetForegroundWindow (minimized to ~160ms)
         try {{ $edit.SetFocus() }} catch {{}}
@@ -682,7 +748,7 @@ if ($edit) {{
         Start-Sleep -Milliseconds 80
         [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
         [GhostType]::SetForegroundWindow($orchHwnd)
-        Write-Host "OK_FALLBACK"
+        $deliveryStatus = "OK_FALLBACK"
     }}
 
     # Restore user clipboard (don't leave dispatch text in clipboard)
@@ -690,8 +756,18 @@ if ($edit) {{
         Start-Sleep -Milliseconds 50
         try {{ [System.Windows.Forms.Clipboard]::SetText($savedClip) }} catch {{}}
     }}
+
+    # Clean up temp file
+    try {{ Remove-Item "{dispatch_file_path}" -Force -ErrorAction SilentlyContinue }} catch {{}}
+
+    Write-Host $deliveryStatus
+    if ($deliveryStatus -like "OK_*") {{
+        exit 0
+    }}
+    exit 1
 }} else {{
     Write-Host "NO_EDIT"
+    exit 1
 }}
 '''
     try:
@@ -724,11 +800,17 @@ if ($edit) {{
             # Inter-dispatch cooldown — prevent clipboard races between workers
             time.sleep(0.5)
 
-        ok = ("OK_ATTACHED" in r.stdout or "OK_FALLBACK" in r.stdout) and "NO_EDIT" not in r.stdout
+        stderr = (r.stderr or "").strip()
+        ok = (
+            r.returncode == 0
+            and ("OK_ATTACHED" in r.stdout or "OK_FALLBACK" in r.stdout)
+            and "NO_EDIT" not in r.stdout
+            and not stderr
+        )
         if not ok and r.stdout:
             log(f"Ghost output: {r.stdout.strip()[:200]}", "WARN")
-        if r.stderr and r.stderr.strip():
-            log(f"Ghost stderr: {r.stderr.strip()[:200]}", "WARN")
+        if stderr:
+            log(f"Ghost stderr: {stderr[:200]}", "WARN")
         return ok
     except Exception as e:
         log(f"Ghost type failed: {e}", "ERR")
@@ -740,7 +822,7 @@ if ($edit) {{
 
 
 def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=None):
-    """Dispatch a single task to a specific worker. Always fires immediately.
+    """Dispatch a single task to a specific routable identity. Always fires immediately.
 
     VS Code queues messages, so there is no reason to wait for IDLE state.
     Only STEERING is handled (auto-cancelled) before dispatch.
@@ -757,6 +839,41 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
     if not orch_hwnd:
         orch_hwnd = load_orch_hwnd()
 
+    target_name = str(worker_name).lower()
+    if target_name == "orchestrator":
+        try:
+            from tools.skynet_delivery import deliver_to_orchestrator
+            log(f"→ ORCHESTRATOR [direct-prompt]: {task[:80]}{'...' if len(task) > 80 else ''}", "SYS")
+            result = deliver_to_orchestrator(task, sender=self_id or "orchestrator", also_bus=True)
+            ok = bool(result.get("success"))
+            _log_dispatch(worker_name, task, "DIRECT_PROMPT", ok, orch_hwnd or 0)
+            if ok:
+                log(f"✓ Dispatched to ORCHESTRATOR [{result.get('detail', '')}]", "OK")
+            else:
+                log(f"✗ Failed to dispatch to ORCHESTRATOR [{result.get('detail', '')}]", "ERR")
+            return ok
+        except Exception as e:
+            log(f"Orchestrator dispatch failed: {e}", "ERR")
+            _log_dispatch(worker_name, task, "DIRECT_PROMPT", False, orch_hwnd or 0)
+            return False
+
+    if target_name in ("consultant", "gemini_consultant"):
+        try:
+            from tools.skynet_delivery import deliver_to_consultant
+            log(f"→ {target_name.upper()} [bridge-queue]: {task[:80]}{'...' if len(task) > 80 else ''}", "SYS")
+            result = deliver_to_consultant(target_name, task, sender=self_id or "orchestrator", msg_type="directive")
+            ok = bool(result.get("success"))
+            _log_dispatch(worker_name, task, "BRIDGE_QUEUE", ok, 0)
+            if ok:
+                log(f"✓ Dispatched to {target_name.upper()} [{result.get('detail', '')}]", "OK")
+            else:
+                log(f"✗ Failed to dispatch to {target_name.upper()} [{result.get('detail', '')}]", "ERR")
+            return ok
+        except Exception as e:
+            log(f"Consultant dispatch failed for {target_name}: {e}", "ERR")
+            _log_dispatch(worker_name, task, "BRIDGE_QUEUE", False, 0)
+            return False
+
     t_start = time.time()
     target = None
     for w in workers:
@@ -765,7 +882,7 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
             break
 
     if not target:
-        log(f"Worker '{worker_name}' not found", "ERR")
+        log(f"Target '{worker_name}' not found", "ERR")
         return False
 
     hwnd = target["hwnd"]
@@ -773,8 +890,12 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
         log(f"Worker {worker_name.upper()} window not visible (HWND={hwnd})", "ERR")
         return False
 
-    # Pre-dispatch UIA state check (no screenshot needed)
-    pre_state = get_worker_state_uia(hwnd)
+    # Pre-dispatch visual check: UIA scan + screenshot for verification
+    vis_ok, pre_state, ss_path = pre_dispatch_visual_check(hwnd, worker_name)
+    if not vis_ok:
+        log(f"✗ Visual check FAILED for {worker_name.upper()} — aborting dispatch", "ERR")
+        return False
+
     log(f"→ {worker_name.upper()} [state={pre_state}] [HWND={hwnd}]: {task[:80]}{'...' if len(task) > 80 else ''}", "SYS")
 
     if pre_state == "STEERING":
@@ -788,6 +909,28 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
     # Enrich task with live system context (worker states, last result, goal, autonomy)
     enriched_task = enrich_task(worker_name, task)
     full_task = build_context_preamble(worker_name, enriched_task, context) if context else build_preamble(worker_name) + enriched_task
+
+    # Security: validate HWND before ghost-typing content into target window
+    try:
+        from skynet_delivery import validate_hwnd as _validate_hwnd
+        validation = _validate_hwnd(hwnd, f"worker:{worker_name}")
+        if not validation["valid"]:
+            failed_checks = [k for k, v in validation["checks"].items() if not v]
+            log(f"✗ HWND {hwnd} FAILED security validation for {worker_name}: "
+                f"{failed_checks} pid={validation['pid']} proc={validation['process_name']}",
+                "SECURITY")
+            _log_dispatch(worker_name, task, pre_state, False, hwnd)
+            return False
+    except ImportError:
+        # Inline fallback: basic IsWindow check if delivery module unavailable
+        try:
+            if not ctypes.windll.user32.IsWindow(hwnd):
+                log(f"✗ HWND {hwnd} is not a valid window for {worker_name}", "SECURITY")
+                _log_dispatch(worker_name, task, pre_state, False, hwnd)
+                return False
+        except Exception:
+            pass  # Allow dispatch if ctypes fails (non-Windows)
+
     ok = ghost_type_to_worker(hwnd, full_task, orch_hwnd)
 
     if ok:
@@ -1324,7 +1467,7 @@ Modes (fastest first):
   --blast        Parallel broadcast to ALL idle workers, no preamble. Max speed.
   --parallel     Parallel broadcast to ALL workers with steering preamble.
   --smart        Auto-route to best idle worker(s). Use --n for multiple.
-  --worker NAME  Target specific worker.
+  --worker NAME  Target specific identity (worker, orchestrator, consultant).
   --idle         Dispatch to first available idle worker.
   --all          Sequential broadcast (legacy, slower).
   --fan-out-parallel FILE  Parallel fan-out from JSON map (fastest for complex tasks).
@@ -1336,7 +1479,7 @@ Examples:
   python skynet_dispatch.py --blast --task "Write-Host hello"
   python skynet_dispatch.py --wait-result "ALPHA-" --timeout 60
 """)
-    parser.add_argument("--worker", type=str, help="Target worker name")
+    parser.add_argument("--worker", type=str, help="Target identity name")
     parser.add_argument("--task", type=str, help="Task to dispatch")
     parser.add_argument("--all", action="store_true", help="Sequential broadcast to all workers")
     parser.add_argument("--parallel", action="store_true", help="PARALLEL broadcast to all workers simultaneously")

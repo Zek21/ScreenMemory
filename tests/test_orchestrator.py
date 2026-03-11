@@ -458,8 +458,12 @@ class TestOrchestrator(unittest.TestCase):
             "then compare Bitcoin and Ethereum performance step by step"
         )
         self.assertIn(result["status"], ("success", "partial"))
-        # Should detect finance + analysis domains
-        daao_step = result["pipeline"][1]
+        # Find the daao_route step by name (index may shift as pipeline evolves)
+        daao_step = next(
+            (s for s in result["pipeline"] if s.get("step") == "daao_route"),
+            None,
+        )
+        self.assertIsNotNone(daao_step, "daao_route step not found in pipeline")
         self.assertIn(daao_step["difficulty"],
                       ("MODERATE", "COMPLEX", "ADVERSARIAL"))
 

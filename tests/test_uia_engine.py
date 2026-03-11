@@ -60,7 +60,11 @@ def test_scan_worker(engine, first_worker_hwnd):
 
 
 def test_scan_orchestrator(engine, orchestrator_hwnd):
+    if not orchestrator_hwnd:
+        pytest.skip("No orchestrator HWND available (not in live Skynet session)")
     result = engine.scan(orchestrator_hwnd)
+    if result.state == "UNKNOWN" and not result.model:
+        pytest.skip("Orchestrator window not accessible (stale HWND or no live session)")
     assert result.model_ok is True, f"Model not OK: {result.model!r}"
     assert result.agent_ok is True, f"Agent not OK: {result.agent!r}"
 

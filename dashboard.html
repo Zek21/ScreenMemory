@@ -173,6 +173,9 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .god-msg.critical{color:var(--red);background:var(--red-dim);animation:dotPulse 1s infinite;}
 .god-empty{font-size:9px;color:var(--dim);font-style:italic;}
 .god-briefing-text{font-size:9px;color:var(--text2);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.orch-telemetry{margin-top:4px;font-size:9px;color:var(--text);line-height:1.5;max-width:260px;}
+.orch-telemetry .label{color:var(--text2);margin-right:4px;}
+.orch-telemetry .value{color:var(--cyan);}
 
 /* ═══ WORKER CARDS (2x2 grid, cols 2-3, row 2) ═══ */
 .worker-grid{
@@ -244,6 +247,23 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   font-family:var(--mono);font-size:9px;font-weight:700;color:var(--text2);
   background:rgba(255,255,255,0.04);padding:2px 6px;border-radius:3px;
 }
+.telemetry-box{
+  padding:7px 14px 8px;border-bottom:1px solid var(--border);
+  display:flex;flex-direction:column;gap:4px;flex-shrink:0;
+  background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));
+}
+.telemetry-row{display:flex;gap:8px;align-items:flex-start;}
+.telemetry-label{
+  min-width:34px;flex-shrink:0;font-family:var(--mono);font-size:8px;
+  letter-spacing:1px;color:var(--text2);
+}
+.telemetry-value{
+  font-size:9px;line-height:1.4;color:var(--text);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.telemetry-value.muted{color:var(--dim);}
+.telemetry-value.typing{color:var(--amber);}
+.telemetry-value.thinking{color:var(--cyan);}
 .progress-track{height:2px;background:rgba(255,255,255,0.04);flex-shrink:0;overflow:hidden;}
 .progress-fill{height:100%;border-radius:1px;transition:width .4s ease;}
 .progress-fill[data-a="alpha"]{background:linear-gradient(90deg,var(--alpha),rgba(68,138,255,0.3));}
@@ -598,6 +618,88 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
 .wo-content{color:var(--text);font-size:8px;margin-top:1px;line-height:1.3;word-break:break-word;}
 
 @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.5;}}
+
+/* ═══ KANBAN BOARD OVERLAY ═══ */
+.kanban-overlay{
+  position:fixed;inset:0;z-index:1200;background:rgba(0,0,0,0.75);backdrop-filter:blur(6px);
+  display:none;align-items:center;justify-content:center;animation:fadeIn .2s ease;
+}
+.kanban-overlay.open{display:flex;}
+.kanban-board{
+  width:min(1400px,calc(100vw - 48px));height:min(800px,calc(100vh - 64px));
+  background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+  display:flex;flex-direction:column;overflow:hidden;backdrop-filter:blur(12px);
+  box-shadow:0 8px 48px rgba(0,0,0,0.5);
+}
+.kanban-header{
+  padding:12px 16px;display:flex;align-items:center;gap:10px;
+  border-bottom:1px solid var(--border);flex-shrink:0;
+}
+.kanban-title{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:2px;color:var(--cyan);text-transform:uppercase;}
+.kanban-meta{font-family:var(--mono);font-size:9px;color:var(--dim);margin-left:4px;}
+.kanban-close{
+  margin-left:auto;background:none;border:1px solid var(--border);border-radius:4px;
+  color:var(--text2);font-family:var(--mono);font-size:9px;padding:4px 10px;cursor:pointer;
+  transition:all .2s;letter-spacing:0.5px;
+}
+.kanban-close:hover{border-color:var(--red);color:var(--red);}
+.kanban-wave-filter{
+  display:flex;gap:2px;margin-left:12px;
+}
+.kanban-wave-btn{
+  background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:3px;
+  color:var(--dim);font-family:var(--mono);font-size:8px;padding:3px 8px;cursor:pointer;
+  transition:all .2s;letter-spacing:0.5px;
+}
+.kanban-wave-btn.active{border-color:var(--cyan);color:var(--cyan);background:var(--cyan-dim);}
+.kanban-wave-btn:hover{border-color:var(--text2);color:var(--text2);}
+.kanban-columns{
+  flex:1;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;padding:12px;overflow:hidden;
+}
+.kanban-col{
+  display:flex;flex-direction:column;background:rgba(255,255,255,0.01);
+  border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;
+}
+.kanban-col-head{
+  padding:8px 12px;display:flex;align-items:center;gap:8px;
+  border-bottom:1px solid var(--border);flex-shrink:0;
+}
+.kanban-col-title{font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;}
+.kanban-col-count{
+  margin-left:auto;font-family:var(--mono);font-size:9px;font-weight:700;
+  padding:1px 6px;border-radius:3px;background:rgba(255,255,255,0.04);color:var(--text2);
+}
+.kanban-col.pending .kanban-col-title{color:var(--amber);}
+.kanban-col.pending .kanban-col-count{color:var(--amber);}
+.kanban-col.active .kanban-col-title{color:var(--cyan);}
+.kanban-col.active .kanban-col-count{color:var(--cyan);}
+.kanban-col.done .kanban-col-title{color:var(--green);}
+.kanban-col.done .kanban-col-count{color:var(--green);}
+.kanban-col-body{flex:1;overflow-y:auto;padding:6px;display:flex;flex-direction:column;gap:6px;}
+.kanban-card{
+  background:rgba(255,255,255,0.02);border:1px solid var(--border);border-radius:6px;
+  padding:10px 12px;cursor:default;transition:border-color .2s,transform .15s;
+  animation:slideIn .2s ease;
+}
+.kanban-card:hover{border-color:rgba(255,255,255,0.12);transform:translateY(-1px);}
+.kanban-card-title{font-family:var(--mono);font-size:10px;color:var(--text);line-height:1.4;margin-bottom:6px;word-break:break-word;}
+.kanban-card-footer{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.kanban-card-assignee{
+  font-family:var(--mono);font-size:8px;font-weight:700;letter-spacing:0.5px;
+  padding:2px 6px;border-radius:3px;text-transform:uppercase;
+}
+.kanban-card-assignee[data-a="alpha"]{color:var(--alpha);background:rgba(68,138,255,0.1);border:1px solid rgba(68,138,255,0.2);}
+.kanban-card-assignee[data-a="beta"]{color:var(--beta);background:rgba(179,136,255,0.1);border:1px solid rgba(179,136,255,0.2);}
+.kanban-card-assignee[data-a="gamma"]{color:var(--gamma);background:rgba(255,128,171,0.1);border:1px solid rgba(255,128,171,0.2);}
+.kanban-card-assignee[data-a="delta"]{color:var(--delta);background:rgba(255,82,82,0.1);border:1px solid rgba(255,82,82,0.2);}
+.kanban-card-assignee[data-a="orchestrator"]{color:var(--orch);background:rgba(255,215,0,0.1);border:1px solid rgba(255,215,0,0.2);}
+.kanban-card-pri{font-family:var(--mono);font-size:8px;font-weight:700;padding:1px 5px;border-radius:2px;}
+.kanban-card-pri.p1{color:var(--red);background:rgba(255,32,64,0.1);}
+.kanban-card-pri.p2{color:var(--amber);background:rgba(255,179,0,0.1);}
+.kanban-card-pri.p3{color:var(--dim);background:rgba(255,255,255,0.03);}
+.kanban-card-wave{font-family:var(--mono);font-size:7px;color:var(--dim);margin-left:auto;}
+.kanban-empty{font-family:var(--mono);font-size:9px;color:var(--dim);font-style:italic;padding:12px;text-align:center;}
+@keyframes slideIn{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:translateY(0);}}
 @keyframes slideIn{from{opacity:0;transform:translateX(-4px);}to{opacity:1;transform:none;}}
 </style>
 </head>
@@ -623,6 +725,8 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
   <span class="hdr-stat">Tasks <span class="val" id="sb-tasks">0</span></span>
   <span class="hdr-sep"></span>
   <span class="hdr-stat">IQ <span class="val hdr-iq" id="sb-iq">--</span></span>
+  <span class="hdr-sep"></span>
+  <span class="hdr-stat" id="learnerHealthStat" title="Learner daemon health"><span class="val" id="sb-learner-dot" style="color:var(--dim);">○</span> Learner</span>
   <div class="hdr-right">
     <span class="hdr-stat">Self <span class="val" id="sb-self" style="color:var(--dim)">BLIND</span></span>
     <span class="hdr-sep"></span>
@@ -698,6 +802,7 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <div class="god-queue" id="godQueue"><span class="god-empty">No pending approvals</span></div>
       <span class="god-count zero" id="godCount" style="display:none">0</span>
       <span class="god-briefing-text" id="godBriefing"></span>
+      <div class="orch-telemetry" id="orchTelemetry"><span class="label">LIVE</span><span class="value">Telemetry unavailable</span></div>
       <div class="orch-stat" id="sb-god" style="display:none">0</div>
     </div>
     <div class="orch-feed" id="orchFeed"></div>
@@ -721,6 +826,11 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <span class="task-text empty" id="task-alpha">Awaiting dispatch…</span>
         <span class="tasks-num" id="count-alpha">0</span>
       </div>
+      <div class="telemetry-box">
+        <div class="telemetry-row"><span class="telemetry-label">DO</span><span class="telemetry-value muted" id="doing-alpha">Standing by</span></div>
+        <div class="telemetry-row"><span class="telemetry-label">TYPE</span><span class="telemetry-value muted" id="typing-alpha">No visible input</span></div>
+        <div class="telemetry-row"><span class="telemetry-label">THINK</span><span class="telemetry-value muted" id="thinking-alpha">unknown</span></div>
+      </div>
       <div class="progress-track"><div class="progress-fill" data-a="alpha" id="prog-alpha" style="width:0"></div></div>
       <div class="card-feed" id="feed-alpha"></div>
     </div>
@@ -738,6 +848,11 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <span class="task-icon">▸</span>
         <span class="task-text empty" id="task-beta">Awaiting dispatch…</span>
         <span class="tasks-num" id="count-beta">0</span>
+      </div>
+      <div class="telemetry-box">
+        <div class="telemetry-row"><span class="telemetry-label">DO</span><span class="telemetry-value muted" id="doing-beta">Standing by</span></div>
+        <div class="telemetry-row"><span class="telemetry-label">TYPE</span><span class="telemetry-value muted" id="typing-beta">No visible input</span></div>
+        <div class="telemetry-row"><span class="telemetry-label">THINK</span><span class="telemetry-value muted" id="thinking-beta">unknown</span></div>
       </div>
       <div class="progress-track"><div class="progress-fill" data-a="beta" id="prog-beta" style="width:0"></div></div>
       <div class="card-feed" id="feed-beta"></div>
@@ -757,6 +872,11 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <span class="task-text empty" id="task-gamma">Awaiting dispatch…</span>
         <span class="tasks-num" id="count-gamma">0</span>
       </div>
+      <div class="telemetry-box">
+        <div class="telemetry-row"><span class="telemetry-label">DO</span><span class="telemetry-value muted" id="doing-gamma">Standing by</span></div>
+        <div class="telemetry-row"><span class="telemetry-label">TYPE</span><span class="telemetry-value muted" id="typing-gamma">No visible input</span></div>
+        <div class="telemetry-row"><span class="telemetry-label">THINK</span><span class="telemetry-value muted" id="thinking-gamma">unknown</span></div>
+      </div>
       <div class="progress-track"><div class="progress-fill" data-a="gamma" id="prog-gamma" style="width:0"></div></div>
       <div class="card-feed" id="feed-gamma"></div>
     </div>
@@ -774,6 +894,11 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <span class="task-icon">▸</span>
         <span class="task-text empty" id="task-delta">Awaiting dispatch…</span>
         <span class="tasks-num" id="count-delta">0</span>
+      </div>
+      <div class="telemetry-box">
+        <div class="telemetry-row"><span class="telemetry-label">DO</span><span class="telemetry-value muted" id="doing-delta">Standing by</span></div>
+        <div class="telemetry-row"><span class="telemetry-label">TYPE</span><span class="telemetry-value muted" id="typing-delta">No visible input</span></div>
+        <div class="telemetry-row"><span class="telemetry-label">THINK</span><span class="telemetry-value muted" id="thinking-delta">unknown</span></div>
       </div>
       <div class="progress-track"><div class="progress-fill" data-a="delta" id="prog-delta" style="width:0"></div></div>
       <div class="card-feed" id="feed-delta"></div>
@@ -827,6 +952,7 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
         <span style="font-size:11px;">☐</span>
         <span class="ops-title" style="color:var(--cyan);">TODOs</span>
         <span class="ops-badge" id="todoCount">0</span>
+        <button onclick="openKanban()" style="margin-left:4px;background:rgba(0,240,255,0.08);border:1px solid rgba(0,240,255,0.2);border-radius:3px;color:var(--cyan);font-family:var(--mono);font-size:7px;padding:2px 6px;cursor:pointer;letter-spacing:0.5px;">BOARD</button>
       </div>
       <div class="ops-body" id="todoBody">
         <div class="task-empty">No TODOs</div>
@@ -931,6 +1057,17 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
     <button class="dispatch-send" id="dispatchBtn" onclick="sendDispatch()">SEND</button>
   </div>
 
+  <!-- WORKER ACTIVITY FEED -->
+  <div id="activity-feed-card" style="grid-column:2/4;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:6px 10px;backdrop-filter:blur(12px);">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+      <span style="background:#e00;color:#fff;font-size:9px;font-weight:700;padding:1px 6px;border-radius:3px;text-transform:uppercase;animation:dotPulse 2s infinite;">LIVE</span>
+      <span style="font-size:12px;font-weight:600;color:var(--fg);">Worker Activity Feed</span>
+    </div>
+    <div id="activityFeed" style="max-height:400px;overflow-y:auto;font-family:'Fira Code','Cascadia Code',monospace;font-size:11px;background:#0a0a0a;padding:8px;border-radius:4px;color:var(--dim);">
+      <div style="color:var(--dim);font-style:italic;">Waiting for activity data...</div>
+    </div>
+  </div>
+
   <!-- LIVE WORKER OUTPUT -->
   <div class="worker-output-panel">
     <div class="worker-output-head">
@@ -955,9 +1092,42 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
     </div>
   </div>
 
-</div>
+  <!-- MISSION CONTROL PANEL -->
+  <div class="bus-panel" style="margin-top:12px;">
+    <div class="bus-hdr">
+      <span class="bus-icon">🎯</span>
+      <span class="bus-title">Mission Control</span>
+      <span class="badge" id="missionCount" style="margin-left:auto;">0</span>
+    </div>
+    <div id="missionList" style="max-height:200px;overflow-y:auto;padding:8px 12px;">
+      <div style="color:var(--dim);font-style:italic;">Loading missions...</div>
+    </div>
+  </div>
 
-<!-- ENGINE DETAIL MODAL -->
+  <!-- SYSTEM HEALTH PANEL -->
+  <div class="bus-panel" style="margin-top:12px;">
+    <div class="bus-hdr">
+      <span class="bus-icon">💚</span>
+      <span class="bus-title">System Health</span>
+      <span id="healthBadge" class="badge" style="margin-left:auto;">--</span>
+    </div>
+    <div id="healthPanel" style="padding:8px 12px;">
+      <div style="color:var(--dim);font-style:italic;">Loading health...</div>
+    </div>
+  </div>
+
+  <!-- THROUGHPUT PANEL -->
+  <div class="bus-panel" style="margin-top:12px;">
+    <div class="bus-hdr">
+      <span class="bus-icon">📊</span>
+      <span class="bus-title">Throughput</span>
+    </div>
+    <div id="throughputPanel" style="padding:8px 12px;">
+      <div style="color:var(--dim);font-style:italic;">Loading throughput...</div>
+    </div>
+  </div>
+
+</div>
 <div class="eng-modal-overlay" id="engModalOverlay" onclick="if(event.target===this)closeEngModal()">
   <div class="eng-modal">
     <button class="eng-modal-close" onclick="closeEngModal()">ESC</button>
@@ -984,6 +1154,45 @@ body::after{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
       <ul class="intro-list" id="introCaps"><li class="neutral">Loading...</li></ul>
     </div>
     <button class="intro-close" onclick="closeIntrospect()">CLOSE</button>
+  </div>
+</div>
+
+<!-- KANBAN BOARD OVERLAY -->
+<div class="kanban-overlay" id="kanbanOverlay" onclick="if(event.target===this)closeKanban()">
+  <div class="kanban-board">
+    <div class="kanban-header">
+      <span style="font-size:13px;">☐</span>
+      <span class="kanban-title">Kanban Board</span>
+      <span class="kanban-meta" id="kanbanMeta">0 items</span>
+      <div class="kanban-wave-filter" id="kanbanWaveFilter"></div>
+      <button class="kanban-close" onclick="closeKanban()">ESC</button>
+    </div>
+    <div class="kanban-columns">
+      <div class="kanban-col pending">
+        <div class="kanban-col-head">
+          <span style="font-size:10px;color:var(--amber);">○</span>
+          <span class="kanban-col-title">Pending</span>
+          <span class="kanban-col-count" id="kbPendingCount">0</span>
+        </div>
+        <div class="kanban-col-body" id="kbPendingBody"></div>
+      </div>
+      <div class="kanban-col active">
+        <div class="kanban-col-head">
+          <span style="font-size:10px;color:var(--cyan);">◉</span>
+          <span class="kanban-col-title">Active</span>
+          <span class="kanban-col-count" id="kbActiveCount">0</span>
+        </div>
+        <div class="kanban-col-body" id="kbActiveBody"></div>
+      </div>
+      <div class="kanban-col done">
+        <div class="kanban-col-head">
+          <span style="font-size:10px;color:var(--green);">✓</span>
+          <span class="kanban-col-title">Done</span>
+          <span class="kanban-col-count" id="kbDoneCount">0</span>
+        </div>
+        <div class="kanban-col-body" id="kbDoneBody"></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1017,6 +1226,8 @@ const CONSULTANT_COLOR='#00f0ff';
 const DEFAULT_ROLES={alpha:'Worker Core 0',beta:'Worker Core 1',gamma:'Worker Core 2',delta:'Worker Core 3'};
 const startTime=Date.now();
 let seenLogIds=new Set(),seenOrchIds=new Set(),totalTasks=0;
+let rafPaused=false;
+document.addEventListener('visibilitychange',()=>{rafPaused=document.hidden;if(!rafPaused)animate();});
 const simProgress={};
 
 /* ═══ SSE DASHBOARD STREAM ═══ */
@@ -1036,6 +1247,68 @@ function initSSE(){
   }catch(x){sseConnected=false;}
 }
 initSSE();
+
+/* ═══ MISSION CONTROL, HEALTH, THROUGHPUT PANELS ═══ */
+function pollMissions(){
+  fetch('/missions/active').then(r=>r.json()).then(d=>{
+    const el=document.getElementById('missionList');
+    const badge=document.getElementById('missionCount');
+    const missions=d.missions||[];
+    badge.textContent=missions.length;
+    if(!missions.length){el.innerHTML='<div style="color:var(--dim);">No active missions</div>';return;}
+    let html='';
+    missions.forEach(m=>{
+      const prog=m.subtasks&&m.subtasks.length?m.subtasks.filter(s=>s.status==='completed').length/m.subtasks.length*100:0;
+      const workers=(m.workers||[]).join(', ')||'unassigned';
+      html+=`<div style="margin-bottom:8px;padding:6px 8px;background:rgba(255,255,255,0.03);border-radius:6px;">
+        <div style="display:flex;justify-content:space-between;font-size:12px;">
+          <span style="color:var(--accent);">${m.title||m.mission_id}</span>
+          <span class="badge">${m.status}</span>
+        </div>
+        <div style="margin-top:4px;height:4px;background:rgba(255,255,255,0.06);border-radius:2px;">
+          <div style="width:${prog}%;height:100%;background:var(--accent);border-radius:2px;transition:width 0.3s;"></div>
+        </div>
+        <div style="font-size:10px;color:var(--dim);margin-top:2px;">Workers: ${workers} | Subtasks: ${m.subtasks?m.subtasks.length:0} (${Math.round(prog)}% done)</div>
+      </div>`;
+    });
+    el.innerHTML=html;
+  }).catch(()=>{});
+}
+function pollHealth(){
+  fetch('/system/health').then(r=>r.json()).then(d=>{
+    const el=document.getElementById('healthPanel');
+    const badge=document.getElementById('healthBadge');
+    const status=d.status||'unknown';
+    badge.textContent=status.toUpperCase();
+    badge.style.background=status==='healthy'?'rgba(0,255,100,0.15)':status==='degraded'?'rgba(255,200,0,0.15)':'rgba(255,50,50,0.15)';
+    badge.style.color=status==='healthy'?'#0f8':status==='degraded'?'#fa0':'#f55';
+    const issues=d.issues||[];
+    let html=`<div style="font-size:11px;color:var(--dim);">Workers: ${d.worker_count||0} | Bus depth: ${d.bus_depth||0} | Issues: ${issues.length}</div>`;
+    if(issues.length){
+      html+='<div style="margin-top:4px;">';
+      issues.forEach(i=>{html+=`<div style="font-size:10px;color:#fa0;">⚠ ${i}</div>`;});
+      html+='</div>';
+    }
+    el.innerHTML=html;
+  }).catch(()=>{});
+}
+function pollThroughput(){
+  fetch('/metrics/throughput').then(r=>r.json()).then(d=>{
+    const el=document.getElementById('throughputPanel');
+    const total=d.total_dispatches||0;
+    const rate=d.success_rate!==undefined?Math.round(d.success_rate*100):0;
+    const perMin=d.per_minute!==undefined?d.per_minute.toFixed(1):'0.0';
+    el.innerHTML=`<div style="display:flex;gap:16px;font-size:12px;">
+      <div><span style="color:var(--dim);">Total</span><br><span style="font-size:18px;color:var(--accent);">${total}</span></div>
+      <div><span style="color:var(--dim);">Success</span><br><span style="font-size:18px;color:#0f8;">${rate}%</span></div>
+      <div><span style="color:var(--dim);">Rate</span><br><span style="font-size:18px;color:var(--accent);">${perMin}/min</span></div>
+    </div>`;
+  }).catch(()=>{});
+}
+setInterval(pollMissions,15000);
+setInterval(pollHealth,15000);
+setInterval(pollThroughput,15000);
+setTimeout(()=>{pollMissions();pollHealth();pollThroughput();},2000);
 
 /* ═══ RADAR ═══ */
 const rc=document.getElementById('radar'),rctx=rc.getContext('2d');
@@ -1085,13 +1358,57 @@ function drawRadar(t){
     rctx.beginPath();rctx.moveTo(cx,cy);rctx.lineTo(px,py);
     rctx.strokeStyle=f.color+'30';rctx.lineWidth=1;rctx.stroke();
     rctx.beginPath();rctx.arc(px,py,2.5,0,Math.PI*2);
-    rctx.fillStyle=f.color;rctx.shadowColor=f.color;rctx.shadowBlur=6;rctx.fill();rctx.shadowBlur=0;
+    rctx.fillStyle=f.color;rctx.fill();
   }
 }
 
 /* ═══ HELPERS ═══ */
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function now(){return new Date().toTimeString().slice(0,8);}
+let _agentTelemetry={};
+
+function renderAgentTelemetry(id,entry){
+  const doingEl=document.getElementById('doing-'+id);
+  const typingEl=document.getElementById('typing-'+id);
+  const thinkingEl=document.getElementById('thinking-'+id);
+  if(!doingEl&&!typingEl&&!thinkingEl)return;
+  const doing=entry&&entry.doing?String(entry.doing):'Standing by';
+  const typing=entry&&entry.typing_visible?String(entry.typing_visible):'No visible input';
+  const thinking=entry&&entry.thinking_summary?String(entry.thinking_summary):'unknown';
+  if(doingEl){
+    doingEl.textContent=doing;
+    doingEl.className='telemetry-value'+((entry&&entry.status&&String(entry.status).toUpperCase()==='UNKNOWN')?' muted':'');
+  }
+  if(typingEl){
+    const hasTyping=!!(entry&&entry.typing_visible);
+    typingEl.textContent=typing;
+    typingEl.className='telemetry-value '+(hasTyping?'typing':'muted');
+  }
+  if(thinkingEl){
+    const known=thinking&&thinking.toLowerCase()!=='unknown';
+    thinkingEl.textContent=thinking;
+    thinkingEl.className='telemetry-value '+(known?'thinking':'muted');
+  }
+}
+
+function renderOrchTelemetry(entry){
+  const el=document.getElementById('orchTelemetry');
+  if(!el)return;
+  const doing=entry&&entry.doing?String(entry.doing):'Standing by';
+  const typing=entry&&entry.typing_visible?String(entry.typing_visible):'No visible input';
+  const thinking=entry&&entry.thinking_summary?String(entry.thinking_summary):'unknown';
+  el.innerHTML=
+    '<span class="label">DO</span><span class="value">'+esc(doing)+'</span> | '+
+    '<span class="label">TYPE</span><span class="value">'+esc(typing)+'</span> | '+
+    '<span class="label">THINK</span><span class="value">'+esc(thinking)+'</span>';
+}
+
+function applyTelemetry(snapshot){
+  const agents=snapshot&&snapshot.agents&&typeof snapshot.agents==='object'?snapshot.agents:{};
+  _agentTelemetry=agents;
+  for(const id of ['alpha','beta','gamma','delta'])renderAgentTelemetry(id,agents[id]||null);
+  renderOrchTelemetry(agents.orchestrator||null);
+}
 
 function addOrchLine(text,type='info'){
   const el=document.getElementById('orchFeed');
@@ -1178,6 +1495,13 @@ function renderConsultants(consultants){
   const entries=consultants&&typeof consultants==='object'&&!Array.isArray(consultants)
     ? Object.values(consultants).filter(v=>v&&typeof v==='object'&&!v.error)
     : [];
+  entries.sort((a,b)=>{
+    const alive=Number(Boolean(b.live))-Number(Boolean(a.live));
+    if(alive)return alive;
+    const routable=Number(Boolean(b.routable))-Number(Boolean(a.routable));
+    if(routable)return routable;
+    return String(a.display_name||a.id||'').localeCompare(String(b.display_name||b.id||''));
+  });
   const liveCount=entries.filter(c=>c.live).length;
   if(badge)badge.textContent=entries.length?liveCount+'/'+entries.length:'0/0';
   if(topStat){
@@ -1200,6 +1524,21 @@ function renderConsultants(consultants){
       ? String(c.last_bus_message.content).slice(0,88)
       : 'No consultant bus activity yet';
     const backend=c.backend_connected?'backend linked':'backend unknown';
+    const taskState=c.task_state&&typeof c.task_state==='object'?c.task_state:{};
+    const workerSnapshot=c.worker_snapshot&&typeof c.worker_snapshot==='object'?c.worker_snapshot:{};
+    const workerSummary=workerSnapshot.summary&&typeof workerSnapshot.summary==='object'?workerSnapshot.summary:{};
+    const workerCount=workerSummary.total!=null?String(workerSummary.available||0)+'/'+String(workerSummary.total):'unknown';
+    const workerSource=workerSnapshot.source?String(workerSnapshot.source):'unknown source';
+    const taskLabel=String(taskState.status||'IDLE').toUpperCase();
+    const assignedWorker=taskState.assigned_worker?' -> '+String(taskState.assigned_worker):'';
+    const taskText=taskState.task?String(taskState.task).slice(0,96):'No active consultant task';
+    const routingLabel=c.routable?'routable':'advisory';
+    const transportLabel=String(c.prompt_transport||c.transport||'no transport');
+    const tele=_agentTelemetry[String(c.id||'').toLowerCase()]||null;
+    const teleDoing=tele&&tele.doing?String(tele.doing).slice(0,96):null;
+    const teleThinking=tele&&tele.thinking_summary&&String(tele.thinking_summary).toLowerCase()!=='unknown'
+      ? String(tele.thinking_summary).slice(0,96)
+      : null;
     const div=document.createElement('div');
     div.className='consultant-item';
     div.innerHTML=
@@ -1207,8 +1546,11 @@ function renderConsultants(consultants){
         '<span class="consultant-name">'+esc(c.display_name||c.id||'Consultant')+'</span>'+
         '<span class="consultant-status '+stCls+'">'+esc(st)+'</span>'+
       '</div>'+
-      '<div class="consultant-meta">'+esc(c.model||'unknown model')+' | advisory | non-routable</div>'+
-      '<div class="consultant-meta">Heartbeat '+esc(hb)+' | '+esc(backend)+'</div>'+
+      '<div class="consultant-meta">'+esc(c.model||'unknown model')+' | '+esc(routingLabel)+' | '+esc(transportLabel)+'</div>'+
+      '<div class="consultant-meta">Heartbeat '+esc(hb)+' | '+esc(backend)+' | workers '+esc(workerCount)+' via '+esc(workerSource)+'</div>'+
+      '<div class="consultant-note">Task '+esc(taskLabel+assignedWorker)+': '+esc(taskText)+'</div>'+
+      (teleDoing?'<div class="consultant-note">Doing: '+esc(teleDoing)+'</div>':'')+
+      (teleThinking?'<div class="consultant-note">Thinking: '+esc(teleThinking)+'</div>':'')+
       '<div class="consultant-note">'+esc(msg)+'</div>';
     body.appendChild(div);
   }
@@ -1235,6 +1577,7 @@ function _applyStatus(d){
       for(const log of s.recent_logs){
         if(!seenLogIds.has(log.id)){
           seenLogIds.add(log.id);
+          if(seenLogIds.size>500)seenLogIds.clear();
           addAgentLine(id,log.text);
           if(log.text.match(/Task|Dispatch|Start|Running/i)){
             const ag=AGENTS[id];if(ag)addFlight(ag.angle,ag.color,log.text);
@@ -1245,11 +1588,11 @@ function _applyStatus(d){
   }
   if(d.orch_thinking){
     for(const th of d.orch_thinking){
-      if(!seenOrchIds.has(th.id)){seenOrchIds.add(th.id);addOrchLine(th.text,th.type||'info');}
+      if(!seenOrchIds.has(th.id)){seenOrchIds.add(th.id);if(seenOrchIds.size>500)seenOrchIds.clear();addOrchLine(th.text,th.type||'info');}
     }
   }
-  if(d.consultants!==undefined&&d.consultants!==null){
-    renderConsultants(d.consultants||{});
+  if(hasConsultantEntries(d.consultants)){
+    renderConsultants(d.consultants);
   }
   updateGod(d.god_queue||[]);
   let tt=0;for(const s of Object.values(d.agents||{}))tt+=(s.tasks_completed||0);
@@ -1276,6 +1619,7 @@ async function poll(){
 
 /* ═══ ANIMATION ═══ */
 function animate(){
+  if(rafPaused)return;
   const t=Date.now()/1000;
   drawRadar(t);
   const s=Math.floor((Date.now()-startTime)/1000);
@@ -1286,7 +1630,7 @@ function animate(){
   requestAnimationFrame(animate);
 }
 animate();
-setInterval(poll,4000);  /* reduced from 2s -- masterPoll covers at 3s */
+setInterval(poll,8000);  /* reduced from 4s -- display-only, no need for fast refresh */
 
 setTimeout(()=>{
   addOrchLine('Orchestrator online -- Claude Opus 4.6 Fast','route');
@@ -1327,7 +1671,7 @@ async function pollGodState(){
   }catch(e){}
 }
 pollGodState();
-setInterval(pollGodState,5000);
+setInterval(pollGodState,15000);
 
 /* ═══ TOPOLOGY ═══ */
 const topoC=document.getElementById('topoCanvas'),topoCtx=topoC.getContext('2d');
@@ -1383,7 +1727,7 @@ function drawTopology(){
 /* ═══ SMART FETCH ═══ */
 const GOD_PORT=8421;
 const BACKEND_PORT=8420;
-const CONSULTANT_BRIDGE_PORTS=[8422,8424];
+const CONSULTANT_BRIDGE_PORTS=[8422,8424,8425];
 async function smartFetch(path){
   try{const r=await fetch(path);if(r.ok)return await r.json();}catch(e){}
   try{const r2=await fetch('http://localhost:'+GOD_PORT+path);if(r2.ok)return await r2.json();}catch(e){}
@@ -1397,6 +1741,7 @@ async function smartFetchUrl(url){
 
 /* ═══ COMBINED DASHBOARD DATA (reduces 3+ HTTP calls to 1) ═══ */
 let _dashCache={status:null,pulse:null,bus:null,t:0};
+const TELEMETRY_URL='http://localhost:8426/telemetry';
 async function fetchDashboardData(){
   try{
     const d=await smartFetch('/dashboard/data');
@@ -1407,18 +1752,29 @@ async function fetchDashboardData(){
 function getCachedStatus(){return _dashCache.status;}
 function getCachedPulse(){return _dashCache.pulse;}
 function getCachedBus(){return _dashCache.bus;}
+function hasConsultantEntries(obj){
+  return !!(obj&&typeof obj==='object'&&!Array.isArray(obj)&&Object.values(obj).some(v=>v&&typeof v==='object'&&!v.error));
+}
+async function pollTelemetry(){
+  try{
+    const r=await fetch(TELEMETRY_URL,{mode:'cors'});
+    if(!r.ok)return;
+    const data=await r.json();
+    applyTelemetry(data);
+  }catch(e){}
+}
 async function fetchConsultantsData(){
   if(sseConnected&&sseData){
-    if(sseData.consultants&&!(sseData.consultants.error))return sseData.consultants;
-    if(sseData.status&&sseData.status.consultants&&!(sseData.status.consultants.error))return sseData.status.consultants;
+    if(hasConsultantEntries(sseData.consultants))return sseData.consultants;
+    if(sseData.status&&hasConsultantEntries(sseData.status.consultants))return sseData.status.consultants;
   }
-  if(_dashCache.status&&_dashCache.status.consultants&&!(_dashCache.status.consultants.error))return _dashCache.status.consultants;
+  if(_dashCache.status&&hasConsultantEntries(_dashCache.status.consultants))return _dashCache.status.consultants;
   const fromConsole=await smartFetch('/consultants');
   const consoleEntries=fromConsole&&typeof fromConsole==='object'&&!Array.isArray(fromConsole)
     ? Object.values(fromConsole).filter(v=>v&&typeof v==='object'&&!v.error)
     : [];
   if(consoleEntries.length)return fromConsole;
-  let best=null;
+  const aggregate={};
   for(const port of CONSULTANT_BRIDGE_PORTS){
     const fromBridge=await smartFetchUrl('http://localhost:'+port+'/consultants');
     if(!fromBridge||!fromBridge.consultant)continue;
@@ -1430,11 +1786,11 @@ async function fetchConsultantsData(){
       c.live=true;
       c.status='LIVE';
       c.pid_alive=true;
-      return fromBridge;
     }
-    if(!best)best=fromBridge;
+    const key=String(c.id||('consultant_'+port));
+    aggregate[key]=c;
   }
-  return best;
+  return Object.keys(aggregate).length?aggregate:null;
 }
 // Master combined poll -- replaces individual status+pulse+bus fetches
 async function masterPoll(){
@@ -1443,7 +1799,9 @@ async function masterPoll(){
   if(_dashCache.status){try{_applyStatus(_dashCache.status);}catch(e){}}
   if(_dashCache.pulse){try{_applyPulse(_dashCache.pulse);}catch(e){}}
 }
-setInterval(masterPoll,3000);
+setInterval(masterPoll,10000);
+setInterval(pollTelemetry,5000);
+pollTelemetry();
 
 /* ═══ WEBSOCKET REAL-TIME PUSH ═══ */
 let _wsConnected=false;
@@ -1464,6 +1822,7 @@ function connectWebSocket(){
         if(d.pulse) try{_applyPulse(d.pulse);}catch(e){}
         if(d.bus&&Array.isArray(d.bus)) _dashCache.bus=d.bus;
         _dashCache.t=Date.now();
+        pollTelemetry();
       }catch(e){}
     };
     ws.onclose=()=>{
@@ -1554,7 +1913,7 @@ async function pollSelfPulse(){
   _applyPulse(data);
 }
 pollSelfPulse();
-setInterval(pollSelfPulse,6000);  /* reduced from 3s -- masterPoll covers at 3s */
+setInterval(pollSelfPulse,15000);  /* display-only panel */
 
 /* ═══ IQ GAUGE ═══ */
 let iqHistory=[];
@@ -1634,7 +1993,7 @@ async function pollBus(){
     for(const m of msgs){
       const mid=m.id||m.timestamp||JSON.stringify(m).slice(0,60);
       if(seenBusIds.has(mid))continue;
-      seenBusIds.add(mid);hasNew=true;
+      seenBusIds.add(mid);if(seenBusIds.size>500)seenBusIds.clear();hasNew=true;
     }
     if(!hasNew)return;
     feed.innerHTML='';
@@ -1654,7 +2013,7 @@ async function pollBus(){
   }catch(e){}
 }
 pollBus();
-setInterval(pollBus,5000);
+setInterval(pollBus,8000);
 
 /* ═══ CONSULTANT PRESENCE ═══ */
 async function pollConsultants(){
@@ -1664,7 +2023,7 @@ async function pollConsultants(){
   }catch(e){}
 }
 pollConsultants();
-setInterval(pollConsultants,2500);
+setInterval(pollConsultants,10000);
 
 /* ═══ TASK QUEUE ═══ */
 async function pollTaskQueue(){
@@ -1707,7 +2066,7 @@ async function pollTaskQueue(){
   }catch(e){}
 }
 pollTaskQueue();
-setInterval(pollTaskQueue,3000);
+setInterval(pollTaskQueue,10000);
 
 /* ═══ BUS HEALTH + CONVENE ═══ */
 let busTimestamps=[];
@@ -1729,7 +2088,7 @@ async function pollBusHealth(){
       }
       const now2=Date.now();
       for(const m of msgs){const t=new Date(m.timestamp).getTime();if(!isNaN(t))busTimestamps.push(t);}
-      busTimestamps=[...new Set(busTimestamps)].filter(t=>now2-t<300000);
+      busTimestamps=[...new Set(busTimestamps)].filter(t=>now2-t<300000).slice(-200);
       const last60=busTimestamps.filter(t=>now2-t<60000).length;
       if(tputEl){tputEl.textContent=last60+'/min';tputEl.className='bh-value '+(last60>5?'ok':last60>0?'warn':'bad');}
       if(statusEl)statusEl.textContent=last60>0?'ACTIVE':'QUIET';
@@ -1761,7 +2120,7 @@ async function pollBusHealth(){
   }catch(e){}
 }
 pollBusHealth();
-setInterval(pollBusHealth,5000);
+setInterval(pollBusHealth,15000);
 
 /* ═══ TODO POLLING ═══ */
 async function pollTodos(){
@@ -1776,7 +2135,34 @@ async function pollTodos(){
     const body=document.getElementById('todoBody');
     const badge=document.getElementById('todoCount');
     if(!body)return;
-    const active=data.pending+data.active;
+
+    // Handle items[] format (from raw todos.json)
+    if(data.items&&Array.isArray(data.items)){
+      const pend=data.items.filter(i=>i.status==='pending').length;
+      const act=data.items.filter(i=>i.status==='active').length;
+      if(badge)badge.textContent=pend+act;
+      if(!data.items.length){body.innerHTML='<div class="task-empty">No TODOs</div>';return;}
+      body.innerHTML='';
+      const sorted=[...data.items].filter(i=>i.status!=='done'&&i.status!=='cancelled').sort((a,b)=>(a.priority||99)-(b.priority||99));
+      for(const t of sorted.slice(0,8)){
+        const div=document.createElement('div');div.className='todo-item';
+        const flagCls=t.status==='active'?'active':'pending';
+        const flagChar=t.status==='active'?'◉':'○';
+        const w=t.assignee||'?';
+        const wColor=AGENTS[w]?AGENTS[w].color:'var(--text2)';
+        let pri='';
+        if(t.priority===1)pri='<span class="todo-pri critical">P1</span>';
+        else if(t.priority===2)pri='<span class="todo-pri high">P2</span>';
+        div.innerHTML='<span class="todo-flag '+flagCls+'">'+flagChar+'</span>'+
+          '<span class="todo-worker" style="color:'+wColor+'">'+esc(w.toUpperCase())+'</span>'+
+          '<span class="todo-text">'+esc(String(t.title||t.task||'').slice(0,50))+'</span>'+pri;
+        body.appendChild(div);
+      }
+      return;
+    }
+
+    // Handle by_worker format (legacy)
+    const active=(data.pending||0)+(data.active||0);
     if(badge)badge.textContent=active;
     if(!data.by_worker||!Object.keys(data.by_worker).length){
       body.innerHTML='<div class="task-empty">No TODOs</div>';return;
@@ -1801,7 +2187,7 @@ async function pollTodos(){
   }catch(e){}
 }
 pollTodos();
-setInterval(pollTodos,5000);
+setInterval(pollTodos,15000);
 
 /* ═══ OVERSEER STATUS ═══ */
 async function pollOverseer(){
@@ -1917,56 +2303,6 @@ async function pollEngines(){
 pollEngines();
 setInterval(pollEngines,8000);
 
-/* ═══ OVERSEER STATUS ═══ */
-async function pollOverseer(){
-  try{
-    const data=await smartFetch('/overseer');
-    const body=document.getElementById('overseerBody');
-    const badge=document.getElementById('overseerBadge');
-    if(!body)return;
-    if(!data||!data.status){
-      if(badge){badge.textContent='OFF';badge.style.background='var(--red-dim)';badge.style.color='var(--red)';}
-      body.innerHTML='<div class="task-empty">Overseer not running</div>';
-      return;
-    }
-    const s=data.status;
-    const running=data.running;
-    if(badge){
-      badge.textContent=running?'LIVE':'DOWN';
-      badge.style.background=running?'var(--green-dim)':'var(--red-dim)';
-      badge.style.color=running?'var(--green)':'var(--red)';
-    }
-    let html='';
-    // Services
-    if(s.services){
-      html+='<div class="ovs-row"><span class="ovs-label">Services</span>';
-      for(const[k,v]of Object.entries(s.services)){
-        const cls=v==='ok'?'ok':'down';
-        html+='<span class="ovs-val '+cls+'" style="margin-right:6px;">'+esc(k)+':'+esc(v)+'</span>';
-      }
-      html+='</div>';
-    }
-    // Uptime + scans
-    if(s.uptime_s!=null){
-      const m=Math.floor(s.uptime_s/60);
-      html+='<div class="ovs-row"><span class="ovs-label">Uptime</span><span class="ovs-val">'+m+'m</span>';
-      html+='<span class="ovs-label" style="margin-left:8px;">Scans</span><span class="ovs-val">'+s.scan_count+'</span></div>';
-    }
-    // Alerts
-    if(s.recent_alerts&&s.recent_alerts.length>0){
-      for(const a of s.recent_alerts.slice(-3)){
-        const cls=a.toLowerCase().includes('critical')?'critical':'';
-        html+='<div class="ovs-alert '+cls+'">'+esc(String(a).slice(0,80))+'</div>';
-      }
-    } else {
-      html+='<div class="ovs-row"><span class="ovs-label">Alerts</span><span class="ovs-val ok">0</span></div>';
-    }
-    body.innerHTML=html;
-  }catch(e){}
-}
-pollOverseer();
-setInterval(pollOverseer,10000);
-
 /* ═══ INCIDENT VIEWER ═══ */
 async function pollIncidents(){
   try{
@@ -2037,7 +2373,7 @@ async function pollWorkerOutput(){
   for(const r of results){
     const rid=r.id||r.timestamp||JSON.stringify(r).slice(0,50);
     if(!woSeenIds.has(rid))hasNew=true;
-    woSeenIds.add(rid);
+    woSeenIds.add(rid);if(woSeenIds.size>500)woSeenIds.clear();
   }
   if(!hasNew)return;
   list.innerHTML='';
@@ -2055,7 +2391,7 @@ async function pollWorkerOutput(){
   }
 }
 pollWorkerOutput();
-setInterval(pollWorkerOutput,3000);
+setInterval(pollWorkerOutput,8000);
 
 /* ═══ ENGINE DETAIL MODAL ═══ */
 function openEngModal(eng){
@@ -2157,6 +2493,133 @@ async function pollLearningTelemetry(){
 }
 setInterval(pollLearningTelemetry,8000);
 pollLearningTelemetry();
+
+/* ── Learner Stale Detection (header indicator) ─────────────────────── */
+async function pollLearnerHealth(){
+  try{
+    const h=await smartFetch('/learner/health');if(!h)return;
+    const dot=document.getElementById('sb-learner-dot');
+    const stat=document.getElementById('learnerHealthStat');
+    if(!dot||!stat)return;
+    if(h.status==='running'&&!h.stale){
+      dot.style.color='var(--green)';dot.textContent='●';
+      stat.title='Learner daemon healthy';
+    }else if(h.stale){
+      dot.style.color='var(--red)';dot.textContent='●';
+      const sec=h.stale_seconds;
+      const ago=sec>0?(sec>=60?Math.round(sec/60)+'m':sec+'s'):'unknown';
+      stat.title='Learner STALE -- no episodes for '+ago;
+    }else{
+      dot.style.color='var(--dim)';dot.textContent='○';
+      stat.title='Learner daemon '+h.status;
+    }
+  }catch(e){console.warn('[LearnerHealth]',e);}
+}
+setInterval(pollLearnerHealth,15000);
+pollLearnerHealth();
+
+/* ═══ WORKER ACTIVITY FEED ═══ */
+const _actColors={alpha:'#0ff',beta:'#0f0',gamma:'#ff0',delta:'#f0f'};
+async function pollActivity(){
+  try{
+    const data=await smartFetch('/api/worker/activity');
+    if(!data)return;
+    const el=document.getElementById('activityFeed');
+    if(!el)return;
+    let html='';
+    for(const name of ['alpha','beta','gamma','delta']){
+      const w=data[name];
+      if(!w)continue;
+      const c=_actColors[name]||'#888';
+      const act=w.current_activity||w.state||'unknown';
+      const ts=w.timestamp?new Date(w.timestamp).toLocaleTimeString():'';
+      const tp=w.activity_type?`<span style="color:var(--dim);margin-left:4px;">[${esc(w.activity_type)}]</span>`:'';
+      html+=`<div style="border-left:3px solid ${c};padding:3px 8px;margin-bottom:4px;">`;
+      html+=`<span style="color:${c};font-weight:700;">${name.toUpperCase()}</span>`;
+      html+=`<span style="color:var(--dim);margin-left:6px;font-size:10px;">${esc(ts)}</span>${tp}`;
+      html+=`<div style="color:var(--fg);margin-top:2px;">${esc(act)}</div></div>`;
+    }
+    el.innerHTML=html||'<div style="color:var(--dim);font-style:italic;">No activity data</div>';
+  }catch(e){}
+}
+setInterval(pollActivity,3000);
+pollActivity();
+
+/* ═══ KANBAN BOARD ═══ */
+let kanbanWaveFilter='all';
+let kanbanData=null;
+
+function openKanban(){document.getElementById('kanbanOverlay').classList.add('open');pollKanban();}
+function closeKanban(){document.getElementById('kanbanOverlay').classList.remove('open');}
+
+function makeKanbanCard(item){
+  const card=document.createElement('div');card.className='kanban-card';
+  const a=item.assignee||'?';
+  const priClass=item.priority===1?'p1':item.priority===2?'p2':'p3';
+  const priLabel=item.priority===1?'P1':item.priority===2?'P2':'P3';
+  card.innerHTML='<div class="kanban-card-title">'+esc(item.title||'Untitled')+'</div>'+
+    '<div class="kanban-card-footer">'+
+      '<span class="kanban-card-assignee" data-a="'+esc(a)+'">'+esc(a.toUpperCase())+'</span>'+
+      '<span class="kanban-card-pri '+priClass+'">'+priLabel+'</span>'+
+      (item.wave?'<span class="kanban-card-wave">W'+item.wave+'</span>':'')+
+    '</div>';
+  return card;
+}
+
+function renderKanban(items){
+  const pending=[],active=[],done=[];
+  const waves=new Set();
+  for(const item of items){
+    if(item.wave)waves.add(item.wave);
+    if(kanbanWaveFilter!=='all'&&item.wave!==kanbanWaveFilter)continue;
+    if(item.status==='pending')pending.push(item);
+    else if(item.status==='active')active.push(item);
+    else if(item.status==='done'||item.status==='cancelled')done.push(item);
+    else pending.push(item);
+  }
+  const sortFn=(a,b)=>(a.priority||99)-(b.priority||99);
+  pending.sort(sortFn);active.sort(sortFn);done.sort(sortFn);
+
+  const pBody=document.getElementById('kbPendingBody');
+  const aBody=document.getElementById('kbActiveBody');
+  const dBody=document.getElementById('kbDoneBody');
+  if(!pBody)return;
+
+  pBody.innerHTML='';aBody.innerHTML='';dBody.innerHTML='';
+  if(!pending.length)pBody.innerHTML='<div class="kanban-empty">No pending items</div>';
+  if(!active.length)aBody.innerHTML='<div class="kanban-empty">No active items</div>';
+  if(!done.length)dBody.innerHTML='<div class="kanban-empty">No completed items</div>';
+  for(const p of pending)pBody.appendChild(makeKanbanCard(p));
+  for(const a of active)aBody.appendChild(makeKanbanCard(a));
+  for(const d of done)dBody.appendChild(makeKanbanCard(d));
+
+  document.getElementById('kbPendingCount').textContent=pending.length;
+  document.getElementById('kbActiveCount').textContent=active.length;
+  document.getElementById('kbDoneCount').textContent=done.length;
+
+  const filtered=pending.length+active.length+done.length;
+  document.getElementById('kanbanMeta').textContent=filtered+' of '+items.length+' items';
+
+  const filterDiv=document.getElementById('kanbanWaveFilter');
+  const sortedWaves=[...waves].sort((a,b)=>a-b);
+  filterDiv.innerHTML='<button class="kanban-wave-btn '+(kanbanWaveFilter==='all'?'active':'')+'" onclick="setKanbanWave(\'all\')">All</button>';
+  for(const w of sortedWaves){
+    filterDiv.innerHTML+='<button class="kanban-wave-btn '+(kanbanWaveFilter===w?'active':'')+'" onclick="setKanbanWave('+w+')">W'+w+'</button>';
+  }
+}
+
+function setKanbanWave(w){kanbanWaveFilter=w;if(kanbanData)renderKanban(kanbanData);}
+
+async function pollKanban(){
+  try{
+    const d=await smartFetch('/todos');
+    if(!d||!d.items)return;
+    kanbanData=d.items;
+    renderKanban(d.items);
+  }catch(e){console.warn('[Kanban]',e);}
+}
+setInterval(function(){if(document.getElementById('kanbanOverlay').classList.contains('open'))pollKanban();},10000);
+document.addEventListener('keydown',function(e){if(e.key==='Escape'&&document.getElementById('kanbanOverlay').classList.contains('open'))closeKanban();});
 </script>
 </body>
 </html>

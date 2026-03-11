@@ -10,7 +10,8 @@ Supports multiple consultant identities via CLI args:
   --state-file <path>           State file path (default: data/consultant_state.json)
 
 Truthful semantics:
-- consultant remains an advisory, non-routable identity
+- consultant remains an advisory identity, but a live bridge may also accept prompts
+- promptable means the live bridge accepts prompts into its queue
 - LIVE means this bridge process is actively heartbeating now
 - DECLARED means the consultant profile exists but no live bridge is running
 """
@@ -29,6 +30,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +38,8 @@ DATA_DIR = ROOT / "data"
 PROFILE_FILE = DATA_DIR / "agent_profiles.json"
 STATE_FILE = DATA_DIR / "consultant_state.json"
 PID_FILE = DATA_DIR / "consultant_bridge.pid"
+PROMPT_FILE = DATA_DIR / "consultant_prompt_queue.json"
+TASK_FILE = DATA_DIR / "consultant_task_state.json"
 SKYNET_URL = "http://localhost:8420"
 CONSULTANT_ID = "consultant"
 DISPLAY_NAME = "Codex Consultant"
@@ -44,6 +48,7 @@ SOURCE_NAME = "CC-Start"
 DEFAULT_INTERVAL_S = 2.0
 DEFAULT_STALE_AFTER_S = 8.0
 DEFAULT_API_PORT = 8422
+MAX_PROMPTS = 200
 STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 
@@ -140,12 +145,440 @@ def _load_profile() -> Dict[str, Any]:
     }
 
 
+def _prompt_file() -> Path:
+    if CONSULTANT_ID == "consultant":
+        return PROMPT_FILE
+    return DATA_DIR / f"{CONSULTANT_ID}_prompt_queue.json"
+
+
+def _task_file() -> Path:
+    if CONSULTANT_ID == "consultant":
+        return TASK_FILE
+    return DATA_DIR / f"{CONSULTANT_ID}_task_state.json"
+
+
+def _load_prompt_store() -> Dict[str, Any]:
+    data = _read_json(_prompt_file())
+    prompts = data.get("prompts", [])
+    if not isinstance(prompts, list):
+        prompts = []
+    return {
+        "consultant_id": CONSULTANT_ID,
+        "updated_at": data.get("updated_at"),
+        "prompts": prompts,
+    }
+
+
+def _save_prompt_store(data: Dict[str, Any]) -> None:
+    payload = {
+        "consultant_id": CONSULTANT_ID,
+        "updated_at": _now_iso(),
+        "prompts": data.get("prompts", []),
+    }
+    _atomic_write(_prompt_file(), payload)
+
+
+def _prompt_stats(prompts: Optional[list[Dict[str, Any]]] = None) -> Dict[str, int]:
+    prompts = prompts if prompts is not None else _load_prompt_store().get("prompts", [])
+    stats = {"total": 0, "pending": 0, "acknowledged": 0, "completed": 0, "failed": 0}
+    for prompt in prompts:
+        stats["total"] += 1
+        status = str(prompt.get("status", "")).lower()
+        if status in stats:
+            stats[status] += 1
+    return stats
+
+
+def _load_task_state() -> Dict[str, Any]:
+    raw = _read_json(_task_file())
+    state = {
+        "status": "IDLE",
+        "prompt_id": None,
+        "task": "",
+        "assigned_worker": None,
+        "claimed_at": None,
+        "delegated_at": None,
+        "completed_at": None,
+        "updated_at": raw.get("updated_at"),
+        "last_result": "",
+        "notes": "",
+    }
+    if isinstance(raw, dict):
+        for key in state.keys():
+            if key in raw:
+                state[key] = raw.get(key)
+    return state
+
+
+def _save_task_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    payload = {
+        "status": str(state.get("status") or "IDLE").upper(),
+        "prompt_id": state.get("prompt_id"),
+        "task": str(state.get("task") or ""),
+        "assigned_worker": state.get("assigned_worker"),
+        "claimed_at": state.get("claimed_at"),
+        "delegated_at": state.get("delegated_at"),
+        "completed_at": state.get("completed_at"),
+        "updated_at": _now_iso(),
+        "last_result": str(state.get("last_result") or ""),
+        "notes": str(state.get("notes") or ""),
+    }
+    _atomic_write(_task_file(), payload)
+    return payload
+
+
+def _publish_consultant_event(event_type: str, content: str,
+                              metadata: Optional[Dict[str, Any]] = None) -> bool:
+    clean_metadata: Dict[str, str] = {}
+    for key, value in (metadata or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, str):
+            clean_metadata[str(key)] = value
+        elif isinstance(value, (int, float, bool)):
+            clean_metadata[str(key)] = str(value)
+        else:
+            clean_metadata[str(key)] = json.dumps(value, default=str)
+    payload = {
+        "sender": CONSULTANT_ID,
+        "topic": "orchestrator",
+        "type": event_type,
+        "content": content,
+        "metadata": clean_metadata,
+    }
+    try:
+        try:
+            from shared.bus import bus_post
+        except ImportError:
+            from tools.shared.bus import bus_post
+        if bus_post(payload):
+            return True
+    except Exception:
+        pass
+    return _http_post("/bus/publish", payload, timeout=2.0)
+
+
+def _normalize_worker_snapshot(workers: Dict[str, Any], source: str, age_s: Optional[float]) -> Dict[str, Any]:
+    normalized = {}
+    available = []
+    busy = []
+    offline = []
+    for name, info in (workers or {}).items():
+        if str(name).lower() == "orchestrator" or not isinstance(info, dict):
+            continue
+        status = str(info.get("status") or "UNKNOWN").upper()
+        queue_depth = int(info.get("queue_depth") or 0)
+        current_task = str(info.get("current_task") or "")
+        worker_available = status == "IDLE" and queue_depth <= 0 and not current_task.strip()
+        if status in ("OFFLINE", "ERROR", "DEAD"):
+            worker_available = False
+            offline.append(name)
+        elif worker_available:
+            available.append(name)
+        else:
+            busy.append(name)
+        normalized[name] = {
+            "status": status,
+            "available": worker_available,
+            "queue_depth": queue_depth,
+            "current_task": current_task,
+            "model": info.get("model"),
+            "last_heartbeat": info.get("last_heartbeat"),
+        }
+    return {
+        "source": source,
+        "age_s": age_s,
+        "workers": normalized,
+        "available_workers": available,
+        "busy_workers": busy,
+        "offline_workers": offline,
+        "summary": {
+            "total": len(normalized),
+            "available": len(available),
+            "busy": len(busy),
+            "offline": len(offline),
+        },
+    }
+
+
+def _load_worker_snapshot(max_age_s: float = 10.0) -> Dict[str, Any]:
+    realtime = _read_json(DATA_DIR / "realtime.json")
+    if realtime:
+        ts = _parse_time(realtime.get("last_update") or realtime.get("timestamp"))
+        age_s = round(time.time() - ts, 1) if ts is not None else None
+        workers = realtime.get("workers") or realtime.get("agents") or {}
+        if isinstance(workers, dict) and age_s is not None and age_s <= max_age_s:
+            return _normalize_worker_snapshot(workers, "realtime.json", age_s)
+
+    backend = _http_get("/status", timeout=2.0)
+    workers = backend.get("agents", {}) if isinstance(backend, dict) else {}
+    if isinstance(workers, dict) and workers:
+        return _normalize_worker_snapshot(workers, "backend:/status", 0.0)
+
+    return _normalize_worker_snapshot({}, "unavailable", None)
+
+
+def list_prompts(status: Optional[str] = None, limit: int = 50) -> list[Dict[str, Any]]:
+    prompts = list(_load_prompt_store().get("prompts", []))
+    prompts.sort(key=lambda p: str(p.get("created_at", "")))
+    if status:
+        status_l = status.lower()
+        prompts = [p for p in prompts if str(p.get("status", "")).lower() == status_l]
+    if limit > 0:
+        prompts = prompts[-limit:]
+    return prompts
+
+
+def queue_prompt(sender: str, content: str, prompt_type: str = "directive",
+                 metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not content:
+        raise ValueError("content required")
+    store = _load_prompt_store()
+    prompts = store.get("prompts", [])
+    prompt_id = f"prompt_{int(time.time() * 1000)}_{len(prompts)}"
+    entry = {
+        "id": prompt_id,
+        "sender": sender or "unknown",
+        "type": prompt_type or "directive",
+        "content": content,
+        "metadata": metadata or {},
+        "status": "pending",
+        "created_at": _now_iso(),
+        "acknowledged_at": None,
+        "completed_at": None,
+        "result": None,
+    }
+    prompts.append(entry)
+    if len(prompts) > MAX_PROMPTS:
+        prompts = prompts[-MAX_PROMPTS:]
+    store["prompts"] = prompts
+    _save_prompt_store(store)
+    return entry
+
+
+def get_next_prompt() -> Optional[Dict[str, Any]]:
+    pending = list_prompts(status="pending", limit=1)
+    return pending[0] if pending else None
+
+
+def acknowledge_prompt(prompt_id: str, consumer: str = "") -> Optional[Dict[str, Any]]:
+    store = _load_prompt_store()
+    updated = None
+    for prompt in store.get("prompts", []):
+        if prompt.get("id") != prompt_id:
+            continue
+        if str(prompt.get("status", "")).lower() == "pending":
+            prompt["status"] = "acknowledged"
+            prompt["acknowledged_at"] = _now_iso()
+            if consumer:
+                prompt["consumer"] = consumer
+        updated = prompt
+        break
+    if updated is not None:
+        _save_prompt_store(store)
+        task_state = _save_task_state({
+            "status": "CLAIMED",
+            "prompt_id": updated.get("id"),
+            "task": updated.get("content", ""),
+            "assigned_worker": None,
+            "claimed_at": updated.get("acknowledged_at"),
+            "delegated_at": None,
+            "completed_at": None,
+            "last_result": "",
+            "notes": f"claimed by {consumer or CONSULTANT_ID}",
+        })
+        workers = _load_worker_snapshot()
+        _publish_consultant_event(
+            "task_claim",
+            f"{DISPLAY_NAME} accepted prompt {updated.get('id')} and is taking the task: "
+            f"{str(updated.get('content') or '')[:200]}",
+            metadata={
+                "prompt_id": updated.get("id"),
+                "consumer": consumer or CONSULTANT_ID,
+                "task_state": task_state.get("status"),
+                "available_workers": workers.get("available_workers", []),
+                "worker_source": workers.get("source"),
+            },
+        )
+    return updated
+
+
+def complete_prompt(prompt_id: str, result: str = "", status: str = "completed") -> Optional[Dict[str, Any]]:
+    status = status.lower()
+    if status not in ("completed", "failed"):
+        status = "completed"
+    store = _load_prompt_store()
+    updated = None
+    for prompt in store.get("prompts", []):
+        if prompt.get("id") != prompt_id:
+            continue
+        prompt["status"] = status
+        prompt["completed_at"] = _now_iso()
+        prompt["result"] = result
+        updated = prompt
+        break
+    if updated is not None:
+        _save_prompt_store(store)
+        state_name = "FAILED" if status == "failed" else "COMPLETED"
+        task_state = _load_task_state()
+        _save_task_state({
+            **task_state,
+            "status": state_name,
+            "prompt_id": updated.get("id"),
+            "task": updated.get("content", "") or task_state.get("task", ""),
+            "completed_at": updated.get("completed_at"),
+            "last_result": result[:500],
+            "notes": f"prompt {updated.get('id')} {state_name.lower()}",
+        })
+        _publish_consultant_event(
+            "error" if status == "failed" else "result",
+            f"{DISPLAY_NAME} {state_name.lower()} prompt {updated.get('id')}: {result[:300]}",
+            metadata={
+                "prompt_id": updated.get("id"),
+                "status": state_name,
+            },
+        )
+    return updated
+
+
+def delegate_prompt(prompt_id: str, worker_name: str = "", task: str = "") -> Dict[str, Any]:
+    store = _load_prompt_store()
+    target = None
+    for prompt in store.get("prompts", []):
+        if prompt.get("id") == prompt_id:
+            target = prompt
+            break
+    if target is None:
+        return {"success": False, "error": "prompt not found"}
+    prompt_status = str(target.get("status") or "").lower()
+    if prompt_status in ("completed", "failed"):
+        return {"success": False, "error": f"prompt already {prompt_status}"}
+
+    if prompt_status == "pending":
+        target = acknowledge_prompt(prompt_id, consumer=CONSULTANT_ID) or target
+        store = _load_prompt_store()
+        for prompt in store.get("prompts", []):
+            if prompt.get("id") == prompt_id:
+                target = prompt
+                break
+
+    workers = _load_worker_snapshot()
+    normalized_workers = workers.get("workers", {})
+    selected_worker = str(worker_name or "").strip()
+    if not selected_worker:
+        available = workers.get("available_workers", [])
+        selected_worker = available[0] if available else ""
+
+    worker_status = normalized_workers.get(selected_worker, {}).get("status") if selected_worker else None
+    if not selected_worker:
+        return {"success": False, "error": "no worker available for delegation", "workers": workers}
+
+    task_text = str(task or target.get("content") or "").strip()
+    if not task_text:
+        return {"success": False, "error": "task content required", "workers": workers}
+
+    try:
+        from tools.skynet_dispatch import dispatch_to_worker, load_orch_hwnd, load_workers
+        ok = dispatch_to_worker(
+            selected_worker,
+            task_text,
+            workers=load_workers(),
+            orch_hwnd=load_orch_hwnd(),
+        )
+    except Exception as exc:
+        return {"success": False, "error": str(exc), "workers": workers}
+
+    if ok:
+        now = _now_iso()
+        target.setdefault("metadata", {})
+        if isinstance(target["metadata"], dict):
+            target["metadata"]["delegated_to"] = selected_worker
+            target["metadata"]["delegated_at"] = now
+        _save_prompt_store(store)
+        task_state = _save_task_state({
+            "status": "DELEGATED",
+            "prompt_id": prompt_id,
+            "task": task_text,
+            "assigned_worker": selected_worker,
+            "claimed_at": target.get("acknowledged_at") or now,
+            "delegated_at": now,
+            "completed_at": None,
+            "last_result": "",
+            "notes": f"delegated to {selected_worker}",
+        })
+        _publish_consultant_event(
+            "delegation",
+            f"{DISPLAY_NAME} delegated prompt {prompt_id} to worker {selected_worker}: {task_text[:200]}",
+            metadata={
+                "prompt_id": prompt_id,
+                "worker": selected_worker,
+                "worker_status": worker_status,
+                "task_state": task_state.get("status"),
+                "worker_source": workers.get("source"),
+            },
+        )
+        return {
+            "success": True,
+            "worker": selected_worker,
+            "worker_status": worker_status,
+            "prompt": target,
+            "workers": workers,
+            "task_state": task_state,
+        }
+
+    return {
+        "success": False,
+        "error": f"dispatch to {selected_worker} failed",
+        "worker": selected_worker,
+        "worker_status": worker_status,
+        "workers": workers,
+    }
+
+
 class ConsultantApiHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path in ("/consultant", "/consultants"):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
+
+        if path in ("/consultant", "/consultants"):
             self._json_response({"consultant": get_consultant_view()})
             return
-        if self.path == "/health":
+        if path in ("/consultant/prompts", "/consultants/prompts"):
+            status = query.get("status", [None])[0]
+            try:
+                limit = int(query.get("limit", ["50"])[0])
+            except Exception:
+                limit = 50
+            prompts = list_prompts(status=status, limit=limit)
+            self._json_response({
+                "consultant": get_consultant_view(),
+                "prompts": prompts,
+                "stats": _prompt_stats(prompts=None),
+            })
+            return
+        if path in ("/consultant/prompts/next", "/consultants/prompts/next"):
+            prompt = get_next_prompt()
+            self._json_response({
+                "consultant": get_consultant_view(),
+                "prompt": prompt,
+                "stats": _prompt_stats(),
+            })
+            return
+        if path in ("/consultant/task", "/consultants/task"):
+            self._json_response({
+                "consultant": get_consultant_view(),
+                "task": _load_task_state(),
+                "workers": _load_worker_snapshot(),
+            })
+            return
+        if path in ("/consultant/workers", "/consultants/workers"):
+            self._json_response({
+                "consultant": get_consultant_view(),
+                "workers": _load_worker_snapshot(),
+            })
+            return
+        if path == "/health":
             self._json_response({
                 "status": "ok",
                 "service": "consultant-bridge",
@@ -154,10 +587,86 @@ class ConsultantApiHandler(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        payload = self._read_json_body()
+        if payload is None:
+            self.send_error(400, "bad json")
+            return
+
+        if path in ("/consultant/prompt", "/consultants/prompt"):
+            content = str(payload.get("content") or payload.get("prompt") or "").strip()
+            if not content:
+                self.send_error(400, "content required")
+                return
+            try:
+                prompt = queue_prompt(
+                    sender=str(payload.get("sender") or "delivery"),
+                    content=content,
+                    prompt_type=str(payload.get("type") or "directive"),
+                    metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None,
+                )
+            except ValueError as exc:
+                self.send_error(400, str(exc))
+                return
+            self._json_response({
+                "status": "queued",
+                "prompt": prompt,
+                "stats": _prompt_stats(),
+            }, status=202)
+            return
+
+        if path in ("/consultant/prompts/ack", "/consultants/prompts/ack"):
+            prompt_id = str(payload.get("id") or payload.get("prompt_id") or "").strip()
+            if not prompt_id:
+                self.send_error(400, "id required")
+                return
+            prompt = acknowledge_prompt(prompt_id, consumer=str(payload.get("consumer") or CONSULTANT_ID))
+            if prompt is None:
+                self.send_error(404, "prompt not found")
+                return
+            self._json_response({"status": "acknowledged", "prompt": prompt, "stats": _prompt_stats()})
+            return
+
+        if path in ("/consultant/prompts/complete", "/consultants/prompts/complete"):
+            prompt_id = str(payload.get("id") or payload.get("prompt_id") or "").strip()
+            if not prompt_id:
+                self.send_error(400, "id required")
+                return
+            prompt = complete_prompt(
+                prompt_id,
+                result=str(payload.get("result") or ""),
+                status=str(payload.get("status") or "completed"),
+            )
+            if prompt is None:
+                self.send_error(404, "prompt not found")
+                return
+            self._json_response({"status": prompt.get("status"), "prompt": prompt, "stats": _prompt_stats()})
+            return
+
+        if path in ("/consultant/prompts/delegate", "/consultants/prompts/delegate"):
+            prompt_id = str(payload.get("id") or payload.get("prompt_id") or "").strip()
+            if not prompt_id:
+                self.send_error(400, "id required")
+                return
+            result = delegate_prompt(
+                prompt_id=prompt_id,
+                worker_name=str(payload.get("worker") or ""),
+                task=str(payload.get("task") or ""),
+            )
+            if not result.get("success"):
+                self._json_response(result, status=409)
+                return
+            self._json_response(result, status=202)
+            return
+
+        self.send_error(404)
+
     def do_OPTIONS(self) -> None:
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
@@ -172,6 +681,18 @@ class ConsultantApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_json_body(self) -> Optional[Dict[str, Any]]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except Exception:
+            length = 0
+        try:
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return None
 
 
 def _start_api_server(api_port: int) -> Optional[ThreadingHTTPServer]:
@@ -211,6 +732,9 @@ def build_live_state(interval_s: float = DEFAULT_INTERVAL_S,
                      stale_after_s: float = DEFAULT_STALE_AFTER_S,
                      api_port: Optional[int] = DEFAULT_API_PORT) -> Dict[str, Any]:
     profile = _load_profile()
+    prompt_stats = _prompt_stats()
+    task_state = _load_task_state()
+    workers = _load_worker_snapshot()
     return {
         "id": CONSULTANT_ID,
         "display_name": profile["display_name"],
@@ -218,9 +742,11 @@ def build_live_state(interval_s: float = DEFAULT_INTERVAL_S,
         "model": profile["model"],
         "kind": "advisor",
         "backend_managed": False,
-        "routable": False,
+        "routable": True,
+        "accepts_prompts": True,
         "requires_hwnd": False,
         "transport": f"{SOURCE_NAME.lower()}-bridge",
+        "prompt_transport": "bridge_queue",
         "source": SOURCE_NAME,
         "status": "LIVE",
         "live": True,
@@ -233,6 +759,9 @@ def build_live_state(interval_s: float = DEFAULT_INTERVAL_S,
         "api_url": f"http://localhost:{api_port}/consultants" if api_port else None,
         "backend_connected": bool(_http_get("/status", timeout=2.0)),
         "last_bus_message": _latest_consultant_message(limit=100),
+        "prompt_queue": prompt_stats,
+        "task_state": task_state,
+        "worker_snapshot": workers,
     }
 
 
@@ -246,9 +775,11 @@ def get_consultant_view() -> Dict[str, Any]:
         "model": profile["model"],
         "kind": "advisor",
         "backend_managed": False,
-        "routable": False,
+        "routable": bool(raw.get("accepts_prompts", False)),
+        "accepts_prompts": bool(raw.get("accepts_prompts", False)),
         "requires_hwnd": False,
         "transport": f"{SOURCE_NAME.lower()}-bridge",
+        "prompt_transport": raw.get("prompt_transport", "bridge_queue"),
         "source": raw.get("source", SOURCE_NAME),
         "declared": True,
         "declared_status": profile["declared_status"],
@@ -265,6 +796,9 @@ def get_consultant_view() -> Dict[str, Any]:
         "last_bus_message": raw.get("last_bus_message"),
         "heartbeat_age_s": None,
         "pid_alive": False,
+        "prompt_queue": raw.get("prompt_queue", _prompt_stats()),
+        "task_state": raw.get("task_state", _load_task_state()),
+        "worker_snapshot": raw.get("worker_snapshot", _load_worker_snapshot()),
     }
 
     hb_ts = _parse_time(view["last_heartbeat"])
@@ -295,13 +829,14 @@ def _announce_presence() -> None:
         "content": (
             f"{DISPLAY_NAME.upper()} LIVE -- {SOURCE_NAME} bridge active. "
             "Advisory peer is visible in consultant live surfaces. "
-            "Routable=false."
+            "Prompt transport=bridge_queue."
         ),
         "metadata": {
             "display_name": DISPLAY_NAME,
             "kind": "advisor",
             "transport": f"{SOURCE_NAME.lower()}-bridge",
-            "routable": "false",
+            "routable": "true",
+            "prompt_transport": "bridge_queue",
         },
     }, timeout=2.0)
 
@@ -321,7 +856,7 @@ def relay_consultant_result(content: str, consultant_id: str = None) -> dict:
     """Relay a consultant bus result to the orchestrator via direct-prompt.
 
     Call this from bus watchers or relay daemons when a consultant posts a
-    result with topic=orchestrator. This bridges the advisory-only bus post
+    result with topic=orchestrator. This bridges the consultant bus post
     into an immediate UIA ghost-type notification.
 
     Returns dict with delivery status.

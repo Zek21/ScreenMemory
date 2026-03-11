@@ -1547,14 +1547,24 @@ def _json_get(url, timeout=2):
         return None
 
 
-def _consultant_endpoint_live(api_port):
+def _consultant_endpoint_status(api_port):
     data = _json_get(f"http://localhost:{api_port}/consultants", timeout=2)
     if not isinstance(data, dict):
-        return False
+        return {"reachable": False, "live": False, "promptable": False}
     consultant = data.get("consultant")
     if not isinstance(consultant, dict):
-        return False
-    return bool(consultant.get("live")) or str(consultant.get("status", "")).upper() == "LIVE"
+        return {"reachable": False, "live": False, "promptable": False}
+    return {
+        "reachable": True,
+        "live": bool(consultant.get("live")) or str(consultant.get("status", "")).upper() == "LIVE",
+        "promptable": bool(consultant.get("accepts_prompts")),
+        "routable": bool(consultant.get("routable")),
+        "prompt_transport": consultant.get("prompt_transport"),
+    }
+
+
+def _consultant_endpoint_live(api_port):
+    return _consultant_endpoint_status(api_port).get("live", False)
 
 
 def _ensure_consultant_bridge():
@@ -1568,7 +1578,10 @@ def _ensure_consultant_bridge():
         "Codex Consultant bridge",
     )
 
-    if _consultant_endpoint_live(8422):
+    status = _consultant_endpoint_status(8422)
+    if status.get("live"):
+        if not status.get("promptable"):
+            log("Consultant bridge on port 8422 is live but not promptable", "WARN")
         return
 
     log("Consultant bridge on port 8422 is not reporting live — starting fallback bridge on 8424", "WARN")
@@ -1597,7 +1610,10 @@ def _ensure_gemini_consultant_bridge():
         ],
     )
 
-    if _consultant_endpoint_live(8425):
+    status = _consultant_endpoint_status(8425)
+    if status.get("live"):
+        if not status.get("promptable"):
+            log("Gemini Consultant bridge on port 8425 is live but not promptable", "WARN")
         return
 
     log("Gemini Consultant bridge on port 8425 is not reporting live", "WARN")
