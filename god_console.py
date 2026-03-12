@@ -1759,6 +1759,8 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             return self._post_worker_metrics(data)
         elif self.path.startswith("/api/worker/") and self.path.endswith("/activity"):
             return self._post_worker_activity(data)
+        elif self.path == "/api/worker/action":
+            return self._post_worker_action(data)
         else:
             self._json_response({"error": "not found"}, status=404)
             return 404
@@ -1932,6 +1934,43 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             pass
         self._json_response({"ok": True, "worker": worker_name})
         return 200
+
+    def _post_worker_action(self, data):
+        """POST /api/worker/action — HALT/CLR/RST buttons from dashboard.  # signed: alpha"""
+        import urllib.request as _ur
+        worker = str(data.get("worker", "")).strip().lower()
+        action = str(data.get("action", "")).strip().lower()
+        valid_workers = ("alpha", "beta", "gamma", "delta")
+        valid_actions = ("halt", "clear_steer", "restart")
+        if worker not in valid_workers:
+            self._json_response({"error": f"unknown worker: {worker}"}, status=400)
+            return 400
+        if action not in valid_actions:
+            self._json_response({"error": f"invalid action: {action}, must be one of {valid_actions}"}, status=400)
+            return 400
+        action_map = {
+            "halt": "HALT: Cancel current generation immediately. Stop what you are doing.",
+            "clear_steer": "/clear",
+            "restart": "RESTART: Begin a new conversation. Forget prior context and re-initialize.",
+        }
+        directive_body = action_map[action]
+        try:
+            payload = json.dumps({"directive": directive_body, "sender": "god_console"}).encode()
+            req = _ur.Request(
+                f"http://localhost:8420/directive?route={worker}",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _ur.urlopen(req, timeout=5) as resp:
+                resp.read()
+            logger.info("Worker action %s on %s succeeded", action, worker)
+            self._json_response({"ok": True, "worker": worker, "action": action})
+            return 200
+        except Exception as e:
+            logger.error("Worker action %s on %s failed: %s", action, worker, e)
+            self._json_response({"error": f"directive failed: {e}"}, status=500)
+            return 500
 
     def log_message(self, fmt, *args):
         pass  # silent — we use _log_access instead

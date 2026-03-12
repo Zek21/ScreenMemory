@@ -1551,6 +1551,8 @@ function pollLeadership(){
       hdrCon.textContent='C:'+cLive+' G:'+gLive;
       hdrCon.className='val '+(totalLive>=2?'hdr-consultant-live':totalLive>=1?'hdr-consultant-waiting':'hdr-consultant-offline');
     }
+    /* Sync leadership panel main-grid cards from /leadership data — signed: gamma */
+    updateLeaderConsultantCards(codex, gemini);
   }).catch(e=>{
     const el=document.getElementById('leadershipPanel');
     if(el)el.innerHTML=`<div style="color:var(--dim);font-size:10px;">Error: ${esc(String(e.message))}</div>`;
@@ -1795,6 +1797,53 @@ function updateGod(items){
   }
 }
 
+/* ═══ LEADERSHIP PANEL — live consultant card updates — signed: gamma ═══ */
+function updateLeaderConsultantCards(codexData, geminiData){
+  function applyLeader(c, prefix){
+    const statusEl=document.getElementById('leader-'+prefix+'-status');
+    const modelEl=document.getElementById('leader-'+prefix+'-model');
+    const transportEl=document.getElementById('leader-'+prefix+'-transport');
+    const activityEl=document.getElementById('leader-'+prefix+'-activity');
+    const queueEl=document.getElementById('leader-'+prefix+'-queue');
+    if(!statusEl) return;
+    if(!c||typeof c!=='object'){
+      statusEl.textContent='OFFLINE';
+      statusEl.className='leader-status offline';
+      if(activityEl) activityEl.textContent='No activity';
+      if(queueEl) queueEl.textContent='';
+      return;
+    }
+    const isLive=c.live||String(c.status||'').toUpperCase()==='LIVE';
+    statusEl.textContent=isLive?'LIVE':'OFFLINE';
+    statusEl.className='leader-status '+(isLive?'live':'offline');
+    if(modelEl){
+      const model=c.model||c.state_file&&c.state_file.model||null;
+      if(model) modelEl.textContent=String(model);
+    }
+    if(transportEl){
+      const transport=c.prompt_transport||c.transport||null;
+      const port=c.bridge_port||c.port||null;
+      if(transport) transportEl.textContent=String(transport);
+      else if(port) transportEl.textContent='Bridge: '+port;
+    }
+    if(activityEl){
+      const tele=_agentTelemetry[String(c.id||'').toLowerCase()]||null;
+      const doing=tele&&tele.doing?String(tele.doing).slice(0,60):null;
+      const msg=c.last_bus_message&&c.last_bus_message.content
+        ? String(c.last_bus_message.content).slice(0,60)
+        : null;
+      activityEl.textContent=doing||msg||'No activity';
+    }
+    if(queueEl){
+      const taskState=c.task_state&&typeof c.task_state==='object'?c.task_state:{};
+      const qDepth=taskState.task?'1 queued':'';
+      queueEl.textContent=qDepth;
+    }
+  }
+  applyLeader(codexData, 'codex');
+  applyLeader(geminiData, 'gemini');
+}
+
 function renderConsultants(consultants){
   /* Dual-card consultant rendering — signed: gamma */
   const codexDot=document.getElementById('codexDot');
@@ -1866,6 +1915,9 @@ function renderConsultants(consultants){
 
   const codexLive=applyCard(codex, codexDot, codexBadge, codexStatus, codexQueue, codexModel, codexFeed);
   const geminiLive=applyCard(gemini, geminiDot, geminiBadge, geminiStatus, geminiQueue, geminiModel, geminiFeed);
+
+  /* Sync leadership panel main-grid cards with live data — signed: gamma */
+  updateLeaderConsultantCards(codex, gemini);
 
   /* Update header bar: C:1 G:0 format */
   if(topStat){
