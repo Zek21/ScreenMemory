@@ -146,20 +146,11 @@ def _post_bus(topic, msg_type, content):
         result = guarded_publish(msg)
         return result.get("allowed", False)
     except ImportError:
-        # Fallback: direct HTTP if SpamGuard not available
-        try:
-            payload = json.dumps(msg).encode()
-            req = urllib.request.Request(
-                f"{BUS_URL}/bus/publish", payload,
-                {"Content-Type": "application/json"}
-            )
-            urllib.request.urlopen(req, timeout=5)
-            return True
-        except Exception:
-            return False
+        log("SpamGuard import failed -- skipping bus publish (anti-spam rule)", "ERROR")
+        return False
     except Exception:
         return False
-    # signed: gamma
+    # signed: beta
 
 
 def _get_skynet_version():

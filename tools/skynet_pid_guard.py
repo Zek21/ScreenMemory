@@ -34,15 +34,39 @@ _active_guards: list[Path] = []
 
 
 def _pid_alive(pid: int) -> bool:
-    """Check if a process with given PID exists (cross-platform)."""
-    try:
-        if pid <= 0:
+    """Check if a process with given PID exists (cross-platform).
+
+    On Windows, ``os.kill(pid, 0)`` does NOT work like Unix signal-0 check.
+    It calls ``GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid)`` which always
+    fails with WinError 87 for background daemons (no matching process
+    group).  This caused _pid_alive to ALWAYS return False on Windows,
+    making the PID guard completely non-functional.
+
+    Fix: use ``kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)``
+    on Windows, which correctly probes process existence without side effects.
+    """
+    if pid <= 0:
+        return False
+    # Windows: use Win32 API (os.kill is broken for liveness checks)
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
             return False
+        except Exception:
+            return False
+    # Unix: signal 0 is the standard liveness check
+    try:
         os.kill(pid, 0)
         return True
     except (OSError, PermissionError):
         return False
-    # signed: alpha
+    # signed: gamma
 
 
 def _pid_matches_daemon(pid: int, daemon_name: str) -> bool:
@@ -51,6 +75,11 @@ def _pid_matches_daemon(pid: int, daemon_name: str) -> bool:
     Uses psutil to inspect the command line of the running process.
     ``daemon_name`` is matched case-insensitively against the joined
     command-line string (with backslashes normalised to forward slashes).
+
+    SAFETY: On transient errors (AccessDenied, process still initializing),
+    returns True (assume it IS the daemon) to prevent false-stale
+    classification that deletes legitimate PID files.  Only returns False
+    when the process provably does NOT exist or is a zombie.
     """
     try:
         import psutil
@@ -58,9 +87,22 @@ def _pid_matches_daemon(pid: int, daemon_name: str) -> bool:
         cmd = " ".join(proc.cmdline() or []).replace("\\", "/").lower()
         name = str(proc.name() or "").lower()
         return "python" in name and daemon_name.lower() in cmd
-    except Exception:
-        return False
-    # signed: alpha
+    except (ImportError,):
+        # psutil not installed -- can't verify, assume match to be safe
+        return True
+    except Exception as exc:
+        # Distinguish "process gone" from "can't read process info"
+        try:
+            import psutil as _ps
+            if isinstance(exc, (_ps.NoSuchProcess, _ps.ZombieProcess)):
+                return False
+        except ImportError:
+            pass
+        # AccessDenied / transient read failure / process still initializing:
+        # err on side of caution -- assume it IS the daemon to prevent
+        # false-stale PID file deletion (root cause of duplicate spawning)
+        return True
+    # signed: gamma
 
 
 def _owned_by_current_process(pid_path: Path) -> bool:
@@ -175,9 +217,26 @@ def acquire_pid_guard(pid_file: str | Path, daemon_name: str,
             except Exception:
                 old_pid = 0
 
-            if old_pid and _pid_alive(old_pid) and _pid_matches_daemon(old_pid, daemon_name):
-                _log(f"{daemon_name} already running (PID {old_pid}) -- exiting to prevent duplicate", "WARN")
-                return False
+            # Empty/unreadable file: another process may have JUST created
+            # it via O_CREAT|O_EXCL but hasn't written its PID yet.
+            # Wait briefly and retry the read before treating as stale.
+            if not old_pid and pid_path.exists():
+                time.sleep(0.3)
+                try:
+                    old_pid = int(pid_path.read_text().strip())
+                except Exception:
+                    old_pid = 0
+            # signed: gamma
+
+            if old_pid and _pid_alive(old_pid):
+                if _pid_matches_daemon(old_pid, daemon_name):
+                    _log(f"{daemon_name} already running (PID {old_pid}) -- exiting to prevent duplicate", "WARN")
+                    return False
+                # PID alive but doesn't match daemon name -- could be PID
+                # recycling (different process reused the PID) so treat as
+                # stale only in that case.  _pid_matches_daemon already errs
+                # on the side of caution for transient errors.
+                # signed: gamma
 
             # Stale PID file -- remove and retry once
             try:
