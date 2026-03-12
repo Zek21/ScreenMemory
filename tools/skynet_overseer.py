@@ -796,7 +796,13 @@ def main():
             pass  # signed: alpha
 
         log(f"Overseer daemon PID {os.getpid()}" + (" [PROD MODE]" if args.prod else ""))
-        OverseerDaemon(prod_mode=args.prod).run()
+        try:
+            OverseerDaemon(prod_mode=args.prod).run()
+        finally:
+            try:
+                PID_FILE.unlink(missing_ok=True)  # signed: beta
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

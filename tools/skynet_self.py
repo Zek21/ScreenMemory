@@ -36,6 +36,18 @@ sys.path.insert(0, str(ROOT / "tools"))
 SKYNET_URL = "http://localhost:8420"
 DATA = ROOT / "data"
 WORKER_NAMES = ["alpha", "beta", "gamma", "delta"]
+CONSULTANT_NAMES = ["consultant", "gemini_consultant"]  # signed: delta
+ALL_AGENT_NAMES = WORKER_NAMES + CONSULTANT_NAMES + ["orchestrator"]  # signed: delta
+
+# Consultant state files and bridge ports
+CONSULTANT_STATE_FILES = {
+    "consultant": DATA / "consultant_state.json",
+    "gemini_consultant": DATA / "gemini_consultant_state.json",
+}  # signed: delta
+CONSULTANT_BRIDGE_PORTS = {
+    "consultant": 8422,
+    "gemini_consultant": 8425,
+}  # signed: delta
 
 
 def _ts():
@@ -102,8 +114,11 @@ class SkynetIdentity:
             "model": self.model,
             "born": self.born,
             "workers": WORKER_NAMES,
+            "consultants": CONSULTANT_NAMES,
+            "all_agents": ALL_AGENT_NAMES,
             "updated": datetime.now().isoformat(),
         }, indent=2))
+        # signed: delta
 
     def agents(self) -> Dict[str, dict]:
         """Get live agent graph from Skynet backend."""
@@ -124,9 +139,75 @@ class SkynetIdentity:
             }
         return result
 
+    def get_consultant_status(self) -> Dict[str, dict]:
+        """Check consultant health: state files, HWND alive, bridge HTTP health.
+
+        Returns dict keyed by consultant name with status details.
+        """
+        result = {}
+        for name, state_file in CONSULTANT_STATE_FILES.items():
+            port = CONSULTANT_BRIDGE_PORTS.get(name, 0)
+            entry = {
+                "name": name,
+                "state_file_exists": state_file.exists(),
+                "hwnd": 0,
+                "hwnd_alive": False,
+                "bridge_port": port,
+                "bridge_alive": False,
+                "transport": "unknown",
+                "status": "UNKNOWN",
+            }
+            # Read state file for HWND and transport info
+            if state_file.exists():
+                try:
+                    state = json.loads(state_file.read_text())
+                    entry["hwnd"] = int(state.get("hwnd", 0))
+                    entry["transport"] = state.get("transport",
+                                                   state.get("prompt_transport", "unknown"))
+                    entry["model"] = state.get("model", "unknown")
+                    entry["sender_id"] = state.get("sender_id", name)
+                except Exception:
+                    pass
+            # Check HWND alive via Win32 IsWindow
+            if entry["hwnd"]:
+                try:
+                    import ctypes
+                    entry["hwnd_alive"] = bool(
+                        ctypes.windll.user32.IsWindow(entry["hwnd"])
+                    )
+                except Exception:
+                    entry["hwnd_alive"] = False
+            # Check bridge HTTP health
+            if port:
+                try:
+                    from urllib.request import urlopen
+                    resp = urlopen(f"http://localhost:{port}/health", timeout=2)
+                    entry["bridge_alive"] = resp.getcode() == 200
+                except Exception:
+                    entry["bridge_alive"] = False
+            # Determine overall status
+            if entry["bridge_alive"] and entry["hwnd_alive"]:
+                entry["status"] = "ONLINE"
+            elif entry["bridge_alive"]:
+                entry["status"] = "BRIDGE_ONLY"
+            elif entry["hwnd_alive"]:
+                entry["status"] = "WINDOW_ONLY"
+            elif entry["state_file_exists"]:
+                entry["status"] = "REGISTERED"
+            else:
+                entry["status"] = "ABSENT"
+            result[name] = entry
+        return result
+        # signed: delta
+
     def report(self) -> dict:
         agents = self.agents()
+        consultants = self.get_consultant_status()
         alive = sum(1 for a in agents.values() if a["status"] != "DEAD")
+        consultants_online = sum(
+            1 for c in consultants.values()
+            if c["status"] in ("ONLINE", "BRIDGE_ONLY", "WINDOW_ONLY")
+        )  # signed: delta
         return {
             "identity": {
                 "name": self.name,
@@ -136,8 +217,11 @@ class SkynetIdentity:
                 "born": self.born,
             },
             "agents": agents,
+            "consultants": consultants,
             "agent_count": len(agents),
             "alive_count": alive,
+            "consultant_count": len(consultants),
+            "consultants_online": consultants_online,
             "orchestrator_status": agents.get("orchestrator", {}).get("status", "UNKNOWN"),
         }
 
@@ -280,6 +364,7 @@ class SkynetHealth:
         checks = {}
         self._check_backend(checks)
         self._check_workers(checks)
+        self._check_consultants(checks)  # signed: delta
         self._check_bus(checks)
         self._check_sse_daemon(checks)
         self._check_intelligence_engines(checks)
@@ -315,6 +400,52 @@ class SkynetHealth:
                                  "working": alive - idle, "all_healthy": alive == len(WORKER_NAMES)}
         else:
             checks["workers"] = {"total": 0, "alive": 0, "all_healthy": False}
+
+    @staticmethod
+    def _check_consultants(checks):
+        """Check consultant bridge health and HWND liveness."""
+        consultant_results = {}
+        total = len(CONSULTANT_NAMES)
+        online = 0
+        for name in CONSULTANT_NAMES:
+            state_file = CONSULTANT_STATE_FILES.get(name)
+            port = CONSULTANT_BRIDGE_PORTS.get(name, 0)
+            c = {"bridge_alive": False, "hwnd_alive": False, "status": "ABSENT"}
+            # Check bridge HTTP
+            if port:
+                try:
+                    from urllib.request import urlopen
+                    resp = urlopen(f"http://localhost:{port}/health", timeout=2)
+                    c["bridge_alive"] = resp.getcode() == 200
+                except Exception:
+                    pass
+            # Check HWND from state file
+            if state_file and state_file.exists():
+                try:
+                    state = json.loads(state_file.read_text())
+                    hwnd = int(state.get("hwnd", 0))
+                    if hwnd:
+                        import ctypes
+                        c["hwnd_alive"] = bool(
+                            ctypes.windll.user32.IsWindow(hwnd)
+                        )
+                except Exception:
+                    pass
+            if c["bridge_alive"] and c["hwnd_alive"]:
+                c["status"] = "ONLINE"
+                online += 1
+            elif c["bridge_alive"]:
+                c["status"] = "BRIDGE_ONLY"
+                online += 1
+            elif c["hwnd_alive"]:
+                c["status"] = "WINDOW_ONLY"
+            consultant_results[name] = c
+        checks["consultants"] = {
+            "total": total,
+            "online": online,
+            "details": consultant_results,
+        }
+        # signed: delta
 
     @staticmethod
     def _check_bus(checks):
@@ -395,6 +526,7 @@ class SkynetIntrospection:
 
         self._reflect_on_backend(checks, strengths, weaknesses, recommendations)
         self._reflect_on_workers(checks, strengths, weaknesses, recommendations)
+        self._reflect_on_consultants(checks, strengths, weaknesses, recommendations)  # signed: delta
 
         cap_ratio = capabilities.get("capability_ratio", 0)
         self._reflect_on_capabilities(cap_ratio, strengths, weaknesses, observations, recommendations)
@@ -408,6 +540,7 @@ class SkynetIntrospection:
         self._reflect_on_evolution(weaknesses, recommendations)
 
         workers = checks.get("workers", {})
+        consultants_info = checks.get("consultants", {})  # signed: delta
         return {
             "timestamp": datetime.now().isoformat(),
             "overall_health": health.get("overall", "UNKNOWN"),
@@ -416,6 +549,8 @@ class SkynetIntrospection:
             "metrics": {
                 "workers_alive": workers.get("alive", 0),
                 "workers_total": workers.get("total", 0),
+                "consultants_online": consultants_info.get("online", 0),
+                "consultants_total": consultants_info.get("total", 0),
                 "capability_ratio": cap_ratio, "collective_iq": iq,
                 "knowledge_facts": facts,
                 "uptime_s": checks.get("backend", {}).get("uptime_s", 0),
@@ -440,6 +575,33 @@ class SkynetIntrospection:
             if dead > 0:
                 weaknesses.append(f"{dead} worker(s) are DEAD")
                 recommendations.append("Run skynet_start.py --reconnect to recover dead workers")
+
+    @staticmethod
+    def _reflect_on_consultants(checks, strengths, weaknesses, recommendations):
+        """Reflect on consultant bridge/HWND health."""
+        consultants = checks.get("consultants", {})
+        total = consultants.get("total", 0)
+        online = consultants.get("online", 0)
+        if total == 0:
+            return
+        details = consultants.get("details", {})
+        if online == total:
+            strengths.append(f"All {total} consultants online (bridge + HWND)")
+        elif online > 0:
+            offline_names = [n for n, d in details.items()
+                            if d.get("status") not in ("ONLINE", "BRIDGE_ONLY")]
+            weaknesses.append(
+                f"{total - online}/{total} consultant(s) offline: {', '.join(offline_names)}"
+            )
+            recommendations.append("Run CC-Start.ps1 / GC-Start.ps1 to recover offline consultants")
+        else:
+            weaknesses.append(f"All {total} consultants are offline")
+            recommendations.append("Start consultant bridges: CC-Start.ps1 and GC-Start.ps1")
+        # Check for WINDOW_ONLY status (bridge dead but HWND alive)
+        for n, d in details.items():
+            if d.get("status") == "WINDOW_ONLY":
+                weaknesses.append(f"Consultant {n} has live HWND but dead bridge -- bridge restart needed")
+        # signed: delta
 
     @staticmethod
     def _reflect_on_capabilities(cap_ratio, strengths, weaknesses, observations, recommendations):
@@ -594,7 +756,12 @@ class SkynetSelf:
         """Fast heartbeat for monitoring — minimal overhead."""
         pulse = self._cached_health_pulse()
         agents = self.identity.agents()
+        consultants = self.identity.get_consultant_status()  # signed: delta
         alive = sum(1 for a in agents.values() if a["status"] != "DEAD")
+        consultants_online = sum(
+            1 for c in consultants.values()
+            if c["status"] in ("ONLINE", "BRIDGE_ONLY", "WINDOW_ONLY")
+        )  # signed: delta
         iq_data = self.compute_iq(pulse, agents)
         return {
             "name": "SKYNET",
@@ -605,8 +772,11 @@ class SkynetSelf:
             "iq": iq_data["score"],
             "iq_trend": iq_data["trend"],
             "agents": {n: a["status"] for n, a in agents.items()},
+            "consultants": {n: c["status"] for n, c in consultants.items()},
             "alive": alive,
             "total": len(agents),
+            "consultants_online": consultants_online,
+            "consultants_total": len(consultants),
         }
 
     _pulse_cache = None
@@ -705,6 +875,12 @@ class SkynetSelf:
         workers = metrics.get("workers_alive", 0)
         total = metrics.get("workers_total", 0)
         lines.append(f"I command {workers}/{total} workers.")
+
+        consultants_online = metrics.get("consultants_online", 0)
+        consultants_total = metrics.get("consultants_total", 0)
+        if consultants_total > 0:
+            lines.append(f"Consultants: {consultants_online}/{consultants_total} online.")
+        # signed: delta
 
         engines_online = metrics.get("engines_online", 0)
         engines_total = metrics.get("engines_total", 0)

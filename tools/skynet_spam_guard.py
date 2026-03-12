@@ -6,6 +6,46 @@ Wraps bus publishing with fingerprint dedup, per-sender rate limiting,
 and pattern-specific spam detection. Blocked messages are logged and
 senders are auto-penalized via skynet_scoring.py.
 
+DUAL SPAM FILTER ARCHITECTURE (IMPORTANT)
+==========================================
+Skynet uses TWO independent spam filters. A message must pass BOTH to be published.
+Messages can be blocked at EITHER layer independently.
+
+Layer 1 — Python SpamGuard (THIS FILE, client-side):
+  - Rate limit: 5 msgs/min/sender (default), 30 msgs/hour/sender
+  - Dedup window: 900 seconds (15 min) general, category-specific overrides
+  - Fingerprint: SHA-256 of (sender|topic|type|normalized_content[:200])
+  - Normalization: strips timestamps, UUIDs, cycle numbers, gate IDs, etc.
+  - Penalty: -0.1 score per blocked message via skynet_scoring.py
+  - Override: monitor(10/min), system(10/min), convene-gate/convene(8/min)
+
+Layer 2 — Go Backend (Skynet/server.go, server-side):
+  - Rate limit: 10 msgs/min/sender (stricter than Python per-minute default)
+  - Dedup window: 60 seconds (shorter than Python's 900s)
+  - Fingerprint: sender|topic|type|content[:200] (NO normalization)
+  - Returns: HTTP 429 "SPAM_BLOCKED: <reason>" when blocked
+  - Cleanup: Background goroutine prunes stale entries every 5 minutes
+  - Exempt: localhost requests exempt from HTTP rate limiting (500μs/IP)
+
+Why two layers?
+  - Python guard pre-filters before network call → saves bandwidth and reduces noise
+  - Go guard catches direct HTTP callers that bypass Python (curl, scripts, etc.)
+  - Python has longer dedup window (900s) to catch slow-repeat spam
+  - Go has shorter dedup (60s) to allow legitimate near-duplicates after cool-down
+  - Python applies score penalties; Go only blocks (no scoring integration)
+
+If a message passes Python SpamGuard but is blocked by Go backend:
+  → guarded_publish() returns {'allowed': True, 'published': False}
+  → The message was not spam by Python rules but hit Go's stricter per-minute rate
+
+If a message is blocked by Python SpamGuard:
+  → The HTTP POST to Go backend never happens (saves network call)
+  → Sender is auto-penalized -0.1 score
+  → Block is logged to data/spam_log.json
+
+Pre-flight check: use check_would_be_blocked(msg) to test without side effects.
+# signed: gamma
+
 State files:
   data/spam_guard_state.json  -- recent fingerprints + per-sender counters
   data/spam_log.json          -- log of blocked spam messages
@@ -676,6 +716,98 @@ def guarded_publish(msg: dict) -> dict:
         except Exception:
             return {"allowed": False, "fallback": True, "reason": "bus_unreachable"}
     # signed: beta
+
+
+def check_would_be_blocked(msg: dict) -> dict:
+    """Pre-flight check: test if a message WOULD be blocked without side effects.
+
+    Runs the same 3-check pipeline as publish_guarded() (pattern spam, dedup,
+    rate limit) but in READ-ONLY mode. Does NOT record fingerprints, does NOT
+    update sender timestamps, does NOT publish the message, and does NOT
+    apply score penalties.
+
+    Useful for pre-flight checks before expensive operations: if the result
+    message would be spam-blocked, the caller can skip the operation entirely.
+
+    Args:
+        msg: dict with sender, topic, type, content keys (same as guarded_publish).
+
+    Returns:
+        dict with:
+            'would_block': bool  -- True if the message WOULD be blocked
+            'reason': str        -- Why it would be blocked (empty if not blocked)
+            'fingerprint': str   -- The computed fingerprint for reference
+            'checks': dict       -- Results of each individual check
+
+    Example:
+        result = check_would_be_blocked({
+            'sender': 'alpha', 'topic': 'orchestrator',
+            'type': 'result', 'content': 'task done'
+        })
+        if result['would_block']:
+            print(f"Skip: would be blocked by {result['reason']}")
+        else:
+            guarded_publish(msg)  # Safe to send
+    """
+    global _singleton_guard
+    try:
+        if _singleton_guard is None:
+            _singleton_guard = SpamGuard()
+        guard = _singleton_guard
+
+        fp = guard.fingerprint(msg)
+        checks = {"pattern": None, "dedup": None, "rate_limit": None}
+
+        # Check 1: Pattern-specific spam
+        pattern_reason = guard._check_spam_patterns(msg, fp)
+        if pattern_reason:
+            checks["pattern"] = pattern_reason
+            return {
+                "would_block": True,
+                "reason": pattern_reason,
+                "fingerprint": fp,
+                "checks": checks,
+            }
+
+        # Check 2: General dedup (read-only -- just checks, doesn't record)
+        if guard.is_duplicate(fp, DEFAULT_DEDUP_WINDOW):
+            reason = "general_dedup: identical message within 900s"
+            checks["dedup"] = reason
+            return {
+                "would_block": True,
+                "reason": reason,
+                "fingerprint": fp,
+                "checks": checks,
+            }
+
+        # Check 3: Per-sender rate limiting (read-only)
+        sender = str(msg.get("sender", "unknown"))
+        rate_reason = guard.is_rate_limited(sender)
+        if rate_reason:
+            checks["rate_limit"] = rate_reason
+            return {
+                "would_block": True,
+                "reason": rate_reason,
+                "fingerprint": fp,
+                "checks": checks,
+            }
+
+        # All checks passed -- message would NOT be blocked
+        return {
+            "would_block": False,
+            "reason": "",
+            "fingerprint": fp,
+            "checks": checks,
+        }
+    except Exception as e:
+        # Guard broken -- assume not blocked (conservative: don't prevent sends)
+        return {
+            "would_block": False,
+            "reason": f"guard_error: {e}",
+            "fingerprint": "",
+            "checks": {},
+        }
+    # signed: gamma
 
 
 if __name__ == "__main__":

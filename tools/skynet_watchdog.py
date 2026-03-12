@@ -1072,7 +1072,7 @@ def run_daemon(args=None):
     def _cleanup_pid():
         try:
             if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
-                PID_FILE.unlink()
+                PID_FILE.unlink(missing_ok=True)  # signed: beta
         except Exception:
             pass
     atexit.register(_cleanup_pid)  # signed: beta

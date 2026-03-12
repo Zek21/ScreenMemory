@@ -808,8 +808,30 @@ if ($focusMethod -ne "NONE") {{
     $savedClip = $null
     $deliveryStatus = "FAILED"
     try {{ $savedClip = [System.Windows.Forms.Clipboard]::GetText() }} catch {{}}
-    [System.Windows.Forms.Clipboard]::SetText($dispatchText)
-    Start-Sleep -Milliseconds 50
+    # Clipboard verification: set text and confirm it was written correctly  # signed: alpha
+    $clipRetries = 0
+    $clipVerified = $false
+    while ($clipRetries -lt 3 -and -not $clipVerified) {{
+        [System.Windows.Forms.Clipboard]::SetText($dispatchText)
+        Start-Sleep -Milliseconds 50
+        try {{
+            $readBack = [System.Windows.Forms.Clipboard]::GetText()
+            if ($readBack -eq $dispatchText) {{
+                $clipVerified = $true
+            }} else {{
+                $clipRetries++
+                Write-Host "DEBUG: Clipboard verify mismatch attempt $clipRetries"
+                Start-Sleep -Milliseconds 100
+            }}
+        }} catch {{
+            $clipRetries++
+            Start-Sleep -Milliseconds 100
+        }}
+    }}
+    if (-not $clipVerified) {{
+        Write-Host "CLIPBOARD_VERIFY_FAILED"
+        exit 1
+    }}
 
     if ($focusMethod -eq "EDIT") {{
         $attached = [GhostType]::FocusViaAttach($hwnd)
@@ -854,6 +876,9 @@ if ($focusMethod -ne "NONE") {{
             $deliveryStatus = "OK_RENDER_FALLBACK"
         }}
     }}
+    # Post-paste clipboard clear: prevent stale dispatch data from lingering  # signed: alpha
+    Start-Sleep -Milliseconds 30
+    try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
     if ($savedClip -and $savedClip.Length -gt 0) {{
         Start-Sleep -Milliseconds 50
         try {{ [System.Windows.Forms.Clipboard]::SetText($savedClip) }} catch {{}}
@@ -896,6 +921,10 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
 
         stderr = (r.stderr or "").strip()
         stdout = r.stdout or ""
+        # Check for clipboard verification failure first  # signed: alpha
+        if "CLIPBOARD_VERIFY_FAILED" in stdout:
+            log(f"Ghost CLIPBOARD_VERIFY_FAILED for HWND={hwnd} -- clipboard race detected", "ERR")
+            return False
         ok = (
             r.returncode == 0
             and any(s in stdout for s in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK"))
@@ -1215,6 +1244,7 @@ def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
 
     Returns True if delivery is verified (state changed or was already PROCESSING).
     Returns False if worker remains in pre_state after timeout (delivery may have failed silently).
+    UNKNOWN state: 3+ consecutive UNKNOWN readings = treat as FAILED (UIA broken).  # signed: alpha
     """
     if pre_state == "PROCESSING":
         return True  # was already processing, dispatch queued in VS Code
@@ -1222,19 +1252,30 @@ def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
     try:
         from tools.uia_engine import get_engine
         engine = get_engine()
+        consecutive_unknown = 0  # track consecutive UNKNOWN readings  # signed: alpha
         for i in range(timeout_s * 2):  # poll every 0.5s
             time.sleep(0.5)
             try:
                 post_state = engine.get_state(hwnd)
+                if post_state == "UNKNOWN":
+                    consecutive_unknown += 1
+                    if consecutive_unknown >= 3:  # signed: alpha
+                        log(f"✗ {worker_name.upper()} delivery FAILED: {consecutive_unknown} consecutive UNKNOWN states (UIA broken)", "WARN")
+                        return False
+                else:
+                    consecutive_unknown = 0  # reset on any real state  # signed: alpha
                 if post_state != pre_state and post_state != "UNKNOWN":  # UNKNOWN = UIA error, not a real transition  # signed: alpha
                     log(f"✓ {worker_name.upper()} delivery VERIFIED: {pre_state} -> {post_state}", "OK")
                     return True
             except Exception:
-                pass
+                consecutive_unknown += 1  # exceptions also count as UNKNOWN  # signed: alpha
+                if consecutive_unknown >= 3:
+                    log(f"✗ {worker_name.upper()} delivery FAILED: {consecutive_unknown} consecutive UIA exceptions", "WARN")
+                    return False
         return False
     except Exception as e:
         log(f"Delivery verify error for {worker_name}: {e}", "WARN")
-        return True  # don't block on verify failure
+        return False  # UIA engine import failed = cannot verify = FAILED, not assumed success  # signed: alpha
 
 
 def notify_backend_dispatch(worker_name, task, success=True):
