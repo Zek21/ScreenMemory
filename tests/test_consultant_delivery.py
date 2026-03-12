@@ -434,6 +434,10 @@ class TestConsultantBootstrapTruth(unittest.TestCase):
         self.assertIn("passed /health", script)  # signed: gamma
         self.assertIn("port 8422", script)
 
+    def test_cc_start_god_console_probe_checks_ipv4_and_ipv6_loopback(self):
+        script = Path("CC-Start.ps1").read_text(encoding="utf-8")
+        self.assertIn('@("127.0.0.1", "localhost", "::1")', script)
+
     def test_gc_start_requires_bridge_health_before_live_claim(self):
         script = Path("GC-Start.ps1").read_text(encoding="utf-8")
         self.assertIn("http://127.0.0.1:8425/health", script)
@@ -441,6 +445,10 @@ class TestConsultantBootstrapTruth(unittest.TestCase):
         self.assertIn("failed live truth verification within 40s", script)
         self.assertIn('"Gemini Consultant"', script)
         self.assertIn('"Gemini 3.1 Pro (Preview)"', script)
+
+    def test_gc_start_god_console_probe_checks_ipv4_and_ipv6_loopback(self):
+        script = Path("GC-Start.ps1").read_text(encoding="utf-8")
+        self.assertIn('@("127.0.0.1", "localhost", "::1")', script)
 
 
 if __name__ == "__main__":

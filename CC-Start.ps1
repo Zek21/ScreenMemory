@@ -31,15 +31,21 @@ function Write-Status($msg, $level = "INFO") {
 }
 
 function Test-Port([int]$port, [int]$timeoutMs = 2000) {
-    try {
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        $ar  = $tcp.BeginConnect("127.0.0.1", $port, $null, $null)
-        $ok  = $ar.AsyncWaitHandle.WaitOne($timeoutMs, $false)
-        if ($ok) { try { $tcp.EndConnect($ar) } catch {} }
-        $tcp.Close()
-        return $ok
-    } catch { return $false }
-}
+    foreach ($loopbackHost in @("127.0.0.1", "localhost", "::1")) {
+        $tcp = $null
+        try {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $ar  = $tcp.BeginConnect($loopbackHost, $port, $null, $null)
+            $ok  = $ar.AsyncWaitHandle.WaitOne($timeoutMs, $false)
+            if ($ok) { try { $tcp.EndConnect($ar) } catch {} }
+            if ($ok) { return $true }
+        } catch {
+        } finally {
+            if ($null -ne $tcp) { $tcp.Close() }
+        }
+    }
+    return $false
+}  # signed: consultant -- IPv6-only localhost bindings must not be reported as down
 
 function Get-SkynetStatus {
     try { return Invoke-RestMethod "http://localhost:8420/status" -TimeoutSec 3 }

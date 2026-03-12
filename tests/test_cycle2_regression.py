@@ -441,6 +441,12 @@ class TestBootScriptIntegrity:
         assert "8420" in content  # backend port
         # signed: alpha
 
+    def test_orch_start_god_console_probe_checks_ipv4_and_ipv6_loopback(self):
+        path = ROOT / "Orch-Start.ps1"
+        content = path.read_text(encoding="utf-8-sig")
+        assert '@("127.0.0.1", "localhost", "::1")' in content
+        # signed: consultant
+
     def test_cc_start_exists_and_parses(self):
         path = ROOT / "CC-Start.ps1"
         assert path.exists(), "CC-Start.ps1 missing"
@@ -454,6 +460,15 @@ class TestBootScriptIntegrity:
         content = path.read_text(encoding="utf-8-sig")
         assert "8425" in content or "gemini" in content.lower()
         # signed: alpha
+
+    def test_skynet_start_port_open_checks_ipv4_and_ipv6_loopback(self):
+        path = ROOT / "tools" / "skynet_start.py"
+        assert path.exists(), "tools/skynet_start.py missing"
+        content = path.read_text(encoding="utf-8")
+        assert '("127.0.0.1", socket.AF_INET)' in content
+        assert '("::1", socket.AF_INET6)' in content
+        assert '("localhost", 0)' in content
+        # signed: consultant
 
 
 # ═══════════════════════════════════════════════════════════

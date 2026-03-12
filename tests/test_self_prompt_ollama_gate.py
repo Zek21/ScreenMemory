@@ -123,7 +123,7 @@ class TestSelfPromptOllamaGate(unittest.TestCase):
         scan_mock.assert_not_called()
 
     def test_check_and_prompt_aborts_when_worker_turns_busy_before_fire(self):
-        self.daemon.all_idle_since = 400.0
+        self.daemon.all_idle_since = 50.0
         first_snapshot = {"alpha": "IDLE", "beta": "IDLE", "gamma": "IDLE", "delta": "IDLE"}
         second_snapshot = {"alpha": "IDLE", "beta": "IDLE", "gamma": "PROCESSING", "delta": "IDLE"}
         with patch.object(self.daemon, "_report_health"), \
@@ -163,6 +163,28 @@ class TestSelfPromptOllamaGate(unittest.TestCase):
         self.assertEqual(len(perception["bus_alerts"]), 1)
         self.assertEqual(perception["bus_alerts"][0]["id"], "alert-real")
 
+    def test_perceive_bus_ignores_idle_unproductive_monitor_noise(self):
+        perception = {"bus_results": [], "bus_alerts": []}
+        with patch("skynet_self_prompt._fetch_json", return_value=[
+            {
+                "id": "alert-idle",
+                "sender": "monitor",
+                "topic": "orchestrator",
+                "type": "alert",
+                "content": "IDLE_UNPRODUCTIVE: ALPHA idle 313s with 7 pending tasks. Dispatch work!",
+            },
+            {
+                "id": "alert-real",
+                "sender": "monitor",
+                "topic": "orchestrator",
+                "type": "alert",
+                "content": "REALTIME DAEMON DOWN -- data/realtime.json stale or missing",
+            },
+        ]):
+            self.daemon._perceive_bus(perception)
+        self.assertEqual(len(perception["bus_alerts"]), 1)
+        self.assertEqual(perception["bus_alerts"][0]["id"], "alert-real")
+
     def test_has_actionable_rejects_idle_backlog_noise(self):
         actionable = self.daemon._has_actionable(
             [],
@@ -176,6 +198,24 @@ class TestSelfPromptOllamaGate(unittest.TestCase):
         )
         self.assertFalse(actionable)
         # signed: consultant
+
+    def test_has_actionable_rejects_idle_unproductive_alert_noise(self):
+        actionable = self.daemon._has_actionable(
+            [],
+            [{
+                "sender": "monitor",
+                "topic": "orchestrator",
+                "type": "alert",
+                "content": "IDLE_UNPRODUCTIVE: ALPHA idle 313s with 7 pending tasks. Dispatch work!",
+            }],
+            ["alpha", "beta", "gamma", "delta"],
+            7,
+            [],
+            {"stall_pattern": False, "failure_rate_10m": 0},
+            "verified_ok",
+            self.perception,
+        )
+        self.assertFalse(actionable)
 
     def test_has_actionable_accepts_orchestrator_todos(self):
         actionable = self.daemon._has_actionable(
@@ -224,12 +264,12 @@ class TestSelfPromptOllamaGate(unittest.TestCase):
         )
         self.assertEqual(hash_a, hash_b)
 
-    def test_duplicate_prompt_suppresses_repeated_state_for_ten_minutes(self):
+    def test_duplicate_prompt_suppresses_repeated_state_for_fifteen_minutes(self):
         self.daemon.pending_prompt_state_hash = "state-1"
         self.daemon.last_prompt_state_hash = "state-1"
         self.daemon.last_prompt_state_hash_time = 1000.0
         self.assertTrue(self.daemon._is_duplicate_prompt("prompt-a", 1500.0))
-        self.assertFalse(self.daemon._is_duplicate_prompt("prompt-b", 1601.0))
+        self.assertFalse(self.daemon._is_duplicate_prompt("prompt-b", 1901.0))
 
     def test_health_payload_includes_version_fields(self):
         with patch("skynet_self_prompt._get_orch_hwnd", return_value=67568), \
@@ -241,6 +281,13 @@ class TestSelfPromptOllamaGate(unittest.TestCase):
         self.assertEqual(health["skynet_version"], "3.0")
         self.assertEqual(health["orchestrator_hwnd"], 67568)
         self.assertEqual(health["pid"], 12345)
+        self.assertEqual(health["min_prompt_gap_s"], self_prompt.MIN_PROMPT_GAP)
+        self.assertEqual(health["all_idle_interval_s"], self_prompt.ALL_IDLE_INTERVAL)
+        self.assertEqual(
+            health["repeated_state_suppression_s"],
+            self_prompt.REPEATED_STATE_SUPPRESSION_S,
+        )
+        self.assertEqual(health["boot_prompt_enabled"], self_prompt.BOOT_PROMPT_ENABLED)
 
     def test_boot_prompt_skips_when_nothing_actionable(self):
         with patch("skynet_self_prompt._get_orch_hwnd", return_value=123), \
