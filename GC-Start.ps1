@@ -68,7 +68,8 @@ function Test-ConsultantBridgeTruth([string]$viewUrl, [int]$maxHeartbeatAgeSec =
     $view = Get-ConsultantView $viewUrl 5
     if ($null -eq $view) { return $null }
 
-    $status = [string]($view.status ?? "")
+    $status = ""
+    if ($null -ne $view.status) { $status = [string]$view.status }
     $live = [bool]$view.live
     $acceptsPrompts = [bool]$view.accepts_prompts
     $heartbeatAge = 999.0
@@ -144,6 +145,99 @@ function Test-WorkerAlive([long]$hwnd) {
     return [Win32GC.GCUser32]::IsWindowVisible([IntPtr]$hwnd)
 }
 
+function Get-ReservedSkynetHwnds {
+    $reserved = New-Object 'System.Collections.Generic.HashSet[long]'
+
+    $workersFile = Join-Path $dataDir "workers.json"
+    if (Test-Path $workersFile) {
+        try {
+            $workersJson = Get-Content $workersFile -Raw | ConvertFrom-Json
+            $workers = if ($workersJson.workers) { $workersJson.workers } else { $workersJson }
+            foreach ($worker in $workers) {
+                $workerHwnd = 0
+                if ($null -ne $worker.hwnd) { $workerHwnd = [long]$worker.hwnd }
+                if ($workerHwnd -gt 0) { [void]$reserved.Add($workerHwnd) }
+            }
+        } catch {}
+    }
+
+    $orchFile = Join-Path $dataDir "orchestrator.json"
+    if (Test-Path $orchFile) {
+        try {
+            $orchJson = Get-Content $orchFile -Raw | ConvertFrom-Json
+            foreach ($key in @("orchestrator_hwnd", "hwnd")) {
+                $orchHwnd = 0
+                if ($null -ne $orchJson.$key) { $orchHwnd = [long]$orchJson.$key }
+                if ($orchHwnd -gt 0) { [void]$reserved.Add($orchHwnd) }
+            }
+        } catch {}
+    }
+
+    return $reserved
+}
+
+function Get-ConsultantHwndTruth([long]$hwnd) {
+    $truth = [ordered]@{
+        hwnd   = $hwnd
+        valid  = $false
+        reason = "missing"
+    }
+    if ($hwnd -le 0) { return [pscustomobject]$truth }
+    if (-not (Test-WorkerAlive $hwnd)) {
+        $truth.reason = "window_not_visible"
+        return [pscustomobject]$truth
+    }
+    if ((Get-ReservedSkynetHwnds).Contains($hwnd)) {
+        $truth.reason = "reserved_skynet_window"
+        return [pscustomobject]$truth
+    }
+    $truth.valid = $true
+    $truth.reason = "accepted"
+    return [pscustomobject]$truth
+}  # signed: consultant
+
+function Get-DiscoveredConsultantProbe([string]$ConsultantId) {
+    $probeScript = Join-Path $repoRoot "tools\skynet_consultant_hwnd.py"
+    if (-not (Test-Path $probeScript)) { return $null }
+    $raw = & $python $probeScript probe --consultant-id $ConsultantId 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $text = ($raw -join "`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    try {
+        return $text | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+}  # signed: consultant
+
+function Set-ConsultantWindowState([long]$Hwnd) {
+    $stateFile = Join-Path $dataDir "gemini_consultant_state.json"
+    if (Test-Path $stateFile) {
+        try {
+            $stateJson = Get-Content $stateFile -Raw | ConvertFrom-Json
+            $stateJson | Add-Member -NotePropertyName "hwnd" -NotePropertyValue $Hwnd -Force
+            $stateJson | Add-Member -NotePropertyName "requires_hwnd" -NotePropertyValue $true -Force
+            $stateJson | Add-Member -NotePropertyName "prompt_transport" -NotePropertyValue "ghost_type" -Force
+            $stateJson | Add-Member -NotePropertyName "hwnd_source" -NotePropertyValue "gc-start" -Force
+            $stateJson | ConvertTo-Json -Depth 10 | Set-Content $stateFile -Encoding UTF8
+            Write-Status "gemini_consultant_state.json updated: hwnd=$Hwnd, prompt_transport=ghost_type" "OK"
+        } catch {
+            Write-Status "Failed to update gemini_consultant_state.json: $_" "WARN"
+        }
+    } else {
+        @{
+            id = "gemini_consultant"
+            display_name = "Gemini Consultant"
+            hwnd = $Hwnd
+            requires_hwnd = $true
+            prompt_transport = "ghost_type"
+            hwnd_source = "gc-start"
+            source = "GC-Start"
+        } | ConvertTo-Json -Depth 10 | Set-Content $stateFile -Encoding UTF8
+        Write-Status "gemini_consultant_state.json created with HWND" "OK"
+    }
+}  # signed: consultant
+
 # ── Banner ───────────────────────────────────────────────
 
 Write-Host ""
@@ -154,62 +248,67 @@ Write-Host "========================================="
 Write-Host ""
 
 # ── HWND Self-Registration (INCIDENT 012 fix) ──────── # signed: alpha
-# Detect this VS Code window's HWND for ghost_type delivery.
-# Bridge queue remains as audit trail fallback.
-$consultantHwnd = [long][Win32GC.GCUser32]::GetForegroundWindow()
+# Detect this VS Code window's HWND for ghost_type delivery, but only keep it
+# if it is not a worker/orchestrator window. Shared Skynet windows stay bridge_queue.
+$consultantHwndCandidate = [long][Win32GC.GCUser32]::GetForegroundWindow()
+$consultantHwndTruth = Get-ConsultantHwndTruth $consultantHwndCandidate
+$consultantHwnd = if ($consultantHwndTruth.valid) { $consultantHwndCandidate } else { 0 }
 if ($consultantHwnd -gt 0) {
-    Write-Status "Consultant window HWND detected: $consultantHwnd" "OK"
-    $stateFile = Join-Path $dataDir "gemini_consultant_state.json"
-    if (Test-Path $stateFile) {
-        try {
-            $stateJson = Get-Content $stateFile -Raw | ConvertFrom-Json
-            $stateJson | Add-Member -NotePropertyName "hwnd" -NotePropertyValue $consultantHwnd -Force
-            $stateJson | Add-Member -NotePropertyName "requires_hwnd" -NotePropertyValue $true -Force
-            $stateJson | Add-Member -NotePropertyName "prompt_transport" -NotePropertyValue "ghost_type" -Force
-            $stateJson | ConvertTo-Json -Depth 10 | Set-Content $stateFile -Encoding UTF8
-            Write-Status "gemini_consultant_state.json updated: hwnd=$consultantHwnd, prompt_transport=ghost_type" "OK"
-        } catch {
-            Write-Status "Failed to update gemini_consultant_state.json: $_" "WARN"
-        }
-    } else {
-        # Create minimal state file with HWND
-        @{
-            id = "gemini_consultant"
-            display_name = "Gemini Consultant"
-            hwnd = $consultantHwnd
-            requires_hwnd = $true
-            prompt_transport = "ghost_type"
-            source = "GC-Start"
-        } | ConvertTo-Json -Depth 10 | Set-Content $stateFile -Encoding UTF8
-        Write-Status "gemini_consultant_state.json created with HWND" "OK"
-    }
+    Write-Status "Consultant window HWND accepted: $consultantHwnd" "OK"
+    Set-ConsultantWindowState $consultantHwnd
 } else {
-    Write-Status "WARNING: Could not detect consultant HWND (GetForegroundWindow returned 0)" "WARN"
+    $probe = Get-DiscoveredConsultantProbe "gemini_consultant"
+    $discoveredHwnd = 0
+    if ($null -ne $probe) {
+        if ($null -ne $probe.hwnd) {
+            $discoveredHwnd = [long]$probe.hwnd
+        }
+    }
+    if ($discoveredHwnd -gt 0) {
+        $consultantHwndTruth = Get-ConsultantHwndTruth $discoveredHwnd
+        if ($consultantHwndTruth.valid) {
+            $consultantHwnd = $discoveredHwnd
+            Write-Status "Consultant HWND rediscovered from consultant transcript markers: $consultantHwnd" "OK"
+            Set-ConsultantWindowState $consultantHwnd
+        }
+    }
+    if ($consultantHwnd -le 0) {
+        if ($consultantHwndCandidate -gt 0) {
+            Write-Status "Consultant HWND rejected: $consultantHwndCandidate ($($consultantHwndTruth.reason)); staying on bridge_queue until a dedicated consultant window exists" "WARN"
+        } else {
+            Write-Status "WARNING: Could not detect consultant HWND (GetForegroundWindow returned 0)" "WARN"
+        }
+        if ($null -ne $probe -and $null -ne $probe.best_candidate) {
+            $bestScore = $probe.best_candidate.score
+            $bestReason = $probe.best_candidate.reason
+            Write-Status "Consultant HWND probe found no bindable window (best_score=$bestScore, reason=$bestReason). Use: python tools/skynet_consultant_hwnd.py open --consultant-id gemini_consultant" "WARN"
+        }
+    }
 }
 # ── End HWND Self-Registration ──────────────────────── # signed: alpha
 
 # ── Consultant Delivery Architecture Verification ────── # signed: beta
-# Architecture: Ghost-type is the PRIMARY delivery transport for consultant prompts.
-# When the orchestrator dispatches to a consultant via skynet_dispatch.py --worker gemini_consultant,
-# it uses ghost_type_to_worker() which pastes into the VS Code chat input via clipboard.
-# Bridge queue (port 8425) is the FALLBACK and audit trail transport.
-# The state file (gemini_consultant_state.json) must have prompt_transport=ghost_type for primary routing.
+# Architecture: ghost_type is allowed only when GC-Start captured a dedicated
+# consultant window that is not a worker/orchestrator HWND.
+# Otherwise bridge queue (port 8425) is the truthful primary route.
 # Reference: docs/DAEMON_ARCHITECTURE.md Section 6 (Communication Daemons)
 #            docs/DELIVERY_PIPELINE.md Section 4 (Ghost Type Mechanism)
 #
-# Verification: Check that gemini_consultant_state.json has prompt_transport=ghost_type set.
-# This was done in HWND Self-Registration above, but verify it persisted correctly.
+# Verification: gemini_consultant_state.json must reflect the truthful route.
 $gcStateFile = Join-Path $dataDir "gemini_consultant_state.json"
 if (Test-Path $gcStateFile) {
     try {
         $gcState = Get-Content $gcStateFile -Raw | ConvertFrom-Json
-        $gcTransport = [string]($gcState.prompt_transport ?? "")
+        $gcTransport = ""
+        if ($null -ne $gcState.prompt_transport) {
+            $gcTransport = [string]$gcState.prompt_transport
+        }
         if ($gcTransport -eq "ghost_type") {
-            Write-Status "Delivery transport verified: ghost_type (primary)" "OK"
+            Write-Status "Delivery transport verified: ghost_type (dedicated consultant window)" "OK"
         } elseif ($gcTransport -eq "bridge_queue") {
-            Write-Status "Delivery transport is bridge_queue (fallback) -- ghost_type preferred" "WARN"
+            Write-Status "Delivery transport verified: bridge_queue (no dedicated consultant HWND)" "OK"
         } else {
-            Write-Status "Delivery transport not configured -- ghost_type should be set" "WARN"
+            Write-Status "Delivery transport not configured -- start script or bridge still needs to set truthful routing" "WARN"
         }
     } catch {
         Write-Status "Could not read gemini_consultant_state.json for transport check: $_" "WARN"
@@ -635,6 +734,9 @@ Write-Host "    - Bridge truth rule: do not claim LIVE/routable from a transient
 Write-Host "    - SELF-HEAL RULE: if /health or /consultants says OFFLINE/STALE, accepts_prompts=false, routable=false, or heartbeat_age_s > 8, do not stop at reporting 'offline'. Repair or restart your own bridge/start path immediately when safe, then re-verify LIVE truth."
 Write-Host "    - TRUTH INCIDENT RULE: if you ever report consultant offline/degraded state without attempting self-heal and without filing a signed bus alert/result plus a repo-root Markdown proposal, that is a consultant truth failure. Correct it immediately."
 Write-Host "    - Recovery evidence rule: publish the failed probe, repair action, and post-repair verification to Skynet before claiming the incident closed."
+Write-Host "    - HWND PERSISTENCE RULE: direct consultant routing is persistent only when a dedicated consultant VS Code window carries consultant markers in its visible transcript: gc-start, Gemini Consultant, sender: gemini_consultant, and signed:gemini_consultant."
+Write-Host "    - If GetForegroundWindow is wrong or 0, recover truth with: python tools/skynet_consultant_hwnd.py probe --consultant-id gemini_consultant. If no bindable window exists, open only a candidate surface with: python tools/skynet_consultant_hwnd.py open --consultant-id gemini_consultant."
+Write-Host "    - Candidate windows are not bound consultant HWNDs by themselves. Do not claim ghost_type routing until probe finds consultant markers and python tools/skynet_consultant_prompt_gate.py reports direct test delivery success."
 Write-Host "    - Startup launch rule: in PowerShell Start-Process, quote any argument value containing spaces or compose a safe single argument string before claiming bootstrap success."
 Write-Host "    - Shared ticket awareness: read bus/TODO/queue state before going idle; if a real Skynet ticket can be cleared or surfaced, do it."
 Write-Host "    - Proactive ticket clearance by consultant/orchestrator is worth +0.2 when independently verified."

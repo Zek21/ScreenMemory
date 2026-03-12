@@ -35,9 +35,12 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 PROFILE_FILE = DATA_DIR / "agent_profiles.json"
 STATE_FILE = DATA_DIR / "consultant_state.json"
 PID_FILE = DATA_DIR / "consultant_bridge.pid"
+REGISTRY_FILE = DATA_DIR / "consultant_registry.json"
 PROMPT_FILE = DATA_DIR / "consultant_prompt_queue.json"
 TASK_FILE = DATA_DIR / "consultant_task_state.json"
 SCORES_FILE = DATA_DIR / "worker_scores.json"
@@ -94,6 +97,188 @@ def _read_json(path: Path) -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _normalize_hwnd(value: Any) -> int:
+    try:
+        hwnd = int(value)
+    except Exception:
+        return 0
+    return hwnd if hwnd > 0 else 0
+
+
+def _window_alive(hwnd: int) -> bool:
+    hwnd = _normalize_hwnd(hwnd)
+    if hwnd <= 0:
+        return False
+    try:
+        return bool(ctypes.windll.user32.IsWindow(hwnd)) and bool(ctypes.windll.user32.IsWindowVisible(hwnd))
+    except Exception:
+        return False
+
+
+def _reserved_hwnds() -> Dict[int, str]:
+    reserved: Dict[int, str] = {}
+
+    workers_raw = _read_json(DATA_DIR / "workers.json")
+    workers = workers_raw if isinstance(workers_raw, list) else workers_raw.get("workers", [])
+    if isinstance(workers, list):
+        for worker in workers:
+            if not isinstance(worker, dict):
+                continue
+            hwnd = _normalize_hwnd(worker.get("hwnd"))
+            if hwnd:
+                reserved[hwnd] = f"worker:{worker.get('name', 'unknown')}"
+
+    orch = _read_json(DATA_DIR / "orchestrator.json")
+    for key in ("orchestrator_hwnd", "hwnd"):
+        hwnd = _normalize_hwnd(orch.get(key))
+        if hwnd:
+            reserved[hwnd] = "orchestrator"
+
+    return reserved
+
+
+def _consultant_hwnd_truth(raw: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    raw = raw if isinstance(raw, dict) else {}
+    candidate = _normalize_hwnd(raw.get("hwnd"))
+    source = "state"
+    discovery: Dict[str, Any] = {}
+    reserved = _reserved_hwnds()
+    if candidate <= 0 or candidate in reserved or not _window_alive(candidate):
+        try:
+            from tools.skynet_consultant_hwnd import discover_consultant_hwnd
+
+            discovery = discover_consultant_hwnd(CONSULTANT_ID)
+            discovered = _normalize_hwnd(discovery.get("hwnd"))
+            if discovered > 0:
+                candidate = discovered
+                source = "discovery"
+        except Exception:
+            discovery = {}
+    if candidate <= 0:
+        return {
+            "hwnd": 0,
+            "hwnd_candidate": 0,
+            "hwnd_alive": False,
+            "hwnd_validation": "missing",
+            "hwnd_reserved_role": None,
+            "hwnd_source": source,
+            "hwnd_markers": discovery.get("best_candidate", {}).get("markers", []),
+            "hwnd_score": discovery.get("best_candidate", {}).get("score"),
+            "visible_surface": bool(discovery.get("visible_surface")),
+            "shared_parent_hwnd": _normalize_hwnd(discovery.get("shared_parent_hwnd")),
+            "pane_slot": str(discovery.get("pane_slot") or ""),
+            "pane_model": str(discovery.get("pane_model") or ""),
+            "pane_session_target": str(discovery.get("pane_session_target") or ""),
+            "pane_permissions": str(discovery.get("pane_permissions") or ""),
+            "pane_markers": discovery.get("pane_markers", []),
+        }
+    if candidate in reserved:
+        return {
+            "hwnd": 0,
+            "hwnd_candidate": candidate,
+            "hwnd_alive": _window_alive(candidate),
+            "hwnd_validation": "reserved_skynet_window",
+            "hwnd_reserved_role": reserved[candidate],
+            "hwnd_source": source,
+            "hwnd_markers": discovery.get("best_candidate", {}).get("markers", []),
+            "hwnd_score": discovery.get("best_candidate", {}).get("score"),
+            "visible_surface": bool(discovery.get("visible_surface")),
+            "shared_parent_hwnd": _normalize_hwnd(discovery.get("shared_parent_hwnd")),
+            "pane_slot": str(discovery.get("pane_slot") or ""),
+            "pane_model": str(discovery.get("pane_model") or ""),
+            "pane_session_target": str(discovery.get("pane_session_target") or ""),
+            "pane_permissions": str(discovery.get("pane_permissions") or ""),
+            "pane_markers": discovery.get("pane_markers", []),
+        }
+    alive = _window_alive(candidate)
+    return {
+        "hwnd": candidate if alive else 0,
+        "hwnd_candidate": candidate,
+        "hwnd_alive": alive,
+        "hwnd_validation": "accepted" if alive else "window_not_alive",
+        "hwnd_reserved_role": None,
+        "hwnd_source": source,
+        "hwnd_markers": discovery.get("best_candidate", {}).get("markers", []),
+        "hwnd_score": discovery.get("best_candidate", {}).get("score"),
+        "visible_surface": bool(alive or discovery.get("visible_surface")),
+        "shared_parent_hwnd": _normalize_hwnd(discovery.get("shared_parent_hwnd")),
+        "pane_slot": str(discovery.get("pane_slot") or ""),
+        "pane_model": str(discovery.get("pane_model") or ""),
+        "pane_session_target": str(discovery.get("pane_session_target") or ""),
+        "pane_permissions": str(discovery.get("pane_permissions") or ""),
+        "pane_markers": discovery.get("pane_markers", []),
+    }  # signed: consultant
+
+
+def _resolve_prompt_routing(raw: Optional[Dict[str, Any]] = None,
+                            bridge_promptable: bool = True) -> Dict[str, Any]:
+    hwnd_truth = _consultant_hwnd_truth(raw)
+    if hwnd_truth["hwnd"] > 0:
+        prompt_transport = "ghost_type"
+        requires_hwnd = True
+        routable = True
+    elif bridge_promptable:
+        prompt_transport = "bridge_queue"
+        requires_hwnd = False
+        routable = True
+    else:
+        prompt_transport = "unavailable"
+        requires_hwnd = False
+        routable = False
+    return {
+        **hwnd_truth,
+        "prompt_transport": prompt_transport,
+        "requires_hwnd": requires_hwnd,
+        "routable": routable,
+    }  # signed: consultant
+
+
+def _refresh_consultant_registry(state: Dict[str, Any]) -> None:
+    registry = _read_json(REGISTRY_FILE)
+    consultants = registry.get("consultants", [])
+    if not isinstance(consultants, list):
+        consultants = []
+    try:
+        state_file_label = str(STATE_FILE.relative_to(ROOT)).replace("\\", "/")
+    except ValueError:
+        state_file_label = str(STATE_FILE)
+
+    entry = {
+        "name": CONSULTANT_ID,
+        "display_name": state.get("display_name") or DISPLAY_NAME,
+        "hwnd": _normalize_hwnd(state.get("hwnd")),
+        "visible_surface": bool(state.get("visible_surface")),
+        "shared_parent_hwnd": _normalize_hwnd(state.get("shared_parent_hwnd")),
+        "pane_slot": str(state.get("pane_slot") or ""),
+        "pane_model": str(state.get("pane_model") or ""),
+        "pane_session_target": str(state.get("pane_session_target") or ""),
+        "pane_permissions": str(state.get("pane_permissions") or ""),
+        "pane_markers": state.get("pane_markers", []),
+        "model": state.get("model") or MODEL_NAME,
+        "bridge_port": state.get("api_port"),
+        "state_file": state_file_label,
+        "status": state.get("status", "UNKNOWN"),
+        "transport": state.get("prompt_transport") or state.get("transport") or "unknown",
+        "requires_hwnd": bool(state.get("requires_hwnd")),
+        "routable": bool(state.get("routable")),
+    }
+
+    updated = False
+    for idx, item in enumerate(consultants):
+        if isinstance(item, dict) and str(item.get("name")) == CONSULTANT_ID:
+            consultants[idx] = entry
+            updated = True
+            break
+    if not updated:
+        consultants.append(entry)
+
+    registry["consultants"] = consultants
+    registry["updated_at"] = _now_iso()
+    registry["updated_by"] = CONSULTANT_ID
+    registry.setdefault("signed_by", CONSULTANT_ID)
+    _atomic_write(REGISTRY_FILE, registry)  # signed: consultant
 
 
 def _signature_token() -> str:
@@ -768,6 +953,8 @@ def build_live_state(interval_s: float = DEFAULT_INTERVAL_S,
                      stale_after_s: float = DEFAULT_STALE_AFTER_S,
                      api_port: Optional[int] = DEFAULT_API_PORT) -> Dict[str, Any]:
     profile = _load_profile()
+    raw = _read_json(STATE_FILE)
+    routing = _resolve_prompt_routing(raw, bridge_promptable=True)
     prompt_stats = _prompt_stats()
     task_state = _load_task_state()
     workers = _load_worker_snapshot()
@@ -779,14 +966,29 @@ def build_live_state(interval_s: float = DEFAULT_INTERVAL_S,
         "model": profile["model"],
         "kind": "advisor",
         "backend_managed": False,
-        "routable": True,
+        "routable": routing["routable"],
         "accepts_prompts": True,
-        "requires_hwnd": False,
-        "transport": f"{SOURCE_NAME.lower()}-bridge",
-        "prompt_transport": "bridge_queue",
+        "requires_hwnd": routing["requires_hwnd"],
+        "transport": str(raw.get("transport") or f"{SOURCE_NAME.lower()}-bridge"),
+        "prompt_transport": routing["prompt_transport"],
         "source": SOURCE_NAME,
         "status": "LIVE",
         "live": True,
+        "hwnd": routing["hwnd"],
+        "hwnd_candidate": routing["hwnd_candidate"],
+        "hwnd_alive": routing["hwnd_alive"],
+        "hwnd_validation": routing["hwnd_validation"],
+        "hwnd_reserved_role": routing["hwnd_reserved_role"],
+        "hwnd_source": routing.get("hwnd_source", "state"),
+        "hwnd_markers": routing.get("hwnd_markers", []),
+        "hwnd_score": routing.get("hwnd_score"),
+        "visible_surface": bool(routing.get("visible_surface")),
+        "shared_parent_hwnd": routing.get("shared_parent_hwnd", 0),
+        "pane_slot": routing.get("pane_slot", ""),
+        "pane_model": routing.get("pane_model", ""),
+        "pane_session_target": routing.get("pane_session_target", ""),
+        "pane_permissions": routing.get("pane_permissions", ""),
+        "pane_markers": routing.get("pane_markers", []),
         "bridge_pid": os.getpid(),
         "started_at": STARTED_AT,
         "last_heartbeat": _now_iso(),
@@ -807,12 +1009,13 @@ def build_live_state(interval_s: float = DEFAULT_INTERVAL_S,
 def get_consultant_view() -> Dict[str, Any]:
     profile = _load_profile()
     raw = _read_json(STATE_FILE)
-    view = _build_base_consultant_view(profile, raw)
+    routing = _resolve_prompt_routing(raw, bridge_promptable=bool(raw.get("accepts_prompts")))
+    view = _build_base_consultant_view(profile, raw, routing)
     _apply_liveness_status(view, raw)
     return view
 
 
-def _build_base_consultant_view(profile: dict, raw: dict) -> dict:
+def _build_base_consultant_view(profile: dict, raw: dict, routing: dict) -> dict:
     source_name = str(raw.get("source") or SOURCE_NAME)
     raw_score_summary = raw.get("score_summary") if isinstance(raw.get("score_summary"), dict) else _load_score_summary(CONSULTANT_ID)
     return {
@@ -822,16 +1025,31 @@ def _build_base_consultant_view(profile: dict, raw: dict) -> dict:
         "model": profile["model"],
         "kind": "advisor",
         "backend_managed": False,
-        "routable": bool(raw.get("accepts_prompts", False)),
+        "routable": bool(raw.get("accepts_prompts", False)) or bool(routing.get("hwnd")),
         "accepts_prompts": bool(raw.get("accepts_prompts", False)),
-        "requires_hwnd": False,
-        "transport": f"{source_name.lower()}-bridge",
-        "prompt_transport": raw.get("prompt_transport", "bridge_queue"),
+        "requires_hwnd": bool(routing.get("requires_hwnd")),
+        "transport": str(raw.get("transport") or f"{source_name.lower()}-bridge"),
+        "prompt_transport": routing.get("prompt_transport", raw.get("prompt_transport", "unavailable")),
         "source": source_name,
         "declared": True,
         "declared_status": profile["declared_status"],
         "live": False,
         "status": "DECLARED",
+        "hwnd": routing.get("hwnd", 0),
+        "hwnd_candidate": routing.get("hwnd_candidate", 0),
+        "hwnd_alive": routing.get("hwnd_alive", False),
+        "hwnd_validation": routing.get("hwnd_validation"),
+        "hwnd_reserved_role": routing.get("hwnd_reserved_role"),
+        "hwnd_source": routing.get("hwnd_source", "state"),
+        "hwnd_markers": routing.get("hwnd_markers", []),
+        "hwnd_score": routing.get("hwnd_score"),
+        "visible_surface": bool(routing.get("visible_surface")),
+        "shared_parent_hwnd": routing.get("shared_parent_hwnd", 0),
+        "pane_slot": routing.get("pane_slot", ""),
+        "pane_model": routing.get("pane_model", ""),
+        "pane_session_target": routing.get("pane_session_target", ""),
+        "pane_permissions": routing.get("pane_permissions", ""),
+        "pane_markers": routing.get("pane_markers", []),
         "bridge_pid": raw.get("bridge_pid"),
         "started_at": raw.get("started_at"),
         "last_heartbeat": raw.get("last_heartbeat"),
@@ -871,25 +1089,37 @@ def _apply_liveness_status(view: dict, raw: dict) -> None:
         view["status"] = "OFFLINE"
 
 
-def _announce_presence() -> None:
+def _announce_presence(state: Optional[Dict[str, Any]] = None) -> None:
+    state = state or build_live_state()
     _publish_consultant_event(
         "identity_ack",
         (
             f"{DISPLAY_NAME.upper()} LIVE -- {SOURCE_NAME} bridge active. "
             "Advisory peer is visible in consultant live surfaces. "
-            "Prompt transport=bridge_queue."
+            f"Prompt transport={state.get('prompt_transport') or 'unknown'}."
         ),
         metadata={
             "display_name": DISPLAY_NAME,
             "kind": "advisor",
-            "transport": f"{SOURCE_NAME.lower()}-bridge",
-            "routable": "true",
-            "prompt_transport": "bridge_queue",
+            "transport": str(state.get("transport") or f"{SOURCE_NAME.lower()}-bridge"),
+            "routable": str(bool(state.get("routable"))).lower(),
+            "prompt_transport": str(state.get("prompt_transport") or "unknown"),
+            "hwnd": str(_normalize_hwnd(state.get("hwnd"))),
+            "requires_hwnd": str(bool(state.get("requires_hwnd"))).lower(),
         },
     )  # signed: consultant
 
 
-def _publish_offline_transition(reason: str = "bridge shutdown") -> None:
+def _publish_offline_transition(reason: str = "bridge shutdown",
+                                state: Optional[Dict[str, Any]] = None) -> None:
+    if state is None:
+        raw = _read_json(STATE_FILE)
+        routing = _resolve_prompt_routing(raw, bridge_promptable=False)
+        state = {
+            "transport": str(raw.get("transport") or f"{SOURCE_NAME.lower()}-bridge"),
+            "prompt_transport": routing["prompt_transport"],
+            "routable": routing["routable"],
+        }
     _publish_consultant_event(
         "alert",
         (
@@ -899,9 +1129,9 @@ def _publish_offline_transition(reason: str = "bridge shutdown") -> None:
         metadata={
             "display_name": DISPLAY_NAME,
             "kind": "advisor",
-            "transport": f"{SOURCE_NAME.lower()}-bridge",
-            "routable": "false",
-            "prompt_transport": "unavailable",
+            "transport": str(state.get("transport") or f"{SOURCE_NAME.lower()}-bridge"),
+            "routable": str(bool(state.get("routable"))).lower(),
+            "prompt_transport": str(state.get("prompt_transport") or "unavailable"),
             "bridge_status": "OFFLINE",
         },
     )  # signed: consultant
@@ -930,10 +1160,31 @@ def _write_offline_snapshot() -> None:
     state = _read_json(STATE_FILE)
     if not state:
         return
+    routing = _resolve_prompt_routing(state, bridge_promptable=False)
     state["status"] = "OFFLINE"
     state["live"] = False
+    state["accepts_prompts"] = False
+    state["routable"] = routing["routable"]
+    state["requires_hwnd"] = routing["requires_hwnd"]
+    state["prompt_transport"] = routing["prompt_transport"]
+    state["hwnd"] = routing["hwnd"]
+    state["hwnd_candidate"] = routing["hwnd_candidate"]
+    state["hwnd_alive"] = routing["hwnd_alive"]
+    state["hwnd_validation"] = routing["hwnd_validation"]
+    state["hwnd_reserved_role"] = routing["hwnd_reserved_role"]
+    state["hwnd_source"] = routing.get("hwnd_source", "state")
+    state["hwnd_markers"] = routing.get("hwnd_markers", [])
+    state["hwnd_score"] = routing.get("hwnd_score")
+    state["visible_surface"] = bool(routing.get("visible_surface"))
+    state["shared_parent_hwnd"] = routing.get("shared_parent_hwnd", 0)
+    state["pane_slot"] = routing.get("pane_slot", "")
+    state["pane_model"] = routing.get("pane_model", "")
+    state["pane_session_target"] = routing.get("pane_session_target", "")
+    state["pane_permissions"] = routing.get("pane_permissions", "")
+    state["pane_markers"] = routing.get("pane_markers", [])
     state["last_heartbeat"] = _now_iso()
     _atomic_write(STATE_FILE, state)
+    _refresh_consultant_registry(state)
 
 
 def _cleanup_pid(pid_file: Path = PID_FILE) -> None:
@@ -965,11 +1216,13 @@ def run_daemon(interval_s: float = DEFAULT_INTERVAL_S,
             atexit.register(server.server_close)
 
     effective_port = api_port if server is not None else None
-    _atomic_write(STATE_FILE, build_live_state(interval_s, stale_after_s, effective_port))
+    live_state = build_live_state(interval_s, stale_after_s, effective_port)
+    _atomic_write(STATE_FILE, live_state)
+    _refresh_consultant_registry(live_state)
 
     if announce:
         try:
-            _announce_presence()
+            _announce_presence(live_state)
         except Exception:
             pass
 
@@ -982,10 +1235,15 @@ def run_daemon(interval_s: float = DEFAULT_INTERVAL_S,
     finally:
         if not once:
             try:
-                _publish_offline_transition("bridge shutdown")
+                offline_state = {
+                    "transport": str(live_state.get("transport") or f"{SOURCE_NAME.lower()}-bridge"),
+                    "prompt_transport": _resolve_prompt_routing(_read_json(STATE_FILE), bridge_promptable=False)["prompt_transport"],
+                    "routable": _resolve_prompt_routing(_read_json(STATE_FILE), bridge_promptable=False)["routable"],
+                }
+                _publish_offline_transition("bridge shutdown", offline_state)
             except Exception:
                 pass
-        _write_offline_snapshot()
+            _write_offline_snapshot()
 
     return 0
 
@@ -1008,7 +1266,9 @@ def _heartbeat_loop(interval_s, stale_after_s, effective_port):
     """Continuously write live state at the heartbeat interval."""
     while True:
         try:
-            _atomic_write(STATE_FILE, build_live_state(interval_s, stale_after_s, effective_port))
+            live_state = build_live_state(interval_s, stale_after_s, effective_port)
+            _atomic_write(STATE_FILE, live_state)
+            _refresh_consultant_registry(live_state)
         except Exception as exc:
             print(
                 f"consultant bridge heartbeat write failed for {STATE_FILE.name}: {exc}",

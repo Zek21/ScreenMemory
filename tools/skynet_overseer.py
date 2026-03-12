@@ -665,14 +665,7 @@ class OverseerDaemon:
             log("Overseer shutting down (Ctrl+C)")
         finally:
             _post_bus("orchestrator", "monitor_alert", "OVERSEER_OFFLINE: Daemon stopped")
-            if PID_FILE.exists():
-                try:
-                    stored_pid = int(PID_FILE.read_text().strip())
-                    if stored_pid == os.getpid():
-                        PID_FILE.unlink()
-                except Exception:
-                    pass
-                # signed: delta
+            # PID file cleanup handled by release_pid_guard in main()  # signed: gamma
 
     def run_once(self):
         """Single scan cycle, print results, exit."""
@@ -773,36 +766,16 @@ def main():
         if existing:
             print(f"Overseer already running (PID {existing}). Use 'status' to check.")
             return
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        PID_FILE.write_text(str(os.getpid()))
-
-        # ── atexit + signal handlers for PID cleanup ──  # signed: alpha
-        import atexit
-        def _cleanup_pid():
-            try:
-                if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
-                    PID_FILE.unlink()
-            except Exception:
-                pass
-        atexit.register(_cleanup_pid)
-
-        def _sigterm_handler(signum, frame):
-            log(f"Received signal {signum} -- requesting graceful shutdown")
-            raise KeyboardInterrupt
-        signal.signal(signal.SIGTERM, _sigterm_handler)
-        try:
-            signal.signal(signal.SIGBREAK, _sigterm_handler)  # Windows Ctrl+Break
-        except (AttributeError, OSError):
-            pass  # signed: alpha
+        # Use shared atomic PID guard for singleton enforcement  # signed: gamma
+        from tools.skynet_pid_guard import acquire_pid_guard, release_pid_guard
+        if not acquire_pid_guard(PID_FILE, "skynet_overseer", logger=log):
+            return
 
         log(f"Overseer daemon PID {os.getpid()}" + (" [PROD MODE]" if args.prod else ""))
         try:
             OverseerDaemon(prod_mode=args.prod).run()
         finally:
-            try:
-                PID_FILE.unlink(missing_ok=True)  # signed: beta
-            except Exception:
-                pass
+            release_pid_guard(PID_FILE)  # signed: gamma
 
 
 if __name__ == "__main__":

@@ -13,8 +13,6 @@ Usage:
     python tools/skynet_bus_relay.py --dry-run    # Show what would be queued/sent
 """
 
-import atexit
-import ctypes
 import json
 import os
 import signal
@@ -353,60 +351,18 @@ def poll_and_relay(dry_run=False):
     return new_queued + flushed
 
 
-def _pid_is_bus_relay(pid: int) -> bool:
-    """Check if a PID is actually a bus_relay process (not a recycled PID)."""
-    try:
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        try:
-            buf = ctypes.create_unicode_buffer(260)
-            size = ctypes.wintypes.DWORD(260)
-            ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
-                handle, 0, buf, ctypes.byref(size))
-            if ok and "python" in buf.value.lower():
-                return True
-        finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
-    except Exception:
-        pass
-    # Fallback: just check if process exists
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
 def _acquire_singleton():
-    """Acquire PID file lock. Returns True if we're the sole instance."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if PID_FILE.exists():
-        try:
-            old_pid = int(PID_FILE.read_text().strip())
-            if _pid_is_bus_relay(old_pid):
-                log(f"Bus Relay already running (PID {old_pid}) -- exiting", "WARN")
-                return False
-            else:
-                log(f"Stale PID file (PID {old_pid} dead) -- taking over", "INFO")
-        except (ValueError, OSError):
-            log("Corrupt PID file -- overwriting", "WARN")
-    PID_FILE.write_text(str(os.getpid()))
-    atexit.register(_release_singleton)
-    return True
+    """Acquire PID file lock via shared atomic PID guard."""
+    from tools.skynet_pid_guard import acquire_pid_guard
+    return acquire_pid_guard(PID_FILE, "skynet_bus_relay", logger=log)
+    # signed: gamma
 
 
 def _release_singleton():
-    """Clean up PID file on exit."""
-    try:
-        if PID_FILE.exists():
-            stored = int(PID_FILE.read_text().strip())
-            if stored == os.getpid():
-                PID_FILE.unlink(missing_ok=True)
-    except Exception:
-        pass
+    """Release PID file lock via shared PID guard."""
+    from tools.skynet_pid_guard import release_pid_guard
+    release_pid_guard(PID_FILE)
+    # signed: gamma
 
 
 def _handle_signal(signum, frame):

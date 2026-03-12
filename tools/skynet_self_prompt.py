@@ -2095,18 +2095,17 @@ class SelfPromptDaemon:
 
 
 def _check_existing():
+    """Check if daemon is already running using shared PID guard logic."""
     if PID_FILE.exists():
         try:
             old_pid = int(PID_FILE.read_text().strip())
-            out = _hidden_check_output(
-                ["tasklist", "/fi", f"pid eq {old_pid}", "/fo", "csv", "/nh"],
-                text=True, timeout=5, stderr=subprocess.DEVNULL
-            )
-            if str(old_pid) in out and "python" in out.lower():
+            from tools.skynet_pid_guard import _pid_alive, _pid_matches_daemon
+            if _pid_alive(old_pid) and _pid_matches_daemon(old_pid, "skynet_self_prompt"):
                 return old_pid
         except Exception:
             pass
     return None
+    # signed: alpha
 
 
 def _action_status():
@@ -2130,23 +2129,15 @@ def _action_version():
 
 def _action_start():
     """Start the self-prompt daemon if not already running."""
-    existing = _check_existing()
-    if existing:
-        print(f"Already running (PID {existing}). Use 'status' to check.")
+    # ── Atomic PID guard via shared utility ──  # signed: alpha
+    from tools.skynet_pid_guard import acquire_pid_guard
+    if not acquire_pid_guard(PID_FILE, "skynet_self_prompt", logger=log):
+        existing = _check_existing()
+        if existing:
+            print(f"Already running (PID {existing}). Use 'status' to check.")
         return
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()))
 
-    # ── atexit + signal handlers for PID cleanup ──  # signed: alpha
-    import atexit
-    def _cleanup_pid():
-        try:
-            if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
-                PID_FILE.unlink()
-        except Exception:
-            pass
-    atexit.register(_cleanup_pid)
-
+    # ── Additional SIGTERM handler for graceful shutdown (daemon-specific) ──  # signed: alpha
     def _sigterm_handler(signum, frame):
         log(f"Received signal {signum} -- requesting graceful shutdown")
         raise KeyboardInterrupt  # triggers existing except/finally blocks

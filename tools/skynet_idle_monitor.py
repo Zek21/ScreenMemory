@@ -22,6 +22,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.chdir(ROOT)
 
+DATA_DIR = ROOT / "data"
+PID_FILE = DATA_DIR / "idle_monitor.pid"  # signed: alpha
+
 SELF_INVOKE_TASK = (
     "You are now fully initialized with all Skynet capabilities. Your mission: "
     "1. Read data/agent_profiles.json to understand your role and specializations. "
@@ -169,6 +172,12 @@ def main():
     parser.add_argument("--cooldown", type=int, default=120,
                         help="Min seconds between redispatches to same worker")
     args = parser.parse_args()
+
+    # ── Atomic PID guard via shared utility ──  # signed: alpha
+    from tools.skynet_pid_guard import acquire_pid_guard
+    if not acquire_pid_guard(PID_FILE, "skynet_idle_monitor", logger=log):
+        print("Idle monitor already running -- exiting.")
+        return
 
     timeout_s = args.timeout * 3600
     end_time = time.time() + timeout_s

@@ -26,6 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+DATA_DIR = ROOT / "data"
+PID_FILE = DATA_DIR / "ws_monitor.pid"  # signed: alpha
 LOG_FILE = ROOT / "data" / "ws_events.log"
 WS_HOST = "localhost"
 WS_PORT = 8420
@@ -271,6 +273,13 @@ if __name__ == "__main__":
     parser.add_argument("--duration", type=int, default=10, help="Listen duration in seconds")
     parser.add_argument("--forever", action="store_true", help="Listen until Ctrl+C")
     args = parser.parse_args()
+
+    # ── Atomic PID guard for long-running mode ──  # signed: alpha
+    if args.forever:
+        from tools.skynet_pid_guard import acquire_pid_guard
+        if not acquire_pid_guard(PID_FILE, "skynet_ws_monitor"):
+            print("WS monitor already running -- exiting.")
+            sys.exit(0)
 
     monitor = WSMonitor()
 

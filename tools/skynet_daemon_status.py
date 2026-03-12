@@ -207,16 +207,63 @@ DAEMON_REGISTRY = [
 def _pid_alive(pid: int) -> bool:
     """Check if a process with given PID is alive.
 
+    Uses psutil as primary method (most reliable on Windows).
+    Falls back to os.kill(pid, 0) with correct PermissionError handling.
+    On Windows, PermissionError means the process exists but we lack
+    signal rights — still alive, not dead.
+
     Reference: docs/DAEMON_ARCHITECTURE.md Section 7: PID Management
     """
     if pid <= 0:
         return False
+    # Primary: psutil (handles Windows quirks correctly)
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except ImportError:
+        pass
+    # Fallback: os.kill signal 0
     try:
         os.kill(pid, 0)
         return True
+    except PermissionError:
+        # Process exists but we lack permission — still alive
+        return True
     except OSError:
         return False
-    # signed: beta
+    # signed: delta
+
+
+def _find_daemon_process(daemon: dict) -> int:
+    """Scan running processes to find a daemon that matches the script name.
+
+    When the PID file is stale or missing, this provides a fallback by
+    scanning all running Python processes for a command line matching the
+    daemon's script path. Returns the PID if found, 0 otherwise.
+
+    Reference: docs/DAEMON_ARCHITECTURE.md Section 7: PID Management
+    """
+    script = daemon.get("script")
+    if not script:
+        return 0
+    # Extract the key identifier from the script path (e.g. "skynet_monitor" from "tools/skynet_monitor.py")
+    script_key = Path(script).stem
+    try:
+        import psutil
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+                if "python" not in name:
+                    continue
+                cmdline = " ".join(proc.info.get("cmdline") or []).replace("\\", "/").lower()
+                if script_key in cmdline and script.replace("\\", "/").lower() in cmdline:
+                    return proc.info["pid"]
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except ImportError:
+        pass
+    return 0
+    # signed: delta
 
 
 def _read_pid(pid_file_path: str) -> int:
@@ -315,14 +362,23 @@ def check_daemon(daemon: dict) -> dict:
         "heartbeat_status": "unknown",
     }
 
-    # PID check
+    # PID check — two-tier: PID file first, then process scan fallback
     pid_file = daemon.get("pid_file")
     if pid_file:
         pid = _read_pid(pid_file)
         result["pid"] = pid
         if pid and _pid_alive(pid):
             result["pid_alive"] = True
-            start = _get_process_start_time(pid)
+        else:
+            # Fallback: PID file is stale/missing — scan for the actual process
+            found_pid = _find_daemon_process(daemon)
+            if found_pid:
+                result["pid"] = found_pid
+                result["pid_alive"] = True
+                result["pid_source"] = "process_scan"
+        # signed: delta
+        if result["pid_alive"]:
+            start = _get_process_start_time(result["pid"])
             if start > 0:
                 uptime = time.time() - start
                 result["uptime_s"] = int(uptime)

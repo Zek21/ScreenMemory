@@ -15,22 +15,26 @@ class TestConsultantPromptQueue(unittest.TestCase):
         self.prompt_file = Path(self.tmpdir.name) / "consultant_prompt_queue.json"
         self.state_file = Path(self.tmpdir.name) / "consultant_state.json"
         self.task_file = Path(self.tmpdir.name) / "consultant_task_state.json"
+        self.registry_file = Path(self.tmpdir.name) / "consultant_registry.json"
 
         self.old_id = bridge.CONSULTANT_ID
         self.old_prompt = bridge.PROMPT_FILE
         self.old_state = bridge.STATE_FILE
         self.old_task = bridge.TASK_FILE
+        self.old_registry = bridge.REGISTRY_FILE
 
         bridge.CONSULTANT_ID = "consultant"
         bridge.PROMPT_FILE = self.prompt_file
         bridge.STATE_FILE = self.state_file
         bridge.TASK_FILE = self.task_file
+        bridge.REGISTRY_FILE = self.registry_file
 
     def tearDown(self):
         self.bridge.CONSULTANT_ID = self.old_id
         self.bridge.PROMPT_FILE = self.old_prompt
         self.bridge.STATE_FILE = self.old_state
         self.bridge.TASK_FILE = self.old_task
+        self.bridge.REGISTRY_FILE = self.old_registry
         self.tmpdir.cleanup()
 
     def test_queue_ack_complete_lifecycle(self):
@@ -65,6 +69,67 @@ class TestConsultantPromptQueue(unittest.TestCase):
         self.assertEqual(state["prompt_transport"], "bridge_queue")
         self.assertEqual(state["prompt_queue"]["pending"], 1)
         self.assertEqual(state["worker_snapshot"]["summary"]["available"], 3)
+
+    def test_live_state_preserves_valid_consultant_hwnd(self):
+        self.state_file.write_text(json.dumps({
+            "hwnd": 424242,
+            "prompt_transport": "ghost_type",
+            "requires_hwnd": True,
+        }), encoding="utf-8")
+        with patch.object(self.bridge, "_load_worker_snapshot", return_value={
+            "source": "realtime.json",
+            "summary": {"total": 4, "available": 4, "busy": 0, "offline": 0},
+            "workers": {},
+            "available_workers": ["alpha", "beta", "gamma", "delta"],
+            "busy_workers": [],
+            "offline_workers": [],
+        }), patch.object(self.bridge, "_window_alive", return_value=True), \
+             patch.object(self.bridge, "_reserved_hwnds", return_value={}):
+            state = self.bridge.build_live_state(api_port=8422)
+        self.assertEqual(state["hwnd"], 424242)
+        self.assertTrue(state["requires_hwnd"])
+        self.assertEqual(state["prompt_transport"], "ghost_type")
+        self.assertEqual(state["hwnd_validation"], "accepted")
+
+    def test_live_state_rejects_reserved_skynet_hwnd(self):
+        self.state_file.write_text(json.dumps({
+            "hwnd": 8132014,
+            "prompt_transport": "ghost_type",
+            "requires_hwnd": True,
+        }), encoding="utf-8")
+        with patch.object(self.bridge, "_load_worker_snapshot", return_value={
+            "source": "realtime.json",
+            "summary": {"total": 4, "available": 4, "busy": 0, "offline": 0},
+            "workers": {},
+            "available_workers": ["alpha", "beta", "gamma", "delta"],
+            "busy_workers": [],
+            "offline_workers": [],
+        }), patch.object(self.bridge, "_window_alive", return_value=True), \
+             patch.object(self.bridge, "_reserved_hwnds", return_value={8132014: "orchestrator"}):
+            state = self.bridge.build_live_state(api_port=8422)
+        self.assertEqual(state["hwnd"], 0)
+        self.assertFalse(state["requires_hwnd"])
+        self.assertEqual(state["prompt_transport"], "bridge_queue")
+        self.assertEqual(state["hwnd_validation"], "reserved_skynet_window")
+
+    def test_registry_refresh_tracks_truthful_transport(self):
+        self.bridge._refresh_consultant_registry({
+            "display_name": "Codex Consultant",
+            "model": "GPT-5 Codex",
+            "hwnd": 424242,
+            "api_port": 8422,
+            "status": "LIVE",
+            "prompt_transport": "ghost_type",
+            "requires_hwnd": True,
+            "routable": True,
+        })
+        registry = json.loads(self.registry_file.read_text(encoding="utf-8"))
+        self.assertEqual(len(registry["consultants"]), 1)
+        entry = registry["consultants"][0]
+        self.assertEqual(entry["name"], "consultant")
+        self.assertEqual(entry["hwnd"], 424242)
+        self.assertEqual(entry["transport"], "ghost_type")
+        self.assertTrue(entry["requires_hwnd"])
 
     def test_acknowledge_updates_task_state_and_publishes_claim(self):
         queued = self.bridge.queue_prompt("orchestrator", "take this task")
@@ -153,6 +218,7 @@ class TestConsultantPromptQueue(unittest.TestCase):
         with patch.object(self.bridge, "_atomic_write", side_effect=flaky_write), \
              patch.object(self.bridge, "build_live_state", return_value={"status": "LIVE"}), \
              patch.object(self.bridge.time, "sleep", side_effect=[None, KeyboardInterrupt]), \
+             patch.object(self.bridge, "_refresh_consultant_registry"), \
              patch.object(self.bridge.sys, "stderr"):
             with self.assertRaises(KeyboardInterrupt):
                 self.bridge._heartbeat_loop(2.0, 8.0, 8425)
@@ -184,7 +250,7 @@ class TestConsultantDeliveryRouting(unittest.TestCase):
              patch.object(self.delivery, "_bus_post", return_value=True):
             result = self.delivery.deliver_to_consultant("consultant", "Investigate bridge drift")
 
-        self.assertTrue(result["success"])
+        self.assertFalse(result["success"])
         self.assertEqual(result["method"], self.delivery.DeliveryMethod.HYBRID.value)
         self.assertIn("prompt_1", result["detail"])
 
@@ -204,6 +270,18 @@ class TestConsultantDeliveryRouting(unittest.TestCase):
             "api_url": "http://localhost:8422/consultants",
         }), encoding="utf-8")
         with patch.object(self.delivery, "_consultant_state_file", return_value=self.state_file):
+            self.assertFalse(self.delivery.is_routable("consultant"))
+
+    def test_consultant_routability_rejects_reserved_hwnd_without_bridge(self):
+        self.state_file.write_text(json.dumps({
+            "id": "consultant",
+            "hwnd": 8132014,
+            "live": False,
+            "accepts_prompts": False,
+        }), encoding="utf-8")
+        with patch.object(self.delivery, "_consultant_state_file", return_value=self.state_file), \
+             patch.object(self.delivery, "_reserved_skynet_hwnds", return_value={8132014}), \
+             patch.object(self.delivery, "_is_window", return_value=True):
             self.assertFalse(self.delivery.is_routable("consultant"))
 
 
@@ -359,10 +437,10 @@ class TestConsultantBootstrapTruth(unittest.TestCase):
     def test_gc_start_requires_bridge_health_before_live_claim(self):
         script = Path("GC-Start.ps1").read_text(encoding="utf-8")
         self.assertIn("http://127.0.0.1:8425/health", script)
-        self.assertIn("started and passed /health on port 8425", script)
-        self.assertIn("failed health verification within 40s", script)
-        self.assertIn("`\"Gemini Consultant`\"", script)
-        self.assertIn("`\"Gemini 3.1 Pro (Preview)`\"", script)
+        self.assertIn("started and passed /health + live heartbeat truth on port 8425", script)
+        self.assertIn("failed live truth verification within 40s", script)
+        self.assertIn('"Gemini Consultant"', script)
+        self.assertIn('"Gemini 3.1 Pro (Preview)"', script)
 
 
 if __name__ == "__main__":

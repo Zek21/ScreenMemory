@@ -721,6 +721,13 @@ def guarded_publish(msg: dict) -> dict:
     Returns:
         dict with 'allowed' bool + details. On fallback: {'allowed': True, 'fallback': True}.
     """
+    # Type guard: reject None and non-dict inputs before they reach the bus  # signed: delta
+    if not isinstance(msg, dict):
+        return {"allowed": False, "published": False,
+                "reason": f"invalid_message_type: expected dict, got {type(msg).__name__}"}
+    if not msg.get("sender") or not msg.get("content"):
+        return {"allowed": False, "published": False,
+                "reason": "missing required fields: sender and content are mandatory"}
     global _singleton_guard
     try:
         if _singleton_guard is None:

@@ -118,6 +118,7 @@ public class MGuard {{
     [DllImport("user32.dll")] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string c, string w);
     [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr h, ref POINT p);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [StructLayout(LayoutKind.Sequential)] public struct POINT {{ public int X, Y; }}
     public static void Click(IntPtr rh, int sx, int sy) {{
         POINT pt; pt.X=sx; pt.Y=sy; ScreenToClient(rh,ref pt);
@@ -144,6 +145,21 @@ $btns=$root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
         [System.Windows.Automation.ControlType]::Button)))
 
+function Get-VisibleEdit([System.Windows.Automation.AutomationElement]$rootEl) {{
+    if($null -eq $rootEl) {{ return $null }}
+    $edits = $rootEl.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+        (New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Edit)))
+    foreach($edit in $edits) {{
+        try {{
+            $r = $edit.Current.BoundingRectangle
+            if($r.Width -gt 0 -and $r.Height -gt 0) {{ return $edit }}
+        }} catch {{}}
+    }}
+    return $null
+}}
+
 $modelOk=$false; $targetOk=$false
 foreach($b in $btns) {{
     $n=$b.Current.Name
@@ -158,12 +174,53 @@ if(-not $modelOk) {{
             Start-Sleep -Milliseconds 300
             $r=$b.Current.BoundingRectangle
             [MGuard]::Click($render,[int]($r.X+$r.Width/2),[int]($r.Y+$r.Height/2))
-            Start-Sleep -Milliseconds 1500
-            [System.Windows.Forms.SendKeys]::SendWait("fast")
-            Start-Sleep -Milliseconds 1000
+            Start-Sleep -Milliseconds 600
+            $edit = $null
+            for($i = 0; $i -lt 10 -and $null -eq $edit; $i++) {{
+                $rootCheck=[System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+                $edit = Get-VisibleEdit $rootCheck
+                if($null -eq $edit) {{ Start-Sleep -Milliseconds 150 }}
+            }}
+            if($null -eq $edit) {{
+                Write-Host "MODEL_PICKER_NOT_READY"
+                break
+            }}
+            try {{
+                $vp = $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+                $vp.SetValue("fast")
+            }} catch {{
+                try {{ $edit.SetFocus() }} catch {{}}
+                Start-Sleep -Milliseconds 100
+                [System.Windows.Forms.SendKeys]::SendWait("^a")
+                Start-Sleep -Milliseconds 50
+                [System.Windows.Forms.SendKeys]::SendWait("fast")
+            }}
+            Start-Sleep -Milliseconds 500
+            try {{ $edit.SetFocus() }} catch {{}}
+            Start-Sleep -Milliseconds 100
+            if([MGuard]::GetForegroundWindow() -ne $hwnd) {{
+                Write-Host "MODEL_SELECTION_ABORTED_FOCUS_LOST"
+                break
+            }}
             [System.Windows.Forms.SendKeys]::SendWait("{{DOWN}}{{ENTER}}")
             Start-Sleep -Milliseconds 800
-            Write-Host "MODEL_FIXED"
+            $rootVerify=[System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+            $btnsVerify=$rootVerify.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                (New-Object System.Windows.Automation.PropertyCondition(
+                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                    [System.Windows.Automation.ControlType]::Button)))
+            $modelFixed = $false
+            foreach($vb in $btnsVerify) {{
+                if($vb.Current.Name -match 'Pick Model.*Opus 4\\.6.*fast') {{
+                    $modelFixed = $true
+                    break
+                }}
+            }}
+            if($modelFixed) {{
+                Write-Host "MODEL_FIXED"
+            }} else {{
+                Write-Host "MODEL_FIX_UNVERIFIED"
+            }}
             break
         }}
     }}
@@ -249,6 +306,12 @@ def fix_model(hwnd, orch_hwnd=None):
             actions.append("TARGET_FIXED")
         if "GUARD_OK" in out:
             actions.append("GUARD_OK")
+        if "MODEL_PICKER_NOT_READY" in out:
+            actions.append("MODEL_PICKER_NOT_READY")
+        if "MODEL_SELECTION_ABORTED_FOCUS_LOST" in out:
+            actions.append("MODEL_SELECTION_ABORTED_FOCUS_LOST")
+        if "MODEL_FIX_UNVERIFIED" in out:
+            actions.append("MODEL_FIX_UNVERIFIED")
         return "+".join(actions) if actions else "NO_CHANGE"
     except Exception as e:
         return f"FAILED:{e}"

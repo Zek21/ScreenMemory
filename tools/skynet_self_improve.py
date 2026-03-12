@@ -585,15 +585,7 @@ class SelfImproveDaemon:
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
 
-        # Register atexit for PID cleanup  # signed: delta
-        import atexit
-        def _cleanup_pid():
-            try:
-                if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
-                    PID_FILE.unlink(missing_ok=True)
-            except Exception:
-                pass
-        atexit.register(_cleanup_pid)
+        # PID cleanup is handled by shared skynet_pid_guard (atexit + signals)  # signed: alpha
 
         _post_bus("orchestrator", "monitor_alert",
                   "SELF_IMPROVE_ONLINE: Self-improvement engine started")
@@ -655,20 +647,18 @@ class SelfImproveDaemon:
 # ── PID file management ─────────────────────────────────────────────────────
 
 def _check_existing():
-    """Check if daemon is already running."""
+    """Check if daemon is already running using shared PID guard logic."""
     if PID_FILE.exists():
         try:
             pid = int(PID_FILE.read_text().strip())
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-            if handle:
-                kernel32.CloseHandle(handle)
+            from tools.skynet_pid_guard import _pid_alive, _pid_matches_daemon
+            if _pid_alive(pid) and _pid_matches_daemon(pid, "skynet_self_improve"):
                 return pid
         except Exception:
             pass
         PID_FILE.unlink(missing_ok=True)
     return None
+    # signed: alpha
 
 
 def main():
@@ -679,11 +669,13 @@ def main():
     cmd = sys.argv[1].lower()
 
     if cmd == "start":
-        existing = _check_existing()
-        if existing:
-            log(f"Already running (PID {existing})")
+        # ── Atomic PID guard via shared utility ──  # signed: alpha
+        from tools.skynet_pid_guard import acquire_pid_guard
+        if not acquire_pid_guard(PID_FILE, "skynet_self_improve", logger=log):
+            existing = _check_existing()
+            if existing:
+                log(f"Already running (PID {existing})")
             return
-        PID_FILE.write_text(str(os.getpid()))
         daemon = SelfImproveDaemon()
         daemon.run()
 

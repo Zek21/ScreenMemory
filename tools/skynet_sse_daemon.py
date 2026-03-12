@@ -217,25 +217,10 @@ def _build_state(sse_data: dict, update_count: int, last_tick_time: float) -> di
 
 
 def _init_pid_guard(pid_file: Path) -> bool:
-    """Check for existing daemon instance. Returns True if safe to proceed."""
-    if pid_file.exists():
-        try:
-            old_pid = int(pid_file.read_text().strip())
-            os.kill(old_pid, 0)
-            print(f"[sse-daemon] Already running (PID {old_pid}) -- exiting to prevent duplicate", flush=True)
-            return False
-        except (OSError, ValueError):
-            pass
-    pid_file.write_text(str(os.getpid()))
-
-    import atexit
-    def _cleanup_pid():
-        try:
-            pid_file.unlink(missing_ok=True)
-        except Exception:
-            pass
-    atexit.register(_cleanup_pid)
-    return True
+    """Check for existing daemon instance via shared atomic PID guard."""
+    from tools.skynet_pid_guard import acquire_pid_guard
+    return acquire_pid_guard(pid_file, "skynet_sse_daemon")
+    # signed: gamma
 
 
 def _process_tick(buf, last_tick, update_count, output, verbose, last_status_print):
@@ -298,10 +283,8 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
     """Main SSE event loop. Connects, parses ticks, writes state atomically."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    if not _init_pid_guard(PID_FILE):
-        return
-
-    # ── Signal handlers for graceful shutdown ──  # signed: alpha
+    # ── Signal handlers for graceful shutdown ──
+    # Registered BEFORE _init_pid_guard so the PID guard chains to them  # signed: gamma
     _sse_shutdown = False
     def _sigterm_handler(signum, frame):
         nonlocal _sse_shutdown
@@ -312,7 +295,10 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
     try:
         signal.signal(signal.SIGBREAK, _sigterm_handler)  # Windows Ctrl+Break
     except (AttributeError, OSError):
-        pass  # signed: alpha
+        pass  # signed: gamma
+
+    if not _init_pid_guard(PID_FILE):
+        return
 
     update_count = 0
     backoff = 2.0
@@ -345,10 +331,8 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
 
         except KeyboardInterrupt:
             print("\n[sse-daemon] Shutting down.", flush=True)
-            try:
-                PID_FILE.unlink(missing_ok=True)
-            except Exception:
-                pass
+            from tools.skynet_pid_guard import release_pid_guard
+            release_pid_guard(PID_FILE)  # signed: gamma
             break
         except (ConnectionError, TimeoutError, OSError) as e:
             _consecutive_errors += 1

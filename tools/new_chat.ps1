@@ -8,7 +8,9 @@ param(
     [int]$Monitor = 2,  # 1=left, 2=right
     [int]$Width = 800,
     [int]$Height = 880,
-    [switch]$SkipEmptyCheck  # Skip the "no first prompt" guard (used by skynet_start.py)
+    [switch]$SkipEmptyCheck,  # Skip the "no first prompt" guard (used by skynet_start.py)
+    [ValidateSet("worker", "consultant")]
+    [string]$Layout = "worker"
 )
 
 # --- Session open failure tracker (max 2 consecutive attempts) ---
@@ -215,28 +217,46 @@ foreach ($cw in $chatWindows) {
     }
 }
 
-# --- Calculate non-overlapping position (2x2 grid on right monitor) ---
-# Right monitor: 1920,0 to 3840,1080. Taskbar ~40px at bottom -> usable y_max = 1040
-# Grid: 930x500 windows (capped so bottom row ends at 1040), 2 columns x 2 rows
-$gridW = 930
-$gridH = 500
-$gridSlots = @(
-    @{X=1930; Y=20},    # top-left    (y+h = 520)
-    @{X=2870; Y=20},    # top-right   (y+h = 520)
-    @{X=1930; Y=540},   # bottom-left (y+h = 1040, taskbar safe)
-    @{X=2870; Y=540}    # bottom-right(y+h = 1040, taskbar safe)
-)
+# --- Calculate non-overlapping position ---
+# Worker layout stays on monitor 2 in the original 2x2 grid.
+# Consultant layout uses 2 dedicated slots over monitor 1 so candidate windows
+# can still open when all worker slots are occupied.
+if ($Layout -eq "consultant") {
+    $gridW = 460
+    $gridH = 500
+    $gridSlots = @(
+        @{X=976;  Y=20},   # monitor 1, left consultant slot
+        @{X=1446; Y=20}    # monitor 1, right consultant slot
+    )
+    $occupiedMinX = 940
+    $occupiedMaxX = 1915
+    $fullMessage = "BLOCKED: All consultant slots occupied. Close a consultant candidate window first."
+} else {
+    # Right monitor: 1920,0 to 3840,1080. Taskbar ~40px at bottom -> usable y_max = 1040
+    # Grid: 930x500 windows (capped so bottom row ends at 1040), 2 columns x 2 rows
+    $gridW = 930
+    $gridH = 500
+    $gridSlots = @(
+        @{X=1930; Y=20},    # top-left    (y+h = 520)
+        @{X=2870; Y=20},    # top-right   (y+h = 520)
+        @{X=1930; Y=540},   # bottom-left (y+h = 1040, taskbar safe)
+        @{X=2870; Y=540}    # bottom-right(y+h = 1040, taskbar safe)
+    )
+    $occupiedMinX = 1900
+    $occupiedMaxX = [int]::MaxValue
+    $fullMessage = "BLOCKED: All 4 grid slots occupied. Close a chat window first."
+}
 
 # Override window size for grid
 $Width = $gridW
 $Height = $gridH
 
-# Collect occupied rects on right monitor
+# Collect occupied rects in the active layout band
 $occupiedRects = @()
 foreach ($cw in $chatWindows) {
     $r = New-Object Ghost+RECT
     [Ghost]::GetWindowRect($cw, [ref]$r)
-    if ($r.Left -ge 1900) {
+    if ($r.Left -ge $occupiedMinX -and $r.Left -lt $occupiedMaxX) {
         $occupiedRects += @{ Left=$r.Left; Top=$r.Top; Right=$r.Right; Bottom=$r.Bottom }
     }
 }
@@ -264,7 +284,7 @@ foreach ($slot in $gridSlots) {
 }
 
 if (-not $placed) {
-    Write-Host "BLOCKED: All 4 grid slots occupied. Close a chat window first."
+    Write-Host $fullMessage
     [Ghost]::SetForegroundWindow($orchHwnd)
     exit 0
 }

@@ -630,6 +630,43 @@ def _load_consultant_state(consultant_id: str) -> dict:
         return {}
 
 
+def _reserved_skynet_hwnds() -> set[int]:
+    reserved: set[int] = set()
+    try:
+        workers_raw = json.loads(WORKERS_FILE.read_text(encoding="utf-8"))
+        workers = workers_raw if isinstance(workers_raw, list) else workers_raw.get("workers", [])
+        if isinstance(workers, list):
+            for worker in workers:
+                if not isinstance(worker, dict):
+                    continue
+                hwnd = int(worker.get("hwnd") or 0)
+                if hwnd > 0:
+                    reserved.add(hwnd)
+    except Exception:
+        pass
+
+    try:
+        orch = json.loads(ORCH_FILE.read_text(encoding="utf-8"))
+        for key in ("orchestrator_hwnd", "hwnd"):
+            hwnd = int(orch.get(key) or 0)
+            if hwnd > 0:
+                reserved.add(hwnd)
+    except Exception:
+        pass
+
+    return reserved
+
+
+def _consultant_hwnd_is_valid(state: dict, consultant_id: str) -> bool:
+    try:
+        hwnd = int(state.get("hwnd") or 0)
+    except Exception:
+        return False
+    if hwnd <= 0 or hwnd in _reserved_skynet_hwnds() or not _is_window(hwnd):
+        return False
+    return bool(validate_hwnd(hwnd, f"consultant:{consultant_id}").get("valid"))  # signed: consultant
+
+
 def _ghost_type(hwnd: int, text: str, orch_hwnd: int = 0,
                 target_label: str = "") -> bool:
     """Deliver text to a window via UIA ghost-type. Returns True on success.
@@ -820,14 +857,15 @@ def _deliver_to_consultant_ghost_type(content: str, consultant_id: str) -> dict:
     """  # signed: gamma
     state = _load_consultant_state(consultant_id)
     hwnd = state.get("hwnd", 0)
-    if not hwnd:
+    if not _consultant_hwnd_is_valid(state, consultant_id):
         return {
             "target": f"consultant:{consultant_id}",
             "method": "ghost_type",
             "success": False,
             "delivery_status": "failed",
-            "detail": f"No HWND in state file for {consultant_id}",
+            "detail": f"No truthful consultant HWND in state file for {consultant_id}",
         }
+    hwnd = int(hwnd)
     orch_hwnd = _load_orch_hwnd()
     ok = _ghost_type(hwnd, content, orch_hwnd or hwnd,
                      target_label=f"consultant:{consultant_id}")
@@ -1300,7 +1338,7 @@ def is_routable(target_name: str) -> bool:
     fallback = info.get("fallback")
     if fallback == DeliveryMethod.CONSULTANT_BRIDGE:
         state = _load_consultant_state(target_name)
-        has_hwnd = bool(state.get("hwnd"))
+        has_hwnd = _consultant_hwnd_is_valid(state, target_name)
         bridge_live = (bool(state.get("live")) and bool(state.get("api_url"))
                        and bool(state.get("accepts_prompts")))
         return has_hwnd or bridge_live  # signed: gamma

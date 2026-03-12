@@ -809,6 +809,9 @@ if __name__ == "__main__":
         print(f"{'='*60}\n")
 
     elif args.monitor:
+        from tools.skynet_pid_guard import acquire_pid_guard  # signed: delta
+        if not acquire_pid_guard("data/realtime.pid", "skynet_realtime"):
+            sys.exit(1)  # signed: delta
         monitor = WorkerHealthMonitor(interval=args.interval)
         monitor.start()
         try:

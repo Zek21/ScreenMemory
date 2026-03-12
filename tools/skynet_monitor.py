@@ -21,6 +21,7 @@ import collections
 import ctypes
 import ctypes.wintypes
 import json
+import os
 import subprocess
 import sys
 import time
@@ -37,6 +38,22 @@ WORKERS_FILE = DATA_DIR / "workers.json"
 HEALTH_FILE = DATA_DIR / "worker_health.json"
 PID_FILE = DATA_DIR / "monitor.pid"
 SKYNET_URL = "http://localhost:8420"
+
+
+# PID guard now uses shared utility -- see tools/skynet_pid_guard.py  # signed: alpha
+from tools.skynet_pid_guard import acquire_pid_guard, release_pid_guard
+
+
+def _acquire_monitor_pid_guard() -> bool:
+    """Acquire the monitor PID guard via shared utility."""
+    return acquire_pid_guard(PID_FILE, "skynet_monitor", logger=log)
+    # signed: alpha
+
+
+def _cleanup_monitor_pid_guard():
+    """Release the monitor PID guard via shared utility."""
+    release_pid_guard(PID_FILE)
+    # signed: alpha
 
 
 def _guarded_bus_publish(msg: dict) -> dict | None:
@@ -919,30 +936,12 @@ def main():
             print("No health.json yet")
         return
 
-    # ── PID guard: prevent duplicate monitor daemons ─────────────────────────
-    import os, signal
-    if PID_FILE.exists():
-        try:
-            old_pid = int(PID_FILE.read_text().strip())
-            # Check if the process is still alive (Windows: OpenProcess trick via os.kill)
-            os.kill(old_pid, 0)
-            log(f"Monitor already running (PID {old_pid}) -- exiting to prevent duplicate", "WARN")
-            return
-        except (OSError, ValueError):
-            pass  # Process dead or PID file stale -- proceed
-    PID_FILE.write_text(str(os.getpid()))
+    # ── PID guard: prevent duplicate monitor daemons (shared utility) ──  # signed: alpha
+    import signal
+    if not _acquire_monitor_pid_guard():
+        return
 
-    # ── atexit for PID cleanup (supplements signal handlers) ──  # signed: alpha
-    import atexit
-    def _cleanup_pid():
-        try:
-            if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
-                PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
-    atexit.register(_cleanup_pid)  # signed: alpha
-
-    # ── SIGTERM handler for graceful shutdown ──  # signed: alpha
+    # ── SIGTERM handler for graceful shutdown (PID cleanup is automatic via shared guard) ──  # signed: alpha
     def _sigterm_handler(signum, frame):
         global _shutdown_requested
         _shutdown_requested = True
@@ -956,10 +955,7 @@ def main():
     try:
         _run_monitor(args)
     finally:
-        try:
-            PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
+        _cleanup_monitor_pid_guard()
 
 
 def _run_monitor_cycle(workers, orch_hwnd, args, cycle, now, last_model_check, last_orch_check) -> tuple:

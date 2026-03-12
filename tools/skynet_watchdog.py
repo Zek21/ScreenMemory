@@ -1230,35 +1230,11 @@ def run_daemon(args=None):
     """Main watchdog loop."""
     import os
     max_runtime = getattr(args, 'max_runtime', 0) if args else 0
-    if PID_FILE.exists():
-        try:
-            old_pid = int(PID_FILE.read_text().strip())
-            os.kill(old_pid, 0)  # check if alive
-            # Verify it's actually a watchdog process (not a recycled PID)
-            import subprocess
-            result = _hidden_run(
-                ["powershell", "-NoProfile", "-Command",
-                 f"(Get-CimInstance Win32_Process -Filter \"ProcessId = {old_pid}\").CommandLine"],
-                capture_output=True, text=True, timeout=5
-            )
-            if "watchdog" in result.stdout.lower():
-                log(f"Watchdog already running (PID {old_pid}) -- exiting")
-                return
-            else:
-                log(f"Stale PID file (PID {old_pid} is not a watchdog) -- taking over")
-        except (OSError, ValueError, Exception):
-            pass
-    PID_FILE.write_text(str(os.getpid()))
 
-    # ── atexit PID cleanup (safety net for abnormal exits) ──  # signed: beta
-    import atexit
-    def _cleanup_pid():
-        try:
-            if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
-                PID_FILE.unlink(missing_ok=True)  # signed: beta
-        except Exception:
-            pass
-    atexit.register(_cleanup_pid)  # signed: beta
+    # ── Atomic PID guard via shared utility ──  # signed: alpha
+    from tools.skynet_pid_guard import acquire_pid_guard
+    if not acquire_pid_guard(PID_FILE, "skynet_watchdog", logger=log):
+        return
 
     # ── SIGTERM handler for graceful shutdown ──  # signed: alpha
     import signal

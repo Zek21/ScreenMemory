@@ -23,6 +23,9 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+DATA_DIR = ROOT / "data"
+PID_FILE = DATA_DIR / "bus_watcher.pid"  # signed: alpha
+
 SKYNET_URL = "http://localhost:8420"
 POLL_INTERVAL = 2.0
 MAX_LOG = 50
@@ -235,6 +238,12 @@ if __name__ == "__main__":
         new = watcher.poll_once()
         print(f"Polled: {new} new messages, {watcher.last_poll_ms:.1f}ms")
     else:
+        # ── Atomic PID guard via shared utility ──  # signed: alpha
+        from tools.skynet_pid_guard import acquire_pid_guard
+        if not acquire_pid_guard(PID_FILE, "skynet_bus_watcher"):
+            print("Bus watcher already running -- exiting.")
+            sys.exit(0)
+
         watcher = BusWatcher()
         watcher.start()
         try:

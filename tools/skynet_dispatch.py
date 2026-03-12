@@ -936,24 +936,29 @@ if ($focusMethod -ne "NONE") {{
     $savedClip = $null
     $deliveryStatus = "FAILED"
     try {{ $savedClip = [System.Windows.Forms.Clipboard]::GetText() }} catch {{}}
-    # Clipboard verification: set text and confirm it was written correctly  # signed: alpha
+    # Clipboard verification: set text and confirm with exponential backoff  # signed: beta
     $clipRetries = 0
     $clipVerified = $false
-    while ($clipRetries -lt 3 -and -not $clipVerified) {{
+    $clipBackoffMs = 100
+    while ($clipRetries -lt 5 -and -not $clipVerified) {{
+        try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
+        Start-Sleep -Milliseconds 30
         [System.Windows.Forms.Clipboard]::SetText($dispatchText)
-        Start-Sleep -Milliseconds 50
+        Start-Sleep -Milliseconds $clipBackoffMs
         try {{
             $readBack = [System.Windows.Forms.Clipboard]::GetText()
             if ($readBack -eq $dispatchText) {{
                 $clipVerified = $true
             }} else {{
                 $clipRetries++
-                Write-Host "DEBUG: Clipboard verify mismatch attempt $clipRetries"
-                Start-Sleep -Milliseconds 100
+                Write-Host "DEBUG: Clipboard verify mismatch attempt $clipRetries (backoff $($clipBackoffMs)ms)"
+                $clipBackoffMs = [Math]::Min($clipBackoffMs * 2, 800)
+                Start-Sleep -Milliseconds $clipBackoffMs
             }}
         }} catch {{
             $clipRetries++
-            Start-Sleep -Milliseconds 100
+            $clipBackoffMs = [Math]::Min($clipBackoffMs * 2, 800)
+            Start-Sleep -Milliseconds $clipBackoffMs
         }}
     }}
     if (-not $clipVerified) {{
@@ -1104,9 +1109,23 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
 
         stderr = (r.stderr or "").strip()
         stdout = r.stdout or ""
-        # Check for clipboard verification failure first  # signed: alpha
+        # Clipboard verify failed -- single auto-retry after clearing clipboard  # signed: beta
         if "CLIPBOARD_VERIFY_FAILED" in stdout:
-            log(f"Ghost CLIPBOARD_VERIFY_FAILED for HWND={hwnd} -- clipboard race detected", "ERR")
+            log(f"Ghost CLIPBOARD_VERIFY_FAILED for HWND={hwnd} -- retrying once after 500ms cooldown", "WARN")
+            time.sleep(0.5)
+            try:
+                r2 = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps],
+                    capture_output=True, text=True, timeout=20,
+                    creationflags=0x08000000
+                )
+                stdout2 = r2.stdout or ""
+                if any(s in stdout2 for s in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK")):
+                    log(f"Ghost CLIPBOARD retry succeeded for HWND={hwnd}", "OK")
+                    return True
+                log(f"Ghost CLIPBOARD retry also failed for HWND={hwnd}: {stdout2.strip()[:150]}", "ERR")
+            except Exception as e2:
+                log(f"Ghost CLIPBOARD retry exception: {e2}", "ERR")
             return False
         # Focus race detection: another window stole focus between clipboard set and paste  # signed: alpha
         if "FOCUS_STOLEN" in stdout:
