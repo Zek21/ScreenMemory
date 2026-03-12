@@ -60,6 +60,8 @@ def _http_post(url, data, timeout=5):
 
 def bench_bus_roundtrip():
     """Post a message and read it back."""
+    # NOTE: Raw bus/publish is INTENTIONAL -- this benchmarks raw bus latency.
+    # SpamGuard would add ~5ms overhead and rate-limit, skewing measurements.  # signed: delta
     tag = f"perf_{time.time_ns()}"
     _http_post(f"{SKYNET}/bus/publish", {"sender": "perf", "topic": tag, "type": "bench", "content": "ping"})
     msgs = _http_get(f"{SKYNET}/bus/messages?topic={tag}&limit=1")
@@ -68,6 +70,8 @@ def bench_bus_roundtrip():
 
 def bench_bus_throughput():
     """Post 20 messages rapidly, measure throughput."""
+    # NOTE: Raw bus/publish is INTENTIONAL -- this benchmarks raw throughput.
+    # SpamGuard rate-limits at 5/min and would block 15 of 20 messages.  # signed: delta
     t0 = time.perf_counter()
     for i in range(20):
         _http_post(f"{SKYNET}/bus/publish", {"sender": "perf", "topic": "perf_tp", "type": "bench", "content": f"m{i}"})

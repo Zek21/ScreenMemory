@@ -98,21 +98,23 @@ def guard_process_kill(pid=None, name=None, caller="unknown"):
     protected, reason = is_process_protected(pid=pid, name=name)
     if protected:
         alert = f"BLOCKED: {caller} tried to kill protected process (pid={pid} name={name}). {reason}"
+        msg = {"sender": "process_guard", "topic": "orchestrator",
+               "type": "alert", "content": alert}
         try:
-            import urllib.request
-            payload = json.dumps({
-                "sender": "process_guard",
-                "topic": "orchestrator",
-                "type": "alert",
-                "content": alert,
-            }).encode()
-            req = urllib.request.Request(
-                "http://localhost:8420/bus/publish", payload,
-                {"Content-Type": "application/json"}
-            )
-            urllib.request.urlopen(req, timeout=3)
-        except (OSError, ValueError) as e:
-            print(f"[GUARD] Bus alert failed: {e}", file=sys.stderr)  # signed: beta
+            from tools.skynet_spam_guard import guarded_publish
+            guarded_publish(msg)
+        except Exception:
+            # Raw fallback for when SpamGuard is unavailable
+            try:
+                import urllib.request
+                payload = json.dumps(msg).encode()
+                req = urllib.request.Request(
+                    "http://localhost:8420/bus/publish", payload,
+                    {"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=3)
+            except Exception as e:
+                print(f"[GUARD] Bus alert failed: {e}", file=sys.stderr)
+        # signed: alpha
         print(f"\033[91m[GUARD] {alert}\033[0m", file=sys.stderr)
         return False  # NOT safe to kill
     return True  # safe to kill

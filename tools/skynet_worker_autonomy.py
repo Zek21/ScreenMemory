@@ -88,7 +88,19 @@ def _fetch_json(url, timeout=5):
 
 
 def _post_bus(sender, topic, msg_type, content):
-    """Post message to Skynet bus."""
+    """Post message to Skynet bus via SpamGuard, raw fallback if unavailable."""
+    try:
+        from tools.skynet_spam_guard import guarded_publish
+        result = guarded_publish({
+            "sender": sender,
+            "topic": topic,
+            "type": msg_type,
+            "content": content,
+        })
+        return result.get("allowed", False) or result.get("published", False)
+    except Exception:
+        pass
+    # Raw fallback only when SpamGuard is unavailable
     try:
         data = json.dumps({
             "sender": sender,
@@ -105,6 +117,7 @@ def _post_bus(sender, topic, msg_type, content):
         return True
     except Exception:
         return False
+    # signed: delta
 
 
 def _load_autonomy_log():

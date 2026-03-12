@@ -257,6 +257,11 @@ def _format_digest(messages):
 
 
 def _bus_post(sender, topic, msg_type, content):
+    # NOTE: Raw bus/publish is INTENTIONAL for the relay daemon. This function
+    # forwards queued/digested bus messages on behalf of the relay. Using SpamGuard
+    # would block forwarded messages as duplicates (same fingerprint as original)
+    # and rate-limit relay traffic. The relay IS the transport layer — it must
+    # bypass application-level spam filtering.  # signed: delta
     payload = json.dumps({
         "sender": sender,
         "topic": topic,

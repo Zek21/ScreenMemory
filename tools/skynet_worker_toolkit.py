@@ -88,11 +88,15 @@ class WorkerToolkit:
     # ── Bus Communication ──────────────────────────────────────────────────
 
     def bus_post(self, topic: str, msg_type: str, content: str) -> bool:
-        """Post a message to the Skynet bus."""
-        result = _http_post(f"{BUS_URL}/bus/publish", {
-            "sender": self.name, "topic": topic, "type": msg_type, "content": content
-        })
-        return result is not None
+        """Post a message to the Skynet bus via SpamGuard."""
+        msg = {"sender": self.name, "topic": topic, "type": msg_type, "content": content}
+        try:
+            from tools.skynet_spam_guard import guarded_publish
+            result = guarded_publish(msg)
+            return bool(result and result.get("allowed", False))
+        except ImportError:
+            return _http_post(f"{BUS_URL}/bus/publish", msg) is not None
+        # signed: gamma
 
     def bus_read(self, limit: int = 20, topic: str = None) -> List[dict]:
         """Read messages from the bus."""

@@ -115,22 +115,33 @@ def _collect_bus_stress():
     import time
     stress_ok = 0
     stress_start = time.time()
-    for i in range(10):
+    try:
+        from tools.skynet_spam_guard import guarded_publish
+    except Exception:
+        guarded_publish = None
+    probe_count = 5  # within SpamGuard rate limit (5/min/sender)
+    for i in range(probe_count):
         try:
-            data = json.dumps({"sender": "health_check", "topic": "health_probe",
-                               "type": "probe", "content": f"probe_{i}"}).encode()
-            req = urllib.request.Request("http://localhost:8420/bus/publish", data=data,
-                                        headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=3)
+            payload = {"sender": "health_check", "topic": "health_probe",
+                       "type": "probe", "content": f"probe_{i}_{int(time.time())}"}
+            if guarded_publish:
+                guarded_publish(payload)
+            else:
+                # Raw fallback only when SpamGuard is unavailable
+                data = json.dumps(payload).encode()
+                req = urllib.request.Request("http://localhost:8420/bus/publish", data=data,
+                                            headers={"Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=3)
             stress_ok += 1
         except Exception:
             pass
     stress_elapsed = time.time() - stress_start
+    # signed: alpha
     return {
-        "messages_sent": 10, "messages_ok": stress_ok,
+        "messages_sent": probe_count, "messages_ok": stress_ok,
         "elapsed_s": round(stress_elapsed, 3),
         "throughput_msg_s": round(stress_ok / stress_elapsed, 1) if stress_elapsed > 0 else 0,
-        "status": "HEALTHY" if stress_ok == 10 else "DEGRADED",
+        "status": "HEALTHY" if stress_ok == probe_count else "DEGRADED",
     }
 
 

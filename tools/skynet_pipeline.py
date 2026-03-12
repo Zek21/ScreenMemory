@@ -52,13 +52,19 @@ def log(msg, level="SYS"):
 
 
 def bus_post(sender, content):
-    """Post result to Skynet bus."""
-    body = json.dumps({"sender": sender, "topic": "orchestrator", "type": "result", "content": content}).encode()
+    """Post result to Skynet bus via SpamGuard."""
+    msg = {"sender": sender, "topic": "orchestrator", "type": "result", "content": content}
     try:
-        req = Request(f"{SKYNET_URL}/bus/publish", data=body, headers={"Content-Type": "application/json"})
-        urlopen(req, timeout=5)
-    except Exception:
-        pass
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish(msg)
+    except ImportError:
+        try:
+            body = json.dumps(msg).encode()
+            req = Request(f"{SKYNET_URL}/bus/publish", data=body, headers={"Content-Type": "application/json"})
+            urlopen(req, timeout=5)
+        except Exception:
+            pass
+    # signed: gamma
 
 
 class StepResult:

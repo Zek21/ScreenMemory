@@ -65,21 +65,23 @@ def _fetch_json(url, timeout=5):
 
 
 def _post_bus(topic, msg_type, content):
+    msg = {"sender": "orch_poller", "topic": topic, "type": msg_type, "content": content}
     try:
-        payload = json.dumps({
-            "sender": "orch_poller",
-            "topic": topic,
-            "type": msg_type,
-            "content": content,
-        }).encode()
-        req = urllib.request.Request(
-            f"{BUS_URL}/bus/publish", payload,
-            {"Content-Type": "application/json"}
-        )
-        urllib.request.urlopen(req, timeout=5)
-        return True
-    except Exception:
-        return False
+        from tools.skynet_spam_guard import guarded_publish
+        result = guarded_publish(msg)
+        return bool(result and result.get("allowed", False))
+    except ImportError:
+        try:
+            payload = json.dumps(msg).encode()
+            req = urllib.request.Request(
+                f"{BUS_URL}/bus/publish", payload,
+                {"Content-Type": "application/json"}
+            )
+            urllib.request.urlopen(req, timeout=5)
+            return True
+        except Exception:
+            return False
+    # signed: gamma
 
 
 def load_queue():

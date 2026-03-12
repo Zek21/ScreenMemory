@@ -23,13 +23,20 @@ sys.path.insert(0, str(ROOT))
 
 
 def _bus_post(content):
-    """Post result to Skynet bus (best-effort)."""
-    from urllib.request import urlopen, Request
-    body = json.dumps({"sender": "cli", "topic": "orchestrator", "type": "result", "content": content}).encode()
+    """Post result to Skynet bus via SpamGuard (best-effort)."""
+    bus_msg = {"sender": "cli", "topic": "orchestrator", "type": "result", "content": content}
     try:
-        urlopen(Request("http://localhost:8420/bus/publish", data=body, headers={"Content-Type": "application/json"}), timeout=3)
-    except Exception:
-        pass
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish(bus_msg)
+    except ImportError:
+        # Fallback: raw urllib when SpamGuard unavailable
+        from urllib.request import urlopen, Request
+        body = json.dumps(bus_msg).encode()
+        try:
+            urlopen(Request("http://localhost:8420/bus/publish", data=body, headers={"Content-Type": "application/json"}), timeout=3)
+        except Exception:
+            pass
+    # signed: beta
 
 
 def _bus_get(limit=20, topic=None):

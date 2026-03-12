@@ -485,10 +485,18 @@ def cmd_dispatch(goal: str) -> str:
 
     if not idle_workers:
         lines.append("[!] **No idle workers available.** Task queued for next available worker.")
-        _http_post(f"{BUS_URL}/bus/publish", {
-            "sender": "skynet_api", "topic": "orchestrator", "type": "info",
-            "content": f"AUTO_DISPATCH_QUEUED: No idle workers for: {goal[:100]}"
-        })
+        try:
+            from tools.skynet_spam_guard import guarded_publish
+            guarded_publish({
+                "sender": "skynet_api", "topic": "orchestrator", "type": "info",
+                "content": f"AUTO_DISPATCH_QUEUED: No idle workers for: {goal[:100]}"
+            })
+        except ImportError:
+            _http_post(f"{BUS_URL}/bus/publish", {
+                "sender": "skynet_api", "topic": "orchestrator", "type": "info",
+                "content": f"AUTO_DISPATCH_QUEUED: No idle workers for: {goal[:100]}"
+            })
+        # signed: gamma
         return "\n".join(lines)
 
     brain = None

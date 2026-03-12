@@ -498,12 +498,21 @@ class OverseerDaemon:
         else:
             self.services["watchdog"] = "no_pidfile"
 
-        # Post critical alerts
+        # Post critical alerts with dedup (300s window per service)  # signed: beta
+        SERVICE_DEDUP_WINDOW = 300
+        now_t = time.time()
         for issue in issues:
+            dedup_key = f"service:{issue}"
+            last_posted = self._last_alert_times.get(dedup_key, 0)
+            if now_t - last_posted < SERVICE_DEDUP_WINDOW:
+                log(f"Service alert suppressed (dedup {SERVICE_DEDUP_WINDOW}s): {issue}", level="WARNING")
+                continue
             alert = f"CRITICAL SERVICE: {issue}"
             _post_bus("orchestrator", "service_alert", alert)
             log(alert, level="CRITICAL")
             self.alerts.append({"msg": alert, "ts": datetime.now().isoformat(), "severity": "critical"})
+            self._last_alert_times[dedup_key] = now_t
+        # signed: beta
 
         return issues
 

@@ -102,20 +102,27 @@ def _ts():
 
 
 def _bus_post(msg: str, msg_type: str = "lifecycle"):
-    """Post a lifecycle event to the Skynet bus."""
+    """Post a lifecycle event to the Skynet bus via SpamGuard."""
+    bus_msg = {
+        "sender": "daemon_ctrl",
+        "topic": "orchestrator",
+        "type": msg_type,
+        "content": msg,
+    }
     try:
-        data = json.dumps({
-            "sender": "daemon_ctrl",
-            "topic": "orchestrator",
-            "type": msg_type,
-            "content": msg
-        }).encode()
-        req = urllib.request.Request(
-            f"{SKYNET_URL}/bus/publish", data=data,
-            headers={"Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=3)
-    except Exception:
-        pass
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish(bus_msg)
+    except ImportError:
+        # Fallback: raw urllib when SpamGuard unavailable
+        try:
+            data = json.dumps(bus_msg).encode()
+            req = urllib.request.Request(
+                f"{SKYNET_URL}/bus/publish", data=data,
+                headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            pass
+    # signed: beta
 
 
 def _is_alive(pid: int) -> bool:

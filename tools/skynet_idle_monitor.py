@@ -84,19 +84,23 @@ def log(msg):
 
 
 def bus_post(sender, topic, msg_type, content):
+    msg = {"sender": sender, "topic": topic,
+           "type": msg_type, "content": content}
     try:
-        from urllib.request import Request, urlopen
-        req = Request(
-            "http://localhost:8420/bus/publish",
-            data=json.dumps({
-                "sender": sender, "topic": topic,
-                "type": msg_type, "content": content
-            }).encode(),
-            headers={"Content-Type": "application/json"}
-        )
-        urlopen(req, timeout=5)
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish(msg)
     except Exception:
-        pass
+        # Raw fallback for when SpamGuard is unavailable
+        try:
+            from urllib.request import Request, urlopen
+            req = Request(
+                "http://localhost:8420/bus/publish",
+                data=json.dumps(msg).encode(),
+                headers={"Content-Type": "application/json"})
+            urlopen(req, timeout=5)
+        except Exception:
+            pass
+    # signed: alpha
 
 
 def get_workers():

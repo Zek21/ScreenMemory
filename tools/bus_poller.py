@@ -40,26 +40,33 @@ def bus_messages(limit=20, sender=None, topic=None):
 
 
 def bus_publish(sender, topic, msg_type, content, metadata=None):
-    """Publish a message to the bus."""
-    payload = json.dumps({
+    """Publish a message to the bus via SpamGuard."""
+    msg = {
         "sender": sender,
         "topic": topic,
         "type": msg_type,
         "content": content,
         "metadata": metadata or {},
-    }).encode()
-    req = urllib.request.Request(
-        f"{SKYNET_URL}/bus/publish",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    }
     try:
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return json.loads(r.read())
-    except urllib.error.URLError as e:
-        print(f"[BUS] Publish failed: {e}", file=sys.stderr)
-        return None
+        from tools.skynet_spam_guard import guarded_publish
+        return guarded_publish(msg)
+    except ImportError:
+        # Fallback: raw urllib when SpamGuard unavailable
+        payload = json.dumps(msg).encode()
+        req = urllib.request.Request(
+            f"{SKYNET_URL}/bus/publish",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return json.loads(r.read())
+        except urllib.error.URLError as e:
+            print(f"[BUS] Publish failed: {e}", file=sys.stderr)
+            return None
+    # signed: beta
 
 
 def format_message(msg):

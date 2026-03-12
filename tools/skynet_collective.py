@@ -21,12 +21,23 @@ STATUS_URL = "http://localhost:8420/status"
 
 
 def _bus_post(sender, topic, msg_type, content):
-    """Publish a message to the Skynet bus."""
-    from tools.shared.bus import bus_post_fields
+    """Publish a message to the Skynet bus via SpamGuard."""
     if not isinstance(content, str):
         content = json.dumps(content)
-    if not bus_post_fields(sender, topic, msg_type, content):
-        print(f"[collective] bus post failed")
+    try:
+        from tools.skynet_spam_guard import guarded_publish
+        result = guarded_publish({
+            "sender": sender, "topic": topic,
+            "type": msg_type, "content": content,
+        })
+        if not (result and result.get("allowed", False)):
+            print(f"[collective] bus post blocked by SpamGuard")
+    except Exception:
+        # Fallback to raw bus post only if SpamGuard unavailable
+        from tools.shared.bus import bus_post_fields
+        if not bus_post_fields(sender, topic, msg_type, content):
+            print(f"[collective] bus post failed")
+    # signed: gamma
 
 
 def _bus_poll(topic=None, limit=50):

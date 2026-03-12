@@ -62,21 +62,30 @@ def _fetch_json(url, timeout=5):
 
 
 def _post_bus(sender, topic, msg_type, content):
+    """Post to bus via SpamGuard with raw fallback."""
+    bus_msg = {
+        "sender": sender,
+        "topic": topic,
+        "type": msg_type,
+        "content": content,
+    }
     try:
-        payload = json.dumps({
-            "sender": sender,
-            "topic": topic,
-            "type": msg_type,
-            "content": content,
-        }).encode()
-        req = urllib.request.Request(
-            f"{BUS_URL}/bus/publish", payload,
-            {"Content-Type": "application/json"}
-        )
-        urllib.request.urlopen(req, timeout=5)
-        return True
-    except Exception:
-        return False
+        from tools.skynet_spam_guard import guarded_publish
+        result = guarded_publish(bus_msg)
+        return bool(result and result.get("allowed", False))
+    except ImportError:
+        # Fallback: raw urllib when SpamGuard unavailable
+        try:
+            payload = json.dumps(bus_msg).encode()
+            req = urllib.request.Request(
+                f"{BUS_URL}/bus/publish", payload,
+                {"Content-Type": "application/json"}
+            )
+            urllib.request.urlopen(req, timeout=5)
+            return True
+        except Exception:
+            return False
+    # signed: beta
 
 
 def _get_worker_hwnd(worker_name):

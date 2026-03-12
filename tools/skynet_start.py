@@ -1210,7 +1210,7 @@ def phase_4b_identity(workers):
         time.sleep(3)
 
     # Post orchestrator's own identity
-    http_post("/bus/publish", {
+    orch_msg = {
         "sender": "orchestrator",
         "topic": "system",
         "type": "identity_ack",
@@ -1220,7 +1220,13 @@ def phase_4b_identity(workers):
             f"Specializations: decomposition, synthesis, routing, delegation, monitoring. "
             f"Ready to command."
         ),
-    })
+    }
+    try:
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish(orch_msg)
+    except Exception:
+        http_post("/bus/publish", orch_msg)
+    # signed: alpha
     log(f"Identity injection complete: {dispatched}/{len(workers)} workers + orchestrator", "OK")
 
 

@@ -47,6 +47,16 @@ DEFAULT_MAX_PER_MINUTE = 5
 DEFAULT_MAX_PER_HOUR = 30
 DEFAULT_DEDUP_WINDOW = 900  # 15 minutes
 
+# Per-sender rate limit overrides (senders with higher legitimate traffic)
+# Format: sender_name -> (max_per_minute, max_per_hour)
+SENDER_RATE_OVERRIDES = {
+    "monitor": (10, 90),        # health checks every 60s + alerts + model drift
+    "system": (10, 60),         # infrastructure messages during boot bursts
+    "convene-gate": (8, 60),    # gate elevation traffic can burst
+    "convene": (8, 60),         # convene session coordination bursts
+}
+# signed: delta
+
 # Pattern-specific windows (seconds)
 PATTERN_WINDOWS = {
     "convene_gate_proposal": 900,
@@ -82,20 +92,29 @@ class SpamGuard:
         msg_type = str(message.get("type", "")).lower().strip()
         content = str(message.get("content", ""))
 
-        # Normalize: strip timestamps, UUIDs, gate IDs, cycle numbers
+        # Normalize: strip timestamps, UUIDs, gate IDs, cycle numbers,
+        # PIDs, port numbers, and line numbers to catch semantic duplicates
         normalized = content.lower().strip()
         normalized = re.sub(
             r"\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}[.\dzZ]*", "",
             normalized)
         # signed: alpha
+        # Preserve worker suffix so different workers' proposals stay distinct
         normalized = re.sub(
-            r"gate_\d+_\w+", "GATE_ID", normalized)
+            r"gate_\d+_(\w+)", r"GATE_\1", normalized)
+        # signed: alpha
         normalized = re.sub(
             r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
             "UUID", normalized)
         normalized = re.sub(r"cycle[= ]*\d+", "CYCLE_N", normalized)
         normalized = re.sub(r"remaining=\d+h?", "REMAINING_N", normalized)
         normalized = re.sub(r"latency=[\d.]+ms", "LATENCY_N", normalized)
+        # Normalize PID, port, and line numbers to catch near-duplicates
+        normalized = re.sub(r"\bpid[= ]*\d+", "PID_N", normalized)
+        normalized = re.sub(r"\bport[= ]*\d+", "PORT_N", normalized)
+        normalized = re.sub(r"\bline[= ]*\d+", "LINE_N", normalized)
+        normalized = re.sub(r"\bhwnd[= ]*\d+", "HWND_N", normalized)
+        # signed: delta
         normalized = re.sub(r"\s+", " ", normalized).strip()
 
         raw = f"{sender}|{topic}|{msg_type}|{normalized}"
@@ -119,8 +138,17 @@ class SpamGuard:
                         max_per_hour: int = DEFAULT_MAX_PER_HOUR) -> Optional[str]:
         """Check if sender exceeds rate limits.
 
+        Uses per-sender overrides from SENDER_RATE_OVERRIDES if available,
+        otherwise falls back to provided defaults.
+
         Returns None if OK, or a reason string if rate-limited.
         """
+        # Apply sender-specific overrides if defined
+        sender_lower = sender.lower().strip()
+        if sender_lower in SENDER_RATE_OVERRIDES:
+            max_per_minute, max_per_hour = SENDER_RATE_OVERRIDES[sender_lower]
+        # signed: delta
+
         now = time.time()
         counters = self._state.get("sender_timestamps", {})
         timestamps = counters.get(sender, [])
@@ -232,20 +260,21 @@ class SpamGuard:
             return {"allowed": False, "reason": rate_reason,
                     "fingerprint": fp}
 
-        # All checks passed -- publish
-        self._record_fingerprint(fp)
-        self._record_sender_timestamp(sender)
+        # All checks passed -- publish FIRST, then record fingerprint.
+        # Recording fingerprint before bus post is a bug: if POST fails,
+        # the fingerprint is stored and the retry is blocked as duplicate.
+        ok = self._bus_post(message)
+        if ok:
+            self._record_fingerprint(fp)
+            self._record_sender_timestamp(sender)
         self._state.setdefault("stats", {
             "total_blocked": 0, "total_allowed": 0,
             "blocked_by_pattern": {}, "blocked_by_sender": {}
         })["total_allowed"] = \
             self._state["stats"].get("total_allowed", 0) + 1
         self._save_state()
-        # signed: alpha
-
-        ok = self._bus_post(message)
         return {"allowed": True, "published": ok, "fingerprint": fp}
-        # signed: alpha
+        # signed: delta
 
     # ── Internal Helpers ────────────────────────────────────────
 

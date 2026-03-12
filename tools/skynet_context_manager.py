@@ -57,24 +57,31 @@ def load_workers():
 
 
 def bus_post(sender, topic, msg_type, content):
-    """Fire-and-forget bus post."""
+    """Fire-and-forget bus post via SpamGuard."""
+    bus_msg = {
+        "sender": sender,
+        "topic": topic,
+        "type": msg_type,
+        "content": content,
+    }
     try:
-        import urllib.request
-        payload = json.dumps({
-            "sender": sender,
-            "topic": topic,
-            "type": msg_type,
-            "content": content,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            f"http://localhost:{SKYNET_PORT}/bus/publish",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=3)
-    except Exception:
-        pass
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish(bus_msg)
+    except ImportError:
+        # Fallback: raw urllib when SpamGuard unavailable
+        try:
+            import urllib.request
+            payload = json.dumps(bus_msg).encode("utf-8")
+            req = urllib.request.Request(
+                f"http://localhost:{SKYNET_PORT}/bus/publish",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            pass
+    # signed: beta
 
 
 def get_context_depth(hwnd):

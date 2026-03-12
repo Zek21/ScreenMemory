@@ -46,21 +46,24 @@ def _fetch_json(url, timeout=5):
 
 
 def _post_bus(sender, topic, msg_type, content):
+    msg = {"sender": sender, "topic": topic,
+           "type": msg_type, "content": content}
     try:
-        payload = json.dumps({
-            "sender": sender,
-            "topic": topic,
-            "type": msg_type,
-            "content": content,
-        }).encode()
-        req = urllib.request.Request(
-            f"{BUS_URL}/bus/publish", payload,
-            {"Content-Type": "application/json"}
-        )
-        urllib.request.urlopen(req, timeout=5)
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish(msg)
         return True
     except Exception:
-        return False
+        # Raw fallback for when SpamGuard is unavailable
+        try:
+            payload = json.dumps(msg).encode()
+            req = urllib.request.Request(
+                f"{BUS_URL}/bus/publish", payload,
+                {"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=5)
+            return True
+        except Exception:
+            return False
+    # signed: alpha
 
 
 def _load_json(path):

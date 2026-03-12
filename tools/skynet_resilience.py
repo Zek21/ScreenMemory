@@ -183,6 +183,9 @@ def test_malformed(base_url=None):
             print(f"  {C_GREEN}{status:>3}{C_RESET}   {path[:60]} ({ms:.0f}ms)")
 
     # Test malformed POST to bus
+    # NOTE: Raw bus/publish is INTENTIONAL here -- this is a resilience test
+    # that sends deliberately malformed payloads to test server crash resistance.
+    # SpamGuard would block these, defeating the test purpose.  # signed: delta
     print(f"\n{C_GOLD}Malformed bus POSTs:{C_RESET}")
     bad_posts = [
         ({}, "empty body"),
@@ -237,6 +240,9 @@ def test_concurrent(n_threads=10, n_requests=50):
 
 def bus_retry_test():
     """Test bus publish with simulated retries."""
+    # NOTE: Raw bus/publish is INTENTIONAL -- this is a reliability benchmark
+    # sending 20 rapid messages to test bus throughput under load.
+    # SpamGuard would rate-limit at 5/min, defeating the test.  # signed: delta
     print(f"\n{C_GOLD}{C_BOLD}BUS RELIABILITY TEST{C_RESET}")
     successes = 0
     for i in range(20):

@@ -65,22 +65,24 @@ def _slugify(text: str, max_len: int = 40) -> str:
 
 
 def _post_bus(sender, topic, msg_type, content):
-    """Post a message to the Skynet bus."""
+    """Post a message to the Skynet bus via SpamGuard."""
+    msg = {"sender": sender, "topic": topic, "type": msg_type, "content": content}
     try:
-        payload = json.dumps({
-            "sender": sender,
-            "topic": topic,
-            "type": msg_type,
-            "content": content,
-        }).encode()
-        req = urllib.request.Request(
-            f"{BUS_URL}/bus/publish", payload,
-            {"Content-Type": "application/json"}
-        )
-        urllib.request.urlopen(req, timeout=5)
-        return True
-    except Exception:
-        return False
+        from tools.skynet_spam_guard import guarded_publish
+        result = guarded_publish(msg)
+        return bool(result and result.get("allowed", False))
+    except ImportError:
+        try:
+            payload = json.dumps(msg).encode()
+            req = urllib.request.Request(
+                f"{BUS_URL}/bus/publish", payload,
+                {"Content-Type": "application/json"}
+            )
+            urllib.request.urlopen(req, timeout=5)
+            return True
+        except Exception:
+            return False
+    # signed: gamma
 
 
 def _store_learnings(worker: str, learnings: list, topic: str):

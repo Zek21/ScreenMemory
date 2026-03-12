@@ -726,12 +726,18 @@ class SkynetSelf:
     def broadcast_awareness(self):
         """Post self-awareness to bus so all agents know the system state."""
         pulse = self.quick_pulse()
-        _http_post("/bus/publish", {
+        msg = {
             "sender": "skynet_self",
             "topic": "awareness",
             "type": "pulse",
             "content": json.dumps(pulse),
-        })
+        }
+        try:
+            from tools.skynet_spam_guard import guarded_publish
+            guarded_publish(msg)
+        except ImportError:
+            _http_post("/bus/publish", msg)
+        # signed: gamma
         return pulse
 
 
