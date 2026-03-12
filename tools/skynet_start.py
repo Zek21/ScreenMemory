@@ -1054,7 +1054,9 @@ def _open_single_worker(worker_idx, orch_hwnd, fresh, boot_memories, existing_ch
         time.sleep(1.5)
         guard_model(new_hwnd, orch_hwnd)
 
-    _prompt_and_wait(new_hwnd, worker_name, orch_hwnd, boot_memories)
+    prompt_ok = _prompt_and_wait(new_hwnd, worker_name, orch_hwnd, boot_memories)
+    if not prompt_ok:
+        log(f"Worker {worker_name} prompt failed — registered but may need re-prompt", "WARN")  # signed: orchestrator
 
     worker_info = {
         "name": worker_name, "hwnd": new_hwnd, "grid": slot["grid"],
@@ -1064,7 +1066,7 @@ def _open_single_worker(worker_idx, orch_hwnd, fresh, boot_memories, existing_ch
         "goal": f"Worker {worker_name} initialized -- CLI chat HWND={new_hwnd} connected",
         "priority": 1,
     })
-    return worker_info, True
+    return worker_info, prompt_ok
 
 
 def phase_3_workers(num_workers=4, orch_hwnd=None, fresh=False, boot_memories=None):
