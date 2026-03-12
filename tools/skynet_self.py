@@ -49,6 +49,10 @@ CONSULTANT_BRIDGE_PORTS = {
     "gemini_consultant": 8425,
 }  # signed: delta
 
+# Dedup tracker for _detect_incident_patterns bus posts — prevents flooding
+# with INCIDENT_PATTERN_WARNING when patterns haven't changed.  # signed: gamma
+_last_incident_pattern_hash: Optional[str] = None
+
 
 def _ts():
     return datetime.now().strftime("%H:%M:%S")
@@ -894,25 +898,31 @@ class SkynetIntrospection:
                                   "defaults are immutable",
             })
 
-        # Post warnings to bus for critical patterns
+        # Post warnings to bus for critical patterns — only when patterns change
+        # to avoid flooding with duplicate INCIDENT_PATTERN_WARNING messages.  # signed: gamma
+        global _last_incident_pattern_hash
         critical_patterns = [p for p in patterns if p["severity"] in ("CRITICAL", "HIGH")]
         if critical_patterns:
-            try:
-                from tools.skynet_spam_guard import guarded_publish
-                summary = "; ".join(
-                    f"{p['pattern']}({p['count']})" for p in critical_patterns
-                )
-                guarded_publish({
-                    "sender": "introspection",
-                    "topic": "orchestrator",
-                    "type": "alert",
-                    "content": f"INCIDENT_PATTERN_WARNING: {summary}",
-                })
-            except Exception:
-                pass
+            import hashlib
+            summary = "; ".join(
+                f"{p['pattern']}({p['count']})" for p in critical_patterns
+            )
+            pattern_hash = hashlib.sha256(summary.encode()).hexdigest()[:16]
+            if pattern_hash != _last_incident_pattern_hash:
+                _last_incident_pattern_hash = pattern_hash
+                try:
+                    from tools.skynet_spam_guard import guarded_publish
+                    guarded_publish({
+                        "sender": "introspection",
+                        "topic": "orchestrator",
+                        "type": "alert",
+                        "content": f"INCIDENT_PATTERN_WARNING: {summary}",
+                    })
+                except Exception:
+                    pass
 
         return patterns
-    # signed: delta
+    # signed: gamma
 
 class SkynetGoals:
     """Autonomous goal generation based on introspection."""

@@ -20,6 +20,7 @@ import argparse
 import collections
 import ctypes
 import ctypes.wintypes
+import hashlib
 import json
 import os
 import subprocess
@@ -204,6 +205,23 @@ def _is_dispatch_active() -> bool:
     return False
 
 
+def _try_refresh_hwnd(name: str, current_hwnd: int) -> int | None:
+    """Re-read workers.json to check if a worker's HWND was updated.
+    Returns the new HWND if changed, None if unchanged or error."""
+    try:
+        data = json.loads(WORKERS_FILE.read_text(encoding="utf-8"))
+        for w in data.get("workers", []):
+            if w.get("name") == name:
+                new_hwnd = w.get("hwnd", 0)
+                if new_hwnd != current_hwnd:
+                    return new_hwnd
+                return None
+    except Exception:
+        pass
+    return None
+    # signed: delta
+
+
 def get_model_via_uia(hwnd: int) -> str:
     """Read the Pick Model button text via COM-based UIA engine. Returns model name or ''."""
     from tools.uia_engine import get_engine
@@ -309,8 +327,21 @@ def _check_worker_dead(name: str, hwnd: int, alive: bool, visible: bool, h: dict
     if consecutive < DEAD_DEBOUNCE_THRESHOLD:
         log(f"{name.upper()}: visibility check failed ({consecutive}/{DEAD_DEBOUNCE_THRESHOLD}) -- debouncing", "WARN")
         h.update({"model": "CHECKING", "status": f"DEBOUNCE_{consecutive}"})
+        # Send heartbeat during debounce so backend doesn't prematurely mark worker dead  # signed: delta
+        skynet_post(f"/worker/{name}/heartbeat", {"hwnd_alive": True, "visible": False, "model": "DEBOUNCING"})
         health[name] = h
         return True
+
+    # Before confirming DEAD, force re-read workers.json to check for HWND refresh  # signed: delta
+    _refreshed_hwnd = _try_refresh_hwnd(name, hwnd)
+    if _refreshed_hwnd is not None and _refreshed_hwnd != hwnd and _refreshed_hwnd != 0:
+        new_alive, new_visible = check_window(_refreshed_hwnd)
+        if new_alive and new_visible:
+            log(f"{name.upper()}: HWND refreshed {hwnd}->{_refreshed_hwnd}, window alive -- clearing DEAD counter", "OK")
+            _dead_consecutive[name] = 0
+            h.update({"hwnd": _refreshed_hwnd, "alive": True, "visible": True, "model": "CHECKING", "status": "HWND_REFRESHED"})
+            health[name] = h
+            return True
 
     h.update({"model": "UNKNOWN", "status": "DEAD"})
     log(f"{name.upper()}: DEAD (hwnd={hwnd} alive={alive} visible={visible}, consecutive={consecutive})", "CRIT")
@@ -367,8 +398,7 @@ def _check_worker_model(name: str, hwnd: int, h: dict, check_model: bool) -> boo
 
 
 def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_orch: bool = False) -> dict:
-    health = {}
-    any_bad = False
+    health = {}  # signed: delta — removed dead code 'any_bad' variable
 
     if check_orch and orch_hwnd:
         _check_orchestrator_drift(orch_hwnd, health)
@@ -382,10 +412,14 @@ def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_or
             h.update({"alive": False, "visible": False, "model": "N/A", "status": "NO_HWND"})
             log(f"{name.upper()}: no HWND -- needs new-chat", "CRIT")
             skynet_post(f"/worker/{name}/heartbeat", {"hwnd_alive": False, "visible": False, "model": ""})
-            _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
-                "content": f"WORKER {name.upper()} has no HWND -- needs new-chat spawn"})
+            # Dedup NO_HWND alerts using same window as DEAD alerts  # signed: delta
+            now_ts = time.time()
+            last_ts = _last_alert.get(name, 0)
+            if (now_ts - last_ts) >= ALERT_DEDUP_WINDOW:
+                _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
+                    "content": f"WORKER {name.upper()} has no HWND -- needs new-chat spawn"})
+                _last_alert[name] = now_ts
             health[name] = h
-            any_bad = True
             continue
 
         alive, visible = check_window(hwnd)
@@ -394,7 +428,6 @@ def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_or
 
         if not alive or not visible:
             if _check_worker_dead(name, hwnd, alive, visible, h, health):
-                any_bad = True
                 continue
 
         _dead_consecutive[name] = 0
@@ -411,8 +444,6 @@ def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_or
 
         if model_ok:
             log(f"{name.upper()}: OK (hwnd={hwnd} model={'checked' if check_model else 'skip'})", "OK")
-        else:
-            any_bad = True
 
         skynet_post(f"/worker/{name}/heartbeat", {
             "hwnd_alive": True, "visible": True,
@@ -558,8 +589,10 @@ _workers_mtime: float = 0.0  # last known mtime of workers.json
 # ─── Productivity tracking state ────────────────────────────────────────────
 _worker_productivity: dict = {}  # name -> {tasks_completed, first_seen, last_result_time}
 _idle_since: dict = {}           # name -> epoch when IDLE streak started
+_idle_unproductive_last: dict = {}  # name -> {signature, timestamp}
 _health_trend: collections.deque = collections.deque(maxlen=200)  # bounded trend snapshots
 _IDLE_UNPRODUCTIVE_THRESHOLD = 300  # 5 minutes idle with pending work = unproductive
+IDLE_UNPRODUCTIVE_DEDUP_WINDOW = 3600  # suppress unchanged idle-backlog blame alerts for 1 hour
 _MAX_HEALTH_TREND = 200            # kept for reference; deque maxlen enforces this
 
 
@@ -574,7 +607,7 @@ def _cleanup_stale_workers():
     except Exception:
         return
 
-    for tracking_dict in (_worker_productivity, _idle_since, _dead_consecutive, _last_alert):
+    for tracking_dict in (_worker_productivity, _idle_since, _idle_unproductive_last, _dead_consecutive, _last_alert):
         stale_keys = [k for k in tracking_dict if k not in current_names]
         for k in stale_keys:
             del tracking_dict[k]
@@ -616,6 +649,33 @@ def _get_pending_work_count() -> int:
     return count
 
 
+def _get_pending_work_signature() -> str:
+    """Build a stable fingerprint of pending work identities, not just the raw count."""
+    items = []
+    try:
+        if TODOS_FILE.exists():
+            data = json.loads(TODOS_FILE.read_text(encoding="utf-8"))
+            todos = data.get("todos", [])
+            for todo in todos:
+                if todo.get("status") in ("pending", "active"):
+                    ident = todo.get("id") or todo.get("task") or todo.get("title") or "todo"
+                    items.append(f"todo:{str(ident)[:160]}")
+    except Exception:
+        pass
+    try:
+        if TASK_QUEUE_FILE.exists():
+            data = json.loads(TASK_QUEUE_FILE.read_text(encoding="utf-8"))
+            tasks = data.get("tasks", [])
+            for task in tasks:
+                if task.get("status") not in ("done", "failed", "cancelled"):
+                    ident = task.get("id") or task.get("task") or task.get("title") or task.get("summary") or "task"
+                    items.append(f"queue:{str(ident)[:160]}")
+    except Exception:
+        pass
+    encoded = json.dumps(sorted(items), ensure_ascii=True).encode("utf-8")
+    return hashlib.md5(encoded).hexdigest()[:12]
+
+
 def _init_productivity_entry(name: str, now: float):
     """Initialize productivity tracking for a worker if not already tracked."""
     if name not in _worker_productivity:
@@ -625,7 +685,15 @@ def _init_productivity_entry(name: str, now: float):
         }
 
 
-def _check_idle_unproductive(name: str, hwnd: int, alive: bool, pending_work: int, now: float):
+def _check_idle_unproductive(
+    name: str,
+    hwnd: int,
+    alive: bool,
+    pending_work: int,
+    pending_signature: str,
+    peers_busy: bool,
+    now: float,
+):
     """Track idle streaks and alert if worker is idle with pending work."""
     state = "UNKNOWN"
     if alive and hwnd:
@@ -640,14 +708,43 @@ def _check_idle_unproductive(name: str, hwnd: int, alive: bool, pending_work: in
         else:
             idle_duration = now - _idle_since[name]
             if idle_duration > _IDLE_UNPRODUCTIVE_THRESHOLD and pending_work > 0:
+                if not peers_busy:
+                    log(
+                        f"{name.upper()}: IDLE with {pending_work} pending work items but no busy peers -- "
+                        "suppressing worker blame alert",
+                        "INFO",
+                    )
+                    _idle_since[name] = now
+                    return
+                issue_signature = f"{pending_work}:{pending_signature}"
+                previous = _idle_unproductive_last.get(name, {})
+                last_signature = previous.get("signature")
+                last_time = float(previous.get("timestamp", 0.0) or 0.0)
+                if (
+                    last_signature == issue_signature
+                    and (now - last_time) < IDLE_UNPRODUCTIVE_DEDUP_WINDOW
+                ):
+                    remaining = int(IDLE_UNPRODUCTIVE_DEDUP_WINDOW - (now - last_time))
+                    log(
+                        f"{name.upper()}: unchanged IDLE_UNPRODUCTIVE suppressed "
+                        f"({remaining}s dedup remaining)",
+                        "INFO",
+                    )
+                    _idle_since[name] = now
+                    return
                 log(f"{name.upper()}: IDLE for {int(idle_duration)}s with {pending_work} pending work items -- UNPRODUCTIVE", "WARN")
                 _guarded_bus_publish({
                     "sender": "monitor", "topic": "orchestrator", "type": "alert",
                     "content": f"IDLE_UNPRODUCTIVE: {name.upper()} idle {int(idle_duration)}s with {pending_work} pending tasks. Dispatch work!"
                 })
+                _idle_unproductive_last[name] = {
+                    "signature": issue_signature,
+                    "timestamp": now,
+                }
                 _idle_since[name] = now  # reset to avoid spamming
     else:
         _idle_since.pop(name, None)
+        _idle_unproductive_last.pop(name, None)
 
 
 def _update_result_counts(now: float):
@@ -687,6 +784,11 @@ def _track_productivity(workers: list, health: dict):
     global _worker_productivity, _idle_since
     now = time.time()
     pending_work = _get_pending_work_count()
+    pending_signature = _get_pending_work_signature()
+    busy_workers = {
+        name for name, snapshot in health.items()
+        if isinstance(snapshot, dict) and snapshot.get("status") in ("PROCESSING", "STEERING", "TYPING")
+    }
 
     for w in workers:
         name = w["name"]
@@ -699,7 +801,15 @@ def _track_productivity(workers: list, health: dict):
             prod["results_this_hour"] = 0
             prod["hour_start"] = now
 
-        _check_idle_unproductive(name, w.get("hwnd", 0), h.get("alive", False), pending_work, now)
+        _check_idle_unproductive(
+            name,
+            w.get("hwnd", 0),
+            h.get("alive", False),
+            pending_work,
+            pending_signature,
+            bool(busy_workers - {name}),
+            now,
+        )
 
     _update_result_counts(now)
 
@@ -965,6 +1075,17 @@ def _run_monitor_cycle(workers, orch_hwnd, args, cycle, now, last_model_check, l
 
     new_workers, new_orch, changed = _reload_workers_if_changed()
     if changed and new_workers is not None:
+        # Reset dead counters for workers whose HWND changed (new window = fresh start)  # signed: delta
+        old_hwnds = {w["name"]: w["hwnd"] for w in workers}
+        for nw in new_workers:
+            wname = nw["name"]
+            old_hwnd = old_hwnds.get(wname, 0)
+            if old_hwnd != 0 and nw["hwnd"] != old_hwnd:
+                if wname in _dead_consecutive:
+                    log(f"{wname.upper()}: HWND changed {old_hwnd}->{nw['hwnd']} -- resetting dead counter", "INFO")
+                    _dead_consecutive[wname] = 0
+                if wname in _last_alert:
+                    del _last_alert[wname]  # allow fresh alerts for the new window
         workers[:] = new_workers
         orch_hwnd = new_orch
         log(f"Workers reloaded: {len(workers)} workers, orch_hwnd={orch_hwnd}", "OK")

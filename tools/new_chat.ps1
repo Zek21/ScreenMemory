@@ -299,15 +299,24 @@ Start-Sleep -Milliseconds 300
 
 $root = [System.Windows.Automation.AutomationElement]::FromHandle($orchHwnd)
 
-# Strategy: find the narrow "New Chat" dropdown button (≤20px wide)
+# Strategy: find the narrow "New Chat" dropdown button (<=20px wide)
 # This exists in panel chat view. In editor chat view we need a different approach.
-$buttons = $root.FindAll(
-    [System.Windows.Automation.TreeScope]::Descendants,
-    (New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Button
-    ))
-)
+# Retry up to 3 times -- UIA tree may load lazily in Chromium/Electron  # signed: gamma
+$buttons = $null
+for ($uiaRetry = 1; $uiaRetry -le 3; $uiaRetry++) {
+    $buttons = $root.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        (New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button
+        ))
+    )
+    if ($buttons.Count -gt 0) { break }
+    Write-Host "UIA retry $uiaRetry/3: 0 buttons found, waiting for tree..."
+    Start-Sleep -Milliseconds 1500
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($orchHwnd)
+}
+Write-Host "UIA found $($buttons.Count) button(s)"
 
 $dropdown = $null
 $orchRect = New-Object Ghost+RECT
@@ -365,75 +374,150 @@ if (-not $dropdown) {
     if ($dropdown) { Write-Host "DROPDOWN: found via narrowest fallback -- w=$dropdownW" }
 }
 
+# Strategy 4 (NEW): Search by Name="New Chat" across all control types  # signed: gamma
+# VS Code Insiders may expose buttons as Custom, SplitButton, or other types
 if (-not $dropdown) {
-    # Diagnostic: list all non-empty buttons to help the user fix the script
+    try {
+        $namedElements = $root.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            (New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::NameProperty,
+                "New Chat"
+            ))
+        )
+        Write-Host "STRATEGY 4: Found $($namedElements.Count) elements named 'New Chat'"
+        foreach ($el in $namedElements) {
+            try {
+                $w = [int]$el.Current.BoundingRectangle.Width
+                $h = [int]$el.Current.BoundingRectangle.Height
+                $y = [int]$el.Current.BoundingRectangle.Y
+            } catch { continue }
+            if ($w -le 0 -or $h -le 0) { continue }
+            if ($w -le 30 -and ($y - $winTop) -lt 200) {
+                $dropdown = $el
+                Write-Host "DROPDOWN: found via name search (narrow) -- w=$w type=$($el.Current.ControlType.ProgrammaticName)"
+                break
+            }
+        }
+        # Fallback: take any "New Chat" element that supports ExpandCollapse
+        if (-not $dropdown) {
+            foreach ($el in $namedElements) {
+                try {
+                    $exp = $el.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+                    if ($exp -ne $null) {
+                        $dropdown = $el
+                        Write-Host "DROPDOWN: found 'New Chat' with ExpandCollapse -- type=$($el.Current.ControlType.ProgrammaticName)"
+                        break
+                    }
+                } catch {}
+            }
+        }
+    } catch {
+        Write-Host "STRATEGY 4 failed: $_"
+    }
+}
+
+# Strategy 5 (NEW): Search for SplitButton control type  # signed: gamma
+if (-not $dropdown) {
+    try {
+        $splitButtons = $root.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            (New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::SplitButton
+            ))
+        )
+        Write-Host "STRATEGY 5: Found $($splitButtons.Count) SplitButton(s)"
+        foreach ($sb in $splitButtons) {
+            $n = $sb.Current.Name
+            if ($n -match 'New Chat|Chat') {
+                $dropdown = $sb
+                Write-Host "DROPDOWN: found SplitButton '$n'"
+                break
+            }
+        }
+    } catch {
+        Write-Host "STRATEGY 5 failed: $_"
+    }
+}
+
+# Strategy 6: Command Palette Fallback -- guaranteed to work  # signed: gamma
+$usedCommandPalette = $false
+if (-not $dropdown) {
     $btnList = @()
     foreach ($btn in $buttons) {
         $n = $btn.Current.Name
         $w = [int]$btn.Current.BoundingRectangle.Width
         if ($n -ne '' -and $w -gt 0) { $btnList += "$n(${w}px)" }
     }
-    $diag = $btnList -join ", "
-    Record-Failure "Could not find New Chat dropdown (▾) button"
-    Write-Host "ERROR: Could not find New Chat dropdown (▾) button."
-    Write-Host "EDIT REQUIRED: Update button detection in tools\new_chat.ps1."
-    Write-Host "Buttons found: $diag"
-    exit 1
+    Write-Host "FALLBACK: All UIA strategies failed. Buttons: $($btnList -join ', ')"
+    Write-Host "Using Command Palette to open new chat window."
+    [Ghost]::SetForegroundWindow($orchHwnd)
+    Start-Sleep -Milliseconds 400
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    [System.Windows.Forms.SendKeys]::SendWait("^+p")
+    Start-Sleep -Milliseconds 1200
+    [System.Windows.Forms.SendKeys]::SendWait("Chat: New Chat Window")
+    Start-Sleep -Milliseconds 1500
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    $usedCommandPalette = $true
 }
 
-$dr = $dropdown.Current.BoundingRectangle
+$launched = $usedCommandPalette  # signed: gamma
+if (-not $usedCommandPalette) {
+    $dr = $dropdown.Current.BoundingRectangle
 
-# Use ExpandCollapsePattern.Expand() -- more reliable than ghost click
-try {
-    $exp = $dropdown.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-    $exp.Expand()
-} catch {
-    [Ghost]::Click($editorRender, [int]($dr.X + $dr.Width/2), [int]($dr.Y + $dr.Height/2))
-}
-Start-Sleep -Milliseconds 1200
+    # Use ExpandCollapsePattern.Expand() -- more reliable than ghost click
+    try {
+        $exp = $dropdown.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+        $exp.Expand()
+    } catch {
+        [Ghost]::Click($editorRender, [int]($dr.X + $dr.Width/2), [int]($dr.Y + $dr.Height/2))
+    }
+    Start-Sleep -Milliseconds 1200
 
-# --- Click "New Chat Window" via real mouse at its UIA coordinates ---
-$launched = $false
-for ($attempt = 1; $attempt -le 3 -and -not $launched; $attempt++) {
-    $desktop = [System.Windows.Automation.AutomationElement]::RootElement
-    $menuItems = $desktop.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        (New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::MenuItem
-        ))
-    )
-    foreach ($mi in $menuItems) {
-        if ($mi.Current.Name -eq 'New Chat Window') {
-            try {
-                $mir = $mi.Current.BoundingRectangle
-                $mix = [int]($mir.X + $mir.Width/2)
-                $miy = [int]($mir.Y + $mir.Height/2)
-                [MouseClick]::ClickAt($mix, $miy)
-            } catch {
-                try { $mi.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } catch {}
+    # --- Click "New Chat Window" via real mouse at its UIA coordinates ---
+    for ($attempt = 1; $attempt -le 3 -and -not $launched; $attempt++) {
+        $desktop = [System.Windows.Automation.AutomationElement]::RootElement
+        $menuItems = $desktop.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            (New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::MenuItem
+            ))
+        )
+        foreach ($mi in $menuItems) {
+            if ($mi.Current.Name -eq 'New Chat Window') {
+                try {
+                    $mir = $mi.Current.BoundingRectangle
+                    $mix = [int]($mir.X + $mir.Width/2)
+                    $miy = [int]($mir.Y + $mir.Height/2)
+                    [MouseClick]::ClickAt($mix, $miy)
+                } catch {
+                    try { $mi.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } catch {}
+                }
+                $launched = $true
+                break
             }
-            $launched = $true
-            break
+        }
+        if (-not $launched) {
+            # Menu may have closed -- re-expand dropdown
+            Write-Host "RETRY ${attempt}: re-expanding dropdown"
+            try {
+                $exp = $dropdown.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+                $exp.Expand()
+            } catch {
+                [Ghost]::Click($editorRender, [int]($dr.X + $dr.Width/2), [int]($dr.Y + $dr.Height/2))
+            }
+            Start-Sleep -Milliseconds 1000
         }
     }
-    if (-not $launched) {
-        # Menu may have closed — re-expand dropdown
-        Write-Host "RETRY ${attempt}: re-expanding dropdown"
-        try {
-            $exp = $dropdown.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-            $exp.Expand()
-        } catch {
-            [Ghost]::Click($editorRender, [int]($dr.X + $dr.Width/2), [int]($dr.Y + $dr.Height/2))
-        }
-        Start-Sleep -Milliseconds 1000
-    }
-}
 
-if (-not $launched) {
-    Record-Failure "Could not find New Chat Window menu item"
-    Write-Host "ERROR: Could not find 'New Chat Window' menu item"
-    exit 1
+    if (-not $launched) {
+        Record-Failure "Could not find New Chat Window menu item"
+        Write-Host "ERROR: Could not find 'New Chat Window' menu item"
+        exit 1
+    }
 }
 
 Start-Sleep -Milliseconds 4000

@@ -52,17 +52,17 @@ DAEMON_VERSION = "1.2.0"
 
 # Defaults (overridden by brain_config.json -> self_prompt section)
 LOOP_INTERVAL = 300
-MIN_PROMPT_GAP = 45
+MIN_PROMPT_GAP = 900
 PROMPT_THRESHOLD = 50
 IDLE_WORKER_THRESHOLD = 90    # raised: 30s was too aggressive, workers need time
 ORCH_INACTIVE_THRESHOLD = 45
 MAX_LOG_ENTRIES = 50
 HEALTH_REPORT_INTERVAL = 300  # report health to bus every 5 min
-MAX_CONSECUTIVE_PROMPTS = 2   # stop after N prompts without orchestrator action
-REPEATED_STATE_SUPPRESSION_S = 600  # suppress repeated no-change prompts for 10 minutes  # signed: consultant
+MAX_CONSECUTIVE_PROMPTS = 3   # stop after N prompts without orchestrator action
+REPEATED_STATE_SUPPRESSION_S = 900  # suppress repeated no-change prompts for 15 minutes  # signed: consultant
 
-ALL_IDLE_INTERVAL = 60  # faster prompting when all workers idle
-BOOT_PROMPT_ENABLED = True
+ALL_IDLE_INTERVAL = 900
+BOOT_PROMPT_ENABLED = False
 
 # Self-prompt generation is template-only. Ollama is removed from the live pipeline.  # signed: consultant
 REQUIRED_WORKERS = ("alpha", "beta", "gamma", "delta")
@@ -71,6 +71,7 @@ def _load_config_overrides():
     """Load self_prompt thresholds from brain_config.json. Called on startup AND each cycle (hot-reload)."""
     global LOOP_INTERVAL, MIN_PROMPT_GAP, IDLE_WORKER_THRESHOLD
     global ORCH_INACTIVE_THRESHOLD, HEALTH_REPORT_INTERVAL, PROMPT_THRESHOLD, MAX_CONSECUTIVE_PROMPTS
+    global REPEATED_STATE_SUPPRESSION_S
     global ALL_IDLE_INTERVAL, BOOT_PROMPT_ENABLED
     try:
         cfg = json.loads(BRAIN_CONFIG_FILE.read_text(encoding="utf-8"))
@@ -92,6 +93,8 @@ def _load_config_overrides():
             MAX_CONSECUTIVE_PROMPTS = sp["max_consecutive"]
         if sp.get("all_idle_interval"):
             ALL_IDLE_INTERVAL = sp["all_idle_interval"]
+        if sp.get("repeated_state_suppression_s"):
+            REPEATED_STATE_SUPPRESSION_S = sp["repeated_state_suppression_s"]
         if "boot_prompt_enabled" in god:
             BOOT_PROMPT_ENABLED = bool(god["boot_prompt_enabled"])
     except Exception:
@@ -524,6 +527,7 @@ class SelfPromptDaemon:
         self.last_prompt_hash_time = 0.0
         self.last_prompt_state_hash = ""
         self.last_prompt_state_hash_time = 0.0
+        self.failure_spike_last_fired = 0.0  # suppress repeated failure spike alerts  # signed: orchestrator
         self.pending_prompt_state_hash = ""
         self.prompts_sent = 0
         self.prompts_failed = 0
@@ -873,6 +877,10 @@ class SelfPromptDaemon:
                 content = str(m.get("content", ""))
                 if sender == "self_prompt" and content.startswith("SELF_PROMPT_"):
                     continue
+                if self._is_non_actionable_alert_message(m):
+                    if mid:
+                        self.seen_alert_ids.add(mid)
+                    continue
                 if mid and mid not in self.seen_alert_ids:
                     self.seen_alert_ids.add(mid)
                     perception["bus_alerts"].append(m)
@@ -1086,23 +1094,31 @@ class SelfPromptDaemon:
             score += 10
 
         if patterns["failure_rate_10m"] >= 3:
-            self.cot.think(
-                f"{patterns['failure_rate_10m']} failures in last 10 minutes",
-                "Elevated failure rate suggests systemic issue (model drift? broken deps?).",
-                f"CRITICAL: Failure rate spike -- {patterns['failure_rate_10m']} in 10min"
-            )
-            score += 50
+            # Suppress repeated failure spike alerts — fire once, then suppress for
+            # REPEATED_STATE_SUPPRESSION_S to prevent orchestrator spam loop.  # signed: orchestrator
+            if (time.time() - self.failure_spike_last_fired) >= REPEATED_STATE_SUPPRESSION_S:
+                self.cot.think(
+                    f"{patterns['failure_rate_10m']} failures in last 10 minutes",
+                    "Elevated failure rate suggests systemic issue (model drift? broken deps?).",
+                    f"CRITICAL: Failure rate spike -- {patterns['failure_rate_10m']} in 10min"
+                )
+                self.failure_spike_last_fired = time.time()
+                score += 50
         return score
 
     def _reason_alerts(self, perception):
         """Thought 4: Alert processing."""
-        if not perception["bus_alerts"]:
+        actionable_alerts = [
+            alert for alert in perception["bus_alerts"]
+            if not self._is_non_actionable_alert_message(alert)
+        ]
+        if not actionable_alerts:
             return 0
-        alert_content = str(perception["bus_alerts"][0].get("content", ""))[:60]
+        alert_content = str(actionable_alerts[0].get("content", ""))[:60]
         self.cot.think(
-            f"{len(perception['bus_alerts'])} active alert(s): {alert_content}",
+            f"{len(actionable_alerts)} active alert(s): {alert_content}",
             "Alerts require orchestrator attention. Triage and respond.",
-            f"{len(perception['bus_alerts'])} alert(s) need attention"
+            f"{len(actionable_alerts)} alert(s) need attention"
         )
         return 40
 
@@ -1274,6 +1290,11 @@ class SelfPromptDaemon:
         normalized = re.sub(r"\d+", "#", normalized)
         return normalized[:160]
 
+    def _is_non_actionable_alert_message(self, message):
+        """Ignore monitor noise that should not wake the orchestrator by itself."""
+        normalized = self._normalize_signal_text(message.get("content", ""))
+        return normalized.startswith("idle_unproductive:")
+
     def _message_identity(self, message, include_message_id=False):
         if include_message_id and message.get("id"):
             return f"id:{message['id']}"
@@ -1293,6 +1314,10 @@ class SelfPromptDaemon:
         orch_todos,
         daemon_status,
     ):
+        actionable_alerts = [
+            message for message in new_alerts
+            if not self._is_non_actionable_alert_message(message)
+        ]
         workers = {
             name: {
                 "state": info.get("state", "UNKNOWN"),
@@ -1306,7 +1331,7 @@ class SelfPromptDaemon:
                 self._message_identity(m, include_message_id=True)
                 for m in new_results
             ),
-            "alerts": sorted({self._message_identity(m) for m in new_alerts}),
+            "alerts": sorted({self._message_identity(m) for m in actionable_alerts}),
             "pending_todos": int(pending_todos),
             "pending_tasks": int(perception.get("pending_tasks", 0)),
             "orch_todos": [
@@ -1464,7 +1489,8 @@ class SelfPromptDaemon:
 
         if patterns["stall_pattern"]:
             actions.append((90, "Worker stall detected -- investigate worker cycling."))
-        if patterns["failure_rate_10m"] >= 3:
+        if patterns["failure_rate_10m"] >= 3 and (time.time() - self.failure_spike_last_fired) < 5:
+            # Only include failure spike action when it was just fired (not suppressed)  # signed: orchestrator
             actions.append((85, f"Failure spike: {patterns['failure_rate_10m']} failures in last 10min."))
         if patterns["dispatch_drought"] and pending_todos > 0:
             actions.append((30, f"Info: {pending_todos} pending tasks, dispatch paused by orchestrator."))
@@ -1489,13 +1515,22 @@ class SelfPromptDaemon:
         Idle workers with pending tasks is NORMAL, not actionable on its own.
         Only genuine system issues or unprocessed results/alerts trigger prompts.
         """
+        actionable_alerts = [
+            alert for alert in new_alerts
+            if not self._is_non_actionable_alert_message(alert)
+        ]
         critical_conclusions = bool(self.cot.critical_conclusions())
+        # Failure spike is NOT actionable if suppressed (already fired recently)  # signed: orchestrator
+        failure_spike_unsuppressed = (
+            patterns["failure_rate_10m"] >= 3
+            and (time.time() - self.failure_spike_last_fired) < 5
+        )
         return (  # signed: consultant
             len(new_results) > 0
-            or len(new_alerts) > 0
+            or len(actionable_alerts) > 0
             or len(orch_todos) > 0
             or patterns["stall_pattern"]
-            or patterns["failure_rate_10m"] >= 3
+            or failure_spike_unsuppressed
             or any(not i["alive"] for i in perception["workers"].values())
             or critical_conclusions
             or daemon_status != "verified_ok"
@@ -1638,6 +1673,10 @@ class SelfPromptDaemon:
             "sent": self.prompts_sent,
             "failed": self.prompts_failed,
             "last_sent_timestamp": getattr(self, 'last_prompt_time', 0.0),
+            "min_prompt_gap_s": int(MIN_PROMPT_GAP),
+            "all_idle_interval_s": int(ALL_IDLE_INTERVAL),
+            "repeated_state_suppression_s": int(REPEATED_STATE_SUPPRESSION_S),
+            "boot_prompt_enabled": bool(BOOT_PROMPT_ENABLED),
             "orchestrator_hwnd": orch_hwnd,
             "pid": os.getpid(),
             "uptime_s": int(now - getattr(self, '_start_time', now)),

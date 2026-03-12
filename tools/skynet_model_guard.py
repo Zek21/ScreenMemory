@@ -4,7 +4,7 @@ skynet_model_guard.py -- Standalone model drift detection and correction.
 
 Ensures all Skynet chat windows (workers + orchestrator) are on
 Claude Opus 4.6 (fast mode) + Copilot CLI. Detects drift and auto-corrects
-via UIA: opens Pick Model picker, types 'fast' to filter, Down+Enter to select.
+via UIA: opens Pick Model picker, types 'opus 4.6' to filter, Down+Enter to select.
 
 Usage:
     python tools/skynet_model_guard.py --check HWND       # report model status
@@ -187,13 +187,13 @@ if(-not $modelOk) {{
             }}
             try {{
                 $vp = $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-                $vp.SetValue("fast")
+                $vp.SetValue("opus 4.6")  # signed: orchestrator
             }} catch {{
                 try {{ $edit.SetFocus() }} catch {{}}
                 Start-Sleep -Milliseconds 100
                 [System.Windows.Forms.SendKeys]::SendWait("^a")
                 Start-Sleep -Milliseconds 50
-                [System.Windows.Forms.SendKeys]::SendWait("fast")
+                [System.Windows.Forms.SendKeys]::SendWait("opus 4.6")  # signed: orchestrator
             }}
             Start-Sleep -Milliseconds 500
             try {{ $edit.SetFocus() }} catch {{}}

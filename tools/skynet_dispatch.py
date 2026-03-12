@@ -735,7 +735,7 @@ def load_orch_hwnd():
     return None
 
 
-def _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path):
+def _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path, render_hwnd=None):
     """Build the PowerShell script for ghost-typing into a worker window.
 
     Generates an inline PowerShell script containing a C# GhostType class with Win32
@@ -745,6 +745,9 @@ def _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path):
         1. STEERING cancel -- find 'Cancel (Alt+Backspace)' UIA button and invoke it
         2. Input target resolution -- score UIA Edit controls by position heuristics,
            or fall back to FindRender() DFS for Chrome_RenderWidgetHostHWND
+           **Fast-path**: when render_hwnd is provided, skip UIA Edit search entirely
+           and go directly to Chrome_RenderWidgetHostHWND targeting (eliminates UIA
+           tree traversal overhead)
         3. Multi-pane disambiguation -- when multiple Chrome render widgets exist,
            select the one with the largest bounding area in the bottom-right quadrant
            (chat panes are typically positioned there in VS Code)
@@ -758,6 +761,9 @@ def _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path):
         hwnd: Target worker/consultant window HWND (int cast to IntPtr in PS)
         orch_hwnd: Orchestrator window HWND for focus restore after delivery
         dispatch_file_path: Path to temp file containing dispatch text (double-escaped backslashes)
+        render_hwnd: Optional pre-resolved Chrome_RenderWidgetHostHWND (int). When provided,
+                     skips UIA Edit search and FindAllRender DFS, going directly to
+                     CHROME_RENDER paste path. Set to None or 0 to use normal discovery.
 
     Returns:
         str: Complete PowerShell script ready for subprocess execution
@@ -766,7 +772,8 @@ def _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path):
         docs/DELIVERY_PIPELINE.md Section 4 (Ghost Type Mechanism)
         docs/DELIVERY_PIPELINE.md Section 7 (Clipboard Safety)
         docs/DELIVERY_PIPELINE.md Section 9 (False Positive Risks)
-    """  # signed: alpha
+    """  # signed: beta
+    render_hwnd_val = int(render_hwnd) if render_hwnd else 0
     return f'''
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
@@ -848,6 +855,15 @@ if ($cancelBtn) {{
     }} catch {{ Write-Host "DEBUG: Cancel invoke failed: $_" }}
 }}
 
+# Fast-path: when render_hwnd is pre-resolved, skip UIA Edit search entirely  # signed: beta
+$fastRenderHwnd = [IntPtr]{render_hwnd_val}
+$focusTarget = $null
+$focusMethod = "NONE"
+if ($fastRenderHwnd -ne [IntPtr]::Zero) {{
+    $renderHwnd = $fastRenderHwnd
+    $focusMethod = "CHROME_RENDER"
+    Write-Host "DEBUG: Fast-path render_hwnd=$($renderHwnd.ToInt64()) -- skipped UIA Edit search"
+}} else {{
 $wnd = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
 $allEdits = $wnd.FindAll(
     [System.Windows.Automation.TreeScope]::Descendants,
@@ -877,8 +893,6 @@ foreach ($e in $allEdits) {{
     }} catch {{}}
 }}
 # Determine focus target: UIA Edit control, or Chrome render widget as fallback  # signed: orchestrator
-$focusTarget = $null
-$focusMethod = "NONE"
 if ($edit) {{
     $focusTarget = $edit
     $focusMethod = "EDIT"
@@ -931,6 +945,7 @@ if ($edit) {{
         }}
     }}
 }}
+}}  # end fast-path else block  # signed: beta
 
 if ($focusMethod -ne "NONE") {{
     $savedClip = $null
@@ -1151,7 +1166,7 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
         return False
 
 
-def ghost_type_to_worker(hwnd, text, orch_hwnd):
+def ghost_type_to_worker(hwnd, text, orch_hwnd, render_hwnd=None):
     """Type text into a worker/consultant chat window via clipboard paste (Level 4.2 dispatch).
 
     This is the core delivery mechanism for all Skynet prompt dispatch. It writes the dispatch
@@ -1163,6 +1178,7 @@ def ghost_type_to_worker(hwnd, text, orch_hwnd):
         2. _build_ghost_type_ps() generates PS script with: STEERING cancel, Edit scoring,
            multi-pane Chrome render widget disambiguation, focus race prevention,
            clipboard verification (3x retry), AttachThreadInput paste, clipboard cleanup
+           **Fast-path**: when render_hwnd is provided, skips UIA Edit search entirely
         3. _execute_ghost_dispatch() runs script under dispatch lock, validates OK_ stdout
 
     Safety features:
@@ -1178,6 +1194,10 @@ def ghost_type_to_worker(hwnd, text, orch_hwnd):
         hwnd: Target window HWND (int). Must be valid (IsWindow check).
         text: Dispatch text content. Newlines replaced with spaces before writing to temp file.
         orch_hwnd: Orchestrator HWND for focus restore after delivery. Can be invalid (warn only).
+        render_hwnd: Optional pre-resolved Chrome_RenderWidgetHostHWND (int). When provided,
+                     _build_ghost_type_ps() skips UIA Edit search and FindAllRender DFS,
+                     going directly to CHROME_RENDER paste path. Eliminates UIA tree
+                     traversal overhead for repeated dispatches to the same window.
 
     Returns:
         bool: True if delivery succeeded (PS reported OK_*), False on any failure.
@@ -1187,7 +1207,7 @@ def ghost_type_to_worker(hwnd, text, orch_hwnd):
         _build_ghost_type_ps() (PS script generation)
         _execute_ghost_dispatch() (subprocess execution and validation)
         _verify_delivery() (post-dispatch UIA state verification)
-    """  # signed: alpha
+    """  # signed: beta
     if not hwnd or not user32.IsWindow(hwnd):
         log(f"ghost_type: invalid target HWND={hwnd}", "ERR")  # signed: beta
         return False
@@ -1201,7 +1221,7 @@ def ghost_type_to_worker(hwnd, text, orch_hwnd):
         log(f"ghost_type: failed to write dispatch temp file: {e}", "ERR")  # signed: beta
         return False
     dispatch_file_path = str(dispatch_file).replace("\\", "\\\\")
-    ps = _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path)
+    ps = _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path, render_hwnd=render_hwnd)
     return _execute_ghost_dispatch(ps, hwnd, orch_hwnd)
 
 

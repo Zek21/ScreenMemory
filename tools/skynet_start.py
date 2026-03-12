@@ -151,10 +151,29 @@ def _clear_boot_phase():
 
 # ─── Network Helpers ───────────────────────────────────
 
+def _port_open_host(host, port, family=0):
+    """Probe one loopback host across its resolved socket addresses."""  # signed: consultant
+    try:
+        addr_infos = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
+    except OSError:
+        return False
+    for af, socktype, proto, _, sockaddr in addr_infos:
+        try:
+            with socket.socket(af, socktype, proto) as s:
+                s.settimeout(2)  # signed: delta — prevent indefinite hang on connect
+                if s.connect_ex(sockaddr) == 0:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def port_open(port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(2)  # signed: delta — prevent indefinite hang on connect
-        return s.connect_ex(("127.0.0.1", port)) == 0
+    """Probe loopback truthfully across IPv4 and IPv6 localhost bindings."""  # signed: consultant
+    for host, family in (("127.0.0.1", socket.AF_INET), ("::1", socket.AF_INET6), ("localhost", 0)):
+        if _port_open_host(host, port, family):
+            return True
+    return False
 
 
 def http_get(path, port=SKYNET_PORT, timeout=5):
@@ -180,10 +199,11 @@ def http_post(path, body, port=SKYNET_PORT, timeout=10):
 # ─── Win32 Helpers ─────────────────────────────────────
 
 def get_orchestrator_hwnd():
-    """Read orchestrator HWND from data/orchestrator.json."""
+    """Read orchestrator HWND from data/orchestrator.json.
+    Checks both 'orchestrator_hwnd' and 'hwnd' keys for consistency."""
     if ORCH_FILE.exists():
         data = json.loads(ORCH_FILE.read_text())
-        return data.get("orchestrator_hwnd")
+        return data.get("orchestrator_hwnd") or data.get("hwnd")  # signed: beta
     return None
 
 
@@ -1384,12 +1404,20 @@ _SYSTEM_CLASSES = [
 ]
 
 
-def _build_essential_hwnds():
-    """Build the set of HWNDs that must never be closed."""
+def _build_essential_hwnds(extra_workers=None):
+    """Build the set of HWNDs that must never be closed.
+
+    Args:
+        extra_workers: optional list of in-memory worker dicts with 'hwnd' keys.
+            These are added to the essential set even if workers.json hasn't been
+            written yet, preventing Phase 7 from destroying windows opened in Phase 4.
+    """
     essential = set()
+    # Orchestrator HWND
     orch_hwnd = get_orchestrator_hwnd()
     if orch_hwnd:
         essential.add(int(orch_hwnd))
+    # Worker HWNDs from workers.json (on-disk)
     if WORKERS_FILE.exists():
         try:
             wdata = json.loads(WORKERS_FILE.read_text())
@@ -1399,7 +1427,24 @@ def _build_essential_hwnds():
                     essential.add(int(h))
         except Exception:
             pass
-    return essential
+    # In-memory worker HWNDs (protects windows not yet saved to disk)  # signed: beta
+    if extra_workers:
+        for w in extra_workers:
+            h = w.get("hwnd")
+            if h:
+                essential.add(int(h))
+    # Consultant HWNDs from state files  # signed: beta
+    for cfile in ("consultant_state.json", "gemini_consultant_state.json"):
+        cpath = DATA_DIR / cfile
+        if cpath.exists():
+            try:
+                cdata = json.loads(cpath.read_text())
+                ch = cdata.get("hwnd")
+                if ch:
+                    essential.add(int(ch))
+            except Exception:
+                pass
+    return essential  # signed: beta
 
 
 def _is_closeable_window(hwnd, essential_hwnds):
@@ -1432,9 +1477,14 @@ def _is_closeable_window(hwnd, essential_hwnds):
     return True, f"{title[:60]} (class={cls_name})"
 
 
-def close_non_essential_windows():
-    """Close all windows that are not Skynet-essential using Win32 API only."""
-    essential_hwnds = _build_essential_hwnds()
+def close_non_essential_windows(extra_workers=None):
+    """Close all windows that are not Skynet-essential using Win32 API only.
+
+    Args:
+        extra_workers: optional list of in-memory worker dicts with 'hwnd' keys.
+            Passed to _build_essential_hwnds() to protect windows not yet saved to disk.
+    """
+    essential_hwnds = _build_essential_hwnds(extra_workers=extra_workers)  # signed: beta
     closed = []
 
     @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
@@ -1727,7 +1777,7 @@ def _run_full_bootstrap(args):
         log("Boot phase lock released", "OK")
 
     log("Phase 7: Window Hygiene", "SYS")
-    close_non_essential_windows()
+    close_non_essential_windows(extra_workers=workers)  # signed: beta — pass in-memory workers to protect them
 
     elapsed = time.time() - t0
     log(f"SKYNET ONLINE -- {len(workers)} workers, {len(engines)} engines -- {elapsed:.1f}s", "OK")
