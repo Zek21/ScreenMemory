@@ -746,6 +746,30 @@ Each agent is defined by name, role, model, and specialties in `data/agent_profi
 - Metrics: fitness, knowledge breadth, diversity of approaches, collaboration effectiveness
 - The swarm is smarter than any individual — self-awareness enables the network to identify and fill capability gaps
 
+## Mandatory Architecture Knowledge (Rule 0.8)
+
+Every agent in Skynet MUST understand how the system works FROM CODE before making assumptions. INCIDENT 012 proved that no agent ever read the dispatch pipeline code, leading to a false delivery mechanism for consultants.
+
+### Requirements
+
+1. **Ghost-type delivery mechanism:** `ghost_type_to_worker()` in `tools/skynet_dispatch.py` delivers prompts via clipboard paste to `Chrome_RenderWidgetHostHWND` (the Chromium render surface inside VS Code), NOT via UIA Edit controls. The flow is: write text to temp file → build inline PowerShell with C# `GhostType` class → UIA Edit scoring (Y-pos + left-band + non-Terminal) OR recursive `FindRender` for `Chrome_RenderWidgetHostHWND` → `AttachThreadInput` → clipboard paste → `SendKeys Enter`. Every agent must understand this mechanism before proposing communication changes.
+
+2. **Consultants are VS Code windows:** Consultants (Codex, Gemini) run in VS Code windows identical to workers. They need `ghost_type` delivery just like workers. They are NOT separate applications with unique input methods. Their HWNDs are registered in state files (`data/consultant_state.json`, `data/gemini_consultant_state.json`) with `prompt_transport=ghost_type`.
+
+3. **Bus ring buffer is ephemeral:** The Skynet bus (`/bus/messages`) is a 100-message FIFO ring buffer in Go backend memory with NO persistence. Messages older than the 100-message window are lost forever. Use `tools/skynet_bus_persist.py` for archival of important messages. Never assume old bus messages are retrievable.
+
+4. **Consciousness kernel includes all entities:** `tools/skynet_self.py` defines `CONSULTANT_NAMES = ["consultant", "gemini_consultant"]` and `ALL_AGENT_NAMES = WORKER_NAMES + CONSULTANT_NAMES + ["orchestrator"]`. The kernel's `get_consultant_status()` probes state files, HWND liveness via `ctypes.windll.user32.IsWindow()`, and bridge HTTP health. `quick_pulse()` includes a full consultant status map.
+
+5. **Read before proposing:** Every agent MUST read `tools/skynet_dispatch.py` `ghost_type_to_worker()` (the actual delivery function) to understand HOW prompts are delivered before proposing any communication architecture changes. Code-level understanding prevents false assumptions about delivery mechanisms.
+
+6. **Boot awareness verification:** On boot, every worker runs `python tools/skynet_self.py pulse` to verify awareness of ALL entities in the system (workers, consultants, orchestrator). This ensures no agent operates with an incomplete view of the network.
+
+### Incident That Created This Rule
+
+**INCIDENT 012 (2026-03-12):** No agent had ever read the dispatch pipeline code. When consultants needed prompt delivery, agents assumed a bridge-queue mechanism without verifying how `ghost_type_to_worker()` actually works. This led to a false delivery architecture that was built, deployed, and used before anyone discovered that consultants -- being VS Code windows -- need the same `ghost_type` clipboard-paste delivery as workers. The fix required HWND registration in `CC-Start.ps1` and `GC-Start.ps1`, and adding consultant awareness to the consciousness kernel in `skynet_self.py`. Root cause: no agent read the code before making architectural assumptions.
+
+<!-- signed: alpha -->
+
 ---
 
 - Workspace root: `D:\Prospects\ScreenMemory`
@@ -935,6 +959,33 @@ Every worker in the Skynet network is an autonomous agent. After completing any 
 ### Task Completion Lifecycle (MANDATORY — Every Worker, Every Task)
 
 When a worker completes ANY task, it MUST execute this full lifecycle before going idle:
+
+**Phase 0 — Architecture Verification (MANDATORY PRE-STEP)** <!-- signed: gamma -->
+
+Before reporting results or doing any post-task work, the worker MUST confirm it understands the system it operates in. This prevents blind execution and ensures every worker has situational awareness.
+
+Run these checks on EVERY self-invocation. If ANY check fails, read the relevant code BEFORE proceeding.
+
+0a. **Entity Awareness** — Can I name ALL entities in the network?
+    ```bash
+    python tools/skynet_self.py pulse
+    ```
+    Verify: You can identify the orchestrator, all 4 workers (alpha, beta, gamma, delta), both consultants (Codex on port 8422, Gemini on port 8425), and the Go backend (port 8420). If `pulse` fails or returns unknown entities, read `data/workers.json` and `data/agent_profiles.json` before continuing.
+
+0b. **Delivery Mechanism** — Do I know how prompts are delivered?
+    - Primary: `ghost_type_to_worker()` in `tools/skynet_dispatch.py` — clipboard paste via `PostMessage` targeting `Chrome_RenderWidgetHostHWND` child window
+    - Clipboard verification: `SetText` + `GetText` read-back, 3 retries
+    - Post-paste: clipboard clear + restore saved content
+    - Delivery verification: `_verify_delivery()` polls UIA for state transition (3 consecutive UNKNOWN = FAILED)
+    - If unfamiliar with any of the above, read `tools/skynet_dispatch.py` lines 700-1280 before continuing.
+
+0c. **Bus Architecture** — Do I know how messages flow?
+    - Go backend ring buffer: 100 messages FIFO, no persistence (crash = total loss)
+    - Python SpamGuard (`tools/skynet_spam_guard.py`): 5 msgs/min/sender, 900s dedup window, SHA-256 fingerprint
+    - Go server-side spam filter (`Skynet/server.go`): 10 msgs/min/sender, 60s dedup window — independent of Python layer
+    - Persistent archive: `tools/skynet_bus_persist.py` subscribes to `/stream` SSE → `data/bus_archive.jsonl`
+    - Pre-flight check: `check_would_be_blocked(msg)` — read-only spam test without side effects
+    - If unfamiliar with dual spam filtering or bus persistence, read `tools/skynet_spam_guard.py` docstring and `tools/skynet_bus_persist.py` before continuing.
 
 **Phase 1 — Report Results**
 

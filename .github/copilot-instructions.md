@@ -379,6 +379,19 @@ Every worker in the Skynet system has access to a comprehensive capability stack
 - `python tools/skynet_self.py assess` -- self-performance assessment
 - Self-assessment runs at configurable intervals (`brain_config.json` `introspection_interval_s`)
 
+**Mandatory Architecture Knowledge (Rule 0.8) -- INCIDENT 012 Response:**
+
+Every agent MUST understand these architectural facts from CODE, not from assumptions:
+
+1. **Ghost-type delivery** (`tools/skynet_dispatch.py` `ghost_type_to_worker()`) works on ANY VS Code window with a valid HWND -- it uses Win32 clipboard paste via `PostMessage(WM_PASTE)`. The mechanism does not distinguish workers from consultants; it only needs `(hwnd: int, text: str, orch_hwnd: int)`.
+2. **Consultants ARE VS Code windows** -- identical to workers. They have HWNDs, run Copilot CLI, and accept ghost-typed input. The consultant state files (`data/consultant_state.json`, `data/gemini_consultant_state.json`) track their HWNDs. The `requires_hwnd: false` field in older state files was incorrect and led to the blind spot exposed by INCIDENT 012.
+3. **Bus ring buffer** -- the Go backend (`Skynet/server.go`) stores messages in a fixed 100-message FIFO ring buffer with NO disk persistence. Messages evicted from the ring are gone forever. Time-critical results must be consumed promptly or will be lost.
+4. **Consciousness kernel constants** -- `tools/skynet_self.py` defines `WORKER_NAMES`, `CONSULTANT_NAMES`, and `ALL_AGENT_NAMES`. The `SkynetHealth._check_consultants()` method probes bridge HTTP health and HWND liveness. `SkynetIdentity.get_consultant_status()` returns per-consultant status: `ONLINE`, `BRIDGE_ONLY`, `WINDOW_ONLY`, `REGISTERED`, or `ABSENT`.
+5. **Boot awareness verification** -- after every boot (`skynet-start`, `orchestrator-start`, `CC-Start`, `GC-Start`), run `python tools/skynet_self.py pulse` and verify the output includes both `agents` (workers) AND `consultants` sections. If consultants are missing, the consciousness kernel has regressed.
+6. **Entity completeness invariant** -- every entity in `data/agent_profiles.json` that is marked as a VS Code window must have a corresponding HWND tracked in either `data/workers.json` (workers) or the consultant state files (consultants). An entity with `is_vs_code_window: true` but no HWND is a blind spot that must be flagged immediately.
+
+<!-- signed: delta -->
+
 **Scoring System:**
 - +0.01 points per cross-validated task completion
 - -0.01 for low-value refactoring (<150 lines mechanical changes)
