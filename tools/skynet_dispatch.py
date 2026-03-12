@@ -787,30 +787,70 @@ foreach ($e in $allEdits) {{
         }}
     }} catch {{}}
 }}
+# Determine focus target: UIA Edit control, or Chrome render widget as fallback  # signed: orchestrator
+$focusTarget = $null
+$focusMethod = "NONE"
 if ($edit) {{
+    $focusTarget = $edit
+    $focusMethod = "EDIT"
+}} else {{
+    # No UIA Edit found -- VS Code chat input lives inside Chrome renderer
+    # Focus the Chrome_RenderWidgetHostHWND child and paste directly
+    $renderHwnd = [GhostType]::FindRender($hwnd)
+    if ($renderHwnd -ne [IntPtr]::Zero) {{
+        $focusMethod = "CHROME_RENDER"
+    }}
+}}
+
+if ($focusMethod -ne "NONE") {{
     $savedClip = $null
     $deliveryStatus = "FAILED"
     try {{ $savedClip = [System.Windows.Forms.Clipboard]::GetText() }} catch {{}}
     [System.Windows.Forms.Clipboard]::SetText($dispatchText)
     Start-Sleep -Milliseconds 50
-    $attached = [GhostType]::FocusViaAttach($hwnd)
-    if ($attached) {{
-        try {{ $edit.SetFocus() }} catch {{}}
-        Start-Sleep -Milliseconds 80
-        [System.Windows.Forms.SendKeys]::SendWait("^v")
-        Start-Sleep -Milliseconds 80
-        [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
-        [GhostType]::DetachThread($hwnd)
-        $deliveryStatus = "OK_ATTACHED"
+
+    if ($focusMethod -eq "EDIT") {{
+        $attached = [GhostType]::FocusViaAttach($hwnd)
+        if ($attached) {{
+            try {{ $edit.SetFocus() }} catch {{}}
+            Start-Sleep -Milliseconds 80
+            [System.Windows.Forms.SendKeys]::SendWait("^v")
+            Start-Sleep -Milliseconds 80
+            [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+            [GhostType]::DetachThread($hwnd)
+            $deliveryStatus = "OK_ATTACHED"
+        }} else {{
+            try {{ $edit.SetFocus() }} catch {{}}
+            [GhostType]::SetForegroundWindow($hwnd)
+            Start-Sleep -Milliseconds 80
+            [System.Windows.Forms.SendKeys]::SendWait("^v")
+            Start-Sleep -Milliseconds 80
+            [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+            [GhostType]::SetForegroundWindow($orchHwnd)
+            $deliveryStatus = "OK_FALLBACK"
+        }}
     }} else {{
-        try {{ $edit.SetFocus() }} catch {{}}
-        [GhostType]::SetForegroundWindow($hwnd)
-        Start-Sleep -Milliseconds 80
-        [System.Windows.Forms.SendKeys]::SendWait("^v")
-        Start-Sleep -Milliseconds 80
-        [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
-        [GhostType]::SetForegroundWindow($orchHwnd)
-        $deliveryStatus = "OK_FALLBACK"
+        # CHROME_RENDER path: focus render widget, then paste  # signed: orchestrator
+        $attached = [GhostType]::FocusViaAttach($hwnd)
+        if ($attached) {{
+            [GhostType]::SetFocus($renderHwnd)
+            Start-Sleep -Milliseconds 120
+            [System.Windows.Forms.SendKeys]::SendWait("^v")
+            Start-Sleep -Milliseconds 100
+            [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+            [GhostType]::DetachThread($hwnd)
+            $deliveryStatus = "OK_RENDER_ATTACHED"
+        }} else {{
+            [GhostType]::SetForegroundWindow($hwnd)
+            Start-Sleep -Milliseconds 80
+            [GhostType]::SetFocus($renderHwnd)
+            Start-Sleep -Milliseconds 120
+            [System.Windows.Forms.SendKeys]::SendWait("^v")
+            Start-Sleep -Milliseconds 100
+            [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
+            [GhostType]::SetForegroundWindow($orchHwnd)
+            $deliveryStatus = "OK_RENDER_FALLBACK"
+        }}
     }}
     if ($savedClip -and $savedClip.Length -gt 0) {{
         Start-Sleep -Milliseconds 50
@@ -821,7 +861,7 @@ if ($edit) {{
     if ($deliveryStatus -like "OK_*") {{ exit 0 }}
     exit 1
 }} else {{
-    Write-Host "NO_EDIT"
+    Write-Host "NO_EDIT_NO_RENDER"
     exit 1
 }}
 '''
@@ -853,12 +893,13 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
             time.sleep(0.5)
 
         stderr = (r.stderr or "").strip()
+        stdout = r.stdout or ""
         ok = (
             r.returncode == 0
-            and ("OK_ATTACHED" in r.stdout or "OK_FALLBACK" in r.stdout)
-            and "NO_EDIT" not in r.stdout
+            and any(s in stdout for s in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK"))
+            and "NO_EDIT" not in stdout
             and not stderr
-        )
+        )  # signed: orchestrator — accept Chrome render widget delivery as valid
         if not ok and r.stdout:
             log(f"Ghost output: {r.stdout.strip()[:200]}", "WARN")
         if stderr:
@@ -1039,7 +1080,45 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
         _record_dispatch_outcome(worker_name, task, pre_state, hwnd, t_start, ok, 'steer-bypass' if ok else '')
     else:
         _record_dispatch_outcome(worker_name, task, pre_state, hwnd, t_start, True)
+
+    # Delivery verification: confirm worker state changed after dispatch  # signed: orchestrator
+    if ok:
+        verified = _verify_delivery(hwnd, worker_name, pre_state)
+        if not verified:
+            log(f"⚠ {worker_name.upper()} delivery UNVERIFIED (state did not change from {pre_state})", "WARN")
+
     return ok
+
+
+def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
+    """Verify dispatch delivery by checking if worker state transitions.  # signed: orchestrator
+
+    After ghost_type reports success, poll UIA for up to timeout_s seconds
+    to confirm the worker moved from its pre-dispatch state (usually IDLE)
+    to PROCESSING. If the worker was already PROCESSING, any state is acceptable.
+
+    Returns True if delivery is verified (state changed or was already PROCESSING).
+    Returns False if worker remains in pre_state after timeout (delivery may have failed silently).
+    """
+    if pre_state == "PROCESSING":
+        return True  # was already processing, dispatch queued in VS Code
+
+    try:
+        from tools.uia_engine import get_engine
+        engine = get_engine()
+        for i in range(timeout_s * 2):  # poll every 0.5s
+            time.sleep(0.5)
+            try:
+                post_state = engine.get_state(hwnd)
+                if post_state != pre_state:
+                    log(f"✓ {worker_name.upper()} delivery VERIFIED: {pre_state} -> {post_state}", "OK")
+                    return True
+            except Exception:
+                pass
+        return False
+    except Exception as e:
+        log(f"Delivery verify error for {worker_name}: {e}", "WARN")
+        return True  # don't block on verify failure
 
 
 def notify_backend_dispatch(worker_name, task, success=True):
