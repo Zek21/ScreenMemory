@@ -638,6 +638,12 @@ def clear_steering_and_send(hwnd, task, orch_hwnd):
     via UIA InvokePattern -- NOT 'Steer with Message', NOT clicking cards, NOT Enter key.
     After cancel, a 'pending requests' dialog may appear: click 'Remove Pending Requests'.
     """
+    # Rule 0.015: Pre-fire visual proof before any corrective action  # signed: orchestrator
+    vis_ok, pre_state, ss_path = pre_dispatch_visual_check(hwnd, "steering_cancel")
+    if not vis_ok:
+        log(f"STEERING cancel BLOCKED: visual check failed (state={pre_state})", "SECURITY")
+        return False
+
     try:
         from tools.uia_engine import get_engine
         engine = get_engine()
@@ -1179,10 +1185,24 @@ def blast_all(task, workers=None, orch_hwnd=None):
         log("blast_all: no IDLE workers available", "WARN")
         return {}
 
-    log(f"BLAST → {list(targets.keys())} simultaneously", "SYS")
-    with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+    # Rule 0.015: Pre-fire visual proof before blast  # signed: orchestrator
+    verified_workers = []
+    for w in workers:
+        if w["name"] in targets:
+            vis_ok, pre_state, ss_path = pre_dispatch_visual_check(w["hwnd"], w["name"])
+            if vis_ok:
+                verified_workers.append(w)
+            else:
+                log(f"BLAST: skipping {w['name']} -- visual check failed (state={pre_state})", "SECURITY")
+
+    if not verified_workers:
+        log("blast_all: no workers passed visual check", "WARN")
+        return {}
+
+    log(f"BLAST → {[w['name'] for w in verified_workers]} simultaneously (visual-verified)", "SYS")
+    with ThreadPoolExecutor(max_workers=len(verified_workers)) as pool:
         futures = {pool.submit(ghost_type_to_worker, w["hwnd"], task, orch_hwnd): w["name"]
-                   for w in workers if w["name"] in targets}
+                   for w in verified_workers}
         results = {}
         for fut in as_completed(futures):
             name = futures[fut]

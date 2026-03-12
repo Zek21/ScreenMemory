@@ -112,6 +112,21 @@ def log(msg, level="INFO"):
     print(f"[{ts}] {prefix} {msg}", flush=True)
 
 
+def _capture_prefire_screenshot_start(hwnd, label):
+    """Rule 0.015: Capture pre-fire screenshot before any window action in skynet_start."""  # signed: orchestrator
+    ss_dir = DATA_DIR / "dispatch_screenshots"
+    ss_dir.mkdir(exist_ok=True)
+    ts = datetime.now().strftime("%H%M%S")
+    ss_path = str(ss_dir / f"{label}_{ts}.png")
+    try:
+        from tools.chrome_bridge.winctl import Desktop
+        Desktop().screenshot(path=ss_path, window=hwnd)
+        log(f"PRE-FIRE SCREENSHOT: {label} saved to {ss_path}", "SYS")
+    except Exception as e:
+        log(f"PRE-FIRE SCREENSHOT failed for {label}: {e}", "WARN")
+    return ss_path
+
+
 def _set_boot_phase(phase_name):
     """Write boot_in_progress.json so other daemons (self-prompt) back off during boot."""
     try:
@@ -549,6 +564,9 @@ if($modelOk -and $targetOk) {{ Write-Host "GUARD_OK" }}
 
 def guard_model(hwnd, orch_hwnd):
     """Ensure a chat window is on Claude Opus 4.6 (fast mode) + Copilot CLI."""
+    # Rule 0.015: Pre-fire screenshot before model correction  # signed: orchestrator
+    _capture_prefire_screenshot_start(hwnd, "guard_model")
+
     ps = _build_guard_model_ps(hwnd, orch_hwnd)
     try:
         r = subprocess.run(
@@ -575,6 +593,9 @@ def guard_permissions(hwnd, orch_hwnd):
     because subprocess PowerShell cannot steal focus on Windows.
     """
     import ctypes
+    # Rule 0.015: Pre-fire screenshot before permission change  # signed: orchestrator
+    _capture_prefire_screenshot_start(hwnd, "guard_permissions")
+
     # Give worker window real OS focus from orchestrator process
     ctypes.windll.user32.SetForegroundWindow(hwnd)
     time.sleep(0.4)
@@ -667,6 +688,9 @@ Start-Sleep -Milliseconds 500
 
 def prompt_worker(hwnd, worker_name, orch_hwnd, boot_memories=None):
     """Send initialization prompt to a worker chat window via clipboard paste."""
+    # Rule 0.015: Pre-fire screenshot before initial worker prompt  # signed: orchestrator
+    _capture_prefire_screenshot_start(hwnd, f"prompt_{worker_name}")
+
     prompt_text = _build_prompt_text(worker_name, boot_memories)
     ps = _build_prompt_ps(hwnd, orch_hwnd, prompt_text)
     try:

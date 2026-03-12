@@ -19,6 +19,7 @@ Usage:
 import json
 import hashlib
 import os
+import re
 import subprocess
 import sys
 import time
@@ -57,20 +58,19 @@ ORCH_INACTIVE_THRESHOLD = 45
 MAX_LOG_ENTRIES = 50
 HEALTH_REPORT_INTERVAL = 300  # report health to bus every 5 min
 MAX_CONSECUTIVE_PROMPTS = 2   # stop after N prompts without orchestrator action
+REPEATED_STATE_SUPPRESSION_S = 600  # suppress repeated no-change prompts for 10 minutes  # signed: consultant
 
 ALL_IDLE_INTERVAL = 60  # faster prompting when all workers idle
 BOOT_PROMPT_ENABLED = True
 
-# Ollama integration for smarter self-prompts
-USE_OLLAMA = True
-OLLAMA_MODEL = "qwen3:14b"
+# Self-prompt generation is template-only. Ollama is removed from the live pipeline.  # signed: consultant
 REQUIRED_WORKERS = ("alpha", "beta", "gamma", "delta")
 
 def _load_config_overrides():
     """Load self_prompt thresholds from brain_config.json. Called on startup AND each cycle (hot-reload)."""
     global LOOP_INTERVAL, MIN_PROMPT_GAP, IDLE_WORKER_THRESHOLD
     global ORCH_INACTIVE_THRESHOLD, HEALTH_REPORT_INTERVAL, PROMPT_THRESHOLD, MAX_CONSECUTIVE_PROMPTS
-    global ALL_IDLE_INTERVAL, USE_OLLAMA, OLLAMA_MODEL, BOOT_PROMPT_ENABLED
+    global ALL_IDLE_INTERVAL, BOOT_PROMPT_ENABLED
     try:
         cfg = json.loads(BRAIN_CONFIG_FILE.read_text(encoding="utf-8"))
         sp = cfg.get("self_prompt", {})
@@ -91,10 +91,6 @@ def _load_config_overrides():
             MAX_CONSECUTIVE_PROMPTS = sp["max_consecutive"]
         if sp.get("all_idle_interval"):
             ALL_IDLE_INTERVAL = sp["all_idle_interval"]
-        if "use_ollama" in sp:
-            USE_OLLAMA = bool(sp["use_ollama"])
-        if sp.get("ollama_model"):
-            OLLAMA_MODEL = sp["ollama_model"]
         if "boot_prompt_enabled" in god:
             BOOT_PROMPT_ENABLED = bool(god["boot_prompt_enabled"])
     except Exception:
@@ -470,6 +466,9 @@ class SelfPromptDaemon:
         self.accumulated_score = 0
         self.last_prompt_hash = ""
         self.last_prompt_hash_time = 0.0
+        self.last_prompt_state_hash = ""
+        self.last_prompt_state_hash_time = 0.0
+        self.pending_prompt_state_hash = ""
         self.prompts_sent = 0
         self.prompts_failed = 0
         self.cycles = 0
@@ -1127,18 +1126,11 @@ class SelfPromptDaemon:
     def _synthesize_prompt(self, perception, patterns, predictions, score):
         """Generate a compact Skynet Intelligence briefing with status + actionable commands.
 
-        Tries Ollama first (if enabled), falls back to template-based generation.
+        Uses the built-in template generator only.
         Only generates if there's something actionable (avoids spam).
         """
-        # Try Ollama-powered smart prompt first
         stamp = self._prompt_timestamp()
 
-        if USE_OLLAMA and self._should_use_ollama_for_prompt():
-            ollama_prompt = self._try_ollama_prompt(perception, patterns)
-            if ollama_prompt:
-                return self._format_prompt(stamp, ollama_prompt)
-
-        # Template fallback
         new_results = self._filter_undelivered(perception.get("bus_results", []), "result")
         new_alerts = self._filter_undelivered(perception.get("bus_alerts", []), "alert")
         pending_todos = perception["pending_todos"]
@@ -1153,8 +1145,19 @@ class SelfPromptDaemon:
             perception, patterns, new_results, new_alerts, pending_todos, orch_todos, idle_workers)
 
         if not self._has_actionable(
-                new_results, new_alerts, idle_workers, pending_todos, patterns, daemon_status, perception):
+                new_results, new_alerts, idle_workers, pending_todos, orch_todos, patterns, daemon_status, perception):
+            self.pending_prompt_state_hash = ""
             return ""
+
+        self.pending_prompt_state_hash = self._build_prompt_state_hash(
+            perception,
+            patterns,
+            new_results,
+            new_alerts,
+            pending_todos,
+            orch_todos,
+            daemon_status,
+        )
 
         self._mark_delivered(new_results, "result")
         self._mark_delivered(new_alerts, "alert")
@@ -1174,64 +1177,12 @@ class SelfPromptDaemon:
         return f"[SELF-PROMPT {stamp}] {content}"
 
     def _try_ollama_prompt(self, perception, patterns):
-        """Attempt to generate a prompt via Ollama. Returns prompt string or None."""
-        try:
-            from tools.skynet_ollama_prompt import generate_technical_prompt
-
-            workers_summary = {}
-            for name, info in perception["workers"].items():
-                w = {"state": info["state"], "alive": info["alive"]}
-                model = info.get("model")
-                if info["state"] == "PROCESSING" and model and model.state_since:
-                    w["processing_elapsed_s"] = int(time.time() - model.state_since)
-                workers_summary[name] = w
-
-            new_results = self._filter_undelivered(perception.get("bus_results", []), "result")
-            new_alerts = self._filter_undelivered(perception.get("bus_alerts", []), "alert")
-            orch_todos = _get_pending_todo_items("orchestrator", limit=3)
-            daemon_status = self._collect_daemon_health(perception.get("bus_alerts", []))
-
-            ollama_perception = {
-                "timestamp": self._prompt_timestamp(),
-                "workers": workers_summary,
-                "new_results": new_results,
-                "new_alerts": new_alerts,
-                "pending_todos": perception["pending_todos"],
-                "orch_todos": orch_todos,
-                "daemon_status": daemon_status,
-                "skynet_purpose": (
-                    "Serve GOD by keeping the orchestrator truthfully aware, prioritizing the highest-value "
-                    "next move, coordinating workers as a CEO, avoiding busywork/noise, surfacing urgent "
-                    "failures/results, and driving security, architecture, integration, and mission progress."
-                ),
-                "shot_context": {
-                    "mode": "final_shot",
-                    "shot_number": self.consecutive_prompts + 1,
-                    "max_shots": self.max_consecutive,
-                    "cooldown_after_s": int(MIN_PROMPT_GAP),
-                },
-                "patterns": {
-                    "stall_pattern": patterns.get("stall_pattern", False),
-                    "failure_rate_10m": patterns.get("failure_rate_10m", 0),
-                    "dispatch_drought": patterns.get("dispatch_drought", False),
-                },
-            }
-
-            result = generate_technical_prompt(ollama_perception, model=OLLAMA_MODEL)
-            if result:
-                self._mark_delivered(new_results, "result")
-                self._mark_delivered(new_alerts, "alert")
-                return f"Skynet Intel [Qwen3 {self.consecutive_prompts + 1}/{self.max_consecutive}]: {result}"
-        except Exception as e:
-            log(f"Ollama prompt generation failed, falling back to template: {e}")
-        return None
+        """Compatibility stub. Ollama is intentionally disabled in the self-prompt pipeline."""
+        return None  # signed: consultant
 
     def _should_use_ollama_for_prompt(self):
-        """Reserve Ollama synthesis for the final consecutive self-prompt shot."""
-        if not USE_OLLAMA:
-            return False
-        next_shot = self.consecutive_prompts + 1
-        return next_shot >= max(1, int(self.max_consecutive))
+        """Compatibility stub. The self-prompt pipeline no longer uses Ollama."""
+        return False  # signed: consultant
 
     def _build_worker_status_parts(self, perception):
         """Build compact worker status string (e.g. 'A=IDLE B=PROC(45s)')."""
@@ -1250,6 +1201,62 @@ class SelfPromptDaemon:
             else:
                 parts.append(f"{name[0].upper()}={state[:4]}")
         return " ".join(parts)
+
+    def _normalize_signal_text(self, text):
+        """Collapse numeric drift so repeating alerts hash to the same issue family."""
+        normalized = " ".join(str(text).lower().split())
+        normalized = re.sub(r"\d+", "#", normalized)
+        return normalized[:160]
+
+    def _message_identity(self, message, include_message_id=False):
+        if include_message_id and message.get("id"):
+            return f"id:{message['id']}"
+        sender = str(message.get("sender", "?")).lower()
+        topic = str(message.get("topic", "?")).lower()
+        msg_type = str(message.get("type", "?")).lower()
+        content = self._normalize_signal_text(message.get("content", ""))
+        return f"{sender}|{topic}|{msg_type}|{content}"
+
+    def _build_prompt_state_hash(
+        self,
+        perception,
+        patterns,
+        new_results,
+        new_alerts,
+        pending_todos,
+        orch_todos,
+        daemon_status,
+    ):
+        workers = {
+            name: {
+                "state": info.get("state", "UNKNOWN"),
+                "alive": bool(info.get("alive", False)),
+            }
+            for name, info in sorted(perception.get("workers", {}).items())
+        }
+        payload = {
+            "workers": workers,
+            "results": sorted(
+                self._message_identity(m, include_message_id=True)
+                for m in new_results
+            ),
+            "alerts": sorted({self._message_identity(m) for m in new_alerts}),
+            "pending_todos": int(pending_todos),
+            "pending_tasks": int(perception.get("pending_tasks", 0)),
+            "orch_todos": [
+                str(t.get("id") or t.get("task") or t.get("title") or "")[:120]
+                for t in orch_todos
+            ],
+            "daemon_status": daemon_status,
+            "stall_pattern": bool(patterns.get("stall_pattern", False)),
+            "failure_rate_10m": int(patterns.get("failure_rate_10m", 0)),
+            "critical": [
+                self._normalize_signal_text(c)
+                for c in self.cot.critical_conclusions()[:3]
+            ],
+        }
+        encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+        return hashlib.md5(encoded).hexdigest()[:12]  # signed: consultant
 
     def _collect_daemon_health(self, alerts):
         """Check daemon health via live probes, not just file reads.
@@ -1410,20 +1417,22 @@ class SelfPromptDaemon:
 
         return actions
 
-    def _has_actionable(self, new_results, new_alerts, idle_workers, pending_todos, patterns, daemon_status, perception):
+    def _has_actionable(self, new_results, new_alerts, idle_workers, pending_todos, orch_todos, patterns, daemon_status, perception):
         """Determine if there's anything worth prompting about.
 
         Idle workers with pending tasks is NORMAL, not actionable on its own.
         Only genuine system issues or unprocessed results/alerts trigger prompts.
         """
-        return (
+        critical_conclusions = bool(self.cot.critical_conclusions())
+        return (  # signed: consultant
             len(new_results) > 0
             or len(new_alerts) > 0
+            or len(orch_todos) > 0
             or patterns["stall_pattern"]
             or patterns["failure_rate_10m"] >= 3
             or any(not i["alive"] for i in perception["workers"].values())
-            or self.cot.has_conclusions()
-            or daemon_status != "OK"
+            or critical_conclusions
+            or daemon_status != "verified_ok"
         )
 
     def _filter_undelivered(self, messages, category):
@@ -1487,9 +1496,10 @@ class SelfPromptDaemon:
         else:
             log("Boot prompt: orchestrator not IDLE after 60s -- sending anyway", "WARN")
 
-        sections = self._gather_intelligence()
+        sections = [s for s in self._gather_intelligence() if s]
         if not sections:
-            sections = ["[STATUS] System clean, no pending work."]
+            log("Boot prompt suppressed: nothing actionable")
+            return  # signed: consultant
 
         prompt = self._format_prompt(
             self._prompt_timestamp(),
@@ -1798,10 +1808,19 @@ class SelfPromptDaemon:
         return False
 
     def _is_duplicate_prompt(self, prompt, now):
-        """Anti-spam: suppress identical prompts within 60s."""
+        """Anti-spam: suppress identical text quickly and repeated no-change states longer."""
         prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:12]
         if prompt_hash == self.last_prompt_hash and (now - self.last_prompt_hash_time) < 60:
             log(f"Duplicate prompt suppressed (hash={prompt_hash})")
+            return True
+        state_hash = self.pending_prompt_state_hash
+        if (
+            state_hash
+            and state_hash == self.last_prompt_state_hash
+            and (now - self.last_prompt_state_hash_time) < REPEATED_STATE_SUPPRESSION_S
+        ):
+            remaining = int(REPEATED_STATE_SUPPRESSION_S - (now - self.last_prompt_state_hash_time))
+            log(f"Repeated prompt state suppressed (hash={state_hash}, remaining={remaining}s)")
             return True
         return False
 
@@ -1825,6 +1844,8 @@ class SelfPromptDaemon:
             self.prompts_sent += 1
             self.consecutive_prompts += 1
             self.all_idle_since = now
+            self.last_prompt_state_hash = self.pending_prompt_state_hash
+            self.last_prompt_state_hash_time = now
             if self.consecutive_prompts >= self.max_consecutive:
                 self.last_cycle_complete_time = now
             log(f"Prompt DELIVERED (consecutive {self.consecutive_prompts}/{self.max_consecutive})")
@@ -1833,6 +1854,8 @@ class SelfPromptDaemon:
         else:
             self.prompts_failed += 1
             log("Prompt FAILED to deliver", "ERROR")
+        if not ok:
+            self.pending_prompt_state_hash = ""
 
     def _final_shot_cooldown_active(self, now):
         """After the last shot fires, wait MIN_PROMPT_GAP before starting a new cycle."""
