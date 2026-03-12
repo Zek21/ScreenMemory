@@ -391,6 +391,28 @@ if ($skynetUp) {
         } else {
             Write-Status "Codex Consultant identity announcement failed before bus confirmation" "WARN"
         }
+
+        # signed: consultant
+        if (-not $consultantBridgeUp) {
+            $offlinePublish = Publish-GuardedBusMessage @{
+                sender  = "consultant"
+                topic   = "orchestrator"
+                type    = "alert"
+                content = "CRITICAL CONSULTANT INCIDENT -- Codex Consultant bridge is offline or not promptable on port 8422. Self-heal is required before going idle. signed:consultant"
+                metadata = @{
+                    display_name     = "Codex Consultant"
+                    transport        = "cc-start-bridge"
+                    prompt_transport = "unavailable"
+                    routable         = "false"
+                    score_actor      = "consultant"
+                    signature        = "signed:consultant"
+                    bridge_status    = $bridgeStatus
+                }
+            }
+            if ($offlinePublish -and $offlinePublish.allowed) {
+                Write-Status "Codex Consultant offline incident posted to Skynet bus" "WARN"
+            }
+        }
     } catch {
         Write-Status "Bus announcement failed: $_" "WARN"
     }
@@ -457,11 +479,15 @@ Write-Host "    - FAIR DEDUCTION: when consultant work was actually dispatched t
 Write-Host "    - If a different validator proves your signed work wrong, that signed incident can cost you -0.1."
 Write-Host "    - If you proactively clear or surface a real Skynet ticket, report it truthfully so consultant scoring can validate the +0.2 award."
 Write-Host ""
+# signed: consultant
 Write-Host "  Failure corrections you must obey:"
 Write-Host "    - CC-Start always means Codex Consultant, never orchestrator."
 Write-Host "    - Report model truth as GPT-5 Codex."
 Write-Host "    - Bring up bridge 8422 before claiming LIVE or routable transport."
 Write-Host "    - Bridge truth rule: do not claim LIVE/routable from a transient port-open alone; require a successful /health check and a surviving state heartbeat."
+Write-Host "    - SELF-HEAL RULE: if /health or /consultants says OFFLINE/STALE, accepts_prompts=false, routable=false, or heartbeat_age_s > 8, do not stop at reporting 'offline'. Repair or restart your own bridge/start path immediately when safe, then re-verify LIVE truth."
+Write-Host "    - TRUTH INCIDENT RULE: if you ever report consultant offline/degraded state without attempting self-heal and without filing a signed bus alert/result plus a repo-root Markdown proposal, that is a consultant truth failure. Correct it immediately."
+Write-Host "    - Recovery evidence rule: publish the failed probe, repair action, and post-repair verification to Skynet before claiming the incident closed."
 Write-Host "    - Startup launch rule: in PowerShell Start-Process, quote any argument value containing spaces or compose a safe single argument string before claiming bootstrap success."
 Write-Host "    - Shared ticket awareness: read bus/TODO/queue state before going idle; if a real Skynet ticket can be cleared or surfaced, do it."
 Write-Host "    - Proactive ticket clearance by consultant/orchestrator is worth +0.2 when independently verified."
@@ -481,7 +507,7 @@ Write-Host "    - Startup presence/identity announcements stay bus-only unless G
 Write-Host "    - Self-prompt truth rule: do not claim the daemon is compliant unless the live send path hard-gates on ALL workers staying IDLE for the full quiet window and re-checks worker state immediately before fire."
 Write-Host "    - If a self-prompt fires while any worker is non-IDLE, report it as a real violation immediately; do not defend it from cached status, prior scans, or inferred timing."
 Write-Host "    - For self-prompt gating truth, registered worker HWND/UIA state outranks backend /status. Do not certify compliance from /status alone."
-Write-Host "    - If you fail or drift: write an artifact, post it to Skynet, and verify delivery."
+Write-Host "    - If you fail or drift: self-heal first when safe, write an artifact, post it to Skynet, and verify delivery."
 Write-Host "    - Keep bus payloads schema-safe unless endpoint support is verified."
 Write-Host "    - Do not claim success without a live endpoint check or sender-filtered bus confirmation."
 Write-Host ""

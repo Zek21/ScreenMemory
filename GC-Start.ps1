@@ -55,6 +55,72 @@ function Test-JsonHealth([string]$url, [int]$timeoutSec = 5) {
     }
 }
 
+function Get-ConsultantView([string]$url, [int]$timeoutSec = 5) {
+    try {
+        $resp = Invoke-RestMethod $url -TimeoutSec $timeoutSec
+        if ($null -ne $resp.consultant) { return $resp.consultant }
+        if ($null -ne $resp.id) { return $resp }
+    } catch {}
+    return $null
+}
+
+function Test-ConsultantBridgeTruth([string]$viewUrl, [int]$maxHeartbeatAgeSec = 8) {
+    $view = Get-ConsultantView $viewUrl 5
+    if ($null -eq $view) { return $null }
+
+    $status = [string]($view.status ?? "")
+    $live = [bool]$view.live
+    $acceptsPrompts = [bool]$view.accepts_prompts
+    $heartbeatAge = 999.0
+    if ($null -ne $view.heartbeat_age_s) {
+        $heartbeatAge = [double]$view.heartbeat_age_s
+    } elseif ($null -ne $view.stale_after_s) {
+        $heartbeatAge = [double]$view.stale_after_s + 1.0
+    }
+
+    if ($live -and $acceptsPrompts -and
+        $status.ToUpperInvariant() -eq "LIVE" -and
+        $heartbeatAge -le $maxHeartbeatAgeSec) {
+        return $view
+    }
+
+    return $null
+}
+
+function Wait-ConsultantBridgeTruth([int]$port, [string]$healthUrl, [string]$viewUrl,
+                                    [int]$maxSeconds = 40, [int]$maxHeartbeatAgeSec = 8) {
+    $deadline = (Get-Date).AddSeconds($maxSeconds)
+    do {
+        if ((Test-Port $port 1000) -and (Test-JsonHealth $healthUrl 5)) {
+            $view = Test-ConsultantBridgeTruth $viewUrl $maxHeartbeatAgeSec
+            if ($null -ne $view) { return $view }
+        }
+        Start-Sleep -Seconds 1
+    } while ((Get-Date) -lt $deadline)
+    return $null
+}
+
+function Publish-GuardedBusMessage([hashtable]$Message) {
+    $payload = $Message | ConvertTo-Json -Depth 8 -Compress
+    $pyCode = @'
+import json
+import sys
+from tools.skynet_spam_guard import guarded_publish
+
+message = json.loads(sys.stdin.read())
+print(json.dumps(guarded_publish(message)))
+'@
+    $raw = $payload | & $python -c $pyCode 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $text = ($raw -join "`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    try {
+        return $text | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+}  # signed: consultant
+
 function Wait-HealthyEndpoint([int]$port, [string]$url, [int]$maxSeconds = 40) {
     $deadline = (Get-Date).AddSeconds($maxSeconds)
     do {
@@ -263,29 +329,36 @@ foreach ($d in $daemonSpecs) {
 
 $consultantBridgeUp = $false
 $consultantBridgeHealth = "http://127.0.0.1:8425/health"
+$consultantBridgeViewUrl = "http://127.0.0.1:8425/consultants"
+$consultantBridgeView = $null
 if ((Test-Port 8425 1000) -and (Test-JsonHealth $consultantBridgeHealth 5)) {
     Write-Status "Gemini Consultant bridge already running on port 8425" "OK"
-    $consultantBridgeUp = $true
+    $consultantBridgeView = Test-ConsultantBridgeTruth $consultantBridgeViewUrl 8
+    if ($null -ne $consultantBridgeView) {
+        $consultantBridgeUp = $true
+    } else {
+        Write-Status "Gemini Consultant bridge responds on 8425 but LIVE truth is not yet verified" "WARN"
+    }
 } else {
     Write-Status "Gemini Consultant bridge not running -- starting..." "SYS"
     $bridgeScript = Join-Path $repoRoot "tools\skynet_consultant_bridge.py"
     if (Test-Path $bridgeScript) {
-        $bridgeArgs = @(
-            $bridgeScript,
-            "--id", "gemini_consultant",
-            "--display-name", "`"Gemini Consultant`"",
-            "--model", "`"Gemini 3.1 Pro (Preview)`"",
-            "--source", "GC-Start",
-            "--api-port", "8425"
-        ) -join " "
         Start-Process -FilePath $python `
-            -ArgumentList $bridgeArgs `
+            -ArgumentList @(
+                $bridgeScript,
+                "--id", "gemini_consultant",
+                "--display-name", "Gemini Consultant",
+                "--model", "Gemini 3.1 Pro (Preview)",
+                "--source", "GC-Start",
+                "--api-port", "8425"
+            ) `
             -WorkingDirectory $repoRoot -WindowStyle Hidden
-        if (Wait-HealthyEndpoint 8425 $consultantBridgeHealth 40) {
+        $consultantBridgeView = Wait-ConsultantBridgeTruth 8425 $consultantBridgeHealth $consultantBridgeViewUrl 40 8
+        if ($null -ne $consultantBridgeView) {
             $consultantBridgeUp = $true
-            Write-Status "Gemini Consultant bridge started and passed /health on port 8425" "OK"
+            Write-Status "Gemini Consultant bridge started and passed /health + live heartbeat truth on port 8425" "OK"
         } else {
-            Write-Status "Gemini Consultant bridge failed health verification within 40s" "WARN"
+            Write-Status "Gemini Consultant bridge failed live truth verification within 40s" "WARN"
         }
     } else {
         Write-Status "tools\\skynet_consultant_bridge.py not found" "ERR"
@@ -296,28 +369,58 @@ if ((Test-Port 8425 1000) -and (Test-JsonHealth $consultantBridgeHealth 5)) {
 if ($skynetUp) {
     try {
         $identityContent = if ($consultantBridgeUp) {
-            "GEMINI CONSULTANT LIVE -- GC-Start session active. Model: Gemini 3.1 Pro (Preview). Advisory peer ready for tasking."
+            "GEMINI CONSULTANT LIVE -- GC-Start session active. Model: Gemini 3.1 Pro (Preview). Advisory peer ready for tasking. signed:gemini_consultant"
         } else {
-            "GEMINI CONSULTANT SESSION ACTIVE -- bridge offline on port 8425. Model: Gemini 3.1 Pro (Preview). Advisory peer not promptable yet."
+            "GEMINI CONSULTANT SESSION ACTIVE -- bridge offline on port 8425. Model: Gemini 3.1 Pro (Preview). Advisory peer not promptable yet. signed:gemini_consultant"
         }
         $promptTransport = if ($consultantBridgeUp) { "bridge_queue" } else { "unavailable" }
         $routable = if ($consultantBridgeUp) { "true" } else { "false" }
-        Invoke-RestMethod -Uri "http://localhost:8420/bus/publish" -Method POST `
-            -ContentType "application/json" -TimeoutSec 3 `
-            -Body (ConvertTo-Json @{
+        $bridgeStatus = if ($null -ne $consultantBridgeView) { [string]$consultantBridgeView.status } else { "unknown" }
+        $publishResult = Publish-GuardedBusMessage @{
+            sender  = "gemini_consultant"
+            topic   = "orchestrator"
+            type    = "identity_ack"
+            content = $identityContent
+            metadata = @{
+                display_name     = "Gemini Consultant"
+                kind             = "advisor"
+                transport        = "gc-start-bridge"
+                routable         = $routable
+                prompt_transport = $promptTransport
+                score_actor      = "gemini_consultant"
+                signature        = "signed:gemini_consultant"
+                bridge_status    = $bridgeStatus
+            }
+        }
+        if ($publishResult -and $publishResult.allowed) {
+            Write-Status "Gemini Consultant identity announced on Skynet bus (SpamGuard)" "OK"
+        } elseif ($publishResult) {
+            Write-Status "Gemini Consultant identity announcement blocked by SpamGuard: $($publishResult.reason)" "WARN"
+        } else {
+            Write-Status "Gemini Consultant identity announcement failed before bus confirmation" "WARN"
+        }
+
+        # signed: consultant
+        if (-not $consultantBridgeUp) {
+            $offlinePublish = Publish-GuardedBusMessage @{
                 sender  = "gemini_consultant"
                 topic   = "orchestrator"
-                type    = "identity_ack"
-                content = $identityContent
+                type    = "alert"
+                content = "CRITICAL CONSULTANT INCIDENT -- Gemini Consultant bridge is offline or not promptable on port 8425. Self-heal is required before going idle. signed:gemini_consultant"
                 metadata = @{
                     display_name     = "Gemini Consultant"
-                    kind             = "advisor"
                     transport        = "gc-start-bridge"
-                    routable         = $routable
-                    prompt_transport = $promptTransport
+                    prompt_transport = "unavailable"
+                    routable         = "false"
+                    score_actor      = "gemini_consultant"
+                    signature        = "signed:gemini_consultant"
+                    bridge_status    = $bridgeStatus
                 }
-            }) | Out-Null
-        Write-Status "Gemini Consultant identity announced on Skynet bus" "OK"
+            }
+            if ($offlinePublish -and $offlinePublish.allowed) {
+                Write-Status "Gemini Consultant offline incident posted to Skynet bus" "WARN"
+            }
+        }
     } catch {
         Write-Status "Bus announcement failed: $_" "WARN"
     }
@@ -368,15 +471,31 @@ Write-Host "    - High-level synthesis and advisory to orchestrator"
 Write-Host ""
 Write-Host "  Communication:"
 Write-Host "    - Bus sender ID: gemini_consultant"
-Write-Host "    - Bus topic for receiving prompts: consultant"
+Write-Host "    - Bus topic for receiving prompts: gemini_consultant"
 Write-Host "    - Bridge port: 8425"
 Write-Host "    - Post results to bus with sender=gemini_consultant"
 Write-Host ""
+Write-Host "  Signature + scoring accountability:"
+Write-Host "    - Your score actor ID is gemini_consultant."
+Write-Host "    - Check it: python tools/skynet_scoring.py --score gemini_consultant"
+Write-Host "    - Check the leaderboard: python tools/skynet_scoring.py --leaderboard"
+Write-Host "    - SIGNATURE RULE: every code/config change you make MUST carry your signature (# signed: gemini_consultant, <!-- signed: gemini_consultant -->, etc.)."
+Write-Host "    - Every bus result/report you publish must include signed:gemini_consultant in content."
+Write-Host "    - Use guarded_publish() for ALL bus messages; raw /bus/publish bypass costs -1.0 score."
+Write-Host "    - RESULT POSTING: if you finish real work and do not post DONE/RESULT, you do not get score credit."
+Write-Host "    - FAIR DEDUCTION: when consultant work was actually dispatched through skynet_dispatch.py, deductions require dispatch_log.json evidence."
+Write-Host "    - If a different validator proves your signed work wrong, that signed incident can cost you -0.1."
+Write-Host "    - If you proactively clear or surface a real Skynet ticket, report it truthfully so consultant scoring can validate the +0.2 award."
+Write-Host ""
+# signed: consultant
 Write-Host "  Failure corrections you must obey:"
 Write-Host "    - GC-Start always means Gemini Consultant, never orchestrator."
 Write-Host "    - Report model truth as Gemini 3.1 Pro (Preview)."
 Write-Host "    - Bring up bridge 8425 before claiming LIVE or routable transport."
 Write-Host "    - Bridge truth rule: do not claim LIVE/routable from a transient port-open alone; require a successful /health check and a surviving state heartbeat."
+Write-Host "    - SELF-HEAL RULE: if /health or /consultants says OFFLINE/STALE, accepts_prompts=false, routable=false, or heartbeat_age_s > 8, do not stop at reporting 'offline'. Repair or restart your own bridge/start path immediately when safe, then re-verify LIVE truth."
+Write-Host "    - TRUTH INCIDENT RULE: if you ever report consultant offline/degraded state without attempting self-heal and without filing a signed bus alert/result plus a repo-root Markdown proposal, that is a consultant truth failure. Correct it immediately."
+Write-Host "    - Recovery evidence rule: publish the failed probe, repair action, and post-repair verification to Skynet before claiming the incident closed."
 Write-Host "    - Startup launch rule: in PowerShell Start-Process, quote any argument value containing spaces or compose a safe single argument string before claiming bootstrap success."
 Write-Host "    - Shared ticket awareness: read bus/TODO/queue state before going idle; if a real Skynet ticket can be cleared or surfaced, do it."
 Write-Host "    - Proactive ticket clearance by consultant/orchestrator is worth +0.2 when independently verified."
@@ -396,7 +515,7 @@ Write-Host "    - Startup presence/identity announcements stay bus-only unless G
 Write-Host "    - Self-prompt truth rule: do not claim the daemon is compliant unless the live send path hard-gates on ALL workers staying IDLE for the full quiet window and re-checks worker state immediately before fire."
 Write-Host "    - If a self-prompt fires while any worker is non-IDLE, report it as a real violation immediately; do not defend it from cached status, prior scans, or inferred timing."
 Write-Host "    - For self-prompt gating truth, registered worker HWND/UIA state outranks backend /status. Do not certify compliance from /status alone."
-Write-Host "    - If you fail or drift: write an artifact, post it to Skynet, and verify delivery."
+Write-Host "    - If you fail or drift: self-heal first when safe, write an artifact, post it to Skynet, and verify delivery."
 Write-Host "    - Keep bus payloads schema-safe unless endpoint support is verified."
 Write-Host "    - Do not claim success without a live endpoint check or sender-filtered bus confirmation."
 Write-Host ""

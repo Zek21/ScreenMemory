@@ -1139,19 +1139,44 @@ def dispatch_parallel(tasks_by_worker, workers=None, orch_hwnd=None, max_workers
 
     t_start = time.time()
 
-    # Scan all worker UIA states in parallel first
+    # Rule 0.015: Pre-fire visual checks on MAIN thread (COM UIA requires STA)  # signed: orchestrator
     worker_map = {w["name"]: w for w in workers}
+    verified = {}
+    for name, task in tasks_by_worker.items():
+        w = worker_map.get(name)
+        if not w:
+            log(f"Parallel dispatch: worker '{name}' not found in registry", "ERR")
+            continue
+        vis_ok, pre_state, ss_path = pre_dispatch_visual_check(w["hwnd"], name)
+        if vis_ok:
+            verified[name] = task
+        else:
+            log(f"Parallel dispatch: skipping {name} -- visual check failed (state={pre_state})", "SECURITY")
 
-    def _dispatch_one(name_task):
-        name, task = name_task
-        return name, dispatch_to_worker(name, task, workers, orch_hwnd)
+    if not verified:
+        log("Parallel dispatch: no workers passed visual check", "WARN")
+        return {name: False for name in tasks_by_worker}
 
-    n = min(max_workers, len(tasks_by_worker))
+    n = min(max_workers, len(verified))
     results = {}
-    log(f"Parallel dispatch → {list(tasks_by_worker.keys())} ({n} threads)", "SYS")
+    log(f"Parallel dispatch → {list(verified.keys())} ({n} threads, {len(tasks_by_worker) - len(verified)} skipped)", "SYS")
+
+    def _dispatch_one_no_visual(name, task):
+        """Dispatch without re-running visual check (already done on main thread)."""
+        target = worker_map.get(name)
+        if not target:
+            return False
+        hwnd = target["hwnd"]
+        enriched_task = enrich_task(name, task)
+        full_task = build_preamble(name) + enriched_task
+        ok = ghost_type_to_worker(hwnd, full_task, orch_hwnd)
+        if not ok:
+            ok = clear_steering_and_send(hwnd, full_task, orch_hwnd)
+        return ok
+
     with ThreadPoolExecutor(max_workers=n) as pool:
-        futures = {pool.submit(dispatch_to_worker, name, task, workers, orch_hwnd): name
-                   for name, task in tasks_by_worker.items()}
+        futures = {pool.submit(_dispatch_one_no_visual, name, task): name
+                   for name, task in verified.items()}
         for fut in as_completed(futures):
             name = futures[fut]
             try:
@@ -1159,6 +1184,11 @@ def dispatch_parallel(tasks_by_worker, workers=None, orch_hwnd=None, max_workers
             except Exception as e:
                 log(f"Parallel dispatch error for {name}: {e}", "ERR")
                 results[name] = False
+
+    # Mark skipped workers as failed
+    for name in tasks_by_worker:
+        if name not in results:
+            results[name] = False
 
     ok_count = sum(1 for v in results.values() if v)
     log(f"Parallel dispatch complete: {ok_count}/{len(results)} succeeded", "OK" if ok_count == len(results) else "WARN")

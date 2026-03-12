@@ -889,6 +889,24 @@ def _announce_presence() -> None:
     )  # signed: consultant
 
 
+def _publish_offline_transition(reason: str = "bridge shutdown") -> None:
+    _publish_consultant_event(
+        "alert",
+        (
+            f"{DISPLAY_NAME.upper()} OFFLINE -- {SOURCE_NAME} bridge is leaving LIVE state. "
+            f"Reason: {reason}. Self-heal or restart is required before claiming routable consultant status."
+        ),
+        metadata={
+            "display_name": DISPLAY_NAME,
+            "kind": "advisor",
+            "transport": f"{SOURCE_NAME.lower()}-bridge",
+            "routable": "false",
+            "prompt_transport": "unavailable",
+            "bridge_status": "OFFLINE",
+        },
+    )  # signed: consultant
+
+
 def relay_consultant_result(content: str, consultant_id: str = None) -> dict:
     """Relay a consultant bus result to the orchestrator via direct-prompt.
 
@@ -962,6 +980,11 @@ def run_daemon(interval_s: float = DEFAULT_INTERVAL_S,
     except KeyboardInterrupt:
         pass
     finally:
+        if not once:
+            try:
+                _publish_offline_transition("bridge shutdown")
+            except Exception:
+                pass
         _write_offline_snapshot()
 
     return 0
