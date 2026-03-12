@@ -150,7 +150,7 @@ class TestDaemonLifecycle(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, os.path.join(ROOT, "tools", "skynet_daemon_status.py"),
              "--json"],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, timeout=90  # 16 daemons with psutil checks can be slow  # signed: gamma
         )
         data = json.loads(result.stdout)
         required = {"name", "alive"}

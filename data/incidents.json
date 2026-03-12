@@ -324,5 +324,35 @@
     "fixed_by": "delta",
     "cross_validation_round": "CV1",
     "signed_by": "delta"
+  },
+  {
+    "id": "auto_restart_bus_persist_restart_1773352172",
+    "timestamp": "2026-03-13T05:49:32",
+    "what_happened": "Service bus_persist_restart died (PID 32100)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 12388)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "bus_persist_restart",
+    "timestamp": "2026-03-13T05:49:33.005016",
+    "old_pid": 32100,
+    "new_pid": 12388,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_consultant_bridge_restart_1773352317",
+    "timestamp": "2026-03-13T05:51:57",
+    "what_happened": "Service consultant_bridge_restart died (PID 22344)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 22344)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "consultant_bridge_restart",
+    "timestamp": "2026-03-13T05:51:57.775693",
+    "old_pid": 22344,
+    "new_pid": 22344,
+    "type": "auto_restart"
   }
 ]

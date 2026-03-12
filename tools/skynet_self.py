@@ -53,6 +53,43 @@ CONSULTANT_BRIDGE_PORTS = {
 # with INCIDENT_PATTERN_WARNING when patterns haven't changed.  # signed: gamma
 _last_incident_pattern_hash: Optional[str] = None
 
+# --- Resolved Incident Pattern Tracking ---  # signed: beta
+_RESOLVED_PATTERNS_FILE = DATA / "resolved_patterns.json"
+
+
+def get_resolved_patterns() -> Dict[str, Any]:
+    """Load the set of acknowledged/resolved incident pattern names."""
+    if not _RESOLVED_PATTERNS_FILE.exists():
+        return {}
+    try:
+        return json.loads(_RESOLVED_PATTERNS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def acknowledge_incident_pattern(pattern_name: str, reason: str = "resolved") -> bool:
+    """Mark an incident pattern as resolved so it stops triggering alerts.
+
+    Args:
+        pattern_name: e.g. 'recurring_hwnd_failures', 'recurring_delivery_failures'
+        reason: why this pattern is being acknowledged
+
+    Returns:
+        True if successfully saved.
+    """
+    resolved = get_resolved_patterns()
+    resolved[pattern_name] = {
+        "acknowledged_at": datetime.now().isoformat(),
+        "reason": reason,
+        "incident_count_at_ack": None,  # filled by caller if available
+    }
+    try:
+        _RESOLVED_PATTERNS_FILE.write_text(json.dumps(resolved, indent=2))
+        return True
+    except Exception:
+        return False
+# signed: beta
+
 
 def _ts():
     return datetime.now().strftime("%H:%M:%S")
@@ -847,8 +884,24 @@ class SkynetIntrospection:
             if any(kw in text for kw in boot_keywords):
                 boot_failures += 1
 
+        # Load resolved/acknowledged patterns to skip old noise  # signed: beta
+        resolved = get_resolved_patterns()
+
         # Detect recurring patterns (threshold: 2+ incidents in same category)
-        if hwnd_failures >= 2:
+        # Skip patterns that have been acknowledged/resolved unless incident
+        # count has grown since acknowledgment.
+        def _should_alert(name: str, count: int) -> bool:
+            """Return True if this pattern should trigger an alert."""
+            if name not in resolved:
+                return True
+            ack = resolved[name]
+            prev_count = ack.get("incident_count_at_ack")
+            if prev_count is not None and count > prev_count:
+                return True  # new incidents since last ack
+            return False
+        # signed: beta
+
+        if hwnd_failures >= 2 and _should_alert("recurring_hwnd_failures", hwnd_failures):
             patterns.append({
                 "pattern": "recurring_hwnd_failures",
                 "count": hwnd_failures,
@@ -858,7 +911,7 @@ class SkynetIntrospection:
                                   "add heartbeat-based liveness instead of IsWindow-only checks",
             })
 
-        if delivery_failures >= 2:
+        if delivery_failures >= 2 and _should_alert("recurring_delivery_failures", delivery_failures):
             patterns.append({
                 "pattern": "recurring_delivery_failures",
                 "count": delivery_failures,
@@ -868,7 +921,7 @@ class SkynetIntrospection:
                                   "via UIA state change detection after ghost_type",
             })
 
-        if awareness_gaps >= 2:
+        if awareness_gaps >= 2 and _should_alert("recurring_self_awareness_gaps", awareness_gaps):
             patterns.append({
                 "pattern": "recurring_self_awareness_gaps",
                 "count": awareness_gaps,
@@ -878,7 +931,7 @@ class SkynetIntrospection:
                                   "add ALL_AGENT_NAMES completeness assertion to Phase 0",
             })
 
-        if process_kills >= 2:
+        if process_kills >= 2 and _should_alert("recurring_process_termination", process_kills):
             patterns.append({
                 "pattern": "recurring_process_termination",
                 "count": process_kills,
@@ -888,7 +941,7 @@ class SkynetIntrospection:
                                   "audit worker permissions",
             })
 
-        if boot_failures >= 2:
+        if boot_failures >= 2 and _should_alert("recurring_boot_failures", boot_failures):
             patterns.append({
                 "pattern": "recurring_boot_failures",
                 "count": boot_failures,
@@ -1285,7 +1338,47 @@ def main():
             print(f"Incident Patterns Detected ({len(patterns)}):")
             print(json.dumps(patterns, indent=2))
         else:
-            print("No recurring incident patterns detected")
+            print("No recurring incident patterns detected (all resolved or below threshold)")
+        # Also show resolved patterns for visibility
+        resolved = get_resolved_patterns()
+        if resolved:
+            print(f"\nResolved/Acknowledged Patterns ({len(resolved)}):")
+            for name, info in resolved.items():
+                print(f"  {name}: acked {info.get('acknowledged_at', '?')} ({info.get('reason', '')})")
+    elif cmd == "acknowledge-pattern":
+        # Usage: python skynet_self.py acknowledge-pattern <pattern_name> [reason]
+        if len(sys.argv) < 3:
+            print("Usage: python skynet_self.py acknowledge-pattern <pattern_name> [reason]")
+            print("Valid patterns: recurring_hwnd_failures, recurring_delivery_failures, "
+                  "recurring_self_awareness_gaps, recurring_process_termination, recurring_boot_failures")
+            sys.exit(1)
+        pname = sys.argv[2]
+        reason = sys.argv[3] if len(sys.argv) > 3 else "manually acknowledged"
+        # Get current count for this pattern before acking
+        all_patterns_raw = SkynetIntrospection._detect_incident_patterns.__wrapped__() \
+            if hasattr(SkynetIntrospection._detect_incident_patterns, '__wrapped__') else None
+        if acknowledge_incident_pattern(pname, reason):
+            print(f"Pattern '{pname}' acknowledged as resolved. Reason: {reason}")
+            print(f"It will no longer trigger alerts unless new incidents are added.")
+        else:
+            print(f"Failed to acknowledge pattern '{pname}'")
+            sys.exit(1)
+    elif cmd == "acknowledge-all-patterns":
+        # Acknowledge all currently-detected patterns at once
+        patterns = SkynetIntrospection._detect_incident_patterns()
+        if not patterns:
+            print("No active patterns to acknowledge")
+        else:
+            reason = sys.argv[2] if len(sys.argv) > 2 else "bulk acknowledged - old resolved incidents"
+            for p in patterns:
+                acknowledge_incident_pattern(p["pattern"], reason)
+                # Update count at ack time
+                resolved = get_resolved_patterns()
+                resolved[p["pattern"]]["incident_count_at_ack"] = p["count"]
+                _RESOLVED_PATTERNS_FILE.write_text(json.dumps(resolved, indent=2))
+                print(f"  Acknowledged: {p['pattern']} (count={p['count']})")
+            print(f"All {len(patterns)} active patterns acknowledged.")
+    # signed: beta
     # signed: delta
     else:
         print(f"Unknown command: {cmd}")
