@@ -139,6 +139,124 @@ class SkynetIdentity:
             }
         return result
 
+    def validate_agent_completeness(self) -> List[dict]:
+        """Scan all identity data files and verify completeness.
+
+        Checks:
+          - data/workers.json: all workers present, HWNDs non-zero and alive, models correct
+          - data/consultant_state.json / gemini_consultant_state.json: required fields, transport set
+          - data/orchestrator.json: HWND non-zero and alive, model correct
+
+        Returns a list of identity gaps (empty list = all complete).
+        """
+        gaps = []
+
+        # --- Workers ---
+        workers_file = DATA / "workers.json"
+        if workers_file.exists():
+            try:
+                raw = json.loads(workers_file.read_text())
+                # workers.json may be a dict with 'workers' key or a list
+                if isinstance(raw, dict):
+                    workers = raw.get("workers", [])
+                elif isinstance(raw, list):
+                    workers = raw
+                else:
+                    workers = []
+                worker_names_found = set()
+                for w in workers:
+                    if isinstance(w, dict):
+                        worker_names_found.add(w.get("name"))
+                    elif isinstance(w, str):
+                        worker_names_found.add(w)
+                for expected in WORKER_NAMES:
+                    if expected not in worker_names_found:
+                        gaps.append({"entity": expected, "type": "worker", "gap": "missing_from_workers_json"})
+                for w in workers:
+                    name = w.get("name", "unknown")
+                    hwnd = w.get("hwnd", 0)
+                    if not hwnd:
+                        gaps.append({"entity": name, "type": "worker", "gap": "hwnd_is_zero"})
+                    elif hwnd:
+                        try:
+                            import ctypes
+                            if not ctypes.windll.user32.IsWindow(int(hwnd)):
+                                gaps.append({"entity": name, "type": "worker", "gap": "hwnd_dead",
+                                             "hwnd": hwnd})
+                        except Exception:
+                            pass
+                    model = w.get("model", "")
+                    if model and "opus" not in model.lower() and "fast" not in model.lower():
+                        gaps.append({"entity": name, "type": "worker", "gap": "wrong_model",
+                                     "model": model})
+            except Exception as e:
+                gaps.append({"entity": "workers.json", "type": "file", "gap": f"parse_error: {e}"})
+        else:
+            gaps.append({"entity": "workers.json", "type": "file", "gap": "file_not_found"})
+
+        # --- Consultants ---
+        required_consultant_fields = ["id", "transport", "role"]
+        for cname, state_file in CONSULTANT_STATE_FILES.items():
+            if state_file.exists():
+                try:
+                    state = json.loads(state_file.read_text())
+                    for field in required_consultant_fields:
+                        if not state.get(field):
+                            gaps.append({"entity": cname, "type": "consultant",
+                                         "gap": f"missing_field:{field}"})
+                    # Check HWND if present
+                    hwnd = int(state.get("hwnd", 0))
+                    if hwnd:
+                        try:
+                            import ctypes
+                            if not ctypes.windll.user32.IsWindow(hwnd):
+                                gaps.append({"entity": cname, "type": "consultant",
+                                             "gap": "hwnd_dead", "hwnd": hwnd})
+                        except Exception:
+                            pass
+                    # Check transport is set
+                    transport = state.get("transport", "")
+                    if not transport or transport == "unknown":
+                        gaps.append({"entity": cname, "type": "consultant",
+                                     "gap": "transport_not_set"})
+                except Exception as e:
+                    gaps.append({"entity": cname, "type": "consultant",
+                                 "gap": f"parse_error: {e}"})
+            else:
+                gaps.append({"entity": cname, "type": "consultant",
+                             "gap": "state_file_not_found"})
+
+        # --- Orchestrator ---
+        orch_file = DATA / "orchestrator.json"
+        if orch_file.exists():
+            try:
+                orch = json.loads(orch_file.read_text())
+                hwnd = int(orch.get("hwnd", 0))
+                if not hwnd:
+                    gaps.append({"entity": "orchestrator", "type": "orchestrator",
+                                 "gap": "hwnd_is_zero"})
+                elif hwnd:
+                    try:
+                        import ctypes
+                        if not ctypes.windll.user32.IsWindow(hwnd):
+                            gaps.append({"entity": "orchestrator", "type": "orchestrator",
+                                         "gap": "hwnd_dead", "hwnd": hwnd})
+                    except Exception:
+                        pass
+                model = orch.get("model", "")
+                if model and "opus" not in model.lower() and "fast" not in model.lower():
+                    gaps.append({"entity": "orchestrator", "type": "orchestrator",
+                                 "gap": "wrong_model", "model": model})
+            except Exception as e:
+                gaps.append({"entity": "orchestrator.json", "type": "file",
+                             "gap": f"parse_error: {e}"})
+        else:
+            gaps.append({"entity": "orchestrator.json", "type": "file",
+                         "gap": "file_not_found"})
+
+        return gaps
+    # signed: delta
+
     def get_consultant_status(self) -> Dict[str, dict]:
         """Check consultant health: state files, HWND alive, bridge HTTP health.
 
@@ -539,6 +657,15 @@ class SkynetIntrospection:
         self._reflect_on_knowledge(facts, strengths, observations, recommendations)
         self._reflect_on_evolution(weaknesses, recommendations)
 
+        # Detect recurring incident patterns  # signed: delta
+        incident_patterns = self._detect_incident_patterns()
+        for p in incident_patterns:
+            if p["severity"] in ("CRITICAL", "HIGH"):
+                weaknesses.append(f"Recurring incident pattern: {p['description']}")
+                recommendations.append(p["recommendation"])
+            else:
+                observations.append(f"Incident pattern: {p['description']}")
+
         workers = checks.get("workers", {})
         consultants_info = checks.get("consultants", {})  # signed: delta
         return {
@@ -546,6 +673,7 @@ class SkynetIntrospection:
             "overall_health": health.get("overall", "UNKNOWN"),
             "strengths": strengths, "weaknesses": weaknesses,
             "observations": observations, "recommendations": recommendations,
+            "incident_patterns": incident_patterns,  # signed: delta
             "metrics": {
                 "workers_alive": workers.get("alive", 0),
                 "workers_total": workers.get("total", 0),
@@ -655,10 +783,136 @@ class SkynetIntrospection:
         except Exception:
             pass
 
+    @staticmethod
+    def _detect_incident_patterns() -> List[dict]:
+        """Analyze data/incidents.json for recurring failure patterns.
 
-# ══════════════════════════════════════════════════════════════════
-#  AUTONOMOUS GOALS — What should I do next?
-# ══════════════════════════════════════════════════════════════════
+        Looks for:
+          - Repeated HWND failures
+          - Repeated delivery failures
+          - Repeated self-awareness gaps
+          - Repeated process termination incidents
+
+        Returns list of detected patterns with severity and recommendation.
+        Posts warnings to bus if critical patterns are detected.
+        """
+        incidents_file = DATA / "incidents.json"
+        if not incidents_file.exists():
+            return []
+
+        try:
+            incidents = json.loads(incidents_file.read_text())
+        except Exception:
+            return []
+
+        if not isinstance(incidents, list) or not incidents:
+            return []
+
+        patterns = []
+        # Category counters
+        hwnd_failures = 0
+        delivery_failures = 0
+        awareness_gaps = 0
+        process_kills = 0
+        boot_failures = 0
+
+        hwnd_keywords = ["hwnd", "window", "iswindow", "dead window", "window handle"]
+        delivery_keywords = ["delivery", "ghost_type", "dispatch", "clipboard", "postmessage",
+                             "wm_paste", "ghost-type"]
+        awareness_keywords = ["self-awareness", "identity", "consciousness", "blind",
+                              "enumerat", "consultant_names", "worker_names"]
+        process_keywords = ["stop-process", "taskkill", "kill", "terminate", "process"]
+        boot_keywords = ["boot", "startup", "start", "skipworkers", "orch-start"]
+
+        for inc in incidents:
+            text = " ".join([
+                str(inc.get("what_happened", "")),
+                str(inc.get("root_cause", "")),
+                str(inc.get("fix_applied", "")),
+                str(inc.get("title", "")),
+            ]).lower()
+
+            if any(kw in text for kw in hwnd_keywords):
+                hwnd_failures += 1
+            if any(kw in text for kw in delivery_keywords):
+                delivery_failures += 1
+            if any(kw in text for kw in awareness_keywords):
+                awareness_gaps += 1
+            if any(kw in text for kw in process_keywords):
+                process_kills += 1
+            if any(kw in text for kw in boot_keywords):
+                boot_failures += 1
+
+        # Detect recurring patterns (threshold: 2+ incidents in same category)
+        if hwnd_failures >= 2:
+            patterns.append({
+                "pattern": "recurring_hwnd_failures",
+                "count": hwnd_failures,
+                "severity": "HIGH",
+                "description": f"HWND/window failures recurring ({hwnd_failures} incidents)",
+                "recommendation": "Strengthen HWND monitoring in skynet_monitor.py; "
+                                  "add heartbeat-based liveness instead of IsWindow-only checks",
+            })
+
+        if delivery_failures >= 2:
+            patterns.append({
+                "pattern": "recurring_delivery_failures",
+                "count": delivery_failures,
+                "severity": "HIGH",
+                "description": f"Delivery mechanism failures recurring ({delivery_failures} incidents)",
+                "recommendation": "Add delivery confirmation protocol; verify WM_PASTE receipt "
+                                  "via UIA state change detection after ghost_type",
+            })
+
+        if awareness_gaps >= 2:
+            patterns.append({
+                "pattern": "recurring_self_awareness_gaps",
+                "count": awareness_gaps,
+                "severity": "CRITICAL",
+                "description": f"Self-awareness/identity gaps recurring ({awareness_gaps} incidents)",
+                "recommendation": "Run skynet_arch_verify.py on every boot; "
+                                  "add ALL_AGENT_NAMES completeness assertion to Phase 0",
+            })
+
+        if process_kills >= 2:
+            patterns.append({
+                "pattern": "recurring_process_termination",
+                "count": process_kills,
+                "severity": "CRITICAL",
+                "description": f"Unauthorized process termination recurring ({process_kills} incidents)",
+                "recommendation": "Verify guard_process_kill() is enforced on all code paths; "
+                                  "audit worker permissions",
+            })
+
+        if boot_failures >= 2:
+            patterns.append({
+                "pattern": "recurring_boot_failures",
+                "count": boot_failures,
+                "severity": "MEDIUM",
+                "description": f"Boot/startup failures recurring ({boot_failures} incidents)",
+                "recommendation": "Add boot sequence integrity checks; verify Orch-Start.ps1 "
+                                  "defaults are immutable",
+            })
+
+        # Post warnings to bus for critical patterns
+        critical_patterns = [p for p in patterns if p["severity"] in ("CRITICAL", "HIGH")]
+        if critical_patterns:
+            try:
+                from tools.skynet_spam_guard import guarded_publish
+                summary = "; ".join(
+                    f"{p['pattern']}({p['count']})" for p in critical_patterns
+                )
+                guarded_publish({
+                    "sender": "introspection",
+                    "topic": "orchestrator",
+                    "type": "alert",
+                    "content": f"INCIDENT_PATTERN_WARNING: {summary}",
+                })
+            except Exception:
+                pass
+
+        return patterns
+    # signed: delta
 
 class SkynetGoals:
     """Autonomous goal generation based on introspection."""
@@ -753,7 +1007,10 @@ class SkynetSelf:
         }
 
     def quick_pulse(self) -> dict:
-        """Fast heartbeat for monitoring — minimal overhead."""
+        """Fast heartbeat for monitoring — minimal overhead.
+
+        Includes architecture/consultant/bus awareness flags (Level 3.4).
+        """
         pulse = self._cached_health_pulse()
         agents = self.identity.agents()
         consultants = self.identity.get_consultant_status()  # signed: delta
@@ -763,6 +1020,12 @@ class SkynetSelf:
             if c["status"] in ("ONLINE", "BRIDGE_ONLY", "WINDOW_ONLY")
         )  # signed: delta
         iq_data = self.compute_iq(pulse, agents)
+
+        # Awareness flags — does the agent truly understand the system?
+        architecture_knowledge_ok = self._check_architecture_knowledge()
+        consultant_awareness = self._check_consultant_awareness(consultants)
+        bus_awareness = self._check_bus_awareness(pulse)
+
         return {
             "name": "SKYNET",
             "version": self.identity.version,
@@ -777,7 +1040,49 @@ class SkynetSelf:
             "total": len(agents),
             "consultants_online": consultants_online,
             "consultants_total": len(consultants),
+            "architecture_knowledge_ok": architecture_knowledge_ok,
+            "consultant_awareness": consultant_awareness,
+            "bus_awareness": bus_awareness,
         }
+        # signed: delta
+
+    @staticmethod
+    def _check_architecture_knowledge() -> bool:
+        """Check if agent knows ghost_type delivery and entity constants."""
+        try:
+            # Verify dispatch module has ghost_type_to_worker
+            import importlib
+            dispatch = importlib.import_module("tools.skynet_dispatch")
+            if not hasattr(dispatch, "ghost_type_to_worker"):
+                return False
+            # Verify consciousness kernel constants are populated
+            if not CONSULTANT_NAMES or not ALL_AGENT_NAMES:
+                return False
+            if len(ALL_AGENT_NAMES) < 7:
+                return False
+            return True
+        except Exception:
+            return False
+    # signed: delta
+
+    @staticmethod
+    def _check_consultant_awareness(consultants: dict) -> bool:
+        """Check if CONSULTANT_NAMES is populated and consultant states are readable."""
+        if not CONSULTANT_NAMES or len(CONSULTANT_NAMES) < 2:
+            return False
+        if not consultants:
+            return False
+        # At least we can enumerate them (even if offline)
+        return len(consultants) == len(CONSULTANT_NAMES)
+    # signed: delta
+
+    @staticmethod
+    def _check_bus_awareness(pulse: dict) -> bool:
+        """Check bus health and ring buffer status."""
+        checks = pulse.get("checks", {})
+        bus = checks.get("bus", {})
+        return bus.get("status") == "UP"
+    # signed: delta
 
     _pulse_cache = None
     _pulse_cache_t = 0
@@ -924,7 +1229,7 @@ class SkynetSelf:
 def main():
     if len(sys.argv) < 2:
         print("Usage: skynet_self.py <command>")
-        print("Commands: status, identity, capabilities, health, introspect, goals, pulse")
+        print("Commands: status, identity, capabilities, health, introspect, goals, pulse, validate, patterns")
         sys.exit(1)
 
     cmd = sys.argv[1].lower()
@@ -957,6 +1262,21 @@ def main():
     elif cmd == "broadcast":
         pulse = skynet.broadcast_awareness()
         print(f"Broadcast: {json.dumps(pulse)}")
+    elif cmd == "validate":
+        gaps = skynet.identity.validate_agent_completeness()
+        if gaps:
+            print(f"Identity Gaps Found ({len(gaps)}):")
+            print(json.dumps(gaps, indent=2))
+        else:
+            print("Identity completeness: ALL PASS (no gaps)")
+    elif cmd == "patterns":
+        patterns = SkynetIntrospection._detect_incident_patterns()
+        if patterns:
+            print(f"Incident Patterns Detected ({len(patterns)}):")
+            print(json.dumps(patterns, indent=2))
+        else:
+            print("No recurring incident patterns detected")
+    # signed: delta
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)

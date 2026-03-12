@@ -1307,6 +1307,32 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._json_response({"error": str(e)}, status=500)
             # signed: delta
+        elif self.path == "/api/daemons":
+            # Daemon health dashboard endpoint — real-time status of ALL daemons.
+            # Reference: docs/DAEMON_ARCHITECTURE.md (Sections 7-9)  # signed: beta
+            try:
+                sys.path.insert(0, str(Path(__file__).parent / "tools"))
+                from skynet_daemon_status import check_all_daemons, DAEMON_REGISTRY
+                statuses = check_all_daemons()
+                # Add criticality tier counts for dashboard summary
+                tiers = {"CATASTROPHIC": 0, "HIGH": 0, "MODERATE": 0, "LOW": 0}
+                alive_count = 0
+                for s in statuses:
+                    if s["alive"]:
+                        alive_count += 1
+                    tiers[s.get("criticality", "LOW")] = tiers.get(s.get("criticality", "LOW"), 0) + 1
+                self._json_response({
+                    "daemons": statuses,
+                    "summary": {
+                        "total": len(statuses),
+                        "alive": alive_count,
+                        "dead": len(statuses) - alive_count,
+                        "tiers": tiers,
+                    },
+                    "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                })  # signed: beta
+            except Exception as e:
+                self._json_response({"error": str(e)}, status=500)
         elif self.path == "/api/ci/latest":
             try:
                 ci_path = Path(__file__).parent / "data" / "ci_report.json"

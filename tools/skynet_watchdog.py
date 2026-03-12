@@ -114,6 +114,8 @@ SSE_CHECK_INTERVAL = 30
 HWND_CHECK_INTERVAL = 30
 LEARNER_CHECK_INTERVAL = 60
 CONSULTANT_CHECK_INTERVAL = 30
+BUS_PERSIST_CHECK_INTERVAL = 60  # signed: beta
+CONSULTANT_CONSUMER_CHECK_INTERVAL = 60  # signed: beta
 
 # ── Restart backoff tracking ─────────────────────────────────────────────────
 # Prevents restart storms when a service is persistently broken.
@@ -565,6 +567,127 @@ def restart_consultant_bridge(config: dict):
         return False
 
 
+def restart_bus_persist():
+    """Restart skynet_bus_persist.py as a hidden background process (with backoff).
+
+    Bus persist archives all bus messages to JSONL via SSE subscription.
+    Reference: docs/DAEMON_ARCHITECTURE.md Section 5.2 (skynet_bus_persist.py)
+    """
+    pid_file = DATA_DIR / "bus_persist.pid"
+    if pid_file.exists():
+        try:
+            old_pid_val = int(pid_file.read_text().strip())
+            if _pid_alive_and_correct(old_pid_val, "skynet_bus_persist"):
+                log(f"Bus persist already running (PID {old_pid_val}) -- skipping restart")
+                _record_restart_result("bus_persist", True)
+                return True
+        except (OSError, ValueError):
+            pass
+
+    if not _should_attempt_restart("bus_persist"):
+        return False
+
+    log("Bus persist DOWN -- attempting restart")
+    old_pid = 0
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text().strip())
+        except (ValueError, OSError):
+            pass
+    try:
+        subprocess.Popen(
+            [PYTHON, str(ROOT / "tools" / "skynet_bus_persist.py")],
+            cwd=str(ROOT),
+            env=_DAEMON_ENV,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+        )
+        time.sleep(3)
+        if pid_file.exists():
+            try:
+                new_pid_val = int(pid_file.read_text().strip())
+                import os
+                os.kill(new_pid_val, 0)
+                log(f"Bus persist restarted (old={old_pid}, new={new_pid_val})")
+                _post_restart_alert("skynet_bus_persist.py", old_pid, new_pid_val)
+                _refresh_protected_registry()
+                _log_incident("bus_persist_restart", old_pid, new_pid_val)
+                _record_restart_result("bus_persist", True)
+                return True
+            except (OSError, ValueError):
+                pass
+        log("Bus persist restart -- cannot verify (may be starting)")
+        _record_restart_result("bus_persist", True)  # optimistic
+        return True
+    except Exception as e:
+        log(f"Bus persist restart error: {e}")
+        _record_restart_result("bus_persist", False)
+        return False
+    # signed: beta
+
+
+def restart_consultant_consumer(port: int):
+    """Restart skynet_consultant_consumer.py for a given bridge port (with backoff).
+
+    Consultant consumers poll bridge queues and relay prompts to the bus.
+    Reference: docs/DAEMON_ARCHITECTURE.md Section 6.3 (skynet_consultant_consumer.py)
+    """
+    svc_name = f"consultant_consumer_{port}"
+    pid_file = DATA_DIR / f"consultant_consumer_{port}.pid"
+    if pid_file.exists():
+        try:
+            old_pid_val = int(pid_file.read_text().strip())
+            if _pid_alive_and_correct(old_pid_val, "skynet_consultant_consumer"):
+                log(f"Consultant consumer ({port}) already running (PID {old_pid_val}) -- skipping restart")
+                _record_restart_result(svc_name, True)
+                return True
+        except (OSError, ValueError):
+            pass
+
+    if not _should_attempt_restart(svc_name):
+        return False
+
+    log(f"Consultant consumer ({port}) DOWN -- attempting restart")
+    old_pid = 0
+    if pid_file.exists():
+        try:
+            old_pid = int(pid_file.read_text().strip())
+        except (ValueError, OSError):
+            pass
+    try:
+        subprocess.Popen(
+            [PYTHON, str(ROOT / "tools" / "skynet_consultant_consumer.py"), "--port", str(port)],
+            cwd=str(ROOT),
+            env=_DAEMON_ENV,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+        )
+        time.sleep(3)
+        if pid_file.exists():
+            try:
+                new_pid_val = int(pid_file.read_text().strip())
+                import os
+                os.kill(new_pid_val, 0)
+                log(f"Consultant consumer ({port}) restarted (old={old_pid}, new={new_pid_val})")
+                _post_restart_alert(f"skynet_consultant_consumer_{port}.py", old_pid, new_pid_val)
+                _refresh_protected_registry()
+                _log_incident(f"consultant_consumer_{port}_restart", old_pid, new_pid_val)
+                _record_restart_result(svc_name, True)
+                return True
+            except (OSError, ValueError):
+                pass
+        log(f"Consultant consumer ({port}) restart -- cannot verify (may be starting)")
+        _record_restart_result(svc_name, True)  # optimistic
+        return True
+    except Exception as e:
+        log(f"Consultant consumer ({port}) restart error: {e}")
+        _record_restart_result(svc_name, False)
+        return False
+    # signed: beta
+
+
 def _get_service_pid(service_name):
     """Get the PID of a known service by name. Returns 0 if not found."""
     try:
@@ -890,6 +1013,66 @@ def _check_consultant_bridges(now, last_check, status):
     return now
 
 
+def _check_bus_persist(now, last_check, status):
+    """Check bus persist daemon health via PID file and archive freshness.
+
+    Bus persist archives all bus messages to JSONL via SSE subscription.
+    Reference: docs/DAEMON_ARCHITECTURE.md Section 5.2 (skynet_bus_persist.py)
+    """
+    if now - last_check < BUS_PERSIST_CHECK_INTERVAL:
+        return last_check
+    bp_ok = False
+    bp_pid_file = DATA_DIR / "bus_persist.pid"
+    if bp_pid_file.exists():
+        try:
+            bp_pid_val = int(bp_pid_file.read_text().strip())
+            import os
+            os.kill(bp_pid_val, 0)
+            bp_ok = True
+        except (OSError, ValueError):
+            pass
+    _update_heartbeat("bus_persist", bp_ok)
+    if bp_ok:
+        status["bus_persist"] = "ok"
+    else:
+        restarted = restart_bus_persist()
+        status["bus_persist"] = "restarted" if restarted else "down"
+    status["bus_persist_last_check"] = datetime.now().isoformat()
+    return now
+    # signed: beta
+
+
+def _check_consultant_consumers(now, last_check, status):
+    """Check consultant consumer daemons health via PID files.
+
+    Consultant consumers poll bridge queues and relay prompts to the bus.
+    Reference: docs/DAEMON_ARCHITECTURE.md Section 6.3 (skynet_consultant_consumer.py)
+    """
+    if now - last_check < CONSULTANT_CONSUMER_CHECK_INTERVAL:
+        return last_check
+    for port in (8422, 8425):
+        svc_name = f"consultant_consumer_{port}"
+        cc_ok = False
+        cc_pid_file = DATA_DIR / f"consultant_consumer_{port}.pid"
+        if cc_pid_file.exists():
+            try:
+                cc_pid_val = int(cc_pid_file.read_text().strip())
+                import os
+                os.kill(cc_pid_val, 0)
+                cc_ok = True
+            except (OSError, ValueError):
+                pass
+        _update_heartbeat(svc_name, cc_ok)
+        if cc_ok:
+            status[svc_name] = "ok"
+        else:
+            restarted = restart_consultant_consumer(port)
+            status[svc_name] = "restarted" if restarted else "down"
+    status["consultant_consumer_last_check"] = datetime.now().isoformat()
+    return now
+    # signed: beta
+
+
 def _check_worker_hwnds(now, last_check, status):
     """Check worker window HWNDs are still valid."""
     if now - last_check < HWND_CHECK_INTERVAL:
@@ -1104,6 +1287,8 @@ def run_daemon(args=None):
     last_learner_check = 0.0
     last_consultant_check = 0.0
     last_dispatch_check = 0.0
+    last_bus_persist_check = 0.0  # signed: beta
+    last_consumer_check = 0.0  # signed: beta
     stuck_detector = None
     skynet_self_cached = None
     status = {
@@ -1111,6 +1296,9 @@ def run_daemon(args=None):
         "skynet": "unknown",
         "sse_daemon": "unknown",
         "learner": "unknown",
+        "bus_persist": "unknown",  # signed: beta
+        "consultant_consumer_8422": "unknown",  # signed: beta
+        "consultant_consumer_8425": "unknown",  # signed: beta
     }
     for config in CONSULTANT_BRIDGES:
         status[config["service_name"]] = "unknown"
@@ -1136,6 +1324,8 @@ def run_daemon(args=None):
                 last_sse_check = _check_sse_daemon(now, last_sse_check, status)
                 last_learner_check = _check_learner_daemon(now, last_learner_check, status)
                 last_consultant_check = _check_consultant_bridges(now, last_consultant_check, status)
+                last_bus_persist_check = _check_bus_persist(now, last_bus_persist_check, status)  # signed: beta
+                last_consumer_check = _check_consultant_consumers(now, last_consumer_check, status)  # signed: beta
                 last_hwnd_check = _check_worker_hwnds(now, last_hwnd_check, status)
                 last_window_scan = _run_window_scan(now, last_window_scan, status)
                 last_stuck_check, stuck_detector = _run_stuck_detection(now, last_stuck_check, status, stuck_detector)

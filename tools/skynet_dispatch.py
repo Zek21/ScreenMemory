@@ -545,9 +545,43 @@ def pre_dispatch_visual_check(hwnd, worker_name):
 
 
 def detect_steering(hwnd):
-    """Return True if the worker window is showing a STEERING panel — UIA-based, no screenshot."""
+    """Return True if the worker window is showing a STEERING panel.
+
+    Uses a two-tier detection strategy for defense-in-depth:
+      1. Primary: COM UIA engine state check (fast, ~10ms)
+      2. Secondary: UIA tree scan for Cancel button with 'Alt+Backspace' in name,
+         which is the definitive indicator of the STEERING panel.
+
+    See docs/DELIVERY_PIPELINE.md Section 5 (Pre-Dispatch Visual Check) for context.
+
+    Args:
+        hwnd: Target worker window HWND
+
+    Returns:
+        bool: True if STEERING panel is detected by either method
+    """  # signed: alpha
     state = get_worker_state_uia(hwnd)
-    return state == "STEERING"
+    if state == "STEERING":
+        return True
+    # Secondary STEERING check: scan UIA tree for Cancel (Alt+Backspace) button
+    # This catches cases where the UIA engine state doesn't report STEERING but the
+    # panel is actually present. Defense-in-depth per docs/DELIVERY_PIPELINE.md Section 9.  # signed: alpha
+    try:
+        import ctypes
+        if not ctypes.windll.user32.IsWindow(hwnd):
+            return False
+        from System.Windows.Automation import AutomationElement, TreeScope, PropertyCondition  # type: ignore
+        wnd = AutomationElement.FromHandle(hwnd)
+        cancel_btn = wnd.FindFirst(
+            TreeScope.Descendants,
+            PropertyCondition(AutomationElement.NameProperty, 'Cancel (Alt+Backspace)')
+        )
+        if cancel_btn is not None:
+            log(f"STEERING detected by secondary UIA button scan for HWND={hwnd}", "WARN")
+            return True
+    except Exception:
+        pass  # .NET UIA not available or window gone — fall through
+    return False
 
 
 def get_worker_state_uia(hwnd):
@@ -702,7 +736,37 @@ def load_orch_hwnd():
 
 
 def _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path):
-    """Build the PowerShell script for ghost-typing into a worker window."""
+    """Build the PowerShell script for ghost-typing into a worker window.
+
+    Generates an inline PowerShell script containing a C# GhostType class with Win32
+    P/Invoke methods for cross-thread focus management and clipboard-based text delivery.
+
+    Architecture (see docs/DELIVERY_PIPELINE.md Section 4):
+        1. STEERING cancel -- find 'Cancel (Alt+Backspace)' UIA button and invoke it
+        2. Input target resolution -- score UIA Edit controls by position heuristics,
+           or fall back to FindRender() DFS for Chrome_RenderWidgetHostHWND
+        3. Multi-pane disambiguation -- when multiple Chrome render widgets exist,
+           select the one with the largest bounding area in the bottom-right quadrant
+           (chat panes are typically positioned there in VS Code)
+        4. Focus race prevention -- verify foreground window hasn't changed between
+           clipboard set and paste; abort with FOCUS_STOLEN if stolen
+        5. Clipboard verification -- 3x SetText/GetText retry loop
+        6. Focus + paste + enter -- AttachThreadInput preferred, SetForegroundWindow fallback
+        7. Clipboard cleanup -- Clear() + restore saved clipboard
+
+    Args:
+        hwnd: Target worker/consultant window HWND (int cast to IntPtr in PS)
+        orch_hwnd: Orchestrator window HWND for focus restore after delivery
+        dispatch_file_path: Path to temp file containing dispatch text (double-escaped backslashes)
+
+    Returns:
+        str: Complete PowerShell script ready for subprocess execution
+
+    See Also:
+        docs/DELIVERY_PIPELINE.md Section 4 (Ghost Type Mechanism)
+        docs/DELIVERY_PIPELINE.md Section 7 (Clipboard Safety)
+        docs/DELIVERY_PIPELINE.md Section 9 (False Positive Risks)
+    """  # signed: alpha
     return f'''
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
@@ -717,14 +781,37 @@ public class GhostType {{
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
     [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
     public static IntPtr FindRender(IntPtr hwnd) {{
+        // MULTI-PANE FIX: Collect ALL Chrome_RenderWidgetHostHWND children,
+        // then let PowerShell pick the best one by bounding rectangle.
+        // See docs/DELIVERY_PIPELINE.md Section 9, Risk 4 (Chrome Render Ambiguity).  // signed: alpha
         var h = FindWindowEx(hwnd, IntPtr.Zero, null, null);
         while (h != IntPtr.Zero) {{
             var sb = new StringBuilder(256); GetClassName(h, sb, 256);
-            if (sb.ToString().StartsWith("Chrome_RenderWidgetHost")) return h;  // signed: beta — prefix match for Electron version resilience
+            if (sb.ToString().StartsWith("Chrome_RenderWidgetHost")) return h;  // signed: beta -- prefix match for Electron version resilience
             var f = FindRender(h); if (f != IntPtr.Zero) return f;
             h = FindWindowEx(hwnd, h, null, null);
         }}
         return IntPtr.Zero;
+    }}
+    // FindAllRender: collect ALL Chrome render widgets for multi-pane disambiguation  // signed: alpha
+    public static System.Collections.Generic.List<IntPtr> FindAllRender(IntPtr hwnd) {{
+        var results = new System.Collections.Generic.List<IntPtr>();
+        FindAllRenderInner(hwnd, results);
+        return results;
+    }}
+    private static void FindAllRenderInner(IntPtr hwnd, System.Collections.Generic.List<IntPtr> results) {{
+        var h = FindWindowEx(hwnd, IntPtr.Zero, null, null);
+        while (h != IntPtr.Zero) {{
+            var sb = new StringBuilder(256); GetClassName(h, sb, 256);
+            if (sb.ToString().StartsWith("Chrome_RenderWidgetHost")) results.Add(h);
+            FindAllRenderInner(h, results);
+            h = FindWindowEx(hwnd, h, null, null);
+        }}
+    }}
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [StructLayout(LayoutKind.Sequential)] public struct RECT {{
+        public int Left, Top, Right, Bottom;
     }}
     public static bool FocusViaAttach(IntPtr target) {{
         uint targetPid;
@@ -797,10 +884,51 @@ if ($edit) {{
     $focusMethod = "EDIT"
 }} else {{
     # No UIA Edit found -- VS Code chat input lives inside Chrome renderer
-    # Focus the Chrome_RenderWidgetHostHWND child and paste directly
-    $renderHwnd = [GhostType]::FindRender($hwnd)
-    if ($renderHwnd -ne [IntPtr]::Zero) {{
-        $focusMethod = "CHROME_RENDER"
+    # MULTI-PANE FIX: Collect ALL Chrome_RenderWidgetHostHWND children and pick the best one.
+    # Chat input pane is typically the rightmost/bottom-most render widget in VS Code layout.
+    # See docs/DELIVERY_PIPELINE.md Section 9, Risk 4 (Chrome Render Ambiguity).  # signed: alpha
+    $allRenderWidgets = [GhostType]::FindAllRender($hwnd)
+    if ($allRenderWidgets.Count -gt 0) {{
+        if ($allRenderWidgets.Count -eq 1) {{
+            $renderHwnd = $allRenderWidgets[0]
+            $focusMethod = "CHROME_RENDER"
+        }} else {{
+            # Multiple render widgets found -- disambiguate by bounding rectangle.
+            # The chat pane render widget is typically the one with the largest area
+            # whose center is in the right half of the window (editor is left, chat is right).
+            # If all widgets are in similar positions, fall back to the last one (highest Z-order).  # signed: alpha
+            $wndMidX = $wndRect.X + ($wndRect.Width / 2)
+            $bestRenderHwnd = [IntPtr]::Zero
+            $bestRenderArea = 0
+            $rightHalfFound = $false
+            foreach ($rh in $allRenderWidgets) {{
+                $rRect = New-Object GhostType+RECT
+                [GhostType]::GetWindowRect($rh, [ref]$rRect) | Out-Null
+                $rWidth = $rRect.Right - $rRect.Left
+                $rHeight = $rRect.Bottom - $rRect.Top
+                $rArea = $rWidth * $rHeight
+                $rCenterX = $rRect.Left + ($rWidth / 2)
+                # Prefer render widgets in the right half of the window (chat pane location)
+                $inRightHalf = ($rCenterX -gt $wndMidX)
+                if ($inRightHalf -and (-not $rightHalfFound -or $rArea -gt $bestRenderArea)) {{
+                    $bestRenderHwnd = $rh
+                    $bestRenderArea = $rArea
+                    $rightHalfFound = $true
+                }} elseif (-not $rightHalfFound -and $rArea -gt $bestRenderArea) {{
+                    $bestRenderHwnd = $rh
+                    $bestRenderArea = $rArea
+                }}
+            }}
+            if ($bestRenderHwnd -ne [IntPtr]::Zero) {{
+                $renderHwnd = $bestRenderHwnd
+                $focusMethod = "CHROME_RENDER"
+                Write-Host "DEBUG: Multi-pane disambiguation: $($allRenderWidgets.Count) widgets, selected area=$bestRenderArea rightHalf=$rightHalfFound"
+            }} else {{
+                # Fallback to first widget if scoring fails  # signed: alpha
+                $renderHwnd = $allRenderWidgets[0]
+                $focusMethod = "CHROME_RENDER"
+            }}
+        }}
     }}
 }}
 
@@ -833,11 +961,24 @@ if ($focusMethod -ne "NONE") {{
         exit 1
     }}
 
+    # FOCUS RACE PREVENTION: Verify foreground window hasn't been stolen between
+    # clipboard set and paste. If another window grabbed focus, the paste would go
+    # to the wrong target. See docs/DELIVERY_PIPELINE.md Section 9, Risk 2.  # signed: alpha
+    $prePasteFgHwnd = [GhostType]::GetForegroundWindow()
+
     if ($focusMethod -eq "EDIT") {{
         $attached = [GhostType]::FocusViaAttach($hwnd)
         if ($attached) {{
             try {{ $edit.SetFocus() }} catch {{}}
             Start-Sleep -Milliseconds 80
+            # Focus race check: verify foreground window is still ours before paste  # signed: alpha
+            $postFocusFg = [GhostType]::GetForegroundWindow()
+            if ($postFocusFg -ne $prePasteFgHwnd -and $postFocusFg -ne $hwnd) {{
+                Write-Host "FOCUS_STOLEN"
+                [GhostType]::DetachThread($hwnd)
+                try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
+                exit 1
+            }}
             [System.Windows.Forms.SendKeys]::SendWait("^v")
             Start-Sleep -Milliseconds 80
             [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
@@ -847,6 +988,13 @@ if ($focusMethod -ne "NONE") {{
             try {{ $edit.SetFocus() }} catch {{}}
             [GhostType]::SetForegroundWindow($hwnd)
             Start-Sleep -Milliseconds 80
+            # Focus race check for fallback path  # signed: alpha
+            $postFocusFg = [GhostType]::GetForegroundWindow()
+            if ($postFocusFg -ne $hwnd) {{
+                Write-Host "FOCUS_STOLEN"
+                try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
+                exit 1
+            }}
             [System.Windows.Forms.SendKeys]::SendWait("^v")
             Start-Sleep -Milliseconds 80
             [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
@@ -859,6 +1007,14 @@ if ($focusMethod -ne "NONE") {{
         if ($attached) {{
             [GhostType]::SetFocus($renderHwnd)
             Start-Sleep -Milliseconds 120
+            # Focus race check: verify foreground hasn't been stolen  # signed: alpha
+            $postFocusFg = [GhostType]::GetForegroundWindow()
+            if ($postFocusFg -ne $prePasteFgHwnd -and $postFocusFg -ne $hwnd) {{
+                Write-Host "FOCUS_STOLEN"
+                [GhostType]::DetachThread($hwnd)
+                try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
+                exit 1
+            }}
             [System.Windows.Forms.SendKeys]::SendWait("^v")
             Start-Sleep -Milliseconds 100
             [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
@@ -869,6 +1025,13 @@ if ($focusMethod -ne "NONE") {{
             Start-Sleep -Milliseconds 80
             [GhostType]::SetFocus($renderHwnd)
             Start-Sleep -Milliseconds 120
+            # Focus race check for render fallback path  # signed: alpha
+            $postFocusFg = [GhostType]::GetForegroundWindow()
+            if ($postFocusFg -ne $hwnd) {{
+                Write-Host "FOCUS_STOLEN"
+                try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
+                exit 1
+            }}
             [System.Windows.Forms.SendKeys]::SendWait("^v")
             Start-Sleep -Milliseconds 100
             [System.Windows.Forms.SendKeys]::SendWait("{{ENTER}}")
@@ -895,7 +1058,27 @@ if ($focusMethod -ne "NONE") {{
 
 
 def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
-    """Execute the ghost-type PS script under dispatch lock. Returns ok bool."""
+    """Execute the ghost-type PS script under dispatch lock and validate delivery.
+
+    Runs the PowerShell script generated by _build_ghost_type_ps() as a subprocess
+    with CREATE_NO_WINDOW flag. Validates success by checking stdout for OK_* prefix
+    status codes. Handles failure codes: CLIPBOARD_VERIFY_FAILED, FOCUS_STOLEN,
+    NO_EDIT_NO_RENDER.
+
+    Architecture (see docs/DELIVERY_PIPELINE.md Section 4.3):
+        - Acquires _dispatch_lock (threading.Lock) to prevent concurrent ghost-type ops
+        - Writes dispatch lock file for external monitoring
+        - Runs PS with 20s timeout, CREATE_NO_WINDOW (0x08000000) creation flag
+        - Validates: returncode==0, stdout contains OK_*, no stderr, no NO_EDIT
+
+    Args:
+        ps: Complete PowerShell script string from _build_ghost_type_ps()
+        hwnd: Target window HWND (for logging)
+        orch_hwnd: Orchestrator HWND (for logging)
+
+    Returns:
+        bool: True if PS reported successful delivery (OK_*), False otherwise
+    """  # signed: alpha
     try:
         with _dispatch_lock:
             try:
@@ -925,6 +1108,10 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
         if "CLIPBOARD_VERIFY_FAILED" in stdout:
             log(f"Ghost CLIPBOARD_VERIFY_FAILED for HWND={hwnd} -- clipboard race detected", "ERR")
             return False
+        # Focus race detection: another window stole focus between clipboard set and paste  # signed: alpha
+        if "FOCUS_STOLEN" in stdout:
+            log(f"Ghost FOCUS_STOLEN for HWND={hwnd} -- focus race detected, paste aborted safely", "ERR")
+            return False
         ok = (
             r.returncode == 0
             and any(s in stdout for s in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK"))
@@ -946,15 +1133,42 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
 
 
 def ghost_type_to_worker(hwnd, text, orch_hwnd):
-    """Type text into a worker chat window via clipboard paste.
+    """Type text into a worker/consultant chat window via clipboard paste (Level 4.2 dispatch).
 
-    Level 4.2 -- File-based dispatch (no clipboard truncation):
-    - Text written to temp file, PowerShell reads from file (unlimited length)
-    - Clipboard save/restore (user clipboard never lost)
-    - AttachThreadInput for less-visible focus transfer (no Z-order flash)
-    - Minimized sleep durations (~200ms vs old 500ms)
-    - CREATE_NO_WINDOW flag on subprocess (no console flash)
-    """
+    This is the core delivery mechanism for all Skynet prompt dispatch. It writes the dispatch
+    text to a temp file, builds an inline PowerShell script with C# Win32 interop, and executes
+    it in a subprocess to paste the text into the target window's chat input.
+
+    Architecture (see docs/DELIVERY_PIPELINE.md Section 4 for full details):
+        1. Text written to temp file at data/.dispatch_tmp_{hwnd}.txt (no clipboard truncation)
+        2. _build_ghost_type_ps() generates PS script with: STEERING cancel, Edit scoring,
+           multi-pane Chrome render widget disambiguation, focus race prevention,
+           clipboard verification (3x retry), AttachThreadInput paste, clipboard cleanup
+        3. _execute_ghost_dispatch() runs script under dispatch lock, validates OK_ stdout
+
+    Safety features:
+        - Clipboard save/restore (user clipboard never lost)
+        - Clipboard verification (3x SetText/GetText readback loop)
+        - Focus race prevention (GetForegroundWindow check before paste)
+        - Multi-pane disambiguation (FindAllRender + right-half area scoring)
+        - AttachThreadInput for less-visible focus transfer (no Z-order flash)
+        - CREATE_NO_WINDOW flag on subprocess (no console flash)
+        - Post-paste Clipboard.Clear() to prevent stale dispatch text lingering
+
+    Args:
+        hwnd: Target window HWND (int). Must be valid (IsWindow check).
+        text: Dispatch text content. Newlines replaced with spaces before writing to temp file.
+        orch_hwnd: Orchestrator HWND for focus restore after delivery. Can be invalid (warn only).
+
+    Returns:
+        bool: True if delivery succeeded (PS reported OK_*), False on any failure.
+
+    See Also:
+        docs/DELIVERY_PIPELINE.md (full architecture reference)
+        _build_ghost_type_ps() (PS script generation)
+        _execute_ghost_dispatch() (subprocess execution and validation)
+        _verify_delivery() (post-dispatch UIA state verification)
+    """  # signed: alpha
     if not hwnd or not user32.IsWindow(hwnd):
         log(f"ghost_type: invalid target HWND={hwnd}", "ERR")  # signed: beta
         return False
@@ -1236,16 +1450,36 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
 
 
 def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
-    """Verify dispatch delivery by checking if worker state transitions.  # signed: orchestrator
+    """Verify dispatch delivery by polling UIA for worker state transitions.
 
-    After ghost_type reports success, poll UIA for up to timeout_s seconds
-    to confirm the worker moved from its pre-dispatch state (usually IDLE)
-    to PROCESSING. If the worker was already PROCESSING, any state is acceptable.
+    After ghost_type_to_worker() reports PS-level success (OK_* stdout), this function
+    provides a secondary verification layer by checking whether the worker's UIA state
+    actually changed. This catches silent delivery failures where the PS script thinks
+    it pasted successfully but the text went to the wrong target or was swallowed.
 
-    Returns True if delivery is verified (state changed or was already PROCESSING).
-    Returns False if worker remains in pre_state after timeout (delivery may have failed silently).
-    UNKNOWN state: 3+ consecutive UNKNOWN readings = treat as FAILED (UIA broken).  # signed: alpha
-    """
+    Architecture (see docs/DELIVERY_PIPELINE.md Section 6):
+        - Polls engine.get_state(hwnd) every 0.5s for up to timeout_s seconds
+        - Success = state changed from pre_state to any non-UNKNOWN state
+        - If pre_state was already PROCESSING, returns True immediately (queued dispatch)
+        - UNKNOWN handling: 3+ consecutive UNKNOWN readings = FAILED (UIA is broken)
+        - This is INFORMATIONAL only -- a False return does NOT mean delivery failed,
+          just that it couldn't be verified. See Risk 6 in docs/DELIVERY_PIPELINE.md.
+
+    Args:
+        hwnd: Target worker window HWND
+        worker_name: Worker name for logging (e.g., 'alpha')
+        pre_state: Worker UIA state captured BEFORE dispatch (typically 'IDLE')
+        timeout_s: Maximum seconds to poll for state transition (default: 8)
+
+    Returns:
+        bool: True if state transition detected (delivery verified),
+              False if state unchanged or UIA unavailable (delivery unverified)
+
+    See Also:
+        docs/DELIVERY_PIPELINE.md Section 6 (Delivery Verification)
+        docs/DELIVERY_PIPELINE.md Section 9, Risk 6 (Verify is Informational)
+        docs/DELIVERY_PIPELINE.md Section 9, Risk 9 (UNKNOWN State Handling)
+    """  # signed: alpha
     if pre_state == "PROCESSING":
         return True  # was already processing, dispatch queued in VS Code
 

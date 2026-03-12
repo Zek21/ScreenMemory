@@ -5,6 +5,8 @@ Provides write_pid, check_pid, cleanup_pid, and ensure_singleton
 so every daemon uses consistent PID file management.
 Prevents duplicate daemon instances (INCIDENT 003 root cause).
 
+Architecture reference: docs/DAEMON_ARCHITECTURE.md (Section 7: PID Management)
+
 Usage:
     from tools.skynet_daemon_utils import write_pid, cleanup_pid, ensure_singleton
 

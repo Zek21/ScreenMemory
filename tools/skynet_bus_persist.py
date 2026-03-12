@@ -304,6 +304,169 @@ def search_archive(keyword: str, limit: int = 50):
     # signed: gamma
 
 
+def diagnose_archive():
+    """Analyze the JSONL archive and print comprehensive diagnostics.
+
+    Examines: message count by sender, messages by topic, spam blocked rate,
+    peak message rates (per-minute), average message size, and largest messages.
+    """
+    if not ARCHIVE_FILE.exists():
+        print("No archive file found.")
+        return
+
+    total = 0
+    senders: dict = {}
+    topics: dict = {}
+    types: dict = {}
+    sizes: list = []
+    largest: list = []  # (size, sender, content_preview)
+    minute_buckets: dict = {}  # minute_key -> count
+    first_ts = None
+    last_ts = None
+    parse_errors = 0
+
+    try:
+        with open(ARCHIVE_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                    total += 1
+                    s = msg.get("sender", "unknown")
+                    t = msg.get("topic", "unknown")
+                    mt = msg.get("type", "unknown")
+                    content = msg.get("content", "")
+
+                    senders[s] = senders.get(s, 0) + 1
+                    topics[t] = topics.get(t, 0) + 1
+                    types[mt] = types.get(mt, 0) + 1
+
+                    msg_size = len(line)
+                    sizes.append(msg_size)
+
+                    # Track largest messages
+                    largest.append((msg_size, s, str(content)[:80]))
+                    if len(largest) > 10:
+                        largest.sort(key=lambda x: -x[0])
+                        largest = largest[:10]
+
+                    # Minute bucketing for peak rate analysis
+                    ts = msg.get("archived_at") or msg.get("timestamp")
+                    if ts:
+                        try:
+                            if isinstance(ts, (int, float)):
+                                minute_key = int(ts) // 60
+                            elif isinstance(ts, str) and "T" in ts:
+                                from datetime import datetime as _dt
+                                dt = _dt.fromisoformat(ts.replace("Z", "+00:00"))
+                                minute_key = int(dt.timestamp()) // 60
+                            else:
+                                minute_key = None
+                            if minute_key:
+                                minute_buckets[minute_key] = \
+                                    minute_buckets.get(minute_key, 0) + 1
+                        except (ValueError, TypeError):
+                            pass
+                    if ts and (first_ts is None or str(ts) < str(first_ts)):
+                        first_ts = ts
+                    if ts and (last_ts is None or str(ts) > str(last_ts)):
+                        last_ts = ts
+                except json.JSONDecodeError:
+                    parse_errors += 1
+                    continue
+    except OSError as e:
+        print(f"Error reading archive: {e}")
+        return
+
+    file_size = ARCHIVE_FILE.stat().st_size
+
+    # Calculate stats
+    avg_size = sum(sizes) / len(sizes) if sizes else 0
+    peak_rate = max(minute_buckets.values()) if minute_buckets else 0
+    peak_minute = None
+    if minute_buckets:
+        peak_minute_key = max(minute_buckets, key=minute_buckets.get)
+        try:
+            from datetime import datetime as _dt
+            peak_minute = _dt.utcfromtimestamp(
+                peak_minute_key * 60).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, OSError):
+            peak_minute = str(peak_minute_key)
+
+    largest.sort(key=lambda x: -x[0])
+
+    print("=" * 60)
+    print("       SKYNET BUS ARCHIVE DIAGNOSTICS")
+    print("=" * 60)
+    print(f"\nArchive file:  {ARCHIVE_FILE}")
+    print(f"File size:     {file_size / 1024:.1f} KB ({file_size / 1024 / 1024:.2f} MB)")
+    print(f"Total msgs:    {total}")
+    print(f"Parse errors:  {parse_errors}")
+    print(f"Time range:    {first_ts} -> {last_ts}")
+
+    print(f"\n--- Messages by Sender ({len(senders)} senders) ---")
+    for sender, count in sorted(senders.items(), key=lambda x: -x[1]):
+        pct = count / total * 100 if total else 0
+        bar = "#" * int(pct / 2)
+        print(f"  {sender:<25} {count:>6} ({pct:5.1f}%) {bar}")
+
+    print(f"\n--- Messages by Topic ({len(topics)} topics) ---")
+    for topic, count in sorted(topics.items(), key=lambda x: -x[1]):
+        pct = count / total * 100 if total else 0
+        print(f"  {topic:<25} {count:>6} ({pct:5.1f}%)")
+
+    print(f"\n--- Messages by Type ({len(types)} types) ---")
+    for mtype, count in sorted(types.items(), key=lambda x: -x[1]):
+        pct = count / total * 100 if total else 0
+        print(f"  {mtype:<25} {count:>6} ({pct:5.1f}%)")
+
+    print(f"\n--- Message Size ---")
+    print(f"  Average:  {avg_size:.0f} bytes")
+    print(f"  Min:      {min(sizes) if sizes else 0} bytes")
+    print(f"  Max:      {max(sizes) if sizes else 0} bytes")
+    print(f"  Total:    {sum(sizes) / 1024:.1f} KB")
+
+    print(f"\n--- Peak Message Rate ---")
+    print(f"  Peak rate:  {peak_rate} msgs/min")
+    if peak_minute:
+        print(f"  Peak time:  {peak_minute} UTC")
+    if minute_buckets:
+        avg_rate = total / len(minute_buckets) if minute_buckets else 0
+        print(f"  Avg rate:   {avg_rate:.1f} msgs/min")
+
+    if largest:
+        print(f"\n--- Top {len(largest)} Largest Messages ---")
+        for i, (sz, sender, preview) in enumerate(largest[:10], 1):
+            print(f"  {i}. {sz:>6} bytes | {sender:<15} | {preview}")
+
+    # Spam detection indicators
+    print(f"\n--- Spam Indicators ---")
+    spam_file = DATA_DIR / "spam_log.json"
+    if spam_file.exists():
+        try:
+            with open(spam_file, "r", encoding="utf-8") as f:
+                spam_log = json.load(f)
+            entries = spam_log.get("entries", [])
+            print(f"  Spam log entries: {len(entries)}")
+            if entries:
+                by_sender = {}
+                for e in entries:
+                    s = e.get("sender", "unknown")
+                    by_sender[s] = by_sender.get(s, 0) + 1
+                print("  Blocked by sender:")
+                for s, c in sorted(by_sender.items(), key=lambda x: -x[1]):
+                    print(f"    {s:<20} {c:>5}")
+        except (json.JSONDecodeError, OSError):
+            print("  Spam log: unreadable")
+    else:
+        print("  No spam log file found")
+
+    print("\n" + "=" * 60)
+    # signed: gamma
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Persistent bus message archiver for Skynet"
@@ -311,6 +474,9 @@ def main():
     parser.add_argument("--stats", action="store_true", help="Show archive statistics")
     parser.add_argument("--tail", type=int, metavar="N", help="Show last N messages")
     parser.add_argument("--search", type=str, metavar="KEYWORD", help="Search archive")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="Full archive diagnostics: sender/topic/type breakdown, "
+                             "peak rates, message sizes, spam indicators")
     args = parser.parse_args()
 
     if args.stats:
@@ -319,6 +485,8 @@ def main():
         show_tail(args.tail)
     elif args.search:
         search_archive(args.search)
+    elif args.diagnose:
+        diagnose_archive()
     else:
         run_daemon()
     # signed: gamma

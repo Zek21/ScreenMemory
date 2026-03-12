@@ -293,12 +293,30 @@ class SpamGuard:
             self._handle_spam(sender, fp, reason, message)
             return {"allowed": False, "reason": reason, "fingerprint": fp}
 
-        # Check 3: Per-sender rate limiting
-        rate_reason = self.is_rate_limited(sender)
-        if rate_reason:
-            self._handle_spam(sender, fp, rate_reason, message)
-            return {"allowed": False, "reason": rate_reason,
-                    "fingerprint": fp}
+        # Check 3: Per-sender rate limiting (priority-aware)
+        # Messages with metadata.priority=critical bypass rate limits
+        # Messages with metadata.priority=low get stricter limits (2/min)
+        priority = "normal"
+        if isinstance(message.get("metadata"), dict):
+            priority = message["metadata"].get("priority", "normal")
+        skip_rate_limit = (priority == "critical")
+
+        if not skip_rate_limit:
+            if priority == "low" and "low" in PRIORITY_RATE_OVERRIDES:
+                low_limits = PRIORITY_RATE_OVERRIDES["low"]
+                if low_limits:
+                    rate_reason = self.is_rate_limited(
+                        sender, max_per_minute=low_limits[0],
+                        max_per_hour=low_limits[1])
+                else:
+                    rate_reason = self.is_rate_limited(sender)
+            else:
+                rate_reason = self.is_rate_limited(sender)
+            if rate_reason:
+                self._handle_spam(sender, fp, rate_reason, message)
+                return {"allowed": False, "reason": rate_reason,
+                        "fingerprint": fp}
+        # signed: gamma
 
         # All checks passed -- publish FIRST, then record fingerprint.
         # Recording fingerprint before bus post is a bug: if POST fails,
@@ -807,6 +825,121 @@ def check_would_be_blocked(msg: dict) -> dict:
             "fingerprint": "",
             "checks": {},
         }
+    # signed: gamma
+
+
+# ── Priority Levels ──────────────────────────────────────────────
+# Messages can specify metadata.priority to affect rate limiting:
+#   critical — Bypasses rate limits entirely (still subject to dedup)
+#   high     — Uses default rate limits (5/min)
+#   normal   — Uses default rate limits (5/min) -- this is the default
+#   low      — Stricter rate limits (2/min, 15/hour)
+PRIORITY_RATE_OVERRIDES = {
+    "critical": None,       # None = bypass rate limiting
+    "high": None,           # Uses sender defaults
+    "normal": None,         # Uses sender defaults
+    "low": (2, 15),         # (max_per_minute, max_per_hour)
+}
+# signed: gamma
+
+
+def bus_health() -> dict:
+    """Return comprehensive bus health metrics for instant visibility.
+
+    Probes the Go backend /bus/messages and /status endpoints plus
+    local state files to build a complete health snapshot.
+
+    Returns:
+        dict with keys:
+            messages_in_last_minute: int   -- Bus messages in last 60s
+            unique_senders: list[str]      -- Distinct senders in last minute
+            spam_blocked_count: int        -- Total spam blocked (all time)
+            ring_buffer_utilization: dict  -- {current: N, max: 100, pct: float}
+            archive_file_size_kb: float    -- JSONL archive size in KB
+            last_message_timestamp: str    -- Timestamp of most recent bus msg
+            spam_guard_fingerprints: int   -- Active fingerprints in guard
+            spam_guard_senders: int        -- Tracked senders in guard
+            bus_reachable: bool            -- Can we reach the Go backend?
+    """
+    import urllib.request
+    import urllib.error
+
+    result = {
+        "messages_in_last_minute": 0,
+        "unique_senders": [],
+        "spam_blocked_count": 0,
+        "ring_buffer_utilization": {"current": 0, "max": 100, "pct": 0.0},
+        "archive_file_size_kb": 0.0,
+        "last_message_timestamp": "",
+        "spam_guard_fingerprints": 0,
+        "spam_guard_senders": 0,
+        "bus_reachable": False,
+    }
+
+    # Probe Go backend for bus messages
+    try:
+        req = urllib.request.Request(
+            "http://localhost:8420/bus/messages?limit=100",
+            headers={"Accept": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=3)
+        messages = json.loads(resp.read().decode("utf-8"))
+        if isinstance(messages, list):
+            result["bus_reachable"] = True
+            result["ring_buffer_utilization"]["current"] = len(messages)
+            result["ring_buffer_utilization"]["pct"] = round(
+                len(messages) / 100.0 * 100, 1
+            )
+
+            # Count messages in last 60 seconds and unique senders
+            now = time.time()
+            senders_set = set()
+            recent_count = 0
+            latest_ts = ""
+            for msg in messages:
+                sender = msg.get("sender", "")
+                ts = msg.get("timestamp", "")
+                if ts and (not latest_ts or ts > latest_ts):
+                    latest_ts = ts
+                # Try to parse timestamp for recency check
+                try:
+                    from datetime import datetime as _dt
+                    if "T" in str(ts):
+                        msg_time = _dt.fromisoformat(
+                            str(ts).replace("Z", "+00:00")
+                        ).timestamp()
+                        if now - msg_time < 60:
+                            recent_count += 1
+                            senders_set.add(sender)
+                except (ValueError, TypeError, OSError):
+                    pass
+            result["messages_in_last_minute"] = recent_count
+            result["unique_senders"] = sorted(senders_set)
+            result["last_message_timestamp"] = latest_ts
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        pass
+
+    # SpamGuard state
+    try:
+        guard = SpamGuard()
+        stats = guard.get_stats()
+        result["spam_blocked_count"] = stats.get("total_blocked", 0)
+        result["spam_guard_fingerprints"] = stats.get("active_fingerprints", 0)
+        result["spam_guard_senders"] = stats.get("senders_tracked", 0)
+    except Exception:
+        pass
+
+    # Archive file size
+    archive_path = DATA_DIR / "bus_archive.jsonl"
+    try:
+        if archive_path.exists():
+            result["archive_file_size_kb"] = round(
+                archive_path.stat().st_size / 1024.0, 1
+            )
+    except OSError:
+        pass
+
+    return result
     # signed: gamma
 
 
