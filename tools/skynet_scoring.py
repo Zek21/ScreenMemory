@@ -1,8 +1,9 @@
 """Skynet Worker Scoring System.
 
 Tracks cross-validated task completions, bug validation, ticket awareness,
-zero-ticket completion bonuses, and refactor-review penalties. Workers earn
-points when their work or findings are validated by a *different* actor.
+zero-ticket completion bonuses, refactor-review penalties, and workspace
+cleanliness accountability (Rule 0.9). Workers earn points when their work
+or findings are validated by a *different* actor.
 
 Scoring defaults:
   - award:                        +0.01 pts per cross-validated task
@@ -25,6 +26,14 @@ Scoring defaults:
                                   truly reaches zero, and +1.00 pts to the
                                   actor that closed the final ticket
 
+Rule 0.9 -- Workspace Cleanliness & Tool Usage Accountability:
+  - uncleared work:               -0.02 orch / -0.01 workers/consultants
+  - tool bypass:                  -0.02 orch / -0.01 workers/consultants
+  - repeat offense:               -0.50 all (previously addressed, repeated)
+  - cleanup help:                 +0.01 for helping clean the workspace
+  - cleanup cross-validate:       +0.01 for cross-validating cleanup
+  - invalid cleanup finder:       +0.02 for catching false/invalid cleanup
+
 Data:  data/worker_scores.json
 Bus:   Posts score changes to topic=scoring on localhost:8420
 
@@ -39,6 +48,12 @@ CLI:
   python tools/skynet_scoring.py --proactive-ticket-clear ACTOR --task-id TID [--validator VNAME]
   python tools/skynet_scoring.py --autonomous-pull WORKER --task-id TID [--validator VNAME]
   python tools/skynet_scoring.py --zero-ticket-bonus --task-id TID --last-worker WORKER [--validator VNAME]
+  python tools/skynet_scoring.py --uncleared-work AGENT --task-id TID --validator VNAME
+  python tools/skynet_scoring.py --tool-bypass AGENT --task-id TID --validator VNAME
+  python tools/skynet_scoring.py --repeat-offense AGENT --task-id TID --validator VNAME
+  python tools/skynet_scoring.py --cleanup-help AGENT --task-id TID --validator VNAME
+  python tools/skynet_scoring.py --cleanup-cv AGENT --task-id TID --validator VNAME
+  python tools/skynet_scoring.py --invalid-cleanup AGENT --task-id TID --validator VNAME
   python tools/skynet_scoring.py --leaderboard
   python tools/skynet_scoring.py --history [WORKER]
   python tools/skynet_scoring.py --score WORKER
@@ -78,6 +93,19 @@ DEFAULT_BIASED_REFACTOR_REPORT_DEDUCT = 0.1
 DEFAULT_PROACTIVE_TICKET_CLEAR_AWARD = 0.2
 DEFAULT_AUTONOMOUS_PULL_AWARD = 0.2
 DEFAULT_TICKET_ZERO_BONUS_AWARD = 1.0
+
+# Rule 0.9: Workspace Cleanliness & Tool Usage Accountability
+DEFAULT_UNCLEARED_WORK_DEDUCT_ORCH = 0.02
+DEFAULT_UNCLEARED_WORK_DEDUCT_OTHER = 0.01
+DEFAULT_TOOL_BYPASS_DEDUCT_ORCH = 0.02
+DEFAULT_TOOL_BYPASS_DEDUCT_OTHER = 0.01
+DEFAULT_REPEAT_OFFENSE_DEDUCT = 0.5
+DEFAULT_CLEANUP_HELP_AWARD = 0.01
+DEFAULT_CLEANUP_CV_AWARD = 0.01
+DEFAULT_INVALID_CLEANUP_AWARD = 0.02
+
+ORCHESTRATOR_ROLES = frozenset({"orchestrator"})
+CONSULTANT_ROLES = frozenset({"consultant", "gemini_consultant"})
 
 _lock = threading.Lock()  # Guards all read-modify-write cycles on SCORES_FILE  # signed: gamma
 
@@ -146,6 +174,12 @@ def _normalize_worker_entry(entry: dict | None) -> dict:
     entry.setdefault("bug_report_confirmations", 0)
     entry.setdefault("bug_cross_validations", 0)
     entry.setdefault("zero_ticket_bonus_awards", 0)
+    entry.setdefault("uncleared_work_deductions", 0)
+    entry.setdefault("tool_bypass_deductions", 0)
+    entry.setdefault("repeat_offense_deductions", 0)
+    entry.setdefault("cleanup_help_awards", 0)
+    entry.setdefault("cleanup_cv_awards", 0)
+    entry.setdefault("invalid_cleanup_awards", 0)
     return entry
 
 
@@ -844,6 +878,206 @@ def award_zero_ticket_clear(
     return {"orchestrator": orchestrator_entry, "last_worker": actor_entry}
 
 
+# ── Rule 0.9: Workspace Cleanliness & Tool Usage Accountability ──────────
+
+def _cleanliness_deduct_amount(agent: str) -> float:
+    """Return the appropriate deduction amount based on agent role."""
+    if agent in ORCHESTRATOR_ROLES:
+        return DEFAULT_UNCLEARED_WORK_DEDUCT_ORCH
+    return DEFAULT_UNCLEARED_WORK_DEDUCT_OTHER
+
+
+def deduct_uncleared_work(
+    agent: str,
+    task_id: str,
+    validator: str,
+    amount: float | None = None,
+) -> dict:
+    """Deduct points for leaving uncleared tasks/todos/incidents in the system.
+
+    Orchestrator: -0.02, Workers/Consultants: -0.01.
+    """
+    _require_independent_validator(agent, validator, "audit uncleared work for")
+    amt = amount if amount is not None else _cleanliness_deduct_amount(agent)
+    with _lock:
+        data = _load()
+        _ensure_worker(data, agent)
+        entry = data["scores"][agent]
+        entry["total"] = round(entry["total"] - amt, 6)
+        entry["deductions"] += 1
+        entry["uncleared_work_deductions"] = entry.get("uncleared_work_deductions", 0) + 1
+        record = {
+            "worker": agent,
+            "action": "uncleared_work",
+            "amount": amt,
+            "task_id": task_id,
+            "validator": validator,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "new_total": entry["total"],
+            "protocol": "rule_0_9_cleanliness",
+        }
+        _append_record(data, record, "uncleared_work")
+    return entry
+
+
+def deduct_tool_bypass(
+    agent: str,
+    task_id: str,
+    validator: str,
+    amount: float | None = None,
+) -> dict:
+    """Deduct points for not using Skynet intelligence tools when available.
+
+    Orchestrator: -0.02, Workers/Consultants: -0.01.
+    """
+    _require_independent_validator(agent, validator, "audit tool bypass for")
+    amt = amount if amount is not None else _cleanliness_deduct_amount(agent)
+    with _lock:
+        data = _load()
+        _ensure_worker(data, agent)
+        entry = data["scores"][agent]
+        entry["total"] = round(entry["total"] - amt, 6)
+        entry["deductions"] += 1
+        entry["tool_bypass_deductions"] = entry.get("tool_bypass_deductions", 0) + 1
+        record = {
+            "worker": agent,
+            "action": "tool_bypass",
+            "amount": amt,
+            "task_id": task_id,
+            "validator": validator,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "new_total": entry["total"],
+            "protocol": "rule_0_9_cleanliness",
+        }
+        _append_record(data, record, "tool_bypass")
+    return entry
+
+
+def deduct_repeat_offense(
+    agent: str,
+    task_id: str,
+    validator: str,
+    amount: float | None = None,
+) -> dict:
+    """Deduct -0.50 for repeating an offense that was already addressed.
+
+    Applied universally to orchestrator, workers, and consultants.
+    """
+    _require_independent_validator(agent, validator, "audit repeat offense for")
+    amt = amount if amount is not None else DEFAULT_REPEAT_OFFENSE_DEDUCT
+    with _lock:
+        data = _load()
+        _ensure_worker(data, agent)
+        entry = data["scores"][agent]
+        entry["total"] = round(entry["total"] - amt, 6)
+        entry["deductions"] += 1
+        entry["repeat_offense_deductions"] = entry.get("repeat_offense_deductions", 0) + 1
+        record = {
+            "worker": agent,
+            "action": "repeat_offense",
+            "amount": amt,
+            "task_id": task_id,
+            "validator": validator,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "new_total": entry["total"],
+            "protocol": "rule_0_9_cleanliness",
+            "finding": "previously_addressed_offense_repeated",
+        }
+        _append_record(data, record, "repeat_offense")
+    return entry
+
+
+def award_cleanup_help(
+    agent: str,
+    task_id: str,
+    validator: str,
+    amount: float | None = None,
+) -> dict:
+    """Award +0.01 for helping make the workspace clean."""
+    _require_independent_validator(agent, validator, "validate cleanup for")
+    amt = amount if amount is not None else DEFAULT_CLEANUP_HELP_AWARD
+    with _lock:
+        data = _load()
+        _ensure_worker(data, agent)
+        entry = data["scores"][agent]
+        entry["total"] = round(entry["total"] + amt, 6)
+        entry["awards"] += 1
+        entry["cleanup_help_awards"] = entry.get("cleanup_help_awards", 0) + 1
+        record = {
+            "worker": agent,
+            "action": "cleanup_help",
+            "amount": amt,
+            "task_id": task_id,
+            "validator": validator,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "new_total": entry["total"],
+            "protocol": "rule_0_9_cleanliness",
+        }
+        _append_record(data, record, "cleanup_help")
+    return entry
+
+
+def award_cleanup_cross_validate(
+    agent: str,
+    task_id: str,
+    validator: str,
+    amount: float | None = None,
+) -> dict:
+    """Award +0.01 for cross-validating cleanup work."""
+    _require_independent_validator(agent, validator, "record cleanup cv for")
+    amt = amount if amount is not None else DEFAULT_CLEANUP_CV_AWARD
+    with _lock:
+        data = _load()
+        _ensure_worker(data, agent)
+        entry = data["scores"][agent]
+        entry["total"] = round(entry["total"] + amt, 6)
+        entry["awards"] += 1
+        entry["cleanup_cv_awards"] = entry.get("cleanup_cv_awards", 0) + 1
+        record = {
+            "worker": agent,
+            "action": "cleanup_cross_validate",
+            "amount": amt,
+            "task_id": task_id,
+            "validator": validator,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "new_total": entry["total"],
+            "protocol": "rule_0_9_cleanliness",
+        }
+        _append_record(data, record, "cleanup_cross_validate")
+    return entry
+
+
+def award_invalid_cleanup_finder(
+    agent: str,
+    task_id: str,
+    validator: str,
+    amount: float | None = None,
+) -> dict:
+    """Award +0.02 for finding invalid/false cleanup."""
+    _require_independent_validator(agent, validator, "validate invalid cleanup finding for")
+    amt = amount if amount is not None else DEFAULT_INVALID_CLEANUP_AWARD
+    with _lock:
+        data = _load()
+        _ensure_worker(data, agent)
+        entry = data["scores"][agent]
+        entry["total"] = round(entry["total"] + amt, 6)
+        entry["awards"] += 1
+        entry["invalid_cleanup_awards"] = entry.get("invalid_cleanup_awards", 0) + 1
+        record = {
+            "worker": agent,
+            "action": "invalid_cleanup_found",
+            "amount": amt,
+            "task_id": task_id,
+            "validator": validator,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "new_total": entry["total"],
+            "protocol": "rule_0_9_cleanliness",
+            "finding": "false_cleanup_detected",
+        }
+        _append_record(data, record, "invalid_cleanup_found")
+    return entry
+
+
 def get_scores() -> dict:
     """Return all worker scores."""
     return _load()["scores"]
@@ -979,6 +1213,31 @@ def main():
     parser.add_argument(
         "--score", metavar="WORKER", help="Show score for a specific worker"
     )
+    # Rule 0.9: Workspace Cleanliness & Tool Usage Accountability
+    parser.add_argument(
+        "--uncleared-work", metavar="AGENT",
+        help="Deduct for leaving uncleared tasks/todos/incidents (-0.02 orch, -0.01 others)",
+    )
+    parser.add_argument(
+        "--tool-bypass", metavar="AGENT",
+        help="Deduct for not using Skynet intelligence tools (-0.02 orch, -0.01 others)",
+    )
+    parser.add_argument(
+        "--repeat-offense", metavar="AGENT",
+        help="Deduct -0.50 for repeating a previously addressed offense",
+    )
+    parser.add_argument(
+        "--cleanup-help", metavar="AGENT",
+        help="Award +0.01 for helping make the workspace clean",
+    )
+    parser.add_argument(
+        "--cleanup-cv", metavar="AGENT",
+        help="Award +0.01 for cross-validating cleanup work",
+    )
+    parser.add_argument(
+        "--invalid-cleanup", metavar="AGENT",
+        help="Award +0.02 for finding invalid/false cleanup",
+    )
 
     args = parser.parse_args()
 
@@ -1111,7 +1370,61 @@ def main():
             f"(total: {result['last_worker']['total']})"
         )
 
+    # ── Rule 0.9 CLI handlers ──
+    elif args.uncleared_work:
+        if not args.task_id or not args.validator:
+            parser.error("--uncleared-work requires --task-id and --validator")
+        amt = args.amount if args.amount is not None else None
+        result = deduct_uncleared_work(args.uncleared_work, args.task_id, args.validator, amt)
+        used = amt if amt is not None else _cleanliness_deduct_amount(args.uncleared_work)
+        print(f"Deducted {used} pts from {args.uncleared_work} for uncleared work (total: {result['total']})")
+
+    elif args.tool_bypass:
+        if not args.task_id or not args.validator:
+            parser.error("--tool-bypass requires --task-id and --validator")
+        amt = args.amount if args.amount is not None else None
+        result = deduct_tool_bypass(args.tool_bypass, args.task_id, args.validator, amt)
+        used = amt if amt is not None else _cleanliness_deduct_amount(args.tool_bypass)
+        print(f"Deducted {used} pts from {args.tool_bypass} for tool bypass (total: {result['total']})")
+
+    elif args.repeat_offense:
+        if not args.task_id or not args.validator:
+            parser.error("--repeat-offense requires --task-id and --validator")
+        amt = args.amount if args.amount is not None else DEFAULT_REPEAT_OFFENSE_DEDUCT
+        result = deduct_repeat_offense(args.repeat_offense, args.task_id, args.validator, amt)
+        print(f"Deducted {amt} pts from {args.repeat_offense} for REPEAT OFFENSE (total: {result['total']})")
+
+    elif args.cleanup_help:
+        if not args.task_id or not args.validator:
+            parser.error("--cleanup-help requires --task-id and --validator")
+        amt = args.amount if args.amount is not None else DEFAULT_CLEANUP_HELP_AWARD
+        result = award_cleanup_help(args.cleanup_help, args.task_id, args.validator, amt)
+        print(f"Awarded {amt} pts to {args.cleanup_help} for cleanup help (total: {result['total']})")
+
+    elif args.cleanup_cv:
+        if not args.task_id or not args.validator:
+            parser.error("--cleanup-cv requires --task-id and --validator")
+        amt = args.amount if args.amount is not None else DEFAULT_CLEANUP_CV_AWARD
+        result = award_cleanup_cross_validate(args.cleanup_cv, args.task_id, args.validator, amt)
+        print(f"Awarded {amt} pts to {args.cleanup_cv} for cleanup cross-validation (total: {result['total']})")
+
+    elif args.invalid_cleanup:
+        if not args.task_id or not args.validator:
+            parser.error("--invalid-cleanup requires --task-id and --validator")
+        amt = args.amount if args.amount is not None else DEFAULT_INVALID_CLEANUP_AWARD
+        result = award_invalid_cleanup_finder(args.invalid_cleanup, args.task_id, args.validator, amt)
+        print(f"Awarded {amt} pts to {args.invalid_cleanup} for finding invalid cleanup (total: {result['total']})")
+
     elif args.leaderboard:
+        # Run cleanliness audit summary if available
+        try:
+            from tools.skynet_cleanliness_audit import run_audit
+            audit = run_audit(quiet=True)
+            if audit and audit.get("total_issues", 0) > 0:
+                print(f"[!] Cleanliness audit: {audit['total_issues']} uncleared items found")
+                print()
+        except Exception:
+            pass
         board = get_leaderboard()
         if not board:
             print("No scores recorded yet.")

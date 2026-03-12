@@ -194,6 +194,62 @@ Consultant bridge truth requirements:
 - Require a successful bridge `/health` probe, and if state-file truth is involved, verify a surviving heartbeat/state update rather than a startup race.
 - On Windows PowerShell `Start-Process`, explicitly quote argument values containing spaces or compose a single safe argument string. Unquoted display/model values can silently break consultant bootstrap.
 
+## Workspace Cleanliness & Tool Usage Accountability (Rule 0.9)
+
+**Every agent — orchestrator, workers, and consultants — is accountable for leaving the Skynet workspace clean and for using Skynet intelligence tools.**
+
+### Deductions
+
+| Violation | Orchestrator | Workers | Consultants |
+|-----------|-------------|---------|-------------|
+| Uncleared tasks/todos/incidents/jobs left in system | -0.02 | -0.01 | -0.01 (if proven error) |
+| Not using Skynet intelligence tools when available | -0.02 | -0.01 | -0.01 |
+| **Repeat offense** (same violation previously addressed) | -0.50 | -0.50 | -0.50 |
+
+### Awards
+
+| Action | Amount | Who |
+|--------|--------|-----|
+| Helping make workplace clean (clearing stale items) | +0.01 | Anyone |
+| Cross-validation of cleanup work | +0.01 | Validator |
+| Finding invalid/false cleanup (caught fake clean) | +0.02 | Finder |
+
+### Grace Period
+The first round after implementation is **warning only**. Deductions apply from the second occurrence onward. This gives all agents time to learn the new expectations.
+
+### What Counts as "Uncleared Work"
+- Pending items in `data/todos.json` assigned to the agent
+- Unresolved incident/remediation Markdown files in the repo root
+- Stale tasks in `data/task_queue.json`
+- Dispatched tasks with no result in `data/dispatch_log.json` (older than 1 hour)
+- Stale PID files in `data/` for dead processes
+- Orphaned plan/proposal Markdown files in the repo root
+
+### Monitoring Tool
+`tools/skynet_cleanliness_audit.py` scans 6 categories of uncleared items:
+```bash
+python tools/skynet_cleanliness_audit.py           # Full audit with details
+python tools/skynet_cleanliness_audit.py --quiet    # Summary only
+python tools/skynet_cleanliness_audit.py --fix      # Auto-fix safe items (stale PIDs)
+python tools/skynet_cleanliness_audit.py --json     # Machine-readable output
+```
+
+### Scoring CLI
+```bash
+python tools/skynet_scoring.py --uncleared-work AGENT --task-id ID --validator NAME
+python tools/skynet_scoring.py --tool-bypass AGENT --task-id ID --validator NAME
+python tools/skynet_scoring.py --repeat-offense AGENT --task-id ID --validator NAME
+python tools/skynet_scoring.py --cleanup-help AGENT --task-id ID --validator NAME
+python tools/skynet_scoring.py --cleanup-cv AGENT --task-id ID --validator NAME
+python tools/skynet_scoring.py --invalid-cleanup AGENT --task-id ID --validator NAME
+```
+
+### Enforcement
+- The orchestrator runs `skynet_cleanliness_audit.py` periodically to detect violations
+- Workers that leave uncleared work after task completion are deducted automatically
+- The `--repeat-offense` flag carries the severe -0.50 penalty and should only be used when the same agent repeats a previously-addressed violation
+- Cross-validation of cleanup work is MANDATORY — a different agent must verify the cleanup was genuine
+
 ## Anti-Spam Accountability Protocol (Rule 0.4)
 
 **Every bus publish MUST go through SpamGuard (`tools/skynet_spam_guard.py`). Raw `requests.post` to `/bus/publish` is FORBIDDEN.**
