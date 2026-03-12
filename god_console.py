@@ -252,7 +252,7 @@ def _build_pulse_data():
         "ts": raw_pulse.get("ts"),
         "alive": alive,
         "total": total,
-        "iq_trend": raw_pulse.get("iq_trend", "stable"),
+        "iq_trend": raw_pulse.get("iq_trend", "unknown"),  # signed: orchestrator -- Truth fix
     }
 
 
@@ -296,7 +296,9 @@ def _get_engine_counts():
 
 def _compute_display_iq(raw_pulse):
     """Normalize IQ from raw pulse (0-1 scale or 0-100 scale) to display value."""
-    iq_raw = raw_pulse.get("iq", 0)
+    iq_raw = raw_pulse.get("iq")  # signed: orchestrator -- Truth fix
+    if iq_raw is None:
+        return None
     return round(iq_raw * 100) if iq_raw <= 1 else round(iq_raw)
 
 
@@ -469,7 +471,7 @@ def _cached_engines():
     data["total_probe_ms"] = round(total_ms, 1)
     # Use real per-engine probe_ms from engine_metrics (not fabricated average)
     for ename, edata in data.get("engines", {}).items():
-        edata["response_time_ms"] = edata.get("probe_ms", 0)
+        edata["response_time_ms"] = edata.get("probe_ms")  # signed: orchestrator — Truth fix (None ≠ 0ms)
     with _cache_lock:
         _cache["engines"] = data
         _cache["engines_t"] = _time.time()
@@ -809,9 +811,9 @@ def _add_learning_store_stats(metrics):
         metrics["avg_confidence"] = round(store_stats.get("average_confidence", 0.0), 3)
         metrics["by_category"] = store_stats.get("by_category", {})
     except Exception:
-        metrics["total_facts"] = 0
-        metrics["avg_confidence"] = 0.0
-        metrics["by_category"] = {}
+        metrics["total_facts"] = None  # signed: orchestrator -- Truth fix
+        metrics["avg_confidence"] = None  # signed: orchestrator -- Truth fix
+        metrics["by_category"] = None  # signed: orchestrator -- Truth fix
 
 
 def _check_learner_daemon(base):
@@ -921,9 +923,9 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         elif self.path == "/bus/stats":
             backend_metrics = _fetch_backend("http://localhost:8420/metrics", timeout=2)
             stats = {
-                "bus_depth": backend_metrics.get("bus_depth", 0) if isinstance(backend_metrics, dict) else 0,
-                "bus_messages_total": backend_metrics.get("bus_messages_total", 0) if isinstance(backend_metrics, dict) else 0,
-                "bus_dropped": backend_metrics.get("bus_dropped", 0) if isinstance(backend_metrics, dict) else 0,
+                "bus_depth": backend_metrics.get("bus_depth", 0) if isinstance(backend_metrics, dict) else None,  # signed: orchestrator -- Truth fix
+                "bus_messages_total": backend_metrics.get("bus_messages_total", 0) if isinstance(backend_metrics, dict) else None,  # signed: orchestrator -- Truth fix
+                "bus_dropped": backend_metrics.get("bus_dropped", 0) if isinstance(backend_metrics, dict) else None,  # signed: orchestrator -- Truth fix
                 "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
             self._json_response(stats)
@@ -1014,7 +1016,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 data = {"status_line": line, "health": health, "iq": iq, "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")}
             except Exception as e:
                 _ver, _lvl = _real_version()  # signed: gamma
-                data = {"status_line": f"SKYNET v{_ver} Level {_lvl} | ERROR: {e}", "health": "ERROR", "iq": 0, "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")}
+                data = {"status_line": f"SKYNET v{_ver} Level {_lvl} | ERROR: {e}", "health": "ERROR", "iq": None, "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")}  # signed: orchestrator -- Truth fix
             self._json_response(data)
         elif self.path == "/status":
             try:
@@ -1025,7 +1027,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 pulse = _cached_pulse()
                 backend["self_aware"] = True
                 backend["pulse"] = pulse
-                backend["collective_iq"] = pulse.get("intelligence_score", 0)
+                backend["collective_iq"] = pulse.get("intelligence_score")  # signed: orchestrator — Truth fix
             except Exception as e:
                 backend["self_aware"] = False
                 backend["error"] = str(e)
@@ -1037,11 +1039,12 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 from skynet_collective import intelligence_score
                 iq = intelligence_score()
                 health = pulse.get("health", "UNKNOWN")
-                iq_score = iq.get("intelligence_score", 0)
-                briefing = f"System Health: {health} | Collective IQ: {iq_score:.3f}"
+                iq_score = iq.get("intelligence_score")  # signed: orchestrator — Truth fix
+                iq_display = f"{iq_score:.3f}" if iq_score is not None else "unknown"
+                briefing = f"System Health: {health} | Collective IQ: {iq_display}"
                 data = {"briefing": briefing, "health": health, "collective_iq": iq_score, "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")}  # signed: delta
             except Exception as e:
-                data = {"briefing": f"Self-awareness unavailable: {e}", "health": "UNKNOWN", "collective_iq": 0, "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")}
+                data = {"briefing": f"Self-awareness unavailable: {e}", "health": "UNKNOWN", "collective_iq": None, "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")}  # signed: orchestrator -- Truth fix
             self._json_response(data)
         elif self.path == "/windows":
             try:
@@ -1116,7 +1119,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 from skynet_observability import throughput_metrics
                 self._json_response(throughput_metrics())
             except Exception as e:
-                self._json_response({"error": str(e), "total_dispatches": 0})
+                self._json_response({"error": str(e), "total_dispatches": None}, status=503)  # signed: orchestrator — Truth fix
         elif self.path == "/todos":
             data = _load_todos()
             if isinstance(data, dict):
@@ -1348,8 +1351,8 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 stale = stale_seconds > 300 if stale_seconds >= 0 else True
                 return {
                     "status": "running", "pid": pid,
-                    "episodes_processed": state.get("total_processed", 0),
-                    "total_learnings": state.get("total_learnings", 0),
+                    "episodes_processed": state.get("total_processed"),  # signed: orchestrator — Truth fix
+                    "total_learnings": state.get("total_learnings"),  # signed: orchestrator — Truth fix
                     "last_run": last_run, "started_at": state.get("started_at"),
                     "stale": stale, "stale_seconds": stale_seconds,
                 }
@@ -1387,7 +1390,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             metrics["cache_misses"] = cache_misses
             self._json_response(metrics)
         except Exception as e:
-            self._json_response({"error": str(e), "total_episodes": 0, "by_outcome": {"success": 0, "failure": 0, "unknown": 0}, "sparkline_hourly": [], "total_facts": 0, "daemon_status": "error", "timestamp": now, "cache_age_ms": 0, "cache_hit": False}, status=200)
+            self._json_response({"error": str(e), "total_episodes": None, "by_outcome": None, "sparkline_hourly": [], "total_facts": None, "daemon_status": "error", "timestamp": now, "cache_age_ms": 0, "cache_hit": False}, status=503)  # signed: orchestrator -- Truth fix
 
     @staticmethod
     def _collect_learner_metrics(now):
