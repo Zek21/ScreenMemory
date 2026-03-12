@@ -365,6 +365,48 @@ if ((Test-Port 8425 1000) -and (Test-JsonHealth $consultantBridgeHealth 5)) {
     }
 }
 
+# ── Gemini Consultant Consumer Daemon ────────────────────
+# signed: gamma
+$consumerScript = Join-Path $repoRoot "tools\skynet_consultant_consumer.py"
+$consumerPidFile = Join-Path $dataDir "consultant_consumer_8425.pid"
+$consumerRunning = $false
+if (Test-Path $consumerPidFile) {
+    $oldPid = Get-Content $consumerPidFile -ErrorAction SilentlyContinue
+    if ($oldPid) {
+        $proc = Get-Process -Id ([int]$oldPid) -ErrorAction SilentlyContinue
+        if ($proc -and (-not $proc.HasExited)) {
+            $consumerRunning = $true
+            Write-Status "Consultant consumer daemon already running (PID $oldPid)" "OK"
+        }
+    }
+}
+if (-not $consumerRunning -and (Test-Path $consumerScript)) {
+    Write-Status "Starting Gemini Consultant consumer daemon..." "SYS"
+    Start-Process -FilePath $python `
+        -ArgumentList @($consumerScript, "--port", "8425", "--consultant-id", "gemini_consultant") `
+        -WindowStyle Hidden
+    # Wait for PID file (max 10s)
+    $waited = 0
+    while ($waited -lt 10) {
+        Start-Sleep -Milliseconds 500
+        $waited += 0.5
+        if (Test-Path $consumerPidFile) {
+            $newPid = Get-Content $consumerPidFile -ErrorAction SilentlyContinue
+            if ($newPid) {
+                Write-Status "Consultant consumer daemon started (PID $newPid)" "OK"
+                $consumerRunning = $true
+                break
+            }
+        }
+    }
+    if (-not $consumerRunning) {
+        Write-Status "Consultant consumer daemon PID file not found after 10s" "WARN"
+    }
+} elseif (-not (Test-Path $consumerScript)) {
+    Write-Status "tools\skynet_consultant_consumer.py not found -- consumer not started" "WARN"
+}
+# signed: gamma
+
 # Announce Gemini Consultant identity on bus
 if ($skynetUp) {
     try {

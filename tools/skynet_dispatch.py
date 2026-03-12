@@ -967,10 +967,13 @@ def _dispatch_to_consultant(target_name, task, self_id):
         log(f"→ {target_name.upper()} [bridge-queue]: {task[:80]}{'...' if len(task) > 80 else ''}", "SYS")
         result = deliver_to_consultant(target_name, task, sender=self_id or "orchestrator", msg_type="directive")
         ok = bool(result.get("success"))
+        # TRUTH: distinguish queued vs delivered -- queued only means bridge accepted it
+        delivery_status = result.get("delivery_status", "unknown")
+        status_note = f" (delivery_status={delivery_status})" if delivery_status == "queued" else ""
         _log_dispatch(target_name, task, "BRIDGE_QUEUE", ok, 0)
-        log(f"{'✓' if ok else '✗'} Dispatched to {target_name.upper()} [{result.get('detail', '')}]",
+        log(f"{'✓' if ok else '✗'} Dispatched to {target_name.upper()}{status_note} [{result.get('detail', '')}]",
             "OK" if ok else "ERR")
-        return ok
+        return ok  # signed: beta
     except Exception as e:
         log(f"Consultant dispatch failed for {target_name}: {e}", "ERR")
         _log_dispatch(target_name, task, "BRIDGE_QUEUE", False, 0)

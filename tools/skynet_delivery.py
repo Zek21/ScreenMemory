@@ -838,17 +838,34 @@ def _deliver_to_consultant_bridge(content: str, consultant_id: Optional[str],
         })
     bus_ok = _bus_post(bus_sender, consultant_id, bus_type or "directive", content[:2000])
     prompt = bridge_resp.get("prompt", {}) if isinstance(bridge_resp, dict) else {}
-    success = bool(isinstance(bridge_resp, dict) and bridge_resp.get("status") == "queued")
+    bridge_status = bridge_resp.get("status", "") if isinstance(bridge_resp, dict) else ""
+    # TRUTH: queued != delivered. Distinguish delivery lifecycle stages.
+    # - "queued": bridge accepted the prompt into its queue (HTTP 202)
+    # - "delivered": prompt was consumed by the consultant window (not yet verifiable here)
+    # - "consumed": consultant acknowledged processing (future: requires callback)
+    # success=True ONLY means the bridge accepted the request -- callers must check
+    # delivery_status to know actual delivery state.  # signed: beta
+    if bridge_status == "queued":
+        delivery_status = "queued"
+    elif bridge_status in ("delivered", "consumed"):
+        delivery_status = bridge_status
+    elif bridge_resp is None or not isinstance(bridge_resp, dict):
+        delivery_status = "failed"
+    else:
+        delivery_status = "unknown"
+    success = delivery_status in ("queued", "delivered", "consumed")
     method = DeliveryMethod.HYBRID.value if bus_ok else DeliveryMethod.CONSULTANT_BRIDGE.value
     return {
         "target": f"consultant:{consultant_id}",
         "method": method,
         "success": success,
+        "delivery_status": delivery_status,
         "detail": (
             f"live={live}, accepts_prompts={accepts_prompts}, api_url={api_url or 'unknown'}, "
-            f"prompt_id={prompt.get('id', 'unknown')}, bus_ok={bus_ok}"
+            f"prompt_id={prompt.get('id', 'unknown')}, bus_ok={bus_ok}, "
+            f"delivery_status={delivery_status}"
         ),
-    }
+    }  # signed: beta
 
 
 def deliver(target: DeliveryTarget, content: str,
