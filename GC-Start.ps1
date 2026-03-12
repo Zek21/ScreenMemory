@@ -135,6 +135,8 @@ function Wait-HealthyEndpoint([int]$port, [string]$url, [int]$maxSeconds = 40) {
 Add-Type -Name "GCUser32" -Namespace "Win32GC" -MemberDefinition @"
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
 "@ -ErrorAction SilentlyContinue
 
 function Test-WorkerAlive([long]$hwnd) {
@@ -150,6 +152,41 @@ Write-Host "     GEMINI CONSULTANT -- GC-Start"
 Write-Host "   Skynet Advisory Peer (port 8425)"
 Write-Host "========================================="
 Write-Host ""
+
+# ── HWND Self-Registration (INCIDENT 012 fix) ──────── # signed: alpha
+# Detect this VS Code window's HWND for ghost_type delivery.
+# Bridge queue remains as audit trail fallback.
+$consultantHwnd = [long][Win32GC.GCUser32]::GetForegroundWindow()
+if ($consultantHwnd -gt 0) {
+    Write-Status "Consultant window HWND detected: $consultantHwnd" "OK"
+    $stateFile = Join-Path $dataDir "gemini_consultant_state.json"
+    if (Test-Path $stateFile) {
+        try {
+            $stateJson = Get-Content $stateFile -Raw | ConvertFrom-Json
+            $stateJson | Add-Member -NotePropertyName "hwnd" -NotePropertyValue $consultantHwnd -Force
+            $stateJson | Add-Member -NotePropertyName "requires_hwnd" -NotePropertyValue $true -Force
+            $stateJson | Add-Member -NotePropertyName "prompt_transport" -NotePropertyValue "ghost_type" -Force
+            $stateJson | ConvertTo-Json -Depth 10 | Set-Content $stateFile -Encoding UTF8
+            Write-Status "gemini_consultant_state.json updated: hwnd=$consultantHwnd, prompt_transport=ghost_type" "OK"
+        } catch {
+            Write-Status "Failed to update gemini_consultant_state.json: $_" "WARN"
+        }
+    } else {
+        # Create minimal state file with HWND
+        @{
+            id = "gemini_consultant"
+            display_name = "Gemini Consultant"
+            hwnd = $consultantHwnd
+            requires_hwnd = $true
+            prompt_transport = "ghost_type"
+            source = "GC-Start"
+        } | ConvertTo-Json -Depth 10 | Set-Content $stateFile -Encoding UTF8
+        Write-Status "gemini_consultant_state.json created with HWND" "OK"
+    }
+} else {
+    Write-Status "WARNING: Could not detect consultant HWND (GetForegroundWindow returned 0)" "WARN"
+}
+# ── End HWND Self-Registration ──────────────────────── # signed: alpha
 
 # ── Phase 1: Skynet Backend ─────────────────────────────
 
@@ -415,9 +452,11 @@ if ($skynetUp) {
         } else {
             "GEMINI CONSULTANT SESSION ACTIVE -- bridge offline on port 8425. Model: Gemini 3.1 Pro (Preview). Advisory peer not promptable yet. signed:gemini_consultant"
         }
-        $promptTransport = if ($consultantBridgeUp) { "bridge_queue" } else { "unavailable" }
-        $routable = if ($consultantBridgeUp) { "true" } else { "false" }
+        # Primary transport is ghost_type if HWND was detected, bridge_queue as fallback  # signed: alpha
+        $promptTransport = if ($consultantHwnd -gt 0) { "ghost_type" } elseif ($consultantBridgeUp) { "bridge_queue" } else { "unavailable" }
+        $routable = if ($consultantHwnd -gt 0 -or $consultantBridgeUp) { "true" } else { "false" }
         $bridgeStatus = if ($null -ne $consultantBridgeView) { [string]$consultantBridgeView.status } else { "unknown" }
+        $hwndMeta = if ($consultantHwnd -gt 0) { $consultantHwnd } else { 0 }
         $publishResult = Publish-GuardedBusMessage @{
             sender  = "gemini_consultant"
             topic   = "orchestrator"
@@ -429,6 +468,8 @@ if ($skynetUp) {
                 transport        = "gc-start-bridge"
                 routable         = $routable
                 prompt_transport = $promptTransport
+                hwnd             = $hwndMeta
+                requires_hwnd    = ($consultantHwnd -gt 0)
                 score_actor      = "gemini_consultant"
                 signature        = "signed:gemini_consultant"
                 bridge_status    = $bridgeStatus

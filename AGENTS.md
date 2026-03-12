@@ -497,6 +497,19 @@ Institutional memory for Skynet. Every incident is stored in `data/incidents.jso
 - **Rule:** The ghost_type script MUST always have a fallback delivery mechanism. If the primary Edit control path fails, the Chrome render widget path MUST be tried. Only if BOTH fail should the dispatch report failure (`NO_EDIT_NO_RENDER`).
 - **Rule:** After every successful ghost_type delivery, `_verify_delivery()` MUST poll UIA to confirm the worker's state changed. An unverified delivery MUST be logged as a warning.
 
+### INCIDENT 011 -- Consultant Bridge Queue False Positive (2026-03-12)
+- **What:** `skynet_delivery.py` reported `success=True` for consultant prompt delivery when HTTP 202 "queued" was returned. Prompts were queued in the bridge but had NO consumer daemon — 19 prompts accumulated with zero actual delivery. The orchestrator believed consultants received research prompts; they received nothing.
+- **Root cause:** `_deliver_to_consultant_bridge()` treated HTTP 202 "queued" as successful delivery. `CC-Start.ps1` and `GC-Start.ps1` did not start any consumer process. The bridge had queue/ACK/complete endpoints but no daemon to drain the queue.
+- **Fix:** Built `tools/skynet_consultant_consumer.py` (245 lines) — daemon polls bridge queue, ACKs, relays to bus, marks complete. Updated `CC-Start.ps1` and `GC-Start.ps1` to auto-start consumer on boot. Fixed `skynet_delivery.py` to add `delivery_status` field distinguishing queued/delivered/consumed/failed. Commit `a9c61ae`.
+- **Rule:** `success=True` MUST only be returned for confirmed delivery, never for "queued". If a message is queued but not consumed, `delivery_status` must be "queued" and `success` must be `False`.
+
+### INCIDENT 012 -- Self-Awareness Protocol Violation: Consultant Delivery (2026-03-12)
+- **What:** System-wide Self-Awareness Protocol violation. The entire system (orchestrator, all workers, both consultants) failed to analyze how consultant prompt delivery actually works. Consultants are VS Code Copilot CLI chat windows — identical to workers. They have `Chrome_RenderWidgetHostHWND` input boxes. They should receive prompts via ghost_type, exactly like workers. Instead, the system built a bridge queue + consumer daemon approach without understanding that consultants ARE VS Code windows.
+- **Root cause:** (1) `CC-Start.ps1` and `GC-Start.ps1` never registered their VS Code window HWND. (2) Consultant state files hardcoded `requires_hwnd=false` and `prompt_transport=bridge_queue`. (3) `skynet_delivery.py` reported false positive `success=True` for HTTP 202 "queued". (4) No agent used `skynet_self.py` or analyzed the dispatch code to trace the actual consultant delivery path. (5) The consumer daemon (INCIDENT 011 fix) relayed to bus, but consultant VS Code sessions don't automatically read from bus — they need direct input to their chat windows.
+- **Fix:** (1) `CC-Start.ps1` and `GC-Start.ps1` now register consultant HWND via `GetForegroundWindow` at boot, set `requires_hwnd=true` and `prompt_transport=ghost_type`. (2) `skynet_dispatch.py` `_dispatch_to_consultant()` now tries ghost_type FIRST (using consultant HWND from state file), falls back to bridge-queue. (3) `skynet_delivery.py` `_deliver_to_consultant_bridge()` tries ghost_type primary, bridge fallback, with correct `delivery_status` handling. (4) `data/consultant_registry.json` created for consultant tracking.
+- **Rule:** ALL system participants must understand HOW they deliver/receive prompts. Consultants are VS Code windows and receive prompts via ghost_type — the same mechanism as workers. Self-awareness is not optional. Agents must analyze the actual code paths before building solutions.
+- **Accountability:** Orchestrator -0.05, all workers -0.01 each. All parties failed to analyze the system they were building on.
+
 ### Forbidden Commands (Workers)
 
 Workers must NEVER execute any of the following:

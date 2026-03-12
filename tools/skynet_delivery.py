@@ -811,13 +811,56 @@ def _deliver_to_worker_hwnd(content: str, worker_name: Optional[str]) -> dict:
     }
 
 
+def _deliver_to_consultant_ghost_type(content: str, consultant_id: str) -> dict:
+    """Attempt ghost_type delivery to consultant window via HWND.
+
+    Loads consultant HWND from state file, validates it, and ghost-types.
+    Returns result dict with delivery_status='delivered' on success,
+    'failed' if no HWND or ghost_type fails.
+    """  # signed: gamma
+    state = _load_consultant_state(consultant_id)
+    hwnd = state.get("hwnd", 0)
+    if not hwnd:
+        return {
+            "target": f"consultant:{consultant_id}",
+            "method": "ghost_type",
+            "success": False,
+            "delivery_status": "failed",
+            "detail": f"No HWND in state file for {consultant_id}",
+        }
+    orch_hwnd = _load_orch_hwnd()
+    ok = _ghost_type(hwnd, content, orch_hwnd or hwnd,
+                     target_label=f"consultant:{consultant_id}")
+    return {
+        "target": f"consultant:{consultant_id}",
+        "method": DeliveryMethod.DIRECT_PROMPT.value,
+        "success": ok,
+        "delivery_status": "delivered" if ok else "failed",
+        "detail": f"HWND={hwnd}, len={len(content)}, ghost_type={'ok' if ok else 'failed'}",
+    }  # signed: gamma
+
+
 def _deliver_to_consultant_bridge(content: str, consultant_id: Optional[str],
                                   bus_sender: str, bus_type: str,
                                   urgent: bool) -> dict:
-    """Handle CONSULTANT target delivery via bridge + bus audit trail."""
+    """Handle CONSULTANT target delivery: ghost_type primary, bridge fallback.
+
+    Delivery priority:
+    1. ghost_type via HWND (if consultant has HWND) -> delivery_status='delivered'
+    2. bridge_queue via HTTP POST (fallback) -> delivery_status='queued'
+    3. bus audit trail always posted regardless of delivery method
+
+    TRUTH: success=True ONLY for ghost_type 'delivered'. queued != delivered.
+    """  # signed: gamma
     if not consultant_id:
         return {"target": "consultant", "method": "failed",
                 "success": False, "detail": "No consultant_id specified"}
+
+    # --- Phase 1: Try ghost_type as primary delivery --- signed: gamma
+    ghost_result = _deliver_to_consultant_ghost_type(content, consultant_id)
+    ghost_ok = ghost_result.get("success", False)
+
+    # --- Phase 2: Bridge queue as fallback + audit trail --- signed: gamma
     state = _load_consultant_state(consultant_id)
     api_url = str(state.get("api_url") or "").strip()
     live = bool(state.get("live"))
@@ -836,36 +879,45 @@ def _deliver_to_consultant_bridge(content: str, consultant_id: Optional[str],
             "content": content,
             "metadata": {"urgent": bool(urgent)},
         })
+    # Bus audit trail always posted
     bus_ok = _bus_post(bus_sender, consultant_id, bus_type or "directive", content[:2000])
     prompt = bridge_resp.get("prompt", {}) if isinstance(bridge_resp, dict) else {}
     bridge_status = bridge_resp.get("status", "") if isinstance(bridge_resp, dict) else ""
-    # TRUTH: queued != delivered. Distinguish delivery lifecycle stages.
-    # - "queued": bridge accepted the prompt into its queue (HTTP 202)
-    # - "delivered": prompt was consumed by the consultant window (not yet verifiable here)
-    # - "consumed": consultant acknowledged processing (future: requires callback)
-    # success=True ONLY means the bridge accepted the request -- callers must check
-    # delivery_status to know actual delivery state.  # signed: beta
-    if bridge_status == "queued":
+
+    # --- Phase 3: Determine final delivery status --- signed: gamma
+    # TRUTH PRINCIPLE: queued != delivered. success=True ONLY for real delivery.
+    if ghost_ok:
+        delivery_status = "delivered"
+        method = DeliveryMethod.DIRECT_PROMPT.value
+        success = True
+    elif bridge_status == "queued":
         delivery_status = "queued"
+        method = DeliveryMethod.CONSULTANT_BRIDGE.value
+        success = False  # queued is NOT delivered -- TRUTH PRINCIPLE
     elif bridge_status in ("delivered", "consumed"):
         delivery_status = bridge_status
-    elif bridge_resp is None or not isinstance(bridge_resp, dict):
-        delivery_status = "failed"
+        method = DeliveryMethod.CONSULTANT_BRIDGE.value
+        success = True
     else:
-        delivery_status = "unknown"
-    success = delivery_status in ("queued", "delivered", "consumed")
-    method = DeliveryMethod.HYBRID.value if bus_ok else DeliveryMethod.CONSULTANT_BRIDGE.value
+        delivery_status = "failed"
+        method = "failed"
+        success = False
+
+    if bus_ok and method != "failed":
+        method = DeliveryMethod.HYBRID.value
+
     return {
         "target": f"consultant:{consultant_id}",
         "method": method,
         "success": success,
         "delivery_status": delivery_status,
         "detail": (
+            f"ghost_type={'delivered' if ghost_ok else 'no_hwnd_or_failed'}, "
             f"live={live}, accepts_prompts={accepts_prompts}, api_url={api_url or 'unknown'}, "
             f"prompt_id={prompt.get('id', 'unknown')}, bus_ok={bus_ok}, "
-            f"delivery_status={delivery_status}"
+            f"bridge_status={bridge_status}, delivery_status={delivery_status}"
         ),
-    }  # signed: beta
+    }  # signed: gamma
 
 
 def deliver(target: DeliveryTarget, content: str,
@@ -880,7 +932,7 @@ def deliver(target: DeliveryTarget, content: str,
     Routes messages to the correct target using the direct-prompt model:
     - ORCHESTRATOR: ghost-type into orchestrator's VS Code chat window
     - WORKER: ghost-type into the named worker's chat window
-    - CONSULTANT: queue prompt into the consultant bridge
+    - CONSULTANT: ghost_type primary (if HWND), bridge_queue fallback + bus audit
     - BUS: post to bus only (no UIA delivery)
     """
     t0 = time.time()
@@ -1216,19 +1268,21 @@ ROUTING_REGISTRY = {
         "notes": "Ghost-type into worker chat window",
     },
     "consultant": {
-        "method": DeliveryMethod.CONSULTANT_BRIDGE,
+        "method": DeliveryMethod.DIRECT_PROMPT,
+        "fallback": DeliveryMethod.CONSULTANT_BRIDGE,
         "hwnd_source": "consultant_state.json",
         "routable": True,
         "convene_gated": False,
-        "notes": "Advisory peer with bridge_queue prompt transport; results forwarded to orchestrator.",
-    },
+        "notes": "Ghost_type primary (if HWND), bridge_queue fallback; queued != delivered.",
+    },  # signed: gamma
     "gemini_consultant": {
-        "method": DeliveryMethod.CONSULTANT_BRIDGE,
+        "method": DeliveryMethod.DIRECT_PROMPT,
+        "fallback": DeliveryMethod.CONSULTANT_BRIDGE,
         "hwnd_source": "gemini_consultant_state.json",
         "routable": True,
         "convene_gated": False,
-        "notes": "Advisory peer with bridge_queue prompt transport; results forwarded to orchestrator.",
-    },
+        "notes": "Ghost_type primary (if HWND), bridge_queue fallback; queued != delivered.",
+    },  # signed: gamma
 }
 
 
@@ -1242,10 +1296,18 @@ def is_routable(target_name: str) -> bool:
     info = ROUTING_REGISTRY.get(target_name, {})
     if not info.get("routable", False):
         return False
+    # Consultant targets: routable if HWND exists (ghost_type) OR bridge is live
+    fallback = info.get("fallback")
+    if fallback == DeliveryMethod.CONSULTANT_BRIDGE:
+        state = _load_consultant_state(target_name)
+        has_hwnd = bool(state.get("hwnd"))
+        bridge_live = (bool(state.get("live")) and bool(state.get("api_url"))
+                       and bool(state.get("accepts_prompts")))
+        return has_hwnd or bridge_live  # signed: gamma
     if info.get("method") == DeliveryMethod.CONSULTANT_BRIDGE:
         state = _load_consultant_state(target_name)
         return bool(state.get("live")) and bool(state.get("api_url")) and bool(state.get("accepts_prompts"))
-    return True
+    return True  # signed: gamma
 
 
 def list_routable_targets() -> list:

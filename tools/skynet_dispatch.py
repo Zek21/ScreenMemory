@@ -960,20 +960,62 @@ def _dispatch_to_orchestrator(task, self_id, orch_hwnd):
         return False
 
 
+def load_consultant_hwnd(consultant_id):
+    """Load consultant HWND from state file. Returns int or 0."""  # signed: orchestrator
+    state_files = {
+        "consultant": ROOT / "data" / "consultant_state.json",
+        "gemini_consultant": ROOT / "data" / "gemini_consultant_state.json",
+    }
+    path = state_files.get(consultant_id)
+    if not path or not path.exists():
+        return 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return int(data.get("hwnd", 0))
+    except (json.JSONDecodeError, OSError, ValueError):
+        return 0
+
+
 def _dispatch_to_consultant(target_name, task, self_id):
-    """Dispatch to consultant via bridge-queue. Returns ok bool."""
+    """Dispatch to consultant via ghost_type (primary) or bridge-queue (fallback).
+
+    Consultants ARE VS Code windows — they receive prompts via ghost_type
+    to Chrome_RenderWidgetHostHWND, exactly like workers. Bridge-queue is
+    kept as audit trail / fallback only.
+    """  # signed: orchestrator — INCIDENT 012 fix
+    orch_hwnd = load_orch_hwnd()
+
+    # --- Phase 1: Try ghost_type (primary delivery) ---
+    consultant_hwnd = load_consultant_hwnd(target_name)
+    if consultant_hwnd and user32.IsWindow(consultant_hwnd):
+        log(f"→ {target_name.upper()} [ghost_type HWND={consultant_hwnd}]: {task[:80]}{'...' if len(task) > 80 else ''}", "SYS")
+        ok = ghost_type_to_worker(consultant_hwnd, task, orch_hwnd or consultant_hwnd)
+        if ok:
+            _log_dispatch(target_name, task, "GHOST_TYPE", True, 0)
+            log(f"✓ Dispatched to {target_name.upper()} via ghost_type [HWND={consultant_hwnd}]", "OK")
+            # Also post to bridge as audit trail (best-effort)
+            try:
+                from tools.skynet_delivery import deliver_to_consultant
+                deliver_to_consultant(target_name, task, sender=self_id or "orchestrator", msg_type="directive")
+            except Exception:
+                pass  # audit trail is best-effort
+            return True
+        else:
+            log(f"ghost_type failed for {target_name.upper()} HWND={consultant_hwnd}, falling back to bridge", "WARN")
+
+    # --- Phase 2: Fallback to bridge-queue ---
     try:
         from tools.skynet_delivery import deliver_to_consultant
-        log(f"→ {target_name.upper()} [bridge-queue]: {task[:80]}{'...' if len(task) > 80 else ''}", "SYS")
+        method_note = "bridge-queue" if not consultant_hwnd else "bridge-queue (ghost_type fallback)"
+        log(f"→ {target_name.upper()} [{method_note}]: {task[:80]}{'...' if len(task) > 80 else ''}", "SYS")
         result = deliver_to_consultant(target_name, task, sender=self_id or "orchestrator", msg_type="directive")
         ok = bool(result.get("success"))
-        # TRUTH: distinguish queued vs delivered -- queued only means bridge accepted it
         delivery_status = result.get("delivery_status", "unknown")
         status_note = f" (delivery_status={delivery_status})" if delivery_status == "queued" else ""
         _log_dispatch(target_name, task, "BRIDGE_QUEUE", ok, 0)
         log(f"{'✓' if ok else '✗'} Dispatched to {target_name.upper()}{status_note} [{result.get('detail', '')}]",
             "OK" if ok else "ERR")
-        return ok  # signed: beta
+        return ok  # signed: orchestrator
     except Exception as e:
         log(f"Consultant dispatch failed for {target_name}: {e}", "ERR")
         _log_dispatch(target_name, task, "BRIDGE_QUEUE", False, 0)

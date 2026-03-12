@@ -194,5 +194,30 @@
     "fix": "Added Chrome render widget fallback. When no Edit found, focuses Chrome_RenderWidgetHostHWND directly and pastes. Added _verify_delivery() post-dispatch UIA polling. Commit 806760f.",
     "rule": "Ghost-type MUST have fallback delivery via Chrome render widget. Post-dispatch delivery verification via _verify_delivery() is MANDATORY.",
     "status": "RESOLVED"
+  },
+  {
+    "id": "INCIDENT_012",
+    "timestamp": "2026-03-12T12:36:34.182545",
+    "title": "Self-Awareness Protocol Violation: Consultant Delivery",
+    "severity": "CRITICAL",
+    "what": "System-wide Self-Awareness Protocol violation. Nobody analyzed that consultants are VS Code windows identical to workers. Bridge queue approach built without understanding the system.",
+    "root_cause": "CC/GC-Start never register HWND. State files hardcoded requires_hwnd=false. delivery.py reported success=True for HTTP 202 queued (false positive). No agent traced actual consultant delivery code paths.",
+    "fix": "CC/GC-Start register HWND via GetForegroundWindow. dispatch uses ghost_type primary. delivery uses ghost_type primary with bridge fallback. consultant_registry.json created.",
+    "rule": "ALL system participants must understand HOW they deliver/receive prompts. Consultants are VS Code windows. Self-awareness is mandatory.",
+    "penalties": {
+      "orchestrator": -0.05,
+      "alpha": -0.01,
+      "beta": -0.01,
+      "gamma": -0.01,
+      "delta": -0.01
+    },
+    "responsible": [
+      "orchestrator",
+      "alpha",
+      "beta",
+      "gamma",
+      "delta"
+    ],
+    "signed_by": "orchestrator"
   }
 ]
