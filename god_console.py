@@ -1276,6 +1276,37 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 })
             except Exception as e:
                 self._json_response({"error": str(e)}, status=500)
+        elif self.path == "/api/scores":
+            # Scoring leaderboard endpoint — reads worker_scores.json  # signed: delta
+            try:
+                scores_path = Path(__file__).parent / "data" / "worker_scores.json"
+                if scores_path.exists():
+                    raw = json.loads(scores_path.read_text(encoding="utf-8"))
+                    scores_dict = raw.get("scores", {})
+                    # Build {name: total} map and system_senders list
+                    system_senders = [
+                        "monitor", "convene", "convene-gate", "convene_gate",
+                        "self_prompt", "system", "overseer", "watchdog",
+                        "bus_relay", "learner", "self_improve", "sse_daemon",
+                        "idle_monitor",
+                    ]
+                    totals = {}
+                    for name, info in scores_dict.items():
+                        if isinstance(info, dict):
+                            totals[name] = info.get("total", 0)
+                        else:
+                            totals[name] = float(info)
+                    self._json_response({
+                        "scores": totals,
+                        "system_senders": system_senders,
+                        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    })
+                else:
+                    self._json_response({"scores": {}, "system_senders": [],
+                                         "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")})
+            except Exception as e:
+                self._json_response({"error": str(e)}, status=500)
+            # signed: delta
         elif self.path == "/api/ci/latest":
             try:
                 ci_path = Path(__file__).parent / "data" / "ci_report.json"
