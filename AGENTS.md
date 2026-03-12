@@ -490,6 +490,13 @@ Institutional memory for Skynet. Every incident is stored in `data/incidents.jso
 - **Fix:** Self-Invocation Protocol added to AGENTS.md. /clear must always use raw ghost_type_to_worker(), never skynet_dispatch.py.
 - **Rule:** Slash commands (/clear, /help, etc.) must be sent via raw ghost_type_to_worker() -- never through the dispatch pipeline.
 
+### INCIDENT 010 -- Ghost-Type NO_EDIT Total Dispatch Failure (2026-03-12)
+- **What:** ALL ghost_type_to_worker() dispatches failed with NO_EDIT. Workers showed IDLE forever because prompts never arrived. The orchestrator reported dispatch success (NO — it reported failure, but had no fallback). Every dispatch to every worker was broken.
+- **Root cause:** VS Code Copilot CLI's chat input is rendered inside `Chrome_RenderWidgetHostHWND`, NOT as a standard UIA Edit control. The only Edit control in the window is a 1px-tall accessibility placeholder. The ghost_type script's height filter (`$r.Height -lt 10`) correctly rejected this 1px placeholder, but then had NO fallback — it just printed NO_EDIT and exited with code 1. This was a total dispatch pipeline failure.
+- **Fix:** Added Chrome render widget fallback to `_build_ghost_type_ps()`. When no suitable Edit control is found, the script now locates `Chrome_RenderWidgetHostHWND` via `GhostType.FindRender()`, focuses it, and does Ctrl+V + Enter directly. New delivery statuses: `OK_RENDER_ATTACHED`, `OK_RENDER_FALLBACK`. Added `_verify_delivery()` post-dispatch UIA polling to confirm worker state transition. Commit `806760f`.
+- **Rule:** The ghost_type script MUST always have a fallback delivery mechanism. If the primary Edit control path fails, the Chrome render widget path MUST be tried. Only if BOTH fail should the dispatch report failure (`NO_EDIT_NO_RENDER`).
+- **Rule:** After every successful ghost_type delivery, `_verify_delivery()` MUST poll UIA to confirm the worker's state changed. An unverified delivery MUST be logged as a warning.
+
 ### Forbidden Commands (Workers)
 
 Workers must NEVER execute any of the following:
@@ -873,7 +880,9 @@ When this does NOT apply (use Rule 13 fire-and-forget instead):
 - Never report "online" on mere import success. Import proves the file exists; instantiation proves it works.
 
 ### Dispatch Verification (tools/skynet_dispatch.py)
-- **"dispatch success"** — means the directive was confirmed delivered to the worker via UIA ghost-typing AND the worker's state transitioned (verified by `get_worker_state_uia()`).
+- **"dispatch success"** — means the directive was confirmed delivered to the worker via UIA ghost-typing AND the worker's state transitioned (verified by `_verify_delivery()` polling UIA for up to 8s).
+- **Ghost-type delivery mechanism**: The chat input in VS Code Copilot CLI lives inside `Chrome_RenderWidgetHostHWND`, NOT a UIA Edit control. The ghost_type script first searches for UIA Edit controls; if none found (NO_EDIT), it falls back to focusing the Chrome render widget directly and using Ctrl+V + Enter. Valid delivery statuses: `OK_ATTACHED`, `OK_FALLBACK`, `OK_RENDER_ATTACHED`, `OK_RENDER_FALLBACK`.
+- **Post-dispatch verification**: After `ghost_type_to_worker()` returns True, `_verify_delivery()` polls the worker's UIA state every 0.5s for up to 8s. If the worker transitions from IDLE to PROCESSING, delivery is VERIFIED. If state doesn't change, a warning is logged but dispatch is still reported as success (the text may be queued).
 - A POST to `/directive` returning HTTP 200 is NOT sufficient — it only means the Go backend accepted the message, not that the worker received or processed it.
 - If UIA delivery cannot be confirmed, report the dispatch as **unverified**.
 

@@ -1,0 +1,198 @@
+[
+  {
+    "id": "INC-001",
+    "timestamp": "2026-03-10T17:20:00",
+    "what_happened": "Alpha tried to dispatch a test message to itself via skynet_dispatch.py, creating an infinite wait loop that blocked the worker.",
+    "root_cause": "No guard against self-dispatch in the dispatch pipeline.",
+    "fix_applied": "Self-dispatch guard added to skynet_dispatch.py -- dispatch_to_worker() now rejects tasks where sender == target.",
+    "rule_created": "Workers must NEVER dispatch to themselves."
+  },
+  {
+    "id": "INC-002",
+    "timestamp": "2026-03-10T17:25:00",
+    "what_happened": "Workers instructed to clean up duplicate processes ran Stop-Process and killed the watchdog, SSE daemon, and GOD Console, causing cascading monitoring blindness.",
+    "root_cause": "Workers had unrestricted process termination privileges. Task instructions were too broad.",
+    "fix_applied": "Ceasefire directive issued. Services restarted. Kill-prevention rule added. guard_process_kill() added to skynet_dispatch.py.",
+    "rule_created": "NO worker may terminate any process. Only orchestrator authorized to manage process lifecycle."
+  },
+  {
+    "id": "INC-003",
+    "timestamp": "2026-03-10T17:10:00",
+    "what_happened": "Multiple watchdogs (4), SSE daemons (4), and GOD Consoles (2) running simultaneously, consuming resources and producing conflicting state.",
+    "root_cause": "Daemons did not check if another instance was already running before starting.",
+    "fix_applied": "PID file locking added to skynet_watchdog.py -- checks data/watchdog.pid, verifies process is alive AND is actually a watchdog before exiting.",
+    "rule_created": "All daemons must implement PID file locking and singleton enforcement before starting."
+  },
+  {
+    "id": "INC-006",
+    "timestamp": "2026-03-11T03:50:00",
+    "title": "Permission Guard PostMessage Failure",
+    "what_happened": "guard_permissions() in skynet_start.py used PostMessage WM_KEYDOWN to Chrome_RenderWidgetHostHWND to select Bypass Approvals from a dropdown. This NEVER worked because VS Code dropdown overlays are Electron webview elements that do NOT receive PostMessage keystrokes when the window lacks OS focus. new_chat.ps1 appeared to work because it runs while the freshly-opened window still has OS focus. UIA reported false success (said 'Bypass') while OCR/screenshots proved the actual screen showed 'Default Approvals'.",
+    "root_cause": "PostMessage ghost keyboard only works for text input into the main webview content area. It does NOT work for UI control dropdowns, menus, or overlays. UIA status reads can report stale or incorrect state, giving false confidence that the operation succeeded.",
+    "fix_applied": "SetForegroundWindow before ExpandCollapse, real SendKeys for Enter, restore orchestrator focus after. Visual verification (OCR/screenshots) must be used instead of trusting UIA alone.",
+    "rule_created": "PostMessage ghost keyboard is ONLY valid for text input into the main webview. For UI control dropdowns, menus, and overlays, use SetForegroundWindow + real SendKeys + restore focus. Always verify UI changes with visual evidence (OCR/screenshots), never trust UIA alone."
+  },
+  {
+    "id": "auto_restart_sse_daemon_restart_1773167284",
+    "timestamp": "2026-03-11T02:28:04",
+    "what_happened": "Service sse_daemon_restart died (PID 0)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 0)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "sse_daemon_restart",
+    "timestamp": "2026-03-11T02:28:04.999377",
+    "old_pid": 0,
+    "new_pid": 0,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_learner_restart_1773214222",
+    "timestamp": "2026-03-11T15:30:22",
+    "what_happened": "Service learner_restart died (PID 0)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 19832)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "learner_restart",
+    "timestamp": "2026-03-11T15:30:22.322857",
+    "old_pid": 0,
+    "new_pid": 19832,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_god_console_restart_1773214325",
+    "timestamp": "2026-03-11T15:32:05",
+    "what_happened": "Service god_console_restart died (PID 30828)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 29064)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "god_console_restart",
+    "timestamp": "2026-03-11T15:32:05.519447",
+    "old_pid": 30828,
+    "new_pid": 29064,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_god_console_restart_1773214766",
+    "timestamp": "2026-03-11T15:39:26",
+    "what_happened": "Service god_console_restart died (PID 17648)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 17648)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "god_console_restart",
+    "timestamp": "2026-03-11T15:39:26.343395",
+    "old_pid": 17648,
+    "new_pid": 17648,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_god_console_restart_1773226890",
+    "timestamp": "2026-03-11T19:01:30",
+    "what_happened": "Service god_console_restart died (PID 55308)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 55308)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "god_console_restart",
+    "timestamp": "2026-03-11T19:01:30.464563",
+    "old_pid": 55308,
+    "new_pid": 55308,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_god_console_restart_1773227401",
+    "timestamp": "2026-03-11T19:10:01",
+    "what_happened": "Service god_console_restart died (PID 55308)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 55308)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "god_console_restart",
+    "timestamp": "2026-03-11T19:10:01.867471",
+    "old_pid": 55308,
+    "new_pid": 55308,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_consultant_bridge_restart_1773275481",
+    "timestamp": "2026-03-12T08:31:21",
+    "what_happened": "Service consultant_bridge_restart died (PID 0)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 49564)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "consultant_bridge_restart",
+    "timestamp": "2026-03-12T08:31:21.646705",
+    "old_pid": 0,
+    "new_pid": 49564,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_god_console_restart_1773275657",
+    "timestamp": "2026-03-12T08:34:17",
+    "what_happened": "Service god_console_restart died (PID 0)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 46856)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "god_console_restart",
+    "timestamp": "2026-03-12T08:34:17.983908",
+    "old_pid": 0,
+    "new_pid": 46856,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_gemini_consultant_bridge_restart_1773275672",
+    "timestamp": "2026-03-12T08:34:32",
+    "what_happened": "Service gemini_consultant_bridge_restart died (PID 63640)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 24656)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "gemini_consultant_bridge_restart",
+    "timestamp": "2026-03-12T08:34:32.798677",
+    "old_pid": 63640,
+    "new_pid": 24656,
+    "type": "auto_restart"
+  },
+  {
+    "id": "INCIDENT_009",
+    "timestamp": "2026-03-12T08:48:43.135887",
+    "title": "Pre-Fire Visual Proof Downgrade (Rule 0.015)",
+    "severity": "CRITICAL",
+    "what_happened": "5 of 10 dispatch/prompt functions lacked screenshot verification before firing into worker/orchestrator windows. Functions clear_steering_and_send(), blast_all(), prompt_worker(), guard_model(), guard_permissions() all executed without visual proof of target state.",
+    "root_cause": "Commit 11ddba1 (Level 3 truth audit) added pre_dispatch_visual_check() to dispatch_to_worker() ONLY. The same developer did not propagate visual checks to clear_steering_and_send, blast_all, or skynet_start.py functions. No systematic audit of Rule 0.015 compliance was performed.",
+    "fix_applied": "Dispatched to alpha (skynet_dispatch.py: clear_steering_and_send + blast_all) and beta (skynet_start.py: prompt_worker + guard_model + guard_permissions) to add pre_dispatch_visual_check() gates.",
+    "rule_created": "Systematic Rule 0.015 audit required after any commit that adds or modifies fire-and-forget functions.",
+    "penalties": {
+      "orchestrator": -0.1
+    },
+    "responsible": [
+      "orchestrator (governance failure)"
+    ],
+    "signed_by": "orchestrator"
+  },
+  {
+    "id": "INCIDENT_010",
+    "title": "Ghost-Type NO_EDIT Total Dispatch Failure",
+    "date": "2026-03-12",
+    "severity": "CRITICAL",
+    "what": "ALL ghost_type_to_worker() dispatches returned NO_EDIT. Workers showed IDLE forever because prompts never arrived.",
+    "root_cause": "VS Code Copilot CLI chat input lives inside Chrome_RenderWidgetHostHWND, not a UIA Edit control. The only Edit control is a 1px accessibility placeholder rejected by the height filter (Height < 10). No fallback existed.",
+    "fix": "Added Chrome render widget fallback. When no Edit found, focuses Chrome_RenderWidgetHostHWND directly and pastes. Added _verify_delivery() post-dispatch UIA polling. Commit 806760f.",
+    "rule": "Ghost-type MUST have fallback delivery via Chrome render widget. Post-dispatch delivery verification via _verify_delivery() is MANDATORY.",
+    "status": "RESOLVED"
+  }
+]
