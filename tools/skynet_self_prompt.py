@@ -885,7 +885,17 @@ class SelfPromptDaemon:
             return
         content_lower = str(msg.get("content", "")).lower()
         model = self.worker_models[sender]
-        if any(kw in content_lower for kw in ("error", "failed", "timeout")):
+        # Recovery/positive keywords negate failure detection so that messages
+        # like 'Fixed 3 errors' or 'CLIPBOARD_VERIFY_FAILED recovery succeeded'
+        # are not falsely counted as failures.  # signed: beta
+        recovery_keywords = (
+            'recovered', 'recovery succeeded', 'fixed', 'resolved',
+            'passed', 'succeeded', 'success', 'no errors', 'no failures',
+            'all tests passed', 'corrected',
+        )
+        has_failure_kw = any(kw in content_lower for kw in ('error', 'failed', 'timeout'))
+        has_recovery_kw = any(kw in content_lower for kw in recovery_keywords)
+        if has_failure_kw and not has_recovery_kw:
             model.tasks_failed += 1
             model.last_result_quality = "failure"
             self._record_event(EVT_FAILURE, sender, content_lower[:80])
