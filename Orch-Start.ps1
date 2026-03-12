@@ -231,6 +231,14 @@ function Start-VerifiedDaemon($spec) {
     $script  = Join-Path $repoRoot $spec.Script
     $scriptName = Split-Path $spec.Script -Leaf
 
+    # 0. Check for .disabled sentinel file — if present, skip starting this daemon
+    $daemonName = [System.IO.Path]::GetFileNameWithoutExtension($spec.Pid)
+    $disabledFile = Join-Path $repoRoot "data\$daemonName.disabled"
+    if (Test-Path $disabledFile) {
+        Write-Status "$($spec.Name) daemon SKIPPED (disabled via $disabledFile)" "WARN"
+        return
+    }
+
     # 1. Check if already running with cmdline verification via Get-CimInstance
     if (Test-Path $pidFile) {
         $daemonPid = 0

@@ -390,6 +390,14 @@ $daemonSpecs = @(
 )
 
 foreach ($d in $daemonSpecs) {
+    # Check for .disabled sentinel file -- if present, skip starting this daemon
+    $daemonName = [System.IO.Path]::GetFileNameWithoutExtension($d.Pid)
+    $disabledFile = Join-Path $repoRoot "data\$daemonName.disabled"
+    if (Test-Path $disabledFile) {
+        Write-Status "$($d.Name) daemon SKIPPED (disabled via $disabledFile)" "WARN"
+        continue
+    }
+
     $pidFile = Join-Path $repoRoot $d.Pid
     $running = $false
     if (Test-Path $pidFile) {

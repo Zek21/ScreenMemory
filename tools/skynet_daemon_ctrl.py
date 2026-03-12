@@ -177,18 +177,21 @@ def status_all():
     summary = {}
     for name, info in DAEMONS.items():
         pid = _get_daemon_pid(name)
+        disabled = is_disabled(name)
         if pid:
             uptime = _get_process_uptime(pid)
             uptime_str = f"{int(uptime)}s" if uptime else "?"
             status = "RUNNING"
-            summary[name] = {"pid": pid, "status": "running", "uptime_s": uptime}
+            summary[name] = {"pid": pid, "status": "running", "uptime_s": uptime, "disabled": disabled}
         else:
             uptime_str = "-"
-            status = "STOPPED"
-            # Check if PID file exists but process is dead (stale)
-            if info["pid_file"].exists():
+            if disabled:
+                status = "DISABLED"
+            elif info["pid_file"].exists():
                 status = "STALE_PID"
-            summary[name] = {"pid": None, "status": "stopped"}
+            else:
+                status = "STOPPED"
+            summary[name] = {"pid": None, "status": "stopped" if not disabled else "disabled", "disabled": disabled}
 
         print(f"{name:<15} {str(pid or '-'):>7} {status:<12} {uptime_str:<12} {info['description']}")
 
@@ -249,11 +252,54 @@ def stop_all():
     print(f"\n[{_ts()}] {stopped}/{len(results)} daemons stopped")
 
 
+def disable_daemon(name: str):
+    """Disable a daemon by creating a .disabled sentinel file. Prevents all boot scripts from starting it."""
+    info = DAEMONS.get(name)
+    if not info:
+        print(f"[{_ts()}] Unknown daemon: {name}")
+        return False
+    disabled_file = DATA_DIR / f"{name}.disabled"
+    disabled_file.write_text(f"disabled at {_ts()}\n")
+    # Also stop it if currently running
+    pid = _get_daemon_pid(name)
+    if pid:
+        stop_daemon(name, report=False)
+    print(f"[{_ts()}] {name}: DISABLED (sentinel: {disabled_file})")
+    _bus_post(f"Daemon {name} DISABLED -- will not restart on boot")
+    return True
+
+
+def enable_daemon(name: str):
+    """Enable a daemon by removing the .disabled sentinel file."""
+    info = DAEMONS.get(name)
+    if not info:
+        print(f"[{_ts()}] Unknown daemon: {name}")
+        return False
+    disabled_file = DATA_DIR / f"{name}.disabled"
+    if disabled_file.exists():
+        disabled_file.unlink()
+        print(f"[{_ts()}] {name}: ENABLED (sentinel removed)")
+        _bus_post(f"Daemon {name} ENABLED -- can be started on next boot")
+    else:
+        print(f"[{_ts()}] {name}: already enabled (no sentinel found)")
+    return True
+
+
+def is_disabled(name: str) -> bool:
+    """Check if a daemon is disabled via sentinel file."""
+    return (DATA_DIR / f"{name}.disabled").exists()
+
+
 def start_daemon(name: str):
     """Start a daemon if not already running."""
     info = DAEMONS.get(name)
     if not info:
         print(f"[{_ts()}] Unknown daemon: {name}")
+        return False
+
+    # Check disabled sentinel
+    if is_disabled(name):
+        print(f"[{_ts()}] {name}: DISABLED -- cannot start (remove data/{name}.disabled to enable)")
         return False
 
     pid = _get_daemon_pid(name)
@@ -305,9 +351,9 @@ def health_summary():
 
 def main():
     parser = argparse.ArgumentParser(description="Skynet Daemon Lifecycle Controller")
-    parser.add_argument("action", choices=["status", "stop-all", "stop", "start", "restart", "health"],
+    parser.add_argument("action", choices=["status", "stop-all", "stop", "start", "restart", "health", "disable", "enable"],
                         help="Action to perform")
-    parser.add_argument("daemon", nargs="?", help="Daemon name (for stop/start/restart)")
+    parser.add_argument("daemon", nargs="?", help="Daemon name (for stop/start/restart/disable/enable)")
     args = parser.parse_args()
 
     if args.action == "status":
@@ -331,6 +377,16 @@ def main():
         restart_daemon(args.daemon)
     elif args.action == "health":
         health_summary()
+    elif args.action == "disable":
+        if not args.daemon:
+            print("Error: daemon name required for 'disable'")
+            sys.exit(1)
+        disable_daemon(args.daemon)
+    elif args.action == "enable":
+        if not args.daemon:
+            print("Error: daemon name required for 'enable'")
+            sys.exit(1)
+        enable_daemon(args.daemon)
 
 
 if __name__ == "__main__":

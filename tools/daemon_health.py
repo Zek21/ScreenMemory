@@ -90,7 +90,12 @@ def check_daemon(name: str) -> dict:
 
 
 def fix_daemon(name: str) -> bool:
-    """Start a dead daemon. Returns True on success."""
+    """Start a dead daemon. Returns True on success. Respects .disabled sentinel."""
+    # Check disabled sentinel -- do not restart disabled daemons
+    disabled_file = ROOT / "data" / f"{name}.disabled"
+    if disabled_file.exists():
+        print(f"  {name}: DISABLED -- skipping fix (remove {disabled_file} to enable)")
+        return False
     _, cmd_parts, _ = DAEMONS[name]
     full_cmd = [PYTHON] + [str(ROOT / "tools" / c) if c.endswith(".py") else c for c in cmd_parts]
     env = os.environ.copy()
