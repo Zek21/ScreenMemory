@@ -298,6 +298,92 @@ foreach ($d in $daemonSpecs) {
     Start-VerifiedDaemon $d
 }
 
+# -- Sprint 2 daemons: bus_persist and consultant_consumer (Level 3.4)  # signed: beta
+# Reference: docs/DAEMON_ARCHITECTURE.md Section 5.2 (bus_persist) and Section 6.3 (consultant_consumer)
+# These are non-blocking checks -- if missing, warn but continue boot.
+
+$busPersistPid = Join-Path $dataDir "bus_persist.pid"
+if (Test-Path $busPersistPid) {
+    try {
+        $bpPid = [int](Get-Content $busPersistPid -Raw).Trim()
+        $bpProc = Get-Process -Id $bpPid -ErrorAction Stop
+        if (-not $bpProc.HasExited) {
+            Write-Status "Bus persist daemon alive (PID $bpPid)" "OK"
+        } else {
+            Write-Status "Bus persist daemon PID $bpPid has exited -- watchdog will restart" "WARN"
+        }
+    } catch {
+        Write-Status "Bus persist daemon not running (stale PID) -- watchdog will restart" "WARN"
+    }
+} else {
+    Write-Status "Bus persist daemon not running (no PID file) -- watchdog will start it" "WARN"
+}
+
+foreach ($ccPort in @(8422, 8425)) {
+    $ccPidFile = Join-Path $dataDir "consultant_consumer_$ccPort.pid"
+    if (Test-Path $ccPidFile) {
+        try {
+            $ccPid = [int](Get-Content $ccPidFile -Raw).Trim()
+            $ccProc = Get-Process -Id $ccPid -ErrorAction Stop
+            if (-not $ccProc.HasExited) {
+                Write-Status "Consultant consumer ($ccPort) alive (PID $ccPid)" "OK"
+            } else {
+                Write-Status "Consultant consumer ($ccPort) PID $ccPid exited -- watchdog will restart" "WARN"
+            }
+        } catch {
+            Write-Status "Consultant consumer ($ccPort) not running -- watchdog will restart" "WARN"
+        }
+    } else {
+        Write-Status "Consultant consumer ($ccPort) not started (no PID file)" "INFO"
+    }
+}
+# signed: beta
+
+# -- Architecture verification (non-blocking)  # signed: beta
+# Reference: docs/DAEMON_ARCHITECTURE.md Section 8 (Health Checks)
+$archVerifyScript = Join-Path $repoRoot "tools\skynet_arch_verify.py"
+if (Test-Path $archVerifyScript) {
+    try {
+        $archResult = & $python $archVerifyScript --check 2>&1
+        $archExitCode = $LASTEXITCODE
+        if ($archExitCode -eq 0) {
+            Write-Status "Architecture verification: PASS" "OK"
+        } else {
+            Write-Status "Architecture verification: ISSUES FOUND (exit=$archExitCode)" "WARN"
+        }
+    } catch {
+        Write-Status "Architecture verification failed to run: $_" "WARN"
+    }
+} else {
+    Write-Status "skynet_arch_verify.py not found -- skipping arch check" "WARN"
+}
+
+# -- Daemon status summary (non-blocking)  # signed: beta
+# Uses Sprint 2 tool: tools/skynet_daemon_status.py for comprehensive daemon inventory
+$daemonStatusScript = Join-Path $repoRoot "tools\skynet_daemon_status.py"
+if (Test-Path $daemonStatusScript) {
+    try {
+        $dsOutput = & $python $daemonStatusScript --json 2>&1
+        if ($LASTEXITCODE -eq 0 -and $dsOutput) {
+            $dsData = $dsOutput | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($dsData -and $dsData.summary) {
+                $dsAlive = $dsData.summary.alive
+                $dsTotal = $dsData.summary.total
+                Write-Status "Daemon inventory: $dsAlive/$dsTotal alive" "OK"
+            } else {
+                Write-Status "Daemon status returned but could not parse summary" "WARN"
+            }
+        } else {
+            Write-Status "Daemon status check returned non-zero or empty output" "WARN"
+        }
+    } catch {
+        Write-Status "Daemon status check failed: $_" "WARN"
+    }
+} else {
+    Write-Status "skynet_daemon_status.py not found -- skipping daemon inventory" "WARN"
+}
+# signed: beta
+
 # -- Orchestrator identity on bus --
 
 if ($skynetUp) {

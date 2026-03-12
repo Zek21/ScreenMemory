@@ -182,7 +182,21 @@
     "responsible": [
       "orchestrator (governance failure)"
     ],
-    "signed_by": "orchestrator"
+    "signed_by": "orchestrator",
+    "files_affected": [
+      "tools/skynet_dispatch.py (dispatch_to_worker, clear_steering_and_send, blast_all)",
+      "tools/skynet_start.py (prompt_worker, guard_model, guard_permissions)",
+      "tools/skynet_delivery.py (deliver_to_consultant)",
+      ".github/copilot-instructions.md (Rule 0.015)",
+      "AGENTS.md (Rule 0.015)"
+    ],
+    "lessons_learned": [
+      "Rule 0.015 was added for dispatch_to_worker only; 7/10 dispatch functions were never audited",
+      "COM threading bug: DXGICapture requires CoInitialize per-thread; multi-threaded UIA scans crashed",
+      "Systematic audit of ALL fire-and-forget functions required after any rule addition",
+      "Pre-fire screenshot gate is critical for shared-window environments (multi-pane VS Code)",
+      "Visual proof prevents orchestrator/consultant misfires in shared windows"
+    ]
   },
   {
     "id": "INCIDENT_010",
@@ -193,7 +207,52 @@
     "root_cause": "VS Code Copilot CLI chat input lives inside Chrome_RenderWidgetHostHWND, not a UIA Edit control. The only Edit control is a 1px accessibility placeholder rejected by the height filter (Height < 10). No fallback existed.",
     "fix": "Added Chrome render widget fallback. When no Edit found, focuses Chrome_RenderWidgetHostHWND directly and pastes. Added _verify_delivery() post-dispatch UIA polling. Commit 806760f.",
     "rule": "Ghost-type MUST have fallback delivery via Chrome render widget. Post-dispatch delivery verification via _verify_delivery() is MANDATORY.",
-    "status": "RESOLVED"
+    "status": "RESOLVED",
+    "files_affected": [
+      "tools/skynet_dispatch.py (ghost_type_to_worker, _find_edit_control)",
+      "tools/skynet_start.py (prompt_worker)",
+      "tools/uia_engine.py (scan method)",
+      "AGENTS.md (delivery pipeline documentation)"
+    ],
+    "lessons_learned": [
+      "VS Code Copilot CLI chat input lives inside Chrome_RenderWidgetHostHWND, NOT a UIA Edit control",
+      "The only Edit control is a 1px accessibility placeholder rejected by height filter (Height < 10)",
+      "Ghost-type MUST have Chrome render widget fallback delivery path",
+      "Post-dispatch delivery verification via _verify_delivery() prevents silent dispatch failures",
+      "UIA Edit-based assumptions break on Electron/Chromium-based chat interfaces"
+    ]
+  },
+  {
+    "id": "INC-011",
+    "title": "Consultant Bridge Queue Had No Consumer - HTTP 202 False Positive",
+    "date": "2026-03-12",
+    "timestamp": "2026-03-12T10:15:00",
+    "severity": "HIGH",
+    "what_happened": "The consultant bridge HTTP queue (skynet_consultant_bridge.py on ports 8422/8425) accepted prompt POSTs with HTTP 202 Accepted, creating the illusion of successful delivery. However, NO consumer daemon was running to drain the queue and deliver prompts to the actual consultant VS Code windows. 19 prompts accumulated in the Codex bridge queue with zero delivery. The orchestrator believed consultants were receiving and working on prompts when in reality nothing was being delivered.",
+    "root_cause": "skynet_consultant_bridge.py was designed as a producer-only HTTP server. It queued incoming prompts to an in-memory list and returned HTTP 202. The design assumed a separate consumer process would poll the queue and deliver prompts via ghost_type to the consultant VS Code window. This consumer was never built. HTTP 202 (Accepted) was interpreted by callers as delivery success when it only meant queued.",
+    "fix": "Started consultant consumer daemons (PIDs 20972 for Codex, 78528 for Gemini) that poll the bridge queue and deliver via ghost_type_to_worker(). Drained 19 pending prompts from Codex queue. Updated delivery.py to use ghost_type as primary delivery mechanism with bridge as fallback only.",
+    "rule_created": "HTTP 202 from a queue endpoint does NOT mean delivered. All queue-based systems MUST have a verified consumer. Consultant delivery must use ghost_type primary with bridge fallback.",
+    "files_affected": [
+      "tools/skynet_consultant_bridge.py (queue server, no consumer)",
+      "tools/skynet_delivery.py (deliver_to_consultant used HTTP queue as primary)",
+      "data/consultant_state.json (transport field incorrectly set)",
+      "data/gemini_consultant_state.json (same issue)"
+    ],
+    "lessons_learned": [
+      "HTTP 202 Accepted means queued, NOT delivered - never conflate the two",
+      "Every producer needs a verified consumer; untested queue paths create false positives",
+      "Consultant bridge was producer-only for the entire system lifetime until discovered",
+      "19 prompts silently accumulated without delivery, wasting orchestrator context and time",
+      "Always verify end-to-end delivery, not just the first hop (HTTP POST success)"
+    ],
+    "penalties": {
+      "orchestrator": -0.05
+    },
+    "responsible": [
+      "orchestrator (designed queue without consumer)",
+      "system (no delivery verification)"
+    ],
+    "signed_by": "delta"
   },
   {
     "id": "INCIDENT_012",
@@ -218,6 +277,52 @@
       "gamma",
       "delta"
     ],
-    "signed_by": "orchestrator"
+    "signed_by": "orchestrator",
+    "files_affected": [
+      "tools/skynet_self.py (consciousness kernel - WORKER_NAMES excluded consultants)",
+      "tools/skynet_delivery.py (deliver_to_consultant used HTTP queue, not ghost_type)",
+      "CC-Start.ps1 (never registered HWND)",
+      "GC-Start.ps1 (never registered HWND)",
+      "data/consultant_state.json (requires_hwnd=false was actively hiding truth)",
+      "data/gemini_consultant_state.json (same issue)",
+      "data/consultant_registry.json (NEW - created as fix)",
+      ".github/copilot-instructions.md (Rule 0.8 added)"
+    ],
+    "lessons_learned": [
+      "Dual identity systems (worker HWND-based vs consultant HTTP-based) never cross-referenced",
+      "Consultants ARE VS Code windows with HWNDs - they receive prompts via ghost_type just like workers",
+      "HTTP bridge queue had NO consumer daemon - HTTP 202 was a false positive",
+      "requires_hwnd=false in state files was set without understanding that consultants DO have HWNDs",
+      "Self-awareness must include ALL system entities, not just the subset you designed first",
+      "Consciousness kernel (skynet_self.py) must track consultants alongside workers",
+      "9 critical gaps identified in self-awareness architecture gap analysis"
+    ]
+  },
+  {
+    "id": "CV1-BUG-001",
+    "title": "skynet_arch_verify.py workers.json Type Mismatch Bug",
+    "date": "2026-03-12",
+    "timestamp": "2026-03-12T13:00:00",
+    "severity": "LOW",
+    "what_happened": "Cross-validation round CV1 discovered that tools/skynet_arch_verify.py and tools/skynet_self.py validate_agent_completeness() both assumed data/workers.json was a flat JSON array of worker dicts. In reality, workers.json is a JSON object (dict) with a top-level 'workers' key containing the array. Code like 'for w in workers: w.get(name)' failed with AttributeError because the top-level keys are strings, not dicts.",
+    "root_cause": "Sprint 2 implementation did not read workers.json before coding the parser. The file format was assumed to be a simple list [{name:alpha,...}] when it is actually {workers:[...], layout:{...}, ...}. Additionally, consultant_state.json uses 'id' not 'name' as the identifier field.",
+    "fix": "Updated validate_agent_completeness() in skynet_self.py to handle both dict-with-workers-key and list formats. Updated consultant required fields from [name, bridge_port, transport] to [id, transport, role]. Both fixes verified via py_compile and smoke test (validate now returns ALL PASS).",
+    "rule_created": "Always read data files before writing code that parses them. Never assume JSON structure.",
+    "files_affected": [
+      "tools/skynet_self.py (validate_agent_completeness method)",
+      "tools/skynet_arch_verify.py (entity check)",
+      "data/workers.json (format: dict with workers key, not flat array)"
+    ],
+    "lessons_learned": [
+      "ALWAYS read the actual data file before writing parsing code",
+      "workers.json is a dict with keys: created, engines, god_console_port, monitor, skynet_port, workers, layout",
+      "consultant_state.json uses 'id' field not 'name' field for identity",
+      "Cross-validation by a different worker (Alpha) caught what implementer (Delta) missed",
+      "Bug filed by Alpha during CV1, fixed by Delta - positive-sum scoring in action"
+    ],
+    "found_by": "alpha",
+    "fixed_by": "delta",
+    "cross_validation_round": "CV1",
+    "signed_by": "delta"
   }
 ]

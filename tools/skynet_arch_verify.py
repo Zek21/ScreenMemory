@@ -132,11 +132,18 @@ def check_entities() -> Dict:
         result["failures"].append(f"Cannot import consciousness kernel constants: {e}")
 
     # 2. Check data/workers.json
+    # BUG FIX: workers.json is a dict with "workers" key, not a flat list  # signed: alpha
     workers_file = DATA / "workers.json"
     if workers_file.exists():
         try:
-            workers = json.loads(workers_file.read_text())
-            names = [w.get("name", "") for w in workers]
+            raw = json.loads(workers_file.read_text())
+            if isinstance(raw, dict):
+                workers = raw.get("workers", [])
+            elif isinstance(raw, list):
+                workers = raw
+            else:
+                workers = []
+            names = [w.get("name", "") for w in workers if isinstance(w, dict)]
             if set(names) >= set(EXPECTED_WORKERS):
                 result["details"].append(f"workers.json: OK ({len(workers)} entries)")
             else:

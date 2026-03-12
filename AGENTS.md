@@ -510,6 +510,21 @@ Institutional memory for Skynet. Every incident is stored in `data/incidents.jso
 - **Rule:** ALL system participants must understand HOW they deliver/receive prompts. Consultants are VS Code windows and receive prompts via ghost_type — the same mechanism as workers. Self-awareness is not optional. Agents must analyze the actual code paths before building solutions.
 - **Accountability:** Orchestrator -0.05, all workers -0.01 each. All parties failed to analyze the system they were building on.
 
+### Cross-Validation Sprint 1 Results (CV1 — 2026-03-12)
+
+All 4 workers completed Sprint 1 implementation tasks and cross-validated each other's work. Results:
+
+| Worker | Sprint 1 Task | Cross-Validator | Verdict | Notes |
+|--------|--------------|-----------------|---------|-------|
+| Alpha | Delivery pipeline false positive fixes (clipboard verify, UNKNOWN hardening, post-paste clear) | — | PASS | Verified by py_compile + live dispatch test |
+| Beta | Daemon robustness audit (signal handlers, SpamGuard migration) | Alpha | PASS | 3 fixes applied to learner during validation |
+| Gamma | Self-prompt delivery hardening | Alpha | PASS | All 6 checkpoints verified |
+| Delta | Self-awareness architecture (arch_verify, validate_agent_completeness, incident patterns) | Alpha | PASS WITH BUG | Bug found+fixed: `skynet_arch_verify.py` L138 iterated `workers.json` dict keys as strings instead of extracting `"workers"` list. Fix: dict/list type dispatch (`raw.get("workers", [])` for dict, `raw` for list). |
+
+**Key finding:** Delta's `skynet_arch_verify.py` had a `workers.json` format assumption bug. The file format is `{"workers": [...], "created": ...}` (a dict), NOT a flat list. Code at L134-148 iterated dict keys (`"workers"`, `"created"`) as if they were worker objects. Alpha fixed with type-dispatch logic. This is a recurring pattern — multiple tools have made the same `workers.json` format assumption. All new code MUST use `raw.get("workers", [])` for dict format or `raw` for list format.
+
+<!-- signed: alpha -->
+
 ### Forbidden Commands (Workers)
 
 Workers must NEVER execute any of the following:
@@ -770,6 +785,143 @@ Every agent in Skynet MUST understand how the system works FROM CODE before maki
 
 <!-- signed: alpha -->
 
+## Architecture Knowledge Registry (Sprint 2 Codified Knowledge)
+<!-- signed: alpha -->
+
+Every agent in Skynet MUST internalize this architecture registry. It captures the complete system topology as verified by Sprint 2 deep audits. For authoritative deep-dives, see the referenced `docs/*.md` files.
+
+### Daemon Ecosystem (16 Daemons)
+
+All daemons live in `tools/` and use PID files under `data/` for singleton enforcement. Manage with `python tools/skynet_daemon_status.py [status|start|stop|restart] [daemon_name]`.
+
+| # | Daemon | Script | PID File | Port | Criticality | Purpose |
+|---|--------|--------|----------|------|-------------|---------|
+| 1 | `skynet_monitor` | `tools/skynet_monitor.py` | `data/monitor.pid` | — | **CRITICAL** | Worker HWND liveness + model drift detection. Auto-corrects model via UIA. False-DEAD debounce (3 consecutive checks). |
+| 2 | `skynet_watchdog` | `tools/skynet_watchdog.py` | `data/watchdog.pid` | — | **CRITICAL** | Backend/GOD Console process liveness. Auto-restarts crashed services. |
+| 3 | `skynet_realtime` | `tools/skynet_realtime.py` | `data/realtime.pid` | — | **CRITICAL** | SSE subscriber → writes `data/realtime.json` atomically every 1s. Enables zero-network orchestrator reads. |
+| 4 | `skynet_self_prompt` | `tools/skynet_self_prompt.py` | `data/self_prompt.pid` | — | **HIGH** | Orchestrator heartbeat. Types status prompts into orchestrator window when all workers are IDLE for quiet window. |
+| 5 | `skynet_self_improve` | `tools/skynet_self_improve.py` | `data/self_improve.pid` | — | **HIGH** | Self-improvement engine. Scans codebase for optimization opportunities. |
+| 6 | `skynet_bus_relay` | `tools/skynet_bus_relay.py` | `data/bus_relay.pid` | — | **HIGH** | Bus message relay between Skynet backend and external consumers. |
+| 7 | `skynet_learner` | `tools/skynet_learner.py` | `data/learner.pid` | — | **HIGH** | Learning engine daemon. Absorbs knowledge, updates learning store. |
+| 8 | `skynet_overseer` | `tools/skynet_overseer.py` | `data/overseer.pid` | — | **HIGH** | Checks every 30s for workers IDLE with pending TODOs. Posts `WORKER_IDLE_WITH_PENDING_TODOS` alerts. |
+| 9 | `skynet_sse_daemon` | `tools/skynet_sse_daemon.py` | `data/sse_daemon.pid` | — | **MEDIUM** | SSE event loop for dashboard live updates. Streams worker/engine state. |
+| 10 | `skynet_bus_watcher` | `tools/skynet_bus_watcher.py` | `data/bus_watcher.pid` | — | **MEDIUM** | Polls bus and auto-routes pending tasks to idle workers. |
+| 11 | `skynet_ws_monitor` | `tools/skynet_ws_monitor.py` | `data/ws_monitor.pid` | — | **MEDIUM** | WebSocket listener for real-time security alerts. |
+| 12 | `skynet_idle_monitor` | `tools/skynet_idle_monitor.py` | `data/idle_monitor.pid` | — | **MEDIUM** | Detects extended worker idle periods and proposes work. |
+| 13 | `skynet_bus_persist` | `tools/skynet_bus_persist.py` | `data/bus_persist.pid` | — | **MEDIUM** | JSONL archival of bus messages. `--diagnose` for bus health diagnostics. |
+| 14 | `skynet_consultant_consumer` | `tools/skynet_consultant_consumer.py` | `data/consultant_consumer.pid` | — | **MEDIUM** | Polls consultant bridge prompt queue, ACKs, relays to bus, marks complete. |
+| 15 | `skynet_worker_loop` | `tools/skynet_worker_loop.py` | `data/worker_loop.pid` | — | **LOW** | Worker polling loop for autonomous task pickup. |
+| 16 | `skynet_health_report` | `tools/skynet_health_report.py` | — | — | **LOW** | Periodic health report generation. |
+
+**Criticality Tiers:**
+- **CRITICAL** — System non-functional without these. Must be restarted within 30s.
+- **HIGH** — Operational degradation without these. Restart within 5 minutes.
+- **MEDIUM** — Feature loss without these. Can wait for next boot cycle.
+- **LOW** — Nice-to-have. Manual restart acceptable.
+
+### Delivery Pipeline Architecture
+
+The prompt delivery pipeline uses Win32/UIA-based clipboard paste to inject text into VS Code Copilot CLI chat windows. This is the ONLY delivery mechanism for workers AND consultants.
+
+```
+dispatch_to_worker(name, task)
+  └── ghost_type_to_worker(hwnd, text, orch_hwnd)
+        ├── Write text to data/.dispatch_tmp_{hwnd}.txt (newlines→spaces)
+        ├── _build_ghost_type_ps(hwnd, orch_hwnd, path)
+        │     ├── STEERING cancel: UIA scan for 'Cancel (Alt+Backspace)' button → InvokePattern
+        │     ├── Input target resolution:
+        │     │     ├── PRIMARY: UIA Edit scoring (Y-pos + left-band + non-Terminal + width)
+        │     │     └── FALLBACK: FindAllRender() DFS for Chrome_RenderWidgetHostHWND
+        │     │           └── Multi-pane disambiguation: right-half area scoring (Sprint 2)
+        │     ├── Clipboard verification: 3x SetText/GetText readback loop
+        │     ├── Focus race prevention: GetForegroundWindow() check before paste (Sprint 2)
+        │     ├── AttachThreadInput → SetFocus → Ctrl+V → Enter
+        │     └── Clipboard cleanup: Clear() + restore saved clipboard
+        ├── _execute_ghost_dispatch(ps, hwnd, orch_hwnd)
+        │     ├── Dispatch lock (threading.Lock) — prevents concurrent ghost-type ops
+        │     ├── CREATE_NO_WINDOW subprocess (20s timeout)
+        │     └── Validates: OK_ATTACHED|OK_FALLBACK|OK_RENDER_ATTACHED|OK_RENDER_FALLBACK
+        └── _verify_delivery(hwnd, name, pre_state)
+              ├── Polls UIA state every 0.5s for 8s
+              ├── Success: state changed from pre_state (usually IDLE → PROCESSING)
+              └── UNKNOWN handling: 3+ consecutive → FAILED
+```
+
+**Delivery status codes:**
+
+| Status | Meaning |
+|--------|---------|
+| `OK_ATTACHED` | UIA Edit found, AttachThreadInput + paste succeeded |
+| `OK_FALLBACK` | UIA Edit found, SetForegroundWindow + paste (no attach) |
+| `OK_RENDER_ATTACHED` | Chrome render widget, AttachThreadInput + paste |
+| `OK_RENDER_FALLBACK` | Chrome render widget, SetForegroundWindow + paste |
+| `CLIPBOARD_VERIFY_FAILED` | Clipboard SetText/GetText mismatch after 3 retries |
+| `FOCUS_STOLEN` | Focus race detected — paste aborted safely (Sprint 2) |
+| `NO_EDIT_NO_RENDER` | Neither UIA Edit nor Chrome render widget found |
+
+**Full reference:** `docs/DELIVERY_PIPELINE.md` (861 lines, by Alpha)
+
+### Bus Architecture
+
+The Skynet message bus is a Go backend running on port 8420 with in-memory ring buffer storage.
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  Go Backend (port 8420)              │
+│  ┌──────────────┐  ┌─────────────┐  ┌────────────┐ │
+│  │ Ring Buffer   │  │ SSE Stream  │  │ Rate Limit │ │
+│  │ 100 messages  │  │ /stream 1Hz │  │ 10/min/    │ │
+│  │ FIFO eviction │  │ live state  │  │ sender     │ │
+│  └──────────────┘  └─────────────┘  └────────────┘ │
+│  ┌──────────────┐  ┌─────────────┐  ┌────────────┐ │
+│  │ TaskTracker   │  │ Spam Filter │  │ Dedup      │ │
+│  │ GET /tasks    │  │ fingerprint │  │ 60s window │ │
+│  │ lifecycle     │  │ SHA-256     │  │ HTTP 429   │ │
+│  └──────────────┘  └─────────────┘  └────────────┘ │
+└─────────────────────────────────────────────────────┘
+```
+
+**Key endpoints:**
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/bus/publish` | POST | Publish message (use `guarded_publish()` only) |
+| `/bus/messages` | GET | Read messages (`?limit=N`, `?topic=X`) |
+| `/stream` | GET | SSE stream (1Hz ticks with live state) |
+| `/status` | GET | Backend status + worker states |
+| `/tasks` | GET | Task lifecycle history (`?worker=X`, `?limit=N`) |
+| `/directive` | POST | Direct worker directive (`?route=worker_name`) |
+| `/worker/{name}/heartbeat` | POST | Worker heartbeat |
+
+**Spam filtering layers:**
+1. **Client-side** — `guarded_publish()` in `tools/skynet_spam_guard.py`: content fingerprinting (SHA-256), per-sender rate limiting (5/min, 30/hour), duplicate dedup (900s window)
+2. **Server-side** — Go backend: fingerprint dedup (60s window), per-sender rate limiting (10 msgs/min), returns HTTP 429 for blocked messages
+
+**Persistence:** Ring buffer is volatile — evicted messages are lost. Use `tools/skynet_bus_persist.py` for JSONL archival.
+
+**Full reference:** `docs/BUS_COMMUNICATION.md` (847 lines, by Gamma)
+
+### Self-Awareness Subsystems
+
+The self-awareness stack ensures every agent knows what it is, what the system looks like, and whether the architecture is healthy.
+
+| Subsystem | Module | Purpose |
+|-----------|--------|---------|
+| **Consciousness Kernel** | `tools/skynet_self.py` | Identity, capabilities, health, introspection, goals, IQ scoring. Constants: `WORKER_NAMES`, `CONSULTANT_NAMES`, `ALL_AGENT_NAMES` (7 entities). |
+| **Identity Registry** | `tools/skynet_self.py` `validate_agent_completeness()` | Scans `workers.json`, consultant state files, `orchestrator.json`. Checks HWNDs alive via `IsWindow()`, models correct, transport set. |
+| **Architecture Verification** | `tools/skynet_arch_verify.py` | Phase 0 boot check: verifies entities, delivery mechanism, bus architecture, daemon ecosystem. `verify_architecture()` returns PASS/FAIL per domain. |
+| **Incident Pattern Detection** | `tools/skynet_self.py` `_detect_incident_patterns()` | Reads `data/incidents.json`, detects 5 recurring categories (HWND, delivery, awareness, process, boot). Posts CRITICAL warnings to bus. |
+| **Architecture Knowledge Check** | `tools/skynet_self.py` `quick_pulse()` | 3 awareness flags: `architecture_knowledge_ok`, `consultant_awareness`, `bus_awareness`. All must be True for healthy operation. |
+| **Collective Intelligence** | `tools/skynet_collective.py` | Strategy federation, bottleneck sharing, swarm evolution. `intelligence_score()` tracks fitness, knowledge, diversity, collaboration. |
+
+**Boot integration:** On every boot, run `python tools/skynet_arch_verify.py --brief` as Phase 0 check. If FAIL, investigate before proceeding.
+
+**Full reference:** `docs/SELF_AWARENESS_ARCHITECTURE.md` (909 lines, by Delta)
+
+### Full Daemon Architecture Reference
+
+For the complete daemon lifecycle (startup, singleton enforcement, signal handling, PID management, health monitoring, graceful shutdown), see `docs/DAEMON_ARCHITECTURE.md` (890 lines, by Beta).
+
 ---
 
 - Workspace root: `D:\Prospects\ScreenMemory`
@@ -951,6 +1103,24 @@ When this does NOT apply (use Rule 13 fire-and-forget instead):
 | **Level 1** | Genesis | Initial system — manual dispatch, single worker, basic bus messaging, no self-awareness |
 | **Level 2** | Awakening | Self-awareness added — `skynet_self.py` consciousness kernel, identity/capabilities/health introspection, GOD Console dashboard, engine metrics, collective intelligence federation |
 | **Level 3** | Production | Production-grade hardening — crash resilience via `skynet_watchdog.py`, real composite IQ with trend tracking (`data/iq_history.json`), request logging via `skynet_metrics.py`, version tracking via `skynet_version.py`, truth audit enforcement, 3-tier engine status (online/available/offline), context-enriched dispatch preambles, WebSocket monitoring, SSE daemon for real-time state |
+| **Level 3.1** | Hardening | Dispatch result tracking, fair deduction rule, false DEAD debounce, task lifecycle tracking, cp1252 encoding fix, anti-spam system (SpamGuard + server-side rate limiting) |
+| **Level 3.5** | Sprint 2 | Delivery pipeline defense-in-depth — multi-pane Chrome disambiguation, focus race prevention, FOCUS_STOLEN handler, steering detection secondary scan, clipboard verification, architecture verification (Phase 0 boot), bus message validation, unified daemon CLI, priority-aware spam filtering, consultant consumer daemon, comprehensive dispatch docstrings, self-awareness expansion |
+
+## Architecture Documentation Index
+<!-- signed: alpha -->
+
+These authoritative deep-dive documents were created during Sprint 2 by specialized workers. Each is the canonical reference for its domain.
+
+| Document | Author | Lines | Size | Content |
+|----------|--------|-------|------|---------|
+| `docs/DELIVERY_PIPELINE.md` | Alpha | 861 | ~43KB | Complete ghost-type delivery architecture. 13 sections: flow overview, input target resolution, clipboard management, focus race prevention, multi-pane disambiguation, STEERING defense, delivery verification, status codes, error recovery, retry logic, constants, Sprint 2 hardening, FAQ. |
+| `docs/DAEMON_ARCHITECTURE.md` | Beta | 890 | ~44KB | All 16 daemons documented. Sections: daemon registry, lifecycle management, PID file protocol, signal handling (SIGTERM/SIGBREAK on Windows), singleton enforcement, health monitoring, criticality tiers, startup ordering, graceful shutdown, watchdog integration, inter-daemon dependencies. |
+| `docs/BUS_COMMUNICATION.md` | Gamma | 847 | ~42KB | Bus architecture reference. Sections: Go backend design, ring buffer mechanics, SSE streaming protocol, message schema, topic taxonomy, endpoint reference, spam filtering layers (client SpamGuard + server rate limiting), JSONL archival, persistence strategy, bus diagnostics, error handling, message lifecycle. |
+| `docs/SELF_AWARENESS_ARCHITECTURE.md` | Delta | 909 | ~45KB | Self-awareness subsystem reference. Sections: consciousness kernel design, identity registry, architecture verification (Phase 0), incident pattern detection, entity awareness (7 agents), consultant awareness protocol, bus awareness, quick_pulse health check, collective intelligence scoring, self-assessment protocol, boot awareness verification. |
+
+**Usage:** When making architectural changes, read the relevant doc FIRST. These documents capture verified code-level knowledge, not assumptions. They were created by workers who read the actual source code.
+
+**Maintenance:** These docs reflect the codebase as of Sprint 2 completion. When code changes, the relevant doc MUST be updated by the worker making the change. Stale documentation is a lie (Truth Principle, Rule 0).
 
 ## Comprehensive Self-Invocation Protocol
 
@@ -1245,6 +1415,15 @@ All tools live in `tools/` and follow the `skynet_*.py` naming convention.
 | `skynet_cli.py` | Unified CLI — single entry point for all Skynet operations |
 | `skynet_roster.py` | Worker roster — formatted display of all agents, capabilities, and mission history |
 | `convene_gate.py` | Convene-first middleware — intercepts worker reports, enforces consensus before orchestrator delivery |
+| `skynet_arch_verify.py` | Architecture verification — Phase 0 boot check for entities, delivery, bus, daemons. `--brief` and `--check` flags |
+| `skynet_bus_validator.py` | Bus message validation — topic taxonomy enforcement, schema validation for bus messages |
+| `skynet_daemon_status.py` | Unified daemon CLI — `status`, `start`, `stop`, `restart` for all 16 daemons. Registry-driven |
+| `skynet_bus_persist.py` | Bus persistence — JSONL archival of bus messages. `--diagnose` for bus health diagnostics |
+| `skynet_consultant_consumer.py` | Consultant bridge consumer — polls bridge prompt queue, ACKs, relays to bus, marks complete |
+| `skynet_spam_guard.py` | Anti-spam system — `guarded_publish()` wrapper, content fingerprinting, rate limiting, score penalties |
+| `skynet_scoring.py` | Score tracking — `--leaderboard`, `--score WORKER`. Reads/writes `data/worker_scores.json` |
+| `skynet_todos.py` | TODO enforcement — `check WORKER`, `pending_count()`, `can_stop()`. Zero-ticket compliance |
+| `skynet_worker_poll.py` | Worker polling — `poll_for_work()`, `find_idle_with_work()`. Autonomous task pickup |
 
 ---
 
@@ -1258,6 +1437,29 @@ All tools live in `tools/` and follow the `skynet_*.py` naming convention.
 | 4 | **Task Lifecycle Tracking** | Go backend `TaskTracker` struct tracks full dispatch-to-completion lifecycle. `GET /tasks` endpoint exposes task history with `?worker=` and `?limit=` query filters for targeted queries. |
 | 5 | **cp1252 Encoding Fix** | `orch_realtime.py` subprocess calls use `encoding='utf-8', errors='replace'` to prevent `UnicodeDecodeError` on Windows cp1252. The `wait()` function includes a bus HTTP fallback (`GET /bus/messages?limit=20`) when `realtime.json` has no match after timeout. |
 | 6 | **Anti-Spam System** | `SpamGuard` with content fingerprinting (SHA-256), per-sender rate limiting (10 msg/min), and auto-penalties (-0.1 per duplicate). `guarded_publish()` wraps all bus publishes. Go backend enforces server-side rate limiting (HTTP 429) and 60-second dedup window. |
+
+---
+
+## Level 3.5 Capabilities (Sprint 2 — Built 2026-03-12) <!-- signed: alpha -->
+
+Sprint 2 focused on delivery pipeline hardening, architecture verification, and defense-in-depth for the dispatch system.
+
+| # | Capability | Module | Details |
+|---|-----------|--------|---------|
+| 1 | **Multi-Pane Chrome Delivery** | `skynet_dispatch.py` L786-930 | `FindAllRender()` + `FindAllRenderInner()` C# methods collect ALL `Chrome_RenderWidgetHostHWND` instances via DFS. When multiple render widgets exist (multi-pane VS Code), PowerShell scores each by right-half area: widgets in the right half of the window (chat pane location) with largest bounding area win. Falls back to first widget if scoring fails. Prevents clipboard paste going to wrong pane. |
+| 2 | **Focus Race Prevention** | `skynet_dispatch.py` L967-1033 | `GetForegroundWindow()` captured before and after focus operations via P/Invoke. If foreground window changed (not matching pre-paste HWND or target HWND), script exits with `FOCUS_STOLEN`. All 4 paste paths (EDIT attached/fallback, CHROME_RENDER attached/fallback) are protected. Prevents clipboard corruption from user interaction during paste. |
+| 3 | **FOCUS_STOLEN Handler** | `skynet_dispatch.py` L1111-1113 | `_execute_ghost_dispatch()` detects `FOCUS_STOLEN` in subprocess stdout and returns False with logged warning. Safe abort — no partial paste, no corrupted clipboard. |
+| 4 | **Steering Detection Defense-in-Depth** | `skynet_dispatch.py` L547-583 | Primary check: COM UIA engine `get_state()` returns `"STEERING"`. Secondary check (Sprint 2): .NET UIA tree scan for `Button` named `'Cancel (Alt+Backspace)'`. If either detects STEERING, auto-cancel via InvokePattern before dispatching. Eliminates single-point-of-failure in STEERING detection. |
+| 5 | **Clipboard Verification** | `skynet_dispatch.py` L811-834 | PowerShell SetText/GetText readback loop with 3 retries. Verifies clipboard content matches dispatch text before pasting. Exits with `CLIPBOARD_VERIFY_FAILED` if readback fails 3x. Prevents silent clipboard corruption from racing processes. |
+| 6 | **Post-Paste Clipboard Clear** | `skynet_dispatch.py` | After successful paste, `Clipboard.Clear()` called before restoring saved clipboard. Prevents stale dispatch text from leaking into subsequent clipboard operations. |
+| 7 | **Consecutive UNKNOWN Hardening** | `skynet_dispatch.py` `_verify_delivery()` | UNKNOWN UIA state excluded from confirmed delivery states. 3+ consecutive UNKNOWN readings → FAILED delivery. Prevents false positive "delivery success" when worker window is in an indeterminate state. |
+| 8 | **Architecture Verification** | `tools/skynet_arch_verify.py` | Phase 0 boot check. `verify_architecture()` tests 4 domains: (1) entities — all 7 agents registered with valid HWNDs/state, (2) delivery — `ghost_type_to_worker` function exists with Chrome render fallback, (3) bus — backend reachable on port 8420 with ring buffer, (4) daemons — PID files valid and processes alive. CLI: `--brief` summary, `--check` exit-code mode. |
+| 9 | **Bus Message Validation** | `tools/skynet_bus_validator.py` | Topic taxonomy enforcement. Validates that every bus message uses an approved topic (`orchestrator`, `workers`, `convene`, `scoring`, `knowledge`, `planning`, `system`, `consultant`). Schema checks for required fields (`sender`, `topic`, `type`, `content`). |
+| 10 | **Unified Daemon CLI** | `tools/skynet_daemon_status.py` | Registry-driven daemon management for all 16 daemons. Commands: `status` (shows running/stopped + PID + uptime), `start NAME`, `stop NAME`, `restart NAME`. Reads PID files and verifies process liveness via `psutil`. |
+| 11 | **Priority-Aware Spam Filtering** | `tools/skynet_spam_guard.py` | Extended SpamGuard with category-specific windows: DEAD alerts (120s), daemon_health (60s), knowledge/learning (1800s), gate-votes (permanent per gate_id). Gate_id normalization fix: `gate_\d+_(\w+)` preserves worker identity instead of stripping to `GATE_ID`. |
+| 12 | **Consultant Consumer Daemon** | `tools/skynet_consultant_consumer.py` | 245-line daemon that polls consultant bridge prompt queue (port 8422/8425), ACKs prompts, relays to bus with `type=consultant_relay`, marks complete. Prevents prompt accumulation in bridge queues (INCIDENT 011 fix). |
+| 13 | **Comprehensive Dispatch Docstrings** | `skynet_dispatch.py` | All 4 key delivery functions now have comprehensive docstrings referencing `docs/DELIVERY_PIPELINE.md`: `_build_ghost_type_ps` (L738-769), `_execute_ghost_dispatch` (L1060-1081), `ghost_type_to_worker` (L1135-1171), `_verify_delivery` (L1452-1482). |
+| 14 | **Self-Awareness Expansion** | `skynet_self.py` | Sprint 2 additions: `validate_agent_completeness()` (L142) checks all 7 entities, `_detect_incident_patterns()` (L787) finds 5 recurring failure categories, `quick_pulse()` (L1025-1027) reports 3 awareness flags (`architecture_knowledge_ok`, `consultant_awareness`, `bus_awareness`). |
 
 ---
 

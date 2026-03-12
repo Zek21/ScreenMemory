@@ -188,6 +188,54 @@ if ($consultantHwnd -gt 0) {
 }
 # ── End HWND Self-Registration ──────────────────────── # signed: alpha
 
+# ── Consultant Delivery Architecture Verification ────── # signed: beta
+# Architecture: Ghost-type is the PRIMARY delivery transport for consultant prompts.
+# When the orchestrator dispatches to a consultant via skynet_dispatch.py --worker consultant,
+# it uses ghost_type_to_worker() which pastes into the VS Code chat input via clipboard.
+# Bridge queue (port 8422) is the FALLBACK and audit trail transport.
+# The state file (consultant_state.json) must have prompt_transport=ghost_type for primary routing.
+# Reference: docs/DAEMON_ARCHITECTURE.md Section 6 (Communication Daemons)
+#            docs/DELIVERY_PIPELINE.md Section 4 (Ghost Type Mechanism)
+#
+# Verification: Check that consultant_state.json has prompt_transport=ghost_type set.
+# This was done in HWND Self-Registration above, but verify it persisted correctly.
+$ccStateFile = Join-Path $dataDir "consultant_state.json"
+if (Test-Path $ccStateFile) {
+    try {
+        $ccState = Get-Content $ccStateFile -Raw | ConvertFrom-Json
+        $ccTransport = [string]($ccState.prompt_transport ?? "")
+        if ($ccTransport -eq "ghost_type") {
+            Write-Status "Delivery transport verified: ghost_type (primary)" "OK"
+        } elseif ($ccTransport -eq "bridge_queue") {
+            Write-Status "Delivery transport is bridge_queue (fallback) -- ghost_type preferred" "WARN"
+        } else {
+            Write-Status "Delivery transport not configured -- ghost_type should be set" "WARN"
+        }
+    } catch {
+        Write-Status "Could not read consultant_state.json for transport check: $_" "WARN"
+    }
+} else {
+    Write-Status "consultant_state.json not found -- HWND registration may have failed" "WARN"
+}
+
+# Architecture verification (non-blocking)  # signed: beta
+$archVerifyScript = Join-Path $repoRoot "tools\skynet_arch_verify.py"
+if (Test-Path $archVerifyScript) {
+    try {
+        $archResult = & $python $archVerifyScript --brief 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Status "Architecture verification: PASS" "OK"
+        } else {
+            Write-Status "Architecture verification: warnings (exit=$LASTEXITCODE)" "WARN"
+        }
+    } catch {
+        Write-Status "Architecture verification failed to run: $_" "WARN"
+    }
+} else {
+    Write-Status "skynet_arch_verify.py not found -- skipping" "WARN"
+}
+# ── End Delivery Architecture Verification ─────────── # signed: beta
+
 # ── Phase 1: Skynet Backend ─────────────────────────────
 
 $skynetUp = $false
