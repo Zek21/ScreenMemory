@@ -344,7 +344,7 @@ foreach ($ccPort in @(8422, 8425)) {
 $archVerifyScript = Join-Path $repoRoot "tools\skynet_arch_verify.py"
 if (Test-Path $archVerifyScript) {
     try {
-        $archResult = & $python $archVerifyScript --check 2>&1
+        $archResult = & $python $archVerifyScript --brief 2>&1
         $archExitCode = $LASTEXITCODE
         if ($archExitCode -eq 0) {
             Write-Status "Architecture verification: PASS" "OK"
