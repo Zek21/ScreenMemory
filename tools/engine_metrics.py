@@ -39,6 +39,9 @@ _PROBES = [
     ("database", "core.database", "ScreenMemoryDB", "storage", False),
     ("desktop", "winctl", "Desktop", "automation", False),
     ("godmode", "god_mode", "GodMode", "browser", False),
+    ("reflexion", "core.cognitive.reflexion", "ReflexionEngine", "cognition", False),        # signed: gamma
+    ("graph_of_thoughts", "core.cognitive.graph_of_thoughts", "GraphOfThoughts", "cognition", False),  # signed: gamma
+    ("planner", "core.cognitive.planner", "HierarchicalPlanner", "cognition", False),        # signed: gamma
 ]
 
 def _probe(name, module_path, class_name, engine_type, import_only=False, extras_fn=None):

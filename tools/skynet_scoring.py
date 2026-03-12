@@ -59,6 +59,14 @@ BRAIN_CONFIG_FILE = DATA_DIR / "brain_config.json"
 BUS_URL = "http://localhost:8420/bus/publish"
 SCHEMA_VERSION = 5
 
+# System/daemon senders — NOT real workers or agents. Their scores come from
+# SpamGuard auto-penalties, not task work. Display separately from workers.  # signed: delta
+SYSTEM_SENDERS = frozenset({
+    "monitor", "convene", "convene-gate", "convene_gate", "self_prompt",
+    "system", "overseer", "watchdog", "bus_relay", "learner",
+    "self_improve", "sse_daemon", "idle_monitor",
+})  # signed: delta
+
 DEFAULT_AWARD = 0.01
 DEFAULT_DEDUCT = 0.005
 DEFAULT_BUG_REPORT_AWARD = 0.01
@@ -841,14 +849,24 @@ def get_scores() -> dict:
     return _load()["scores"]
 
 
-def get_leaderboard() -> list:
-    """Return workers sorted by total score (descending)."""
+def get_leaderboard(include_system: bool = True) -> list:
+    """Return workers sorted by total score (descending).
+
+    If *include_system* is True (default), all senders are returned.
+    Use ``is_system_sender()`` to partition results afterward.
+    """
     scores = get_scores()
-    return sorted(
-        [{"worker": w, **s} for w, s in scores.items()],
-        key=lambda x: x["total"],
-        reverse=True,
-    )
+    entries = [{"worker": w, **s} for w, s in scores.items()]
+    if not include_system:
+        entries = [e for e in entries if not is_system_sender(e["worker"])]
+    return sorted(entries, key=lambda x: x["total"], reverse=True)
+    # signed: delta
+
+
+def is_system_sender(name: str) -> bool:
+    """Return True if *name* is a daemon/system sender, not a real worker."""
+    return name in SYSTEM_SENDERS
+    # signed: delta
 
 
 def get_history(worker: str | None = None) -> list:
@@ -1098,16 +1116,22 @@ def main():
         if not board:
             print("No scores recorded yet.")
             return
-        print(
+
+        # Separate worker/agent scores from system/daemon scores  # signed: delta
+        worker_board = [e for e in board if not is_system_sender(e["worker"])]
+        system_board = [e for e in board if is_system_sender(e["worker"])]
+
+        header = (
             f"{'Rank':<5} {'Worker':<20} {'Score':<10} {'Awards':<8} "
             f"{'Deductions':<10} {'RefD':<6} {'RefOK':<6} {'Bias':<6} "
             f"{'PClr':<6} {'Auto':<6} {'BugR':<6} {'BugOK':<6} "
             f"{'BugX':<6} {'Zero':<6}"
         )
-        print("-" * 136)
-        for i, entry in enumerate(board, 1):
+        separator = "-" * 136
+
+        def _print_row(rank, entry):
             print(
-                f"{i:<5} {entry['worker']:<20} {entry['total']:<10.4f} "
+                f"{rank:<5} {entry['worker']:<20} {entry['total']:<10.4f} "
                 f"{entry['awards']:<8} {entry['deductions']:<10} "
                 f"{entry.get('refactor_deductions', 0):<6} "
                 f"{entry.get('refactor_reversals', 0):<6} "
@@ -1119,6 +1143,23 @@ def main():
                 f"{entry.get('bug_cross_validations', 0):<6} "
                 f"{entry.get('zero_ticket_bonus_awards', 0):<6}"
             )
+
+        # -- Workers & Agents --
+        print("=== Workers & Agents ===")
+        print(header)
+        print(separator)
+        for i, entry in enumerate(worker_board, 1):
+            _print_row(i, entry)
+
+        # -- System / Daemon Senders --
+        if system_board:
+            print()
+            print("=== System / Daemon Senders (spam penalties only) ===")
+            print(header)
+            print(separator)
+            for i, entry in enumerate(system_board, 1):
+                _print_row(i, entry)
+        # signed: delta
 
     elif args.history is not None:
         worker = None if args.history == "__all__" else args.history

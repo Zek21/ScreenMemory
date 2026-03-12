@@ -269,6 +269,28 @@ def _process_tick(buf, last_tick, update_count, output, verbose, last_status_pri
     return buf, last_tick, update_count, last_status_print
 
 
+def _post_degraded_alert(content):
+    """Post DAEMON_DEGRADED alert to bus via guarded_publish with raw fallback."""
+    msg = {"sender": "sse_daemon", "topic": "orchestrator", "type": "alert", "content": f"DAEMON_DEGRADED {content}"}
+    try:
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish(msg)
+    except ImportError:
+        try:
+            import urllib.request
+            payload = json.dumps(msg).encode()
+            req = urllib.request.Request(
+                "http://127.0.0.1:8420/bus/publish", payload,
+                {"Content-Type": "application/json"}
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # signed: beta
+
+
 # ─── Main Daemon Loop ─────────────────────────────────
 
 def run_daemon(host: str = "127.0.0.1", port: int = 8420,
@@ -296,6 +318,8 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
     backoff = 2.0
     max_backoff = 30.0
     last_status_print = 0
+    _consecutive_errors = 0  # signed: beta
+    _DEGRADED_THRESHOLD = 10  # signed: beta
 
     print(f"[sse-daemon] Connecting to SSE at {host}:{port}/stream", flush=True)
     print(f"[sse-daemon] Writing state to {output}", flush=True)
@@ -305,6 +329,7 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
         try:
             conn, resp = _sse_connect(host, port)
             backoff = 2.0
+            _consecutive_errors = 0  # reset on successful connect  # signed: beta
             print(f"[sse-daemon] SSE connected, streaming...", flush=True)
 
             buf = ""
@@ -325,8 +350,18 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
             except Exception:
                 pass
             break
+        except (ConnectionError, TimeoutError, OSError) as e:
+            _consecutive_errors += 1
+            print(f"[sse-daemon] Disconnected (network, {_consecutive_errors}x): {e}. Reconnecting in {backoff}s...", flush=True)
+            if _consecutive_errors % _DEGRADED_THRESHOLD == 0:
+                _post_degraded_alert(f"sse_daemon {_consecutive_errors} consecutive errors: {e}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
         except Exception as e:
-            print(f"[sse-daemon] Disconnected: {e}. Reconnecting in {backoff}s...", flush=True)
+            _consecutive_errors += 1
+            print(f"[sse-daemon] Error ({_consecutive_errors}x): {e}. Reconnecting in {backoff}s...", flush=True)
+            if _consecutive_errors % _DEGRADED_THRESHOLD == 0:
+                _post_degraded_alert(f"sse_daemon {_consecutive_errors} consecutive errors: {e}")
             time.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
         finally:

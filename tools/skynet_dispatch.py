@@ -1134,7 +1134,7 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
                     current_state = get_engine().get_state(hwnd)
                 except Exception:
                     current_state = "UNKNOWN"
-                if current_state != "IDLE":
+                if current_state not in ("IDLE", "UNKNOWN"):  # UNKNOWN = UIA failed, not confirmed  # signed: alpha
                     log(f"✓ {worker_name.upper()} now {current_state} before retry -- delivery confirmed", "OK")
                     verified = True
                     _reset_dispatch_failures(worker_name)  # signed: beta
@@ -1181,7 +1181,7 @@ def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
             time.sleep(0.5)
             try:
                 post_state = engine.get_state(hwnd)
-                if post_state != pre_state:
+                if post_state != pre_state and post_state != "UNKNOWN":  # UNKNOWN = UIA error, not a real transition  # signed: alpha
                     log(f"✓ {worker_name.upper()} delivery VERIFIED: {pre_state} -> {post_state}", "OK")
                     return True
             except Exception:

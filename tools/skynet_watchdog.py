@@ -1067,6 +1067,16 @@ def run_daemon(args=None):
             pass
     PID_FILE.write_text(str(os.getpid()))
 
+    # ── atexit PID cleanup (safety net for abnormal exits) ──  # signed: beta
+    import atexit
+    def _cleanup_pid():
+        try:
+            if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
+                PID_FILE.unlink()
+        except Exception:
+            pass
+    atexit.register(_cleanup_pid)  # signed: beta
+
     # ── SIGTERM handler for graceful shutdown ──  # signed: alpha
     import signal
     _wd_shutdown = False

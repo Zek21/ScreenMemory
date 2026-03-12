@@ -2058,6 +2058,9 @@ class SelfPromptDaemon:
         else:
             time.sleep(5)
 
+    _consecutive_loop_errors = 0  # signed: beta
+    _DEGRADED_THRESHOLD = 10  # signed: beta
+
     def _main_loop_cycle(self):
         """Single iteration of the main daemon loop."""
         try:
@@ -2069,8 +2072,26 @@ class SelfPromptDaemon:
                 log(f"Delivered {queued_delivered} queued directive(s)")
             else:
                 self.check_and_prompt(deliver_queue_first=False)
+            self._consecutive_loop_errors = 0  # reset on success  # signed: beta
+        except (ConnectionError, TimeoutError, OSError) as e:
+            self._consecutive_loop_errors += 1
+            log(f"Check failed (network, {self._consecutive_loop_errors}x): {e}", "ERROR")
+            if self._consecutive_loop_errors % self._DEGRADED_THRESHOLD == 0:
+                _post_bus("orchestrator", "alert",
+                          f"DAEMON_DEGRADED self_prompt {self._consecutive_loop_errors} consecutive errors: {e}")
+        except (json.JSONDecodeError, FileNotFoundError, ValueError) as e:
+            self._consecutive_loop_errors += 1
+            log(f"Check failed (data, {self._consecutive_loop_errors}x): {e}", "ERROR")
+            if self._consecutive_loop_errors % self._DEGRADED_THRESHOLD == 0:
+                _post_bus("orchestrator", "alert",
+                          f"DAEMON_DEGRADED self_prompt {self._consecutive_loop_errors} consecutive errors: {e}")
         except Exception as e:
-            log(f"Check failed: {e}", "ERROR")
+            self._consecutive_loop_errors += 1
+            log(f"Check failed ({self._consecutive_loop_errors}x): {e}", "ERROR")
+            if self._consecutive_loop_errors % self._DEGRADED_THRESHOLD == 0:
+                _post_bus("orchestrator", "alert",
+                          f"DAEMON_DEGRADED self_prompt {self._consecutive_loop_errors} consecutive errors: {e}")
+        # signed: beta
 
 
 def _check_existing():
