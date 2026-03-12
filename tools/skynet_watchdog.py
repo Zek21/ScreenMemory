@@ -1105,6 +1105,9 @@ def run_daemon(args=None):
     for config in CONSULTANT_BRIDGES:
         status[config["service_name"]] = "unknown"
 
+    _consecutive_loop_errors = 0  # signed: gamma
+    DEGRADED_THRESHOLD = 10  # signed: gamma
+
     try:
         while True:
             if _wd_shutdown:  # signed: alpha
@@ -1117,17 +1120,30 @@ def run_daemon(args=None):
                 log(f"Max runtime {max_runtime}s reached -- shutting down gracefully")
                 break
 
-            last_god_check = _check_god_console(now, last_god_check, status)
-            last_skynet_check = _check_skynet_backend(now, last_skynet_check, status)
-            last_sse_check = _check_sse_daemon(now, last_sse_check, status)
-            last_learner_check = _check_learner_daemon(now, last_learner_check, status)
-            last_consultant_check = _check_consultant_bridges(now, last_consultant_check, status)
-            last_hwnd_check = _check_worker_hwnds(now, last_hwnd_check, status)
-            last_window_scan = _run_window_scan(now, last_window_scan, status)
-            last_stuck_check, stuck_detector = _run_stuck_detection(now, last_stuck_check, status, stuck_detector)
-            last_awareness, skynet_self_cached = _run_awareness_broadcast(now, last_awareness, status, skynet_self_cached)
-            last_guard_refresh = _run_guard_refresh(now, last_guard_refresh, status)
-            last_dispatch_check = _check_dispatch_timeouts(now, last_dispatch_check, status)
+            try:
+                last_god_check = _check_god_console(now, last_god_check, status)
+                last_skynet_check = _check_skynet_backend(now, last_skynet_check, status)
+                last_sse_check = _check_sse_daemon(now, last_sse_check, status)
+                last_learner_check = _check_learner_daemon(now, last_learner_check, status)
+                last_consultant_check = _check_consultant_bridges(now, last_consultant_check, status)
+                last_hwnd_check = _check_worker_hwnds(now, last_hwnd_check, status)
+                last_window_scan = _run_window_scan(now, last_window_scan, status)
+                last_stuck_check, stuck_detector = _run_stuck_detection(now, last_stuck_check, status, stuck_detector)
+                last_awareness, skynet_self_cached = _run_awareness_broadcast(now, last_awareness, status, skynet_self_cached)
+                last_guard_refresh = _run_guard_refresh(now, last_guard_refresh, status)
+                last_dispatch_check = _check_dispatch_timeouts(now, last_dispatch_check, status)
+                _consecutive_loop_errors = 0  # reset on successful cycle  # signed: gamma
+            except (ConnectionError, TimeoutError, OSError) as e:
+                _consecutive_loop_errors += 1
+                log(f"Watchdog cycle network error ({_consecutive_loop_errors}): {e}")
+            except (json.JSONDecodeError, FileNotFoundError, ValueError) as e:
+                _consecutive_loop_errors += 1
+                log(f"Watchdog cycle data error ({_consecutive_loop_errors}): {e}")
+            except Exception as e:
+                _consecutive_loop_errors += 1
+                log(f"Watchdog cycle error ({_consecutive_loop_errors}): {e}")
+            if _consecutive_loop_errors >= DEGRADED_THRESHOLD and _consecutive_loop_errors % DEGRADED_THRESHOLD == 0:
+                _post_bus_alert_safe(f"DAEMON_DEGRADED: skynet_watchdog hit {_consecutive_loop_errors} consecutive errors")  # signed: gamma
 
             write_status(status)
             time.sleep(WATCHDOG_INTERVAL)

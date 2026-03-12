@@ -24,6 +24,7 @@ import ctypes
 import ctypes.wintypes
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -626,21 +627,37 @@ class OverseerDaemon:
 
         timers = {"worker": 0.0, "task": 0.0, "service": 0.0, "bus": 0.0, "report": 0.0, "heartbeat": 0.0}
         HEARTBEAT_INTERVAL = 60
+        _consecutive_loop_errors = 0  # signed: gamma
+        DEGRADED_THRESHOLD = 10  # signed: gamma
 
         try:
             while True:
-                now = time.time()
-                timers["worker"] = self._run_timed_task("Worker scan", self.scan_workers, timers["worker"], WORKER_SCAN_INTERVAL, now)
-                timers["task"] = self._run_timed_task("Delivery verify", self.verify_deliveries, timers["task"], TASK_VERIFY_INTERVAL, now)
-                timers["service"] = self._run_timed_task("Service check", self.check_services, timers["service"], SERVICE_CHECK_INTERVAL, now)
-                timers["bus"] = self._run_timed_task("Bus scan", self.scan_bus_activity, timers["bus"], BUS_SCAN_INTERVAL, now)
-                timers["report"] = self._run_timed_task("Report", self.generate_report, timers["report"], REPORT_INTERVAL, now)
+                try:
+                    now = time.time()
+                    timers["worker"] = self._run_timed_task("Worker scan", self.scan_workers, timers["worker"], WORKER_SCAN_INTERVAL, now)
+                    timers["task"] = self._run_timed_task("Delivery verify", self.verify_deliveries, timers["task"], TASK_VERIFY_INTERVAL, now)
+                    timers["service"] = self._run_timed_task("Service check", self.check_services, timers["service"], SERVICE_CHECK_INTERVAL, now)
+                    timers["bus"] = self._run_timed_task("Bus scan", self.scan_bus_activity, timers["bus"], BUS_SCAN_INTERVAL, now)
+                    timers["report"] = self._run_timed_task("Report", self.generate_report, timers["report"], REPORT_INTERVAL, now)
 
-                if now - timers["heartbeat"] >= HEARTBEAT_INTERVAL:
-                    uptime = int(now - self.start_time)
-                    _post_bus("overseer", "heartbeat",
-                              f"ALIVE pid={os.getpid()} uptime={uptime}s scans={self.scan_count} alerts={len(self.alerts)}")
-                    timers["heartbeat"] = now
+                    if now - timers["heartbeat"] >= HEARTBEAT_INTERVAL:
+                        uptime = int(now - self.start_time)
+                        _post_bus("overseer", "heartbeat",
+                                  f"ALIVE pid={os.getpid()} uptime={uptime}s scans={self.scan_count} alerts={len(self.alerts)}")
+                        timers["heartbeat"] = now
+                    _consecutive_loop_errors = 0  # reset on successful cycle  # signed: gamma
+                except (ConnectionError, TimeoutError, OSError) as e:
+                    _consecutive_loop_errors += 1
+                    log(f"Overseer cycle network error ({_consecutive_loop_errors}): {e}", level="ERROR")
+                except (json.JSONDecodeError, FileNotFoundError, ValueError) as e:
+                    _consecutive_loop_errors += 1
+                    log(f"Overseer cycle data error ({_consecutive_loop_errors}): {e}", level="ERROR")
+                except Exception as e:
+                    _consecutive_loop_errors += 1
+                    log(f"Overseer cycle error ({_consecutive_loop_errors}): {e}", level="ERROR")
+                if _consecutive_loop_errors >= DEGRADED_THRESHOLD and _consecutive_loop_errors % DEGRADED_THRESHOLD == 0:
+                    _post_bus("orchestrator", "alert",
+                              f"DAEMON_DEGRADED: skynet_overseer hit {_consecutive_loop_errors} consecutive errors")  # signed: gamma
 
                 time.sleep(5)
 
@@ -758,6 +775,26 @@ def main():
             return
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         PID_FILE.write_text(str(os.getpid()))
+
+        # ── atexit + signal handlers for PID cleanup ──  # signed: alpha
+        import atexit
+        def _cleanup_pid():
+            try:
+                if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
+                    PID_FILE.unlink()
+            except Exception:
+                pass
+        atexit.register(_cleanup_pid)
+
+        def _sigterm_handler(signum, frame):
+            log(f"Received signal {signum} -- requesting graceful shutdown")
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+        try:
+            signal.signal(signal.SIGBREAK, _sigterm_handler)  # Windows Ctrl+Break
+        except (AttributeError, OSError):
+            pass  # signed: alpha
+
         log(f"Overseer daemon PID {os.getpid()}" + (" [PROD MODE]" if args.prod else ""))
         OverseerDaemon(prod_mode=args.prod).run()
 

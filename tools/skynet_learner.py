@@ -155,10 +155,14 @@ def bus_get(topic: Optional[str] = None, limit: int = 200) -> List[dict]:
             data = json.loads(r.read())
             _bus_fetch_failures = 0  # reset on success  # signed: delta
             return data if isinstance(data, list) else []
-    except Exception:
+    except (ConnectionError, TimeoutError, URLError, OSError):
         _bus_fetch_failures += 1
         if _bus_fetch_failures <= 3 or _bus_fetch_failures % 10 == 0:
-            logger.warning(f"Bus fetch failed (attempt {_bus_fetch_failures})")  # signed: delta
+            logger.warning(f"Bus fetch failed (attempt {_bus_fetch_failures})")  # signed: gamma
+        return []
+    except (json.JSONDecodeError, ValueError):
+        _bus_fetch_failures += 1
+        logger.warning(f"Bus fetch parse error (attempt {_bus_fetch_failures})")  # signed: gamma
         return []
 
 
@@ -622,8 +626,19 @@ class SkynetLearner:
                         self._last_episode_time = time.time()
                     self._check_stale()
                     self.report_health()
+                    self._consecutive_loop_errors = 0  # reset on successful cycle  # signed: gamma
+                except (ConnectionError, TimeoutError, URLError, OSError) as e:
+                    self._consecutive_loop_errors = getattr(self, '_consecutive_loop_errors', 0) + 1
+                    logger.error(f"Cycle network error ({self._consecutive_loop_errors}): {e}")
+                except (json.JSONDecodeError, FileNotFoundError, ValueError) as e:
+                    self._consecutive_loop_errors = getattr(self, '_consecutive_loop_errors', 0) + 1
+                    logger.error(f"Cycle data error ({self._consecutive_loop_errors}): {e}")
                 except Exception as e:
-                    logger.error(f"Cycle error: {e}")
+                    self._consecutive_loop_errors = getattr(self, '_consecutive_loop_errors', 0) + 1
+                    logger.error(f"Cycle error ({self._consecutive_loop_errors}): {e}")
+                if getattr(self, '_consecutive_loop_errors', 0) >= 10 and self._consecutive_loop_errors % 10 == 0:
+                    bus_post("learner", "orchestrator", "alert",
+                             f"DAEMON_DEGRADED: skynet_learner hit {self._consecutive_loop_errors} consecutive errors")  # signed: gamma
                 # Backoff: if bus is unreachable, slow down polling  # signed: alpha
                 backoff = min(_bus_fetch_failures * 2, 30)
                 time.sleep(interval + backoff)

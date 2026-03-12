@@ -932,6 +932,16 @@ def main():
             pass  # Process dead or PID file stale -- proceed
     PID_FILE.write_text(str(os.getpid()))
 
+    # ── atexit for PID cleanup (supplements signal handlers) ──  # signed: alpha
+    import atexit
+    def _cleanup_pid():
+        try:
+            if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
+                PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+    atexit.register(_cleanup_pid)  # signed: alpha
+
     # ── SIGTERM handler for graceful shutdown ──  # signed: alpha
     def _sigterm_handler(signum, frame):
         global _shutdown_requested
@@ -1037,6 +1047,8 @@ def _run_monitor(args):
     consecutive_idle = 0
     current_interval = args.hwnd_interval
     DAEMON_CHECK_INTERVAL = 120
+    _consecutive_loop_errors = 0  # signed: gamma
+    DEGRADED_THRESHOLD = 10  # signed: gamma
 
     try:
         while True:
@@ -1089,8 +1101,19 @@ def _run_monitor(args):
                     cycle, health, workers, productivity, pending_work, now,
                     last_daemon_restart_check, DAEMON_CHECK_INTERVAL)
 
+                _consecutive_loop_errors = 0  # reset on successful cycle  # signed: gamma
+            except (ConnectionError, TimeoutError, OSError) as e:
+                _consecutive_loop_errors += 1
+                log(f"Monitor cycle network error ({_consecutive_loop_errors}): {e}", "ERR")
+            except (json.JSONDecodeError, FileNotFoundError, ValueError) as e:
+                _consecutive_loop_errors += 1
+                log(f"Monitor cycle data error ({_consecutive_loop_errors}): {e}", "ERR")
             except Exception as e:
-                log(f"Monitor cycle error: {e}", "ERR")
+                _consecutive_loop_errors += 1
+                log(f"Monitor cycle error ({_consecutive_loop_errors}): {e}", "ERR")
+            if _consecutive_loop_errors >= DEGRADED_THRESHOLD and _consecutive_loop_errors % DEGRADED_THRESHOLD == 0:
+                _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
+                    "content": f"DAEMON_DEGRADED: skynet_monitor hit {_consecutive_loop_errors} consecutive errors"})  # signed: gamma
 
             time.sleep(current_interval)
     except KeyboardInterrupt:

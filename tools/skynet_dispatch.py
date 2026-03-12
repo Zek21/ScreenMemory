@@ -999,6 +999,40 @@ def _validate_target_hwnd(hwnd, worker_name):
     return True
 
 
+# ── Dispatch failure tracking (consecutive failures per worker) ──  # signed: beta
+_dispatch_failure_counts = {}  # {worker_name: consecutive_failure_count}
+UNRESPONSIVE_THRESHOLD = 5  # consecutive unverified dispatches before alert
+
+
+def _track_dispatch_failure(worker_name):
+    """Increment consecutive dispatch failure counter; alert at threshold."""
+    _dispatch_failure_counts[worker_name] = _dispatch_failure_counts.get(worker_name, 0) + 1
+    count = _dispatch_failure_counts[worker_name]
+    log(f"[DISPATCH_FAILURES] {worker_name.upper()} consecutive failures: {count}/{UNRESPONSIVE_THRESHOLD}", "WARN")
+    if count >= UNRESPONSIVE_THRESHOLD:
+        alert_msg = f"WORKER_UNRESPONSIVE: {worker_name.upper()} failed {count} consecutive dispatches -- worker may be dead/stuck"
+        log(alert_msg, "ERR")
+        try:
+            from tools.skynet_spam_guard import guarded_publish
+            guarded_publish({
+                "sender": "dispatch",
+                "topic": "orchestrator",
+                "type": "alert",
+                "content": alert_msg,
+            })
+        except Exception:
+            pass  # best-effort alert
+    # signed: beta
+
+
+def _reset_dispatch_failures(worker_name):
+    """Reset consecutive failure counter on successful delivery."""
+    if worker_name in _dispatch_failure_counts and _dispatch_failure_counts[worker_name] > 0:
+        log(f"[DISPATCH_FAILURES] {worker_name.upper()} reset from {_dispatch_failure_counts[worker_name]} to 0", "OK")
+        _dispatch_failure_counts[worker_name] = 0
+    # signed: beta
+
+
 def _record_dispatch_outcome(worker_name, task, pre_state, hwnd, t_start, ok, method=""):
     """Record dispatch metrics, log, heartbeat, and backend notification."""
     _log_dispatch(worker_name, task, pre_state, ok, hwnd)
@@ -1087,11 +1121,13 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
     if ok:
         verified = _verify_delivery(hwnd, worker_name, pre_state)
         if not verified and pre_state == "IDLE":
-            # Auto-retry: if worker stayed IDLE, ghost_type may have failed silently  # signed: alpha
+            # Auto-retry with exponential backoff  # signed: beta
             MAX_RETRIES = 2
+            BACKOFF_BASE = 2.0  # seconds: 2s, 4s, 8s
             for attempt in range(2, MAX_RETRIES + 2):  # attempts 2 and 3
-                log(f"[RETRY] {worker_name.upper()} attempt {attempt}/3 -- delivery unverified, retrying in 2s", "WARN")
-                time.sleep(2.0)
+                delay = BACKOFF_BASE * (2 ** (attempt - 2))  # 2s, 4s
+                log(f"[RETRY] {worker_name.upper()} attempt {attempt}/3 -- delivery unverified, retrying in {delay:.0f}s (exp backoff)", "WARN")
+                time.sleep(delay)
                 # Re-check state before retry -- abort if worker moved on its own
                 try:
                     from tools.uia_engine import get_engine
@@ -1101,6 +1137,7 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
                 if current_state != "IDLE":
                     log(f"✓ {worker_name.upper()} now {current_state} before retry -- delivery confirmed", "OK")
                     verified = True
+                    _reset_dispatch_failures(worker_name)  # signed: beta
                     break
                 # Retry ghost_type
                 retry_ok = ghost_type_to_worker(hwnd, full_task, orch_hwnd)
@@ -1108,13 +1145,18 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
                     verified = _verify_delivery(hwnd, worker_name, "IDLE")
                     if verified:
                         log(f"✓ {worker_name.upper()} delivery VERIFIED on attempt {attempt}/3", "OK")
+                        _reset_dispatch_failures(worker_name)  # signed: beta
                         break
                 else:
                     log(f"[RETRY] {worker_name.upper()} ghost_type failed on attempt {attempt}/3", "WARN")
             if not verified:
                 log(f"⚠ {worker_name.upper()} delivery UNVERIFIED after 3 attempts", "WARN")
+                _track_dispatch_failure(worker_name)  # signed: beta
         elif not verified:
             log(f"⚠ {worker_name.upper()} delivery UNVERIFIED (state did not change from {pre_state})", "WARN")
+            _track_dispatch_failure(worker_name)  # signed: beta
+        else:
+            _reset_dispatch_failures(worker_name)  # signed: beta
 
     return ok
 

@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -120,11 +121,14 @@ def _fetch_messages(limit=50):
             data = json.loads(resp.read())
         _consecutive_fetch_failures = 0  # reset on success  # signed: delta
         return data if isinstance(data, list) else data.get("messages", [])
-    except Exception as e:
+    except (ConnectionError, TimeoutError, OSError, urllib.error.URLError) as e:
         _consecutive_fetch_failures += 1
-        # Log every 10th failure to avoid log spam during backend downtime  # signed: delta
         if _consecutive_fetch_failures <= 3 or _consecutive_fetch_failures % 10 == 0:
-            log(f"Bus fetch failed (attempt {_consecutive_fetch_failures}): {e}", "ERR")
+            log(f"Bus fetch failed (attempt {_consecutive_fetch_failures}): {e}", "ERR")  # signed: gamma
+        return []
+    except (json.JSONDecodeError, ValueError) as e:
+        _consecutive_fetch_failures += 1
+        log(f"Bus fetch parse error (attempt {_consecutive_fetch_failures}): {e}", "ERR")  # signed: gamma
         return []
 
 
@@ -421,6 +425,8 @@ def run_daemon():
     log(f"Bus Relay daemon started -- polling every {effective_interval}s")
     log(f"Relay topics: {RELAY_TOPICS}")
     log(f"Relay types: {RELAY_TYPES}")
+    _consecutive_loop_errors = 0  # signed: gamma
+    DEGRADED_THRESHOLD = 10  # signed: gamma
 
     # Register signal handlers for graceful shutdown  # signed: delta
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -433,11 +439,22 @@ def run_daemon():
             n = poll_and_relay()
             if n > 0:
                 log(f"Delivered {n} messages this cycle")
+            _consecutive_loop_errors = 0  # reset on successful cycle  # signed: gamma
         except KeyboardInterrupt:
             log("Shutting down")
             break
+        except (ConnectionError, TimeoutError, OSError) as e:
+            _consecutive_loop_errors += 1
+            log(f"Relay network error ({_consecutive_loop_errors}): {e}", "ERR")
+        except (json.JSONDecodeError, FileNotFoundError, ValueError) as e:
+            _consecutive_loop_errors += 1
+            log(f"Relay data error ({_consecutive_loop_errors}): {e}", "ERR")
         except Exception as e:
-            log(f"Relay error: {e}", "ERR")
+            _consecutive_loop_errors += 1
+            log(f"Relay error ({_consecutive_loop_errors}): {e}", "ERR")
+        if _consecutive_loop_errors >= DEGRADED_THRESHOLD and _consecutive_loop_errors % DEGRADED_THRESHOLD == 0:
+            _bus_post("bus_relay", "orchestrator", "alert",
+                      f"DAEMON_DEGRADED: skynet_bus_relay hit {_consecutive_loop_errors} consecutive errors")  # signed: gamma
         time.sleep(effective_interval + backoff)
 
 

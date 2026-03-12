@@ -63,10 +63,14 @@ def _fetch_json(url, timeout=5):
             data = json.loads(r.read())
         _fetch_failures = 0  # reset on success  # signed: delta
         return data
-    except Exception:
+    except (ConnectionError, TimeoutError, OSError) as e:
         _fetch_failures += 1
         if _fetch_failures <= 3 or _fetch_failures % 10 == 0:
-            log(f"Fetch failed (attempt {_fetch_failures}): {url}", "WARN")  # signed: delta
+            log(f"Fetch network error (attempt {_fetch_failures}): {url}", "WARN")  # signed: gamma
+        return None
+    except (json.JSONDecodeError, ValueError) as e:
+        _fetch_failures += 1
+        log(f"Fetch parse error (attempt {_fetch_failures}): {url}", "WARN")  # signed: gamma
         return None
 
 
@@ -603,8 +607,19 @@ class SelfImproveDaemon:
             while not self._shutting_down:
                 try:
                     self.scan_and_improve()
+                    self._consecutive_loop_errors = 0  # reset on successful cycle  # signed: gamma
+                except (ConnectionError, TimeoutError, OSError) as e:
+                    self._consecutive_loop_errors = getattr(self, '_consecutive_loop_errors', 0) + 1
+                    log(f"Scan network error ({self._consecutive_loop_errors}): {e}", "ERROR")
+                except (json.JSONDecodeError, FileNotFoundError, ValueError) as e:
+                    self._consecutive_loop_errors = getattr(self, '_consecutive_loop_errors', 0) + 1
+                    log(f"Scan data error ({self._consecutive_loop_errors}): {e}", "ERROR")
                 except Exception as e:
-                    log(f"Scan failed: {e}", "ERROR")
+                    self._consecutive_loop_errors = getattr(self, '_consecutive_loop_errors', 0) + 1
+                    log(f"Scan failed ({self._consecutive_loop_errors}): {e}", "ERROR")
+                if getattr(self, '_consecutive_loop_errors', 0) >= 10 and self._consecutive_loop_errors % 10 == 0:
+                    _post_bus("orchestrator", "alert",
+                              f"DAEMON_DEGRADED: skynet_self_improve hit {self._consecutive_loop_errors} consecutive errors")  # signed: gamma
                 # Backoff: if fetches are failing, slow down scanning  # signed: delta
                 backoff = min(_fetch_failures * 5, 60)
                 time.sleep(SCAN_INTERVAL + backoff)

@@ -19,6 +19,7 @@ Usage:
 import argparse
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -277,6 +278,19 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
 
     if not _init_pid_guard(PID_FILE):
         return
+
+    # ── Signal handlers for graceful shutdown ──  # signed: alpha
+    _sse_shutdown = False
+    def _sigterm_handler(signum, frame):
+        nonlocal _sse_shutdown
+        _sse_shutdown = True
+        print(f"[sse-daemon] Received signal {signum} -- shutting down", flush=True)
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    try:
+        signal.signal(signal.SIGBREAK, _sigterm_handler)  # Windows Ctrl+Break
+    except (AttributeError, OSError):
+        pass  # signed: alpha
 
     update_count = 0
     backoff = 2.0

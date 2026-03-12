@@ -20,6 +20,7 @@ import json
 import hashlib
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -2114,6 +2115,26 @@ def _action_start():
         return
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
+
+    # ── atexit + signal handlers for PID cleanup ──  # signed: alpha
+    import atexit
+    def _cleanup_pid():
+        try:
+            if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
+                PID_FILE.unlink()
+        except Exception:
+            pass
+    atexit.register(_cleanup_pid)
+
+    def _sigterm_handler(signum, frame):
+        log(f"Received signal {signum} -- requesting graceful shutdown")
+        raise KeyboardInterrupt  # triggers existing except/finally blocks
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    try:
+        signal.signal(signal.SIGBREAK, _sigterm_handler)  # Windows Ctrl+Break
+    except (AttributeError, OSError):
+        pass  # signed: alpha
+
     log(f"Self-prompt daemon v{DAEMON_VERSION} PID {os.getpid()}")
     _update_last_action("daemon_start")
     SelfPromptDaemon().run()
