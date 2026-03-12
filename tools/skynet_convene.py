@@ -1240,26 +1240,65 @@ class ConveneGate:
         self._flush_due_digest()
         return self._state.get("stats", {})
 
+    def _count_available_workers(self) -> int:
+        """Count workers that are alive (from workers.json + status endpoint).
+        Returns the number of workers that could potentially vote."""
+        workers_file = DATA / "workers.json"
+        count = 0
+        if workers_file.exists():
+            try:
+                wdata = json.loads(workers_file.read_text(encoding="utf-8"))
+                wlist = wdata if isinstance(wdata, list) else wdata.get("workers", [])
+                count = len(wlist)
+            except (json.JSONDecodeError, OSError):
+                pass
+        # Fallback: try backend /status
+        if count == 0:
+            try:
+                import urllib.request
+                with urllib.request.urlopen("http://localhost:8420/status", timeout=3) as resp:
+                    sdata = json.loads(resp.read().decode())
+                    agents = sdata.get("agents", {})
+                    count = len([a for a in agents if a not in ("orchestrator",)])
+            except Exception:
+                pass
+        return max(count, 1)  # at least 1 (the proposer)
+        # signed: delta
+
     def expire_stale(self, max_age_s: int = 300):
-        """Expire proposals older than max_age_s that haven't reached consensus."""
+        """Expire proposals older than max_age_s that haven't reached consensus.
+        If fewer workers are available than MAJORITY_THRESHOLD, auto-elevate
+        proposals that have at least 1 YES vote instead of silently dropping them."""
         self._state = self._load()
         self._flush_due_digest()
         now = time.time()
         expired = []
+        available = self._count_available_workers()
         for gid, p in list(self._state["pending"].items()):
             if now - p.get("created_at", 0) > max_age_s:
+                yes_count = sum(1 for v in p.get("votes", {}).values() if v == "YES")
+                # If not enough peers exist to ever reach threshold,
+                # auto-elevate proposals that have at least 1 YES vote
+                can_reach_threshold = available >= self.MAJORITY_THRESHOLD
+                if not can_reach_threshold and yes_count >= 1:
+                    p["elevated_at"] = now
+                    self._elevate(gid, p)
+                    expired.append(gid)
+                    continue
+                # Normal expiry
                 p["status"] = "expired"
                 self._state["rejected"].append({
                     "gate_id": gid,
                     "report": p["report"][:200],
                     "proposer": p["proposer"],
-                    "reason": "expired",
+                    "reason": "expired" if can_reach_threshold else "expired_insufficient_peers",
                 })
                 expired.append(gid)
                 del self._state["pending"][gid]
         if expired:
             self._save()
         return expired
+        # signed: delta
 
 
 # ── Original Consensus Voting ────────────────────────────────────

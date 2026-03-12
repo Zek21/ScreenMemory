@@ -718,7 +718,7 @@ public class GhostType {{
         var h = FindWindowEx(hwnd, IntPtr.Zero, null, null);
         while (h != IntPtr.Zero) {{
             var sb = new StringBuilder(256); GetClassName(h, sb, 256);
-            if (sb.ToString() == "Chrome_RenderWidgetHostHWND") return h;
+            if (sb.ToString().StartsWith("Chrome_RenderWidgetHost")) return h;  // signed: beta — prefix match for Electron version resilience
             var f = FindRender(h); if (f != IntPtr.Zero) return f;
             h = FindWindowEx(hwnd, h, null, null);
         }}
@@ -1084,7 +1084,34 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
     # Delivery verification: confirm worker state changed after dispatch  # signed: orchestrator
     if ok:
         verified = _verify_delivery(hwnd, worker_name, pre_state)
-        if not verified:
+        if not verified and pre_state == "IDLE":
+            # Auto-retry: if worker stayed IDLE, ghost_type may have failed silently  # signed: alpha
+            MAX_RETRIES = 2
+            for attempt in range(2, MAX_RETRIES + 2):  # attempts 2 and 3
+                log(f"[RETRY] {worker_name.upper()} attempt {attempt}/3 -- delivery unverified, retrying in 2s", "WARN")
+                time.sleep(2.0)
+                # Re-check state before retry -- abort if worker moved on its own
+                try:
+                    from tools.uia_engine import get_engine
+                    current_state = get_engine().get_state(hwnd)
+                except Exception:
+                    current_state = "UNKNOWN"
+                if current_state != "IDLE":
+                    log(f"✓ {worker_name.upper()} now {current_state} before retry -- delivery confirmed", "OK")
+                    verified = True
+                    break
+                # Retry ghost_type
+                retry_ok = ghost_type_to_worker(hwnd, full_task, orch_hwnd)
+                if retry_ok:
+                    verified = _verify_delivery(hwnd, worker_name, "IDLE")
+                    if verified:
+                        log(f"✓ {worker_name.upper()} delivery VERIFIED on attempt {attempt}/3", "OK")
+                        break
+                else:
+                    log(f"[RETRY] {worker_name.upper()} ghost_type failed on attempt {attempt}/3", "WARN")
+            if not verified:
+                log(f"⚠ {worker_name.upper()} delivery UNVERIFIED after 3 attempts", "WARN")
+        elif not verified:
             log(f"⚠ {worker_name.upper()} delivery UNVERIFIED (state did not change from {pre_state})", "WARN")
 
     return ok

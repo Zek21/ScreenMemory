@@ -64,6 +64,7 @@ PID_FILE = ROOT / "data" / "learner.pid"
 
 DEFAULT_LOOP_INTERVAL = 30
 HEALTH_REPORT_INTERVAL = 300  # 5 minutes
+_bus_fetch_failures = 0  # backoff counter for bus connectivity  # signed: delta
 
 # Domain keyword mappings for task categorization
 DOMAIN_KEYWORDS = {
@@ -119,12 +120,20 @@ FAILURE_SIGNALS = [
 # ─── Bus Helpers ───────────────────────────────────────
 
 def bus_post(sender: str, topic: str, msg_type: str, content: str) -> bool:
-    """POST a message to the Skynet bus."""
+    """POST a message to the Skynet bus (SpamGuard first, raw fallback)."""
+    payload = {
+        "sender": sender, "topic": topic,
+        "type": msg_type, "content": content,
+    }
     try:
-        data = json.dumps({
-            "sender": sender, "topic": topic,
-            "type": msg_type, "content": content,
-        }).encode()
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish(payload)
+        return True
+    except Exception:
+        pass
+    # Raw fallback for when SpamGuard is unavailable  # signed: alpha
+    try:
+        data = json.dumps(payload).encode()
         req = Request(
             f"{BUS_URL}/bus/publish", data=data, method="POST",
             headers={"Content-Type": "application/json"},
@@ -137,14 +146,19 @@ def bus_post(sender: str, topic: str, msg_type: str, content: str) -> bool:
 
 def bus_get(topic: Optional[str] = None, limit: int = 200) -> List[dict]:
     """GET messages from the Skynet bus."""
+    global _bus_fetch_failures
     try:
         url = f"{BUS_URL}/bus/messages?limit={limit}"
         if topic:
             url += f"&topic={topic}"
         with urlopen(url, timeout=5) as r:
             data = json.loads(r.read())
+            _bus_fetch_failures = 0  # reset on success  # signed: delta
             return data if isinstance(data, list) else []
     except Exception:
+        _bus_fetch_failures += 1
+        if _bus_fetch_failures <= 3 or _bus_fetch_failures % 10 == 0:
+            logger.warning(f"Bus fetch failed (attempt {_bus_fetch_failures})")  # signed: delta
         return []
 
 
@@ -569,11 +583,30 @@ class SkynetLearner:
                             sys.exit(1)
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
-            except (ValueError, ImportError):
+            except ValueError:
                 pass
+            except ImportError:
+                # psutil not available -- check PID via OS  # signed: delta
+                try:
+                    os.kill(old_pid, 0)
+                    logger.error(f"PID {old_pid} still alive and psutil unavailable. Exiting to be safe.")
+                    sys.exit(1)
+                except (OSError, ProcessLookupError):
+                    pass  # PID is dead, safe to take over
 
         import os
         PID_FILE.write_text(str(os.getpid()))
+
+        # Register atexit for PID cleanup  # signed: delta
+        import atexit
+        def _cleanup_pid():
+            try:
+                if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
+                    PID_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+        atexit.register(_cleanup_pid)
+
         logger.info(f"Learner daemon started (PID {os.getpid()}, interval={interval}s)")
 
         # Register signal handlers for graceful shutdown
@@ -591,15 +624,19 @@ class SkynetLearner:
                     self.report_health()
                 except Exception as e:
                     logger.error(f"Cycle error: {e}")
-                time.sleep(interval)
+                # Backoff: if bus is unreachable, slow down polling  # signed: alpha
+                backoff = min(_bus_fetch_failures * 2, 30)
+                time.sleep(interval + backoff)
         except KeyboardInterrupt:
             logger.info("Learner daemon stopped by keyboard interrupt")
         finally:
             logger.info("Learner daemon shutting down")
             if PID_FILE.exists():
                 try:
-                    PID_FILE.unlink()
-                except OSError:
+                    # Only delete if we own the PID file  # signed: delta
+                    if int(PID_FILE.read_text().strip()) == os.getpid():
+                        PID_FILE.unlink()
+                except (OSError, ValueError):
                     pass
 
     def get_stats(self) -> dict:

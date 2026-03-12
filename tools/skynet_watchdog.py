@@ -167,19 +167,27 @@ def _record_restart_result(service_name: str, success: bool):
 
 
 def _post_bus_alert_safe(content: str):
-    """Best-effort bus alert (used during restart tracking)."""
+    """Best-effort bus alert (used during restart tracking). Uses SpamGuard with raw fallback."""
     try:
-        data = json.dumps({
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish({
             "sender": "watchdog", "topic": "orchestrator",
             "type": "alert", "content": content
-        }).encode()
-        req = urllib.request.Request(
-            "http://localhost:8420/bus/publish", data=data,
-            headers={"Content-Type": "application/json"}
-        )
-        urllib.request.urlopen(req, timeout=3)
+        })
     except Exception:
-        pass
+        # SpamGuard unavailable (import error, Skynet down) -- raw fallback
+        try:
+            data = json.dumps({
+                "sender": "watchdog", "topic": "orchestrator",
+                "type": "alert", "content": content
+            }).encode()
+            req = urllib.request.Request(
+                "http://localhost:8420/bus/publish", data=data,
+                headers={"Content-Type": "application/json"}
+            )
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            pass  # signed: alpha
 
 
 def _hidden_subprocess_kwargs(**kwargs):
@@ -633,21 +641,28 @@ def _port_to_pid(port):
 
 
 def _post_restart_alert(service_name, old_pid, new_pid):
-    """Post a SERVICE_RESTARTED alert to the bus."""
+    """Post a SERVICE_RESTARTED alert to the bus via SpamGuard."""
+    content = f"SERVICE_RESTARTED: {service_name}, old_pid={old_pid}, new_pid={new_pid}"
     try:
-        data = json.dumps({
-            "sender": "watchdog",
-            "topic": "orchestrator",
-            "type": "alert",
-            "content": f"SERVICE_RESTARTED: {service_name}, old_pid={old_pid}, new_pid={new_pid}"
-        }).encode()
-        req = urllib.request.Request(
-            "http://localhost:8420/bus/publish", data=data,
-            headers={"Content-Type": "application/json"}
-        )
-        urllib.request.urlopen(req, timeout=3)
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish({
+            "sender": "watchdog", "topic": "orchestrator",
+            "type": "alert", "content": content
+        })
     except Exception:
-        log(f"Failed to post restart alert for {service_name}")
+        try:
+            data = json.dumps({
+                "sender": "watchdog", "topic": "orchestrator",
+                "type": "alert", "content": content
+            }).encode()
+            req = urllib.request.Request(
+                "http://localhost:8420/bus/publish", data=data,
+                headers={"Content-Type": "application/json"}
+            )
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            log(f"Failed to post restart alert for {service_name}")
+    # signed: alpha
 
 
 def _refresh_protected_registry():
@@ -886,20 +901,7 @@ def _check_worker_hwnds(now, last_check, status):
         if dead_workers:
             names = [d["name"] for d in dead_workers]
             log(f"CRITICAL: Worker window(s) GONE: {names}")
-            try:
-                alert = json.dumps({
-                    "sender": "watchdog",
-                    "topic": "orchestrator",
-                    "type": "alert",
-                    "content": f"WORKER_WINDOW_DEAD: {', '.join(names)} -- HWNDs invalid"
-                }).encode()
-                req = urllib.request.Request(
-                    "http://localhost:8420/bus/publish", data=alert,
-                    headers={"Content-Type": "application/json"}
-                )
-                urllib.request.urlopen(req, timeout=3)
-            except Exception:
-                pass
+            _post_bus_alert(f"WORKER_WINDOW_DEAD: {', '.join(names)} -- HWNDs invalid")  # signed: alpha
     except Exception as e:
         log(f"Worker HWND check failed: {e}")
     return now
@@ -1019,19 +1021,26 @@ def _check_dispatch_timeouts(now, last_check, status):
 
 
 def _post_bus_alert(content: str):
-    """Post an alert message to the Skynet bus."""
+    """Post an alert message to the Skynet bus via SpamGuard."""
     try:
-        data = json.dumps({
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish({
             "sender": "watchdog", "topic": "orchestrator",
             "type": "alert", "content": content
-        }).encode()
-        req = urllib.request.Request(
-            "http://localhost:8420/bus/publish", data=data,
-            headers={"Content-Type": "application/json"}
-        )
-        urllib.request.urlopen(req, timeout=3)
+        })
     except Exception:
-        pass
+        try:
+            data = json.dumps({
+                "sender": "watchdog", "topic": "orchestrator",
+                "type": "alert", "content": content
+            }).encode()
+            req = urllib.request.Request(
+                "http://localhost:8420/bus/publish", data=data,
+                headers={"Content-Type": "application/json"}
+            )
+            urllib.request.urlopen(req, timeout=3)
+        except Exception:
+            pass  # signed: alpha
 
 
 def run_daemon(args=None):
@@ -1057,6 +1066,19 @@ def run_daemon(args=None):
         except (OSError, ValueError, Exception):
             pass
     PID_FILE.write_text(str(os.getpid()))
+
+    # ── SIGTERM handler for graceful shutdown ──  # signed: alpha
+    import signal
+    _wd_shutdown = False
+    def _wd_sigterm_handler(signum, frame):
+        nonlocal _wd_shutdown
+        _wd_shutdown = True
+        log(f"Received signal {signum} -- requesting graceful shutdown")
+    signal.signal(signal.SIGTERM, _wd_sigterm_handler)
+    try:
+        signal.signal(signal.SIGBREAK, _wd_sigterm_handler)  # Windows Ctrl+Break
+    except (AttributeError, OSError):
+        pass  # SIGBREAK only on Windows  # signed: alpha
 
     log("Skynet Watchdog v2 starting (auto-recovery + heartbeat + HWND checks)")
     start_time = time.time()
@@ -1085,6 +1107,9 @@ def run_daemon(args=None):
 
     try:
         while True:
+            if _wd_shutdown:  # signed: alpha
+                log("SIGTERM/SIGBREAK received -- shutting down gracefully")
+                break
             now = time.time()
             cycle += 1
 
@@ -1108,14 +1133,7 @@ def run_daemon(args=None):
             time.sleep(WATCHDOG_INTERVAL)
     except KeyboardInterrupt:
         log("Watchdog shutting down (Ctrl+C)")
-        try:
-            data = json.dumps({"sender": "watchdog", "topic": "orchestrator", "type": "lifecycle",
-                "content": f"Watchdog shutdown: KeyboardInterrupt after {cycle} cycles"}).encode()
-            req = urllib.request.Request(f"{SKYNET_URL}/bus/publish", data=data,
-                                        headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=3)
-        except Exception:
-            pass
+        _post_bus_alert_safe(f"Watchdog shutdown: KeyboardInterrupt after {cycle} cycles")  # signed: alpha
     finally:
         try:
             PID_FILE.unlink(missing_ok=True)

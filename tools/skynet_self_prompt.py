@@ -291,16 +291,80 @@ def _append_log(entry):
     _save_json(LOG_FILE, log_data)
 
 
-def _send_self_prompt(orch_hwnd, prompt_text):
-    """Type a prompt into the orchestrator's chat window."""
+def _verify_orch_delivery(orch_hwnd, pre_state, timeout_s=8):
+    """Verify self-prompt delivery by checking orchestrator state transition.
+
+    Polls UIA for up to timeout_s seconds to confirm orchestrator moved from
+    pre_state (usually IDLE) to PROCESSING. Returns True if state changed.
+    """
+    if pre_state == "PROCESSING":
+        return True  # already processing, prompt queued in VS Code
     try:
-        sys.path.insert(0, str(ROOT / "tools"))
-        from skynet_delivery import deliver_to_orchestrator
-        result = deliver_to_orchestrator(prompt_text, sender="self_prompt", also_bus=False)
-        return bool(result.get("success"))
-    except Exception as e:
-        log(f"Send failed: {e}", "ERROR")
+        from uia_engine import get_engine
+        engine = get_engine()
+        for _ in range(timeout_s * 2):  # poll every 0.5s
+            time.sleep(0.5)
+            try:
+                post_state = engine.get_state(orch_hwnd)
+                if post_state != pre_state:
+                    log(f"Delivery VERIFIED: orchestrator {pre_state} -> {post_state}", "OK")
+                    return True
+            except Exception:
+                pass
+        log(f"Delivery UNVERIFIED: orchestrator stayed {pre_state} after {timeout_s}s", "WARN")
         return False
+    except Exception as e:
+        log(f"Delivery verify error: {e}", "WARN")
+        return True  # don't block on verify infra failure
+    # signed: gamma
+
+
+def _send_self_prompt(orch_hwnd, prompt_text):
+    """Type a prompt into the orchestrator's chat window with delivery verification.
+
+    After delivering, verifies orchestrator state changed (IDLE -> PROCESSING).
+    Retries once after 3s if first delivery fails verification.
+    Posts SELF_PROMPT_DELIVERY_FAILED alert if both attempts fail.
+    """
+    sys.path.insert(0, str(ROOT / "tools"))
+
+    for attempt in range(1, 3):
+        try:
+            pre_state = _get_worker_state(orch_hwnd) or "UNKNOWN"
+            t0 = time.time()
+
+            from skynet_delivery import deliver_to_orchestrator
+            result = deliver_to_orchestrator(prompt_text, sender="self_prompt", also_bus=False)
+            ok = bool(result.get("success"))
+            elapsed_ms = int((time.time() - t0) * 1000)
+
+            if not ok:
+                log(f"Attempt {attempt}: delivery call returned failure ({elapsed_ms}ms)", "WARN")
+                if attempt == 1:
+                    time.sleep(3)
+                continue
+
+            verified = _verify_orch_delivery(orch_hwnd, pre_state, timeout_s=8)
+            if verified:
+                log(f"Attempt {attempt}: delivery OK + verified ({elapsed_ms}ms)", "OK")
+                return True
+
+            log(f"Attempt {attempt}: delivery OK but state unchanged ({elapsed_ms}ms, pre={pre_state})", "WARN")
+            if attempt == 1:
+                time.sleep(3)
+
+        except Exception as e:
+            log(f"Attempt {attempt}: send exception: {e}", "ERROR")
+            if attempt == 1:
+                time.sleep(3)
+
+    # Both attempts failed — post alert to bus
+    log("SELF_PROMPT_DELIVERY_FAILED after 2 attempts", "ERROR")
+    _post_bus("orchestrator", "alert",
+              _versioned_signal("SELF_PROMPT_DELIVERY_FAILED",
+                                "Self-prompt delivery failed after 2 attempts (delivery unverified)"))
+    return False
+    # signed: gamma
 
 
 DAEMON_STATE_FILE = DATA_DIR / "daemon_state.json"

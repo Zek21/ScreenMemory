@@ -250,8 +250,8 @@ def _spawn_new_chat(worker_name, workers_data, orch_hwnd):
 
         result = _hidden_run(
             ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(NEW_CHAT_SCRIPT)],
-            capture_output=True, text=True, timeout=30, cwd=str(ROOT)
-        )
+            capture_output=True, encoding='utf-8', errors='replace', timeout=30, cwd=str(ROOT)
+        )  # signed: gamma — cp1252 fix: explicit utf-8 prevents Windows encoding crash
 
         if result.returncode != 0:
             log(f"new_chat.ps1 failed: {result.stderr[:200]}", "ERR")
@@ -331,8 +331,8 @@ SCORE_FILE = ROOT / "data" / "worker_scores.json"
 
 def _load_scores():
     if SCORE_FILE.exists():
-        return json.loads(SCORE_FILE.read_text())
-    return {}
+        return json.loads(SCORE_FILE.read_text(encoding='utf-8'))
+    return {}  # signed: gamma — cp1252 fix: explicit utf-8 encoding
 
 
 def _save_scores(scores):
@@ -646,24 +646,17 @@ class RealtimeCollector:
 
 
 def _bus_post(sender, content):
-    """Post extracted result to bus for other systems."""
+    """Post extracted result to bus via SpamGuard (anti-spam compliant)."""
     try:
-        import urllib.request
-        body = json.dumps({
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish({
             "sender": sender,
             "topic": "orchestrator",
             "type": "result",
             "content": content,
-        }).encode()
-        req = urllib.request.Request(
-            "http://localhost:8420/bus/publish",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=3)
+        })
     except Exception:
-        pass  # Bus post is best-effort
+        pass  # Bus post is best-effort  # signed: gamma
 
 
 # ─── Worker Health Monitor ──────────────────────────────────────────────────

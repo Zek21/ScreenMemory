@@ -24,7 +24,6 @@ import ctypes
 import ctypes.wintypes
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -169,14 +168,14 @@ def _is_window_alive(hwnd):
 
 
 def _get_worker_state_uia(hwnd):
-    """Get worker state via UIA engine. Returns state string."""
+    """Get worker state via UIA engine singleton. Returns state string."""
     try:
-        from uia_engine import UIAEngine
-        engine = UIAEngine()
-        result = engine.scan(int(hwnd))
+        from uia_engine import get_engine
+        result = get_engine().scan(int(hwnd))
         return getattr(result, "state", "UNKNOWN")
     except Exception:
         return "UNKNOWN"
+    # signed: beta
 
 
 class OverseerDaemon:
@@ -247,22 +246,35 @@ class OverseerDaemon:
                 })
 
     def _worker_has_pending_todos(self, name):
-        """Check if a worker has pending/active TODO items (own + shared/claimable)."""
+        """Check if a worker has pending/active TODO items (own + shared/claimable) or pending tasks."""
         try:
             todos_file = DATA_DIR / "todos.json"
             if todos_file.exists():
                 tdata = json.loads(todos_file.read_text(encoding="utf-8"))
                 shared_assignees = ("", "all", "shared", "any", "unassigned", "backlog")
-                return any(
+                has_todos = any(
                     (str(t.get("assignee", t.get("worker", "")) or "").strip().lower() == name
                      or str(t.get("assignee", t.get("worker", "")) or "").strip().lower() in shared_assignees)
                     and t.get("status") in ("pending", "active")
                     for t in tdata.get("todos", [])
                 )
-        except Exception:
-            pass
+                if has_todos:
+                    return True
+        except Exception as e:
+            log(f"Error checking todos for {name}: {e}", "ERROR")
+        # Also check task_queue.json for pending tasks
+        try:
+            task_file = DATA_DIR / "task_queue.json"
+            if task_file.exists():
+                tdata = json.loads(task_file.read_text(encoding="utf-8"))
+                terminal = ("done", "failed", "cancelled")
+                for t in tdata.get("tasks", []):
+                    if t.get("status") not in terminal and t.get("target") in (name, "all"):
+                        return True
+        except Exception as e:
+            log(f"Error checking task_queue for {name}: {e}", "ERROR")
         return False
-        # signed: delta
+        # signed: beta
 
     def _check_idle_with_todos(self, name, state, issues):
         """Zero Ticket Stop Rule: flag IDLE workers with pending TODOs (own + shared)."""
@@ -291,9 +303,9 @@ class OverseerDaemon:
                         "detail": detail,
                         "severity": "warning"
                     })
-        except Exception:
-            pass
-        # signed: delta
+        except Exception as e:
+            log(f"Error checking idle+todos for {name}: {e}", "ERROR")
+        # signed: beta
 
     def _post_deduped_alerts(self, issues):
         """Post alerts for issues, deduplicating within a 5-minute window."""
@@ -629,9 +641,12 @@ class OverseerDaemon:
             _post_bus("orchestrator", "monitor_alert", "OVERSEER_OFFLINE: Daemon stopped")
             if PID_FILE.exists():
                 try:
-                    PID_FILE.unlink()
+                    stored_pid = int(PID_FILE.read_text().strip())
+                    if stored_pid == os.getpid():
+                        PID_FILE.unlink()
                 except Exception:
                     pass
+                # signed: delta
 
     def run_once(self):
         """Single scan cycle, print results, exit."""

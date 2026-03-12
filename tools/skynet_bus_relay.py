@@ -37,6 +37,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 SKYNET_URL = "http://localhost:8420"
 POLL_INTERVAL = 3.0  # Must be >= 2.0s to prevent CPU spin
 MIN_POLL_INTERVAL = 2.0
+_consecutive_fetch_failures = 0  # backoff counter for bus fetch errors  # signed: delta
+_shutting_down = False  # graceful shutdown flag  # signed: delta
 HOLD_INTERVAL_S = 3600
 WORKER_NAMES = {"alpha", "beta", "gamma", "delta"}
 # Topics that should be delivered to workers
@@ -110,14 +112,19 @@ def _save_queue_state(state):
 
 
 def _fetch_messages(limit=50):
+    global _consecutive_fetch_failures
     try:
         req = urllib.request.Request(
             f"{SKYNET_URL}/bus/messages?limit={limit}", method="GET")
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read())
+        _consecutive_fetch_failures = 0  # reset on success  # signed: delta
         return data if isinstance(data, list) else data.get("messages", [])
     except Exception as e:
-        log(f"Bus fetch failed: {e}", "ERR")
+        _consecutive_fetch_failures += 1
+        # Log every 10th failure to avoid log spam during backend downtime  # signed: delta
+        if _consecutive_fetch_failures <= 3 or _consecutive_fetch_failures % 10 == 0:
+            log(f"Bus fetch failed (attempt {_consecutive_fetch_failures}): {e}", "ERR")
         return []
 
 
@@ -393,15 +400,31 @@ def _release_singleton():
         pass
 
 
+def _handle_signal(signum, frame):
+    """Graceful shutdown on SIGTERM/SIGINT."""
+    global _shutting_down
+    sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+    log(f"Received {sig_name} -- shutting down gracefully")
+    _shutting_down = True
+    # signed: delta
+
+
 def run_daemon():
     """Main relay loop."""
+    global _shutting_down, _consecutive_fetch_failures
     effective_interval = max(POLL_INTERVAL, MIN_POLL_INTERVAL)
     log(f"Bus Relay daemon started -- polling every {effective_interval}s")
     log(f"Relay topics: {RELAY_TOPICS}")
     log(f"Relay types: {RELAY_TYPES}")
 
-    while True:
+    # Register signal handlers for graceful shutdown  # signed: delta
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    while not _shutting_down:
         try:
+            # Backoff: if backend is persistently down, slow polling  # signed: delta
+            backoff = min(_consecutive_fetch_failures * 2, 30)
             n = poll_and_relay()
             if n > 0:
                 log(f"Delivered {n} messages this cycle")
@@ -410,7 +433,7 @@ def run_daemon():
             break
         except Exception as e:
             log(f"Relay error: {e}", "ERR")
-        time.sleep(effective_interval)
+        time.sleep(effective_interval + backoff)
 
 
 def print_status():

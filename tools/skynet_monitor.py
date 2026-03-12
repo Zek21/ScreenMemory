@@ -107,6 +107,10 @@ user32 = ctypes.windll.user32
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+LOG_FILE = DATA_DIR / "monitor.log"
+MAX_LOG_SIZE = 1_000_000  # 1MB -- rotate log file to prevent unbounded growth  # signed: alpha
+
+
 def log(msg: str, level: str = "INFO"):
     ts = datetime.now().strftime("%H:%M:%S")
     prefix = {"INFO": "[INFO]", "OK": "[OK]  ", "WARN": "[WARN]", "ERR": "[ERR] ", "CRIT": "[CRIT]", "FIX": "[FIX] "}.get(level, "     ")
@@ -115,6 +119,19 @@ def log(msg: str, level: str = "INFO"):
         print(line, flush=True)
     except UnicodeEncodeError:
         print(line.encode("ascii", "replace").decode(), flush=True)
+    # File logging for daemon mode (stdout may be /dev/null)  # signed: alpha
+    DATA_DIR.mkdir(exist_ok=True)
+    try:
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > MAX_LOG_SIZE:
+            content = LOG_FILE.read_text(encoding="utf-8", errors="replace")
+            LOG_FILE.write_text(content[-500_000:], encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {prefix} {msg}\n")
+    except Exception:
+        pass  # signed: alpha
 
 
 def load_workers():
@@ -881,6 +898,10 @@ def _check_realtime_daemon() -> dict:
         }
 
 
+# ─── Graceful shutdown flag ──────────────────────────────────────────────────
+_shutdown_requested = False  # signed: alpha
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true", help="Single check and exit")
@@ -910,6 +931,18 @@ def main():
         except (OSError, ValueError):
             pass  # Process dead or PID file stale -- proceed
     PID_FILE.write_text(str(os.getpid()))
+
+    # ── SIGTERM handler for graceful shutdown ──  # signed: alpha
+    def _sigterm_handler(signum, frame):
+        global _shutdown_requested
+        _shutdown_requested = True
+        log(f"Received signal {signum} -- requesting graceful shutdown", "INFO")
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    try:
+        signal.signal(signal.SIGBREAK, _sigterm_handler)  # Windows Ctrl+Break
+    except (AttributeError, OSError):
+        pass  # SIGBREAK only on Windows  # signed: alpha
+
     try:
         _run_monitor(args)
     finally:
@@ -1007,6 +1040,11 @@ def _run_monitor(args):
 
     try:
         while True:
+            if _shutdown_requested:  # signed: alpha
+                log("SIGTERM/SIGBREAK received -- shutting down gracefully", "INFO")
+                _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",
+                    "content": f"Monitor shutdown: signal received after {cycle} cycles"})
+                break
             if max_runtime and (time.time() - start_time) >= max_runtime:
                 log(f"Max runtime {max_runtime}s reached -- shutting down gracefully", "INFO")
                 _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",

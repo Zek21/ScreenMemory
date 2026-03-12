@@ -225,6 +225,68 @@ if ($action -ne "none") {
 
 # -- Ensure daemons (lightweight, no UIA) --
 
+# Helper: start daemon with cmdline-verified PID check, post-start verification, and 1 retry  # signed: beta
+function Start-VerifiedDaemon($spec) {
+    $pidFile = Join-Path $repoRoot $spec.Pid
+    $script  = Join-Path $repoRoot $spec.Script
+    $scriptName = Split-Path $spec.Script -Leaf
+
+    # 1. Check if already running with cmdline verification via Get-CimInstance
+    if (Test-Path $pidFile) {
+        $daemonPid = 0
+        try { $daemonPid = [int](Get-Content $pidFile -Raw).Trim() } catch {}
+        if ($daemonPid -gt 0) {
+            try {
+                $cimProc = Get-CimInstance Win32_Process -Filter "ProcessId = $daemonPid" -ErrorAction Stop
+                if ($cimProc -and $cimProc.CommandLine -match [regex]::Escape($scriptName)) {
+                    Write-Status "$($spec.Name) daemon alive (PID $daemonPid, cmdline verified)" "OK"
+                    return
+                }
+                # PID exists but cmdline doesn't match -- stale PID file
+                Write-Status "$($spec.Name) PID $daemonPid is stale (cmdline mismatch) -- restarting" "WARN"
+                Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+            } catch {
+                Write-Status "$($spec.Name) PID $daemonPid not found -- restarting" "WARN"
+                Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # 2. Start daemon with verification and 1 retry
+    if (-not (Test-Path $script)) {
+        Write-Status "$($spec.Name) script not found: $($spec.Script)" "ERR"
+        return
+    }
+
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $dArgs = @($script) + ($spec.Args ?? @())
+        Start-Process -FilePath $python -ArgumentList $dArgs -WorkingDirectory $repoRoot -WindowStyle Hidden
+        Start-Sleep -Seconds 2
+
+        # 3. Post-start verification: PID file exists and process is alive
+        if (Test-Path $pidFile) {
+            $newPid = 0
+            try { $newPid = [int](Get-Content $pidFile -Raw).Trim() } catch {}
+            if ($newPid -gt 0) {
+                try {
+                    $p = Get-Process -Id $newPid -ErrorAction Stop
+                    if (-not $p.HasExited) {
+                        Write-Status "$($spec.Name) daemon started and verified (PID $newPid)" "OK"
+                        return
+                    }
+                } catch {}
+            }
+        }
+
+        if ($attempt -eq 1) {
+            Write-Status "$($spec.Name) start unverified -- retrying (attempt 2/2)" "WARN"
+            Start-Sleep -Seconds 1
+        } else {
+            Write-Status "$($spec.Name) daemon failed to verify after 2 attempts" "ERR"
+        }
+    }
+}  # signed: beta
+
 $daemonSpecs = @(
     @{ Script = "tools\skynet_self_prompt.py";  Pid = "data\self_prompt.pid";  Name = "Self-prompt";  Args = @("start") },
     @{ Script = "tools\skynet_self_improve.py"; Pid = "data\self_improve.pid"; Name = "Self-improve"; Args = @("start") },
@@ -233,23 +295,7 @@ $daemonSpecs = @(
 )
 
 foreach ($d in $daemonSpecs) {
-    $pidFile = Join-Path $repoRoot $d.Pid
-    $running = $false
-    if (Test-Path $pidFile) {
-        $daemonPid = [int](Get-Content $pidFile -Raw).Trim()
-        try {
-            $p = Get-Process -Id $daemonPid -ErrorAction Stop
-            if (-not $p.HasExited) { $running = $true }
-        } catch {}
-    }
-    if (-not $running) {
-        $script = Join-Path $repoRoot $d.Script
-        if (Test-Path $script) {
-            $dArgs = @($script) + ($d.Args ?? @())
-            Start-Process -FilePath $python -ArgumentList $dArgs -WorkingDirectory $repoRoot -WindowStyle Hidden
-            Write-Status "Started $($d.Name) daemon" "SYS"
-        }
-    }
+    Start-VerifiedDaemon $d
 }
 
 # -- Orchestrator identity on bus --

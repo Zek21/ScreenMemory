@@ -14,6 +14,7 @@ Usage:
 
 import json
 import os
+import signal
 import sys
 import time
 import hashlib
@@ -45,6 +46,7 @@ except Exception:
     SCAN_INTERVAL = _DEFAULT_SCAN_INTERVAL
 
 MAX_PROPOSALS = 50  # max stored proposals
+_fetch_failures = 0  # backoff counter for HTTP fetch failures  # signed: delta
 
 
 def log(msg, level="INFO"):
@@ -53,11 +55,18 @@ def log(msg, level="INFO"):
 
 
 def _fetch_json(url, timeout=5):
+    global _fetch_failures
     try:
-        import requests
-        r = requests.get(url, timeout=timeout)
-        return r.json()
+        from urllib.request import urlopen, Request
+        req = Request(url, method="GET")
+        with urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+        _fetch_failures = 0  # reset on success  # signed: delta
+        return data
     except Exception:
+        _fetch_failures += 1
+        if _fetch_failures <= 3 or _fetch_failures % 10 == 0:
+            log(f"Fetch failed (attempt {_fetch_failures}): {url}", "WARN")  # signed: delta
         return None
 
 
@@ -516,6 +525,14 @@ class SelfImproveDaemon:
         self.checker = RegressionChecker()
         self.metrics = MetricsTracker()
         self._start_time = time.time()
+        self._shutting_down = False  # signed: delta
+
+    def _handle_signal(self, signum, frame):
+        """Graceful shutdown on SIGTERM/SIGINT."""
+        sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+        log(f"Received {sig_name} -- shutting down gracefully")
+        self._shutting_down = True
+        # signed: delta
 
     def scan_and_improve(self):
         """Single improvement cycle."""
@@ -557,7 +574,23 @@ class SelfImproveDaemon:
 
     def run(self):
         """Main daemon loop."""
+        global _fetch_failures
         log("Self-improvement daemon starting")
+
+        # Register signal handlers  # signed: delta
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+
+        # Register atexit for PID cleanup  # signed: delta
+        import atexit
+        def _cleanup_pid():
+            try:
+                if PID_FILE.exists() and int(PID_FILE.read_text().strip()) == os.getpid():
+                    PID_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+        atexit.register(_cleanup_pid)
+
         _post_bus("orchestrator", "monitor_alert",
                   "SELF_IMPROVE_ONLINE: Self-improvement engine started")
 
@@ -567,12 +600,14 @@ class SelfImproveDaemon:
         log(f"Baseline regression: {passes} pass, {fails} fail")
 
         try:
-            while True:
+            while not self._shutting_down:
                 try:
                     self.scan_and_improve()
                 except Exception as e:
                     log(f"Scan failed: {e}", "ERROR")
-                time.sleep(SCAN_INTERVAL)
+                # Backoff: if fetches are failing, slow down scanning  # signed: delta
+                backoff = min(_fetch_failures * 5, 60)
+                time.sleep(SCAN_INTERVAL + backoff)
         except KeyboardInterrupt:
             log("Shutting down (Ctrl+C)")
         finally:
@@ -580,7 +615,8 @@ class SelfImproveDaemon:
                       "SELF_IMPROVE_OFFLINE: Self-improvement engine stopped")
             if PID_FILE.exists():
                 try:
-                    PID_FILE.unlink()
+                    if int(PID_FILE.read_text().strip()) == os.getpid():  # signed: delta
+                        PID_FILE.unlink()
                 except Exception:
                     pass
 
