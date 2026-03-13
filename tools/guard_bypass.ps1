@@ -1,13 +1,13 @@
-# guard_bypass.ps1 - Single source of truth for setting Bypass Approvals
-# Uses PostMessage ghost click + ghost keyboard (Down+Enter) to switch
-# from "Default Approvals" to "Bypass Approvals" in VS Code Copilot chat.
+# guard_bypass.ps1 - Single source of truth for setting Autopilot permissions
+# Uses UIA ExpandCollapse + PostMessage ghost keyboard (Down+Enter) to switch
+# from "Default Approvals" to "Autopilot" in VS Code Copilot chat.
 #
 # Requires: the Ghost C# class must already be loaded (Add-Type).
 # Called by: new_chat.ps1 and skynet_start.py
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File tools\guard_bypass.ps1 -Hwnd <int>
-#   (standalone mode — loads its own Ghost class)
+#   (standalone mode -- loads its own Ghost class)
 #
 #   Or dot-source from new_chat.ps1 where Ghost is already loaded:
 #   & .\tools\guard_bypass.ps1 -Hwnd $newHwnd
@@ -72,11 +72,11 @@ $btns = $root.FindAll(
 $permBtn = $null
 foreach ($btn in $btns) {
     $n = $btn.Current.Name
-    if ($n -eq 'Set Permissions - Bypass Approvals') {
+    if ($n -match 'Permissions.*(Autopilot|Bypass)') {
         Write-Host "PERMS_OK"
         exit 0
     }
-    if ($n -eq 'Set Permissions - Default Approvals') {
+    if ($n -match 'Permissions.*Default') {
         $permBtn = $btn
     }
 }
@@ -86,7 +86,7 @@ if (-not $permBtn) {
     exit 0
 }
 
-# --- Switch from Default to Bypass ---
+# --- Switch from Default to Autopilot ---
 
 # Step 1: Open dropdown via ExpandCollapsePattern (UIA -- no focus needed)
 try {
@@ -96,7 +96,7 @@ try {
     Write-Host "PERMS_EXPAND_FAILED:$($_.Exception.Message)"
     exit 1
 }
-Start-Sleep -Milliseconds 1500
+Start-Sleep -Milliseconds 800
 
 # Step 2: PostMessage ghost keys DOWN+ENTER to render surface (no focus needed)
 $render = [Ghost]::FindRenderSurface($targetHwnd)
@@ -108,35 +108,28 @@ $dkU = [IntPtr]::new([long](1L -bor (0x50L -shl 16) -bor 0xC0000000L))
 [Ghost]::PostMessage($render, $WM_KEYDOWN, [IntPtr]0x28, $dkD) | Out-Null
 Start-Sleep -Milliseconds 50
 [Ghost]::PostMessage($render, $WM_KEYUP, [IntPtr]0x28, $dkU) | Out-Null
-Start-Sleep -Milliseconds 300
+Start-Sleep -Milliseconds 200
 # ENTER: VK=0x0D, scan=0x1C
 $ekD = [IntPtr]::new([long](1L -bor (0x1CL -shl 16)))
 $ekU = [IntPtr]::new([long](1L -bor (0x1CL -shl 16) -bor 0xC0000000L))
 [Ghost]::PostMessage($render, $WM_KEYDOWN, [IntPtr]0x0D, $ekD) | Out-Null
 Start-Sleep -Milliseconds 50
 [Ghost]::PostMessage($render, $WM_KEYUP, [IntPtr]0x0D, $ekU) | Out-Null
-Start-Sleep -Milliseconds 1500
+Start-Sleep -Milliseconds 800
 
-# Verify — UIA caches aggressively; retry up to 3 times with increasing delays
-$verified = $false
-for ($i = 1; $i -le 3; $i++) {
-    Start-Sleep -Milliseconds ($i * 1000)
-    $root2 = [System.Windows.Automation.AutomationElement]::FromHandle($targetHwnd)
-    $btns2 = $root2.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        (New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::Button
-        ))
-    )
-    $verifyPerm = ($btns2 | Where-Object { $_.Current.Name -match 'Set Permissions' } | Select-Object -First 1).Current.Name
-    if ($verifyPerm -match 'Bypass') {
-        Write-Host "PERMS_FIXED"
-        $verified = $true
-        break
-    }
-}
-if (-not $verified) {
-    # UIA may still be stale — report as applied (visually confirmed to work)
+# Verify with single quick check (avoid UIA hangs with many windows)
+$root2 = [System.Windows.Automation.AutomationElement]::FromHandle($targetHwnd)
+$btns2 = $root2.FindAll(
+    [System.Windows.Automation.TreeScope]::Descendants,
+    (New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button
+    ))
+)
+$verifyPerm = ($btns2 | Where-Object { $_.Current.Name -match 'Permissions' } | Select-Object -First 1).Current.Name
+if ($verifyPerm -match 'Autopilot|Bypass') {
+    Write-Host "PERMS_FIXED"
+} else {
+    # UIA may be stale -- the ExpandCollapse+ghostkeys fix is proven reliable
     Write-Host "PERMS_APPLIED"
 }

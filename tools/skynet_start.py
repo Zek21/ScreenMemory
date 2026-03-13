@@ -196,6 +196,71 @@ def http_post(path, body, port=SKYNET_PORT, timeout=10):
         return None
 
 
+# ─── Workers.json Integrity Guard ─────────────────────
+
+def _validate_workers_before_write(workers: list, context: str = "save") -> list:
+    """Validate worker data before writing to workers.json.
+    Prevents corruption by enforcing:
+      1. No duplicate HWNDs across workers
+      2. All HWNDs are alive via IsWindow
+      3. No worker HWND matches the orchestrator HWND
+    Returns the validated (possibly filtered) worker list.
+    Raises ValueError if all workers share the same HWND (corruption signal).
+    """
+    if not workers:
+        return workers
+
+    orch_hwnd = get_orchestrator_hwnd()
+
+    # Collect all HWNDs
+    hwnds = [w.get("hwnd", 0) for w in workers]
+    nonzero = [h for h in hwnds if h]
+
+    # Guard 1: Never write all workers with the same HWND
+    if len(nonzero) > 1 and len(set(nonzero)) == 1:
+        bogus = nonzero[0]
+        log(f"CORRUPTION BLOCKED ({context}): all {len(nonzero)} workers have same HWND={bogus} -- refusing to write", "ERR")
+        raise ValueError(f"All workers have same HWND={bogus}")
+
+    validated = []
+    for w in workers:
+        hwnd = w.get("hwnd", 0)
+        name = w.get("name", "unknown")
+
+        # Guard 2: Validate HWND is alive via IsWindow
+        if hwnd and not user32.IsWindow(int(hwnd)):
+            log(f"HWND INVALID ({context}): worker {name} HWND={hwnd} is not a valid window -- skipping from write", "WARN")
+            continue
+
+        # Guard 3: Never write orchestrator HWND as a worker
+        if hwnd and orch_hwnd and int(hwnd) == int(orch_hwnd):
+            log(f"ORCH HWND BLOCKED ({context}): worker {name} has orchestrator HWND={hwnd} -- skipping", "ERR")
+            continue
+
+        validated.append(w)
+
+    # Guard 1b: Check again after filtering (in case filtering created duplicates)
+    final_hwnds = [w.get("hwnd", 0) for w in validated if w.get("hwnd", 0)]
+    if len(final_hwnds) > 1 and len(set(final_hwnds)) == 1:
+        log(f"CORRUPTION BLOCKED ({context}): post-filter all workers share HWND={final_hwnds[0]}", "ERR")
+        raise ValueError(f"Post-filter all workers share HWND={final_hwnds[0]}")
+
+    # Guard 4: Warn on duplicate HWNDs (two different workers with same HWND)
+    seen = {}
+    for w in validated:
+        hwnd = w.get("hwnd", 0)
+        if hwnd and hwnd in seen:
+            log(f"DUPLICATE HWND ({context}): {w['name']} and {seen[hwnd]} share HWND={hwnd}", "WARN")
+        elif hwnd:
+            seen[hwnd] = w.get("name", "unknown")
+
+    if len(validated) < len(workers):
+        log(f"Filtered workers: {len(workers)} -> {len(validated)} ({context})", "WARN")
+
+    return validated
+    # signed: beta
+
+
 # ─── Win32 Helpers ─────────────────────────────────────
 
 def get_orchestrator_hwnd():
@@ -988,12 +1053,16 @@ def phase_2_dashboard():
 
 
 def _try_restore_saved_workers(orch_hwnd, num_workers):
-    """Check if saved workers are still alive. Returns list of alive workers or None."""
+    """Check if saved workers are still alive. Discovers chat windows to fill dead slots.
+    
+    Returns list of workers (saved alive + discovered adoptees) or None if insufficient.
+    """
     if not WORKERS_FILE.exists():
         return None
     saved = json.loads(WORKERS_FILE.read_text())
     saved_workers = saved.get("workers", [])
     still_alive = []
+    dead_workers = []
     for idx, sw in enumerate(saved_workers):
         hwnd = sw.get("hwnd")
         if hwnd and user32.IsWindowVisible(hwnd):
@@ -1002,9 +1071,43 @@ def _try_restore_saved_workers(orch_hwnd, num_workers):
             log(f"Worker {sw['name']}: HWND={hwnd} still alive", "OK")
             if idx < len(saved_workers) - 1:
                 time.sleep(3)
+        else:
+            dead_workers.append(sw)
+            log(f"Worker {sw['name']}: HWND={hwnd} dead", "WARN")
+
     if len(still_alive) >= num_workers:
         log(f"All {len(still_alive)} workers still connected", "OK")
         return still_alive
+
+    # Not all saved workers alive -- try to discover chat windows to fill dead slots
+    if dead_workers:
+        discovered = get_chat_windows(orch_hwnd)
+        alive_hwnds = {w.get("hwnd", 0) for w in still_alive}
+        untracked = [cw for cw in discovered if cw["hwnd"] not in alive_hwnds]
+
+        if untracked:
+            log(f"Found {len(untracked)} untracked chat window(s) to adopt for {len(dead_workers)} dead slot(s)", "OK")
+            adopted = []
+            for i, dw in enumerate(dead_workers):
+                if i >= len(untracked):
+                    break
+                cw = untracked[i]
+                old_hwnd = dw.get("hwnd", 0)
+                dw["hwnd"] = cw["hwnd"]
+                dw["x"] = cw.get("x", dw.get("x", 0))
+                dw["y"] = cw.get("y", dw.get("y", 0))
+                dw["w"] = cw.get("w", dw.get("w", 930))
+                dw["h"] = cw.get("h", dw.get("h", 500))
+                adopted.append(dw)
+                guard_model(cw["hwnd"], orch_hwnd)
+                log(f"Adopted HWND={cw['hwnd']} as {dw['name'].upper()} (was HWND={old_hwnd})", "OK")
+                time.sleep(1)
+
+            result = still_alive + adopted
+            if len(result) >= num_workers:
+                log(f"Restored {len(still_alive)} saved + {len(adopted)} adopted = {len(result)} workers", "OK")
+                return result
+
     return None
 
 
@@ -1342,8 +1445,37 @@ def _classify_workers(workers):
     return alive, dead
 
 
+def _adopt_discovered_workers(workers, orch_hwnd):
+    """Apply model guard to discovered/adopted worker windows."""
+    for w in workers:
+        hwnd = w.get("hwnd", 0)
+        if hwnd:
+            guard_model(hwnd, orch_hwnd)
+            time.sleep(1)
+            log(f"Model guard applied to adopted {w['name'].upper()} HWND={hwnd}", "OK")
+
+
+def _save_workers_state(workers, engines):
+    """Save workers and engines to workers.json."""
+    now_iso = datetime.now().isoformat()
+    data = {
+        "created": now_iso,
+        "workers": workers,
+        "engines": list(engines.keys()),
+        "reconnected": now_iso,
+    }
+    for w in workers:
+        w["updated_at"] = now_iso
+        w.setdefault("last_seen", now_iso)
+    WORKERS_FILE.write_text(json.dumps(data, indent=2, default=str))
+
+
 def reconnect():
-    """Reconnect to existing workers without opening new windows."""
+    """Reconnect to existing workers without opening new windows.
+    
+    When saved workers are dead, discovers existing VS Code Chat windows
+    on screen and adopts them as replacements.
+    """
     log("Reconnecting to existing workers...", "SYS")
 
     if not phase_1_backend():
@@ -1357,8 +1489,22 @@ def reconnect():
         return False
 
     if not WORKERS_FILE.exists():
-        log("No workers.json -- nothing to reconnect", "ERR")
-        return False
+        # No workers.json -- try to discover chat windows on screen
+        log("No workers.json -- scanning for existing chat windows...", "SYS")
+        discovered = get_chat_windows(orch_hwnd)
+        if discovered:
+            log(f"Discovered {len(discovered)} chat window(s) on screen", "OK")
+            workers = _map_chats_to_workers(discovered, orch_hwnd)
+            _adopt_discovered_workers(workers, orch_hwnd)
+            engines = connect_engines()
+            phase_4_register(workers)
+            phase_4b_identity(workers)
+            _start_post_boot_daemons()
+            _save_workers_state(workers, engines)
+            return True
+        else:
+            log("No workers.json and no chat windows found -- nothing to reconnect", "ERR")
+            return False
 
     data = json.loads(WORKERS_FILE.read_text())
     alive, dead = _classify_workers(data.get("workers", []))
@@ -1367,27 +1513,65 @@ def reconnect():
         log(f"Worker {w['name'].upper()}: HWND={w.get('hwnd', 0)} alive", "OK")
     for w in dead:
         log(f"Worker {w['name'].upper()}: HWND={w.get('hwnd', 0)} dead", "WARN")
+
+    # When dead workers exist, discover chat windows and adopt them as replacements
+    adopted = []
     if dead:
-        log(f"{len(dead)} worker(s) dead -- need to reopen", "WARN")
+        log(f"{len(dead)} worker(s) dead -- scanning for discoverable chat windows...", "SYS")
+        discovered = get_chat_windows(orch_hwnd)
+        # Filter out windows already tracked as alive workers
+        alive_hwnds = {w.get("hwnd", 0) for w in alive}
+        untracked = [cw for cw in discovered if cw["hwnd"] not in alive_hwnds]
+
+        if untracked:
+            log(f"Found {len(untracked)} untracked chat window(s) -- adopting as replacements", "OK")
+            for i, dead_worker in enumerate(dead):
+                if i >= len(untracked):
+                    break
+                cw = untracked[i]
+                old_hwnd = dead_worker.get("hwnd", 0)
+                new_hwnd = cw["hwnd"]
+                dead_worker["hwnd"] = new_hwnd
+                dead_worker["x"] = cw.get("x", dead_worker.get("x", 0))
+                dead_worker["y"] = cw.get("y", dead_worker.get("y", 0))
+                dead_worker["w"] = cw.get("w", dead_worker.get("w", 930))
+                dead_worker["h"] = cw.get("h", dead_worker.get("h", 500))
+                adopted.append(dead_worker)
+                log(f"Adopted HWND={new_hwnd} as {dead_worker['name'].upper()} (was HWND={old_hwnd})", "OK")
+                # Apply model guard to adopted window
+                guard_model(new_hwnd, orch_hwnd)
+                time.sleep(1)
+        else:
+            log(f"{len(dead)} dead worker(s) -- no discoverable chat windows found to adopt", "WARN")
+
+    all_workers = alive + adopted
+    remaining_dead = [w for w in dead if w not in adopted]
 
     engines = connect_engines()
-    phase_4_register(alive)
+    phase_4_register(all_workers)
 
-    if alive:
+    if all_workers:
         log("Reconnect: Identity Injection", "SYS")
-        phase_4b_identity(alive)
+        phase_4b_identity(all_workers)
 
     _start_post_boot_daemons()
 
     now_iso = datetime.now().isoformat()
-    # Update timestamps on reconnected workers  # signed: delta
-    for w in data.get("workers", []):
+    # Rebuild workers list with updated HWNDs
+    updated_workers = all_workers + remaining_dead
+    for w in updated_workers:
         w["updated_at"] = now_iso
         w.setdefault("last_seen", now_iso)
 
+    data["workers"] = updated_workers
     data["engines"] = list(engines.keys())
     data["reconnected"] = now_iso
     WORKERS_FILE.write_text(json.dumps(data, indent=2, default=str))
+
+    if adopted:
+        log(f"Reconnect complete: {len(alive)} saved + {len(adopted)} adopted = {len(all_workers)} workers", "OK")
+    if remaining_dead:
+        log(f"{len(remaining_dead)} worker(s) still dead -- need fresh windows", "WARN")
     return True
 
 

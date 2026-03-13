@@ -835,8 +835,10 @@ def _log_incident(incident_id, old_pid, new_pid):
 
 
 def _check_worker_hwnds_internal():
-    """Check if worker window HWNDs are still valid using Win32 IsWindow().
+    """Check if worker window HWNDs are still valid and visible.
 
+    Uses IsWindowVisible (not just IsWindow) to detect hidden/zombie windows
+    that have a valid HWND but are not actually usable.
     Returns list of dead workers (name, hwnd).
     """
     import ctypes
@@ -852,7 +854,7 @@ def _check_worker_hwnds_internal():
             for w in workers:
                 hwnd = w.get("hwnd", 0)
                 name = w.get("name", "unknown")
-                if hwnd and not user32.IsWindow(int(hwnd)):
+                if hwnd and not user32.IsWindowVisible(int(hwnd)):
                     dead.append({"name": name, "hwnd": hwnd})
     except Exception:
         pass

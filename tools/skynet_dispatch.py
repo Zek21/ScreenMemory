@@ -1412,8 +1412,16 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
 
     hwnd = target["hwnd"]
     if not user32.IsWindowVisible(hwnd):
-        log(f"Worker {worker_name.upper()} window not visible (HWND={hwnd})", "ERR")
-        return False
+        # HWND may be stale -- re-read workers.json in case discovery updated it
+        fresh_workers = load_workers()
+        fresh_target = next((w for w in fresh_workers if w["name"] == worker_name), None)
+        if fresh_target and fresh_target["hwnd"] != hwnd:
+            hwnd = fresh_target["hwnd"]
+            target["hwnd"] = hwnd
+            log(f"Refreshed stale HWND for {worker_name.upper()} -> HWND={hwnd}", "SYS")
+        if not user32.IsWindowVisible(hwnd):
+            log(f"Worker {worker_name.upper()} window not visible (HWND={hwnd})", "ERR")
+            return False
 
     vis_ok, pre_state, ss_path = pre_dispatch_visual_check(hwnd, worker_name)
     if not vis_ok:

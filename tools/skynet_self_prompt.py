@@ -195,7 +195,7 @@ def _get_worker_state(hwnd):
 
 
 def _is_window_alive(hwnd):
-    return bool(user32.IsWindow(int(hwnd)))
+    return bool(user32.IsWindowVisible(int(hwnd)))
 
 
 def _load_workers():

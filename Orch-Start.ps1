@@ -64,11 +64,64 @@ function Get-SkynetStatus {
 Add-Type -Name "OrchUser32" -Namespace "Win32Orch" -MemberDefinition @"
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")]
+    public static extern int GetWindowTextLength(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
 "@ -ErrorAction SilentlyContinue
 
 function Test-WorkerAlive([long]$hwnd) {
     if ($hwnd -le 0) { return $false }
     return [Win32Orch.OrchUser32]::IsWindowVisible([IntPtr]$hwnd)
+}
+
+function Find-ChatWindows {
+    # Discover existing VS Code Chat windows via Win32 EnumWindows.
+    # Returns list of @{Hwnd; Title; Width; Height; X; Y} for detached chat windows.
+    $orchFile = Join-Path $dataDir "orchestrator.json"
+    $orchHwnd = 0
+    if (Test-Path $orchFile) {
+        $orchData = Get-Content $orchFile -Raw | ConvertFrom-Json
+        $orchHwnd = [long]$orchData.orchestrator_hwnd
+    }
+
+    $found = [System.Collections.ArrayList]::new()
+    $callback = [Win32Orch.OrchUser32+EnumWindowsProc]{
+        param([IntPtr]$hwnd, [IntPtr]$lParam)
+        if (-not [Win32Orch.OrchUser32]::IsWindowVisible($hwnd)) { return $true }
+        $len = [Win32Orch.OrchUser32]::GetWindowTextLength($hwnd)
+        if ($len -le 0) { return $true }
+        $sb = New-Object System.Text.StringBuilder($len + 1)
+        [void][Win32Orch.OrchUser32]::GetWindowText($hwnd, $sb, $sb.Capacity)
+        $title = $sb.ToString()
+        if ($title -like "*Visual Studio Code*") {
+            if ([long]$hwnd -ne $orchHwnd) {
+                $r = New-Object Win32Orch.OrchUser32+RECT
+                [void][Win32Orch.OrchUser32]::GetWindowRect($hwnd, [ref]$r)
+                $w = $r.Right - $r.Left
+                if ($w -lt 1200) {
+                    [void]$found.Add(@{
+                        Hwnd   = [long]$hwnd
+                        Title  = $title
+                        Width  = $w
+                        Height = $r.Bottom - $r.Top
+                        X      = $r.Left
+                        Y      = $r.Top
+                    })
+                }
+            }
+        }
+        return $true
+    }
+    [void][Win32Orch.OrchUser32]::EnumWindows($callback, [IntPtr]::Zero)
+    return @($found)
 }
 
 # -- Banner --
@@ -135,7 +188,7 @@ if ($godUp) {
     }
 }
 
-# -- Phase 3: Worker health check --
+# -- Phase 3: Worker health check + window discovery --
 
 $workersFile   = Join-Path $dataDir "workers.json"
 $workersAlive  = 0
@@ -157,6 +210,14 @@ if (Test-Path $workersFile) {
     if ($workersAlive -gt 0) {
         Write-Status "$workersAlive worker(s) alive ($($workerDetails -join ', '))" "OK"
     }
+}
+
+# Discover existing VS Code Chat windows on screen (regardless of workers.json)
+$discoveredChats = Find-ChatWindows
+$discoveredCount = $discoveredChats.Count
+if ($discoveredCount -gt 0) {
+    $chatDetails = ($discoveredChats | ForEach-Object { "HWND=$($_.Hwnd) $($_.Width)x$($_.Height)" }) -join ', '
+    Write-Status "Discovered $discoveredCount VS Code Chat window(s) on screen ($chatDetails)" "OK"
 }
 
 # -- Decision: what needs to happen? --
@@ -184,12 +245,26 @@ if ($SkipInfra) {
 } elseif (-not $skynetUp) {
     $action = "full"
     Write-Status "Backend was down -- full boot needed" "SYS"
+} elseif ($workersAlive -eq 0 -and $discoveredCount -ge $Workers) {
+    # No saved workers alive, but enough chat windows discovered on screen -- adopt them
+    $action = "full"
+    Write-Status "No saved workers alive, but $discoveredCount chat window(s) discovered -- will adopt" "SYS"
 } elseif ($workersAlive -eq 0) {
     $action = "full"
-    Write-Status "No live workers -- full boot needed" "SYS"
+    if ($discoveredCount -gt 0) {
+        Write-Status "No saved workers alive, $discoveredCount chat window(s) found -- will adopt + open remaining" "SYS"
+    } else {
+        Write-Status "No live workers -- full boot needed" "SYS"
+    }
 } elseif ($workersDead -gt 0) {
-    $action = "reconnect"
-    Write-Status "$workersDead dead worker(s) -- reconnect needed" "SYS"
+    if ($discoveredCount -gt $workersAlive) {
+        # More chat windows exist than saved-alive workers -- reconnect with discovery
+        $action = "reconnect"
+        Write-Status "$workersDead dead worker(s), but $discoveredCount chat window(s) on screen -- reconnect with discovery" "SYS"
+    } else {
+        $action = "reconnect"
+        Write-Status "$workersDead dead worker(s) -- reconnect needed" "SYS"
+    }
 } else {
     Write-Status "System fully operational -- nothing to start" "OK"
 }

@@ -170,6 +170,49 @@ public class Ghost {
 }
 "@
 
+# --- UIA scan with timeout (prevents hangs with 4+ VS Code windows) ---
+function Scan-ButtonsWithTimeout {
+    param([long]$Hwnd, [int]$TimeoutMs = 12000)
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.ApartmentState = [System.Threading.ApartmentState]::STA
+    $rs.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript({
+        param($h)
+        Add-Type -AssemblyName UIAutomationClient
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$h)
+        $btns = $root.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            (New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::Button
+            ))
+        )
+        $data = @()
+        foreach ($b in $btns) {
+            $r = $b.Current.BoundingRectangle
+            $data += [PSCustomObject]@{
+                Name = $b.Current.Name
+                CX = [int]($r.X + $r.Width/2)
+                CY = [int]($r.Y + $r.Height/2)
+            }
+        }
+        return $data
+    })
+    [void]$ps.AddArgument($Hwnd)
+    $handle = $ps.BeginInvoke()
+    $completed = $handle.AsyncWaitHandle.WaitOne($TimeoutMs)
+    if ($completed) {
+        $result = $ps.EndInvoke($handle)
+        $ps.Dispose(); $rs.Dispose()
+        return @($result)
+    } else {
+        $ps.Stop(); $ps.Dispose(); $rs.Dispose()
+        return $null
+    }
+}
+
 # --- Load config ---
 $orchConfig = Get-Content "D:\Prospects\ScreenMemory\data\orchestrator.json" | ConvertFrom-Json
 $orchHwnd = [IntPtr]$orchConfig.orchestrator_hwnd
@@ -189,31 +232,43 @@ foreach ($hwnd in $allWindows) {
 }
 
 # --- Check if any existing chat window is empty (no first prompt) ---
-foreach ($cw in $chatWindows) {
-    $cwRoot = [System.Windows.Automation.AutomationElement]::FromHandle($cw)
-    # Conversation messages are ListItem with class 'monaco-list-row request/response'
-    $listItems = $cwRoot.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        (New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::ListItem
-        ))
-    )
-    $chatMessages = 0
-    foreach ($li in $listItems) {
-        if ($li.Current.ClassName -match 'monaco-list-row') {
-            $chatMessages++
-        }
-    }
-    $isEmpty = ($chatMessages -eq 0)
+if (-not $SkipEmptyCheck) {
+    foreach ($cw in $chatWindows) {
+        # Use timeout-protected scan to avoid UIA hangs with many windows
+        $listItemJob = Start-Job -ScriptBlock {
+            param($h)
+            Add-Type -AssemblyName UIAutomationClient
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$h)
+            $items = $root.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                (New-Object System.Windows.Automation.PropertyCondition(
+                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                    [System.Windows.Automation.ControlType]::ListItem
+                ))
+            )
+            $count = 0
+            foreach ($li in $items) {
+                if ($li.Current.ClassName -match 'monaco-list-row') { $count++ }
+            }
+            return $count
+        } -ArgumentList ([long]$cw)
 
-    if ($isEmpty -and -not $SkipEmptyCheck) {
-        Write-Host "BLOCKED: Chat window HWND=$cw has no first prompt yet. Use it before opening another."
-        # Bring the empty window to attention
-        [Ghost]::SetForegroundWindow($cw)
-        Start-Sleep -Milliseconds 300
-        [Ghost]::SetForegroundWindow($orchHwnd)
-        exit 0
+        $completed = $listItemJob | Wait-Job -Timeout 8
+        if ($completed) {
+            $chatMessages = Receive-Job $listItemJob
+            Remove-Job $listItemJob
+        } else {
+            Stop-Job $listItemJob; Remove-Job $listItemJob
+            $chatMessages = 1  # Assume not empty on timeout
+        }
+
+        if ($chatMessages -eq 0) {
+            Write-Host "BLOCKED: Chat window HWND=$cw has no first prompt yet. Use it before opening another."
+            [Ghost]::SetForegroundWindow($cw)
+            Start-Sleep -Milliseconds 300
+            [Ghost]::SetForegroundWindow($orchHwnd)
+            exit 0
+        }
     }
 }
 
@@ -292,246 +347,35 @@ if (-not $placed) {
 # --- Snapshot windows before creation ---
 $before = [Ghost]::GetVSCodeWindows()
 
-# --- Open dropdown menu via ghost click ---
+# --- FAST PATH: Command Palette (reliable, no UIA needed) ---
+# Command Palette is the fastest way to open a new chat window.
+# UIA Descendants scan can hang on complex VS Code DOM; Command Palette avoids this entirely.
 $editorRender = [Ghost]::FindRenderSurface($orchHwnd)
 [Ghost]::SetForegroundWindow($orchHwnd)
-Start-Sleep -Milliseconds 300
+Start-Sleep -Milliseconds 200
+Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+[System.Windows.Forms.SendKeys]::SendWait("^+p")
+Start-Sleep -Milliseconds 800
+[System.Windows.Forms.SendKeys]::SendWait("Chat: New Chat Window")
+Start-Sleep -Milliseconds 1000
+[System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+$launched = $true
 
-$root = [System.Windows.Automation.AutomationElement]::FromHandle($orchHwnd)
-
-# Strategy: find the narrow "New Chat" dropdown button (<=20px wide)
-# This exists in panel chat view. In editor chat view we need a different approach.
-# Retry up to 3 times -- UIA tree may load lazily in Chromium/Electron  # signed: gamma
-$buttons = $null
-for ($uiaRetry = 1; $uiaRetry -le 3; $uiaRetry++) {
-    $buttons = $root.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        (New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::Button
-        ))
-    )
-    if ($buttons.Count -gt 0) { break }
-    Write-Host "UIA retry $uiaRetry/3: 0 buttons found, waiting for tree..."
-    Start-Sleep -Milliseconds 1500
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($orchHwnd)
-}
-Write-Host "UIA found $($buttons.Count) button(s)"
-
-$dropdown = $null
-$orchRect = New-Object Ghost+RECT
-[Ghost]::GetWindowRect($orchHwnd, [ref]$orchRect)
-$winTop = $orchRect.Top
-
-# Strategy 1: ExpandCollapsePattern button that is small (≤25px wide) AND near the top of the window (toolbar area)
-foreach ($btn in $buttons) {
-    $n = $btn.Current.Name
-    try {
-        $w = [int]$btn.Current.BoundingRectangle.Width
-        $h = [int]$btn.Current.BoundingRectangle.Height
-        $y = [int]$btn.Current.BoundingRectangle.Y
-    } catch { continue }
-    if ($w -le 0 -or $h -le 0) { continue }
-    if ($w -gt 25) { continue }  # The ▾ chevron is narrow (≤25px)
-    if (($y - $winTop) -gt 200) { continue }  # Must be in top 200px of window (toolbar)
-    try {
-        $exp = $btn.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-        if ($exp -ne $null) {
-            $dropdown = $btn
-            Write-Host "DROPDOWN: found via ExpandCollapse -- '$n' w=$w y=$y"
-            break
-        }
-    } catch {}
-}
-
-# Strategy 2: button name contains ▾ or explicit chevron label
-if (-not $dropdown) {
-    foreach ($btn in $buttons) {
-        $n = $btn.Current.Name
-        $w = [int]$btn.Current.BoundingRectangle.Width
-        $h = [int]$btn.Current.BoundingRectangle.Height
-        if ($w -le 0 -or $h -le 0) { continue }
-        if ($n -match '▾|chevron|dropdown' -or ($n -match 'New Chat' -and $w -lt 25)) {
-            $dropdown = $btn
-            Write-Host "DROPDOWN: found via name match -- '$n' w=$w"
+# --- Poll for new window (faster than fixed 4s wait) ---
+$newHwnd = $null
+for ($poll = 1; $poll -le 8; $poll++) {
+    Start-Sleep -Milliseconds 500
+    $after = [Ghost]::GetVSCodeWindows()
+    foreach ($hwnd in $after) {
+        if ($before -notcontains $hwnd) {
+            $newHwnd = $hwnd
             break
         }
     }
+    if ($newHwnd) { break }
 }
-
-# Strategy 3: narrowest visible "New Chat" button (original fallback)
-if (-not $dropdown) {
-    $dropdownW = 999
-    foreach ($btn in $buttons) {
-        $n = $btn.Current.Name
-        $w = [int]$btn.Current.BoundingRectangle.Width
-        $h = [int]$btn.Current.BoundingRectangle.Height
-        if ($n -eq 'New Chat' -and $w -gt 0 -and $h -gt 15 -and $w -lt $dropdownW) {
-            $dropdown = $btn
-            $dropdownW = $w
-        }
-    }
-    if ($dropdown) { Write-Host "DROPDOWN: found via narrowest fallback -- w=$dropdownW" }
-}
-
-# Strategy 4 (NEW): Search by Name="New Chat" across all control types  # signed: gamma
-# VS Code Insiders may expose buttons as Custom, SplitButton, or other types
-if (-not $dropdown) {
-    try {
-        $namedElements = $root.FindAll(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            (New-Object System.Windows.Automation.PropertyCondition(
-                [System.Windows.Automation.AutomationElement]::NameProperty,
-                "New Chat"
-            ))
-        )
-        Write-Host "STRATEGY 4: Found $($namedElements.Count) elements named 'New Chat'"
-        foreach ($el in $namedElements) {
-            try {
-                $w = [int]$el.Current.BoundingRectangle.Width
-                $h = [int]$el.Current.BoundingRectangle.Height
-                $y = [int]$el.Current.BoundingRectangle.Y
-            } catch { continue }
-            if ($w -le 0 -or $h -le 0) { continue }
-            if ($w -le 30 -and ($y - $winTop) -lt 200) {
-                $dropdown = $el
-                Write-Host "DROPDOWN: found via name search (narrow) -- w=$w type=$($el.Current.ControlType.ProgrammaticName)"
-                break
-            }
-        }
-        # Fallback: take any "New Chat" element that supports ExpandCollapse
-        if (-not $dropdown) {
-            foreach ($el in $namedElements) {
-                try {
-                    $exp = $el.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-                    if ($exp -ne $null) {
-                        $dropdown = $el
-                        Write-Host "DROPDOWN: found 'New Chat' with ExpandCollapse -- type=$($el.Current.ControlType.ProgrammaticName)"
-                        break
-                    }
-                } catch {}
-            }
-        }
-    } catch {
-        Write-Host "STRATEGY 4 failed: $_"
-    }
-}
-
-# Strategy 5 (NEW): Search for SplitButton control type  # signed: gamma
-if (-not $dropdown) {
-    try {
-        $splitButtons = $root.FindAll(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            (New-Object System.Windows.Automation.PropertyCondition(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                [System.Windows.Automation.ControlType]::SplitButton
-            ))
-        )
-        Write-Host "STRATEGY 5: Found $($splitButtons.Count) SplitButton(s)"
-        foreach ($sb in $splitButtons) {
-            $n = $sb.Current.Name
-            if ($n -match 'New Chat|Chat') {
-                $dropdown = $sb
-                Write-Host "DROPDOWN: found SplitButton '$n'"
-                break
-            }
-        }
-    } catch {
-        Write-Host "STRATEGY 5 failed: $_"
-    }
-}
-
-# Strategy 6: Command Palette Fallback -- guaranteed to work  # signed: gamma
-$usedCommandPalette = $false
-if (-not $dropdown) {
-    $btnList = @()
-    foreach ($btn in $buttons) {
-        $n = $btn.Current.Name
-        $w = [int]$btn.Current.BoundingRectangle.Width
-        if ($n -ne '' -and $w -gt 0) { $btnList += "$n(${w}px)" }
-    }
-    Write-Host "FALLBACK: All UIA strategies failed. Buttons: $($btnList -join ', ')"
-    Write-Host "Using Command Palette to open new chat window."
-    [Ghost]::SetForegroundWindow($orchHwnd)
-    Start-Sleep -Milliseconds 400
-    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-    [System.Windows.Forms.SendKeys]::SendWait("^+p")
-    Start-Sleep -Milliseconds 1200
-    [System.Windows.Forms.SendKeys]::SendWait("Chat: New Chat Window")
-    Start-Sleep -Milliseconds 1500
-    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
-    $usedCommandPalette = $true
-}
-
-$launched = $usedCommandPalette  # signed: gamma
-if (-not $usedCommandPalette) {
-    $dr = $dropdown.Current.BoundingRectangle
-
-    # Use ExpandCollapsePattern.Expand() -- more reliable than ghost click
-    try {
-        $exp = $dropdown.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-        $exp.Expand()
-    } catch {
-        [Ghost]::Click($editorRender, [int]($dr.X + $dr.Width/2), [int]($dr.Y + $dr.Height/2))
-    }
-    Start-Sleep -Milliseconds 1200
-
-    # --- Click "New Chat Window" via real mouse at its UIA coordinates ---
-    for ($attempt = 1; $attempt -le 3 -and -not $launched; $attempt++) {
-        $desktop = [System.Windows.Automation.AutomationElement]::RootElement
-        $menuItems = $desktop.FindAll(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            (New-Object System.Windows.Automation.PropertyCondition(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                [System.Windows.Automation.ControlType]::MenuItem
-            ))
-        )
-        foreach ($mi in $menuItems) {
-            if ($mi.Current.Name -eq 'New Chat Window') {
-                try {
-                    $mir = $mi.Current.BoundingRectangle
-                    $mix = [int]($mir.X + $mir.Width/2)
-                    $miy = [int]($mir.Y + $mir.Height/2)
-                    [MouseClick]::ClickAt($mix, $miy)
-                } catch {
-                    try { $mi.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() } catch {}
-                }
-                $launched = $true
-                break
-            }
-        }
-        if (-not $launched) {
-            # Menu may have closed -- re-expand dropdown
-            Write-Host "RETRY ${attempt}: re-expanding dropdown"
-            try {
-                $exp = $dropdown.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-                $exp.Expand()
-            } catch {
-                [Ghost]::Click($editorRender, [int]($dr.X + $dr.Width/2), [int]($dr.Y + $dr.Height/2))
-            }
-            Start-Sleep -Milliseconds 1000
-        }
-    }
-
-    if (-not $launched) {
-        Record-Failure "Could not find New Chat Window menu item"
-        Write-Host "ERROR: Could not find 'New Chat Window' menu item"
-        exit 1
-    }
-}
-
-Start-Sleep -Milliseconds 4000
 
 # --- Find the new window ---
-$after = [Ghost]::GetVSCodeWindows()
-$newHwnd = $null
-foreach ($hwnd in $after) {
-    if ($before -notcontains $hwnd) {
-        $newHwnd = $hwnd
-        break
-    }
-}
-
 if (-not $newHwnd) {
     Record-Failure "New chat window not detected"
     Write-Host "ERROR: New chat window not detected"
@@ -541,136 +385,122 @@ if (-not $newHwnd) {
 # --- Position without overlap ---
 [Ghost]::MoveWindow($newHwnd, $newX, $newY, $Width, $Height, $true)
 
-# --- Configure session target to Copilot CLI (invisible) ---
+# --- Configure: Session Target + Model + Permissions ---
 $newRender = [Ghost]::FindRenderSurface($newHwnd)
 [Ghost]::SetForegroundWindow($newHwnd)
-Start-Sleep -Milliseconds 2000
+Start-Sleep -Milliseconds 600
+Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
 
-$chatRoot = [System.Windows.Automation.AutomationElement]::FromHandle($newHwnd)
-$chatButtons = $chatRoot.FindAll(
-    [System.Windows.Automation.TreeScope]::Descendants,
-    (New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Button
-    ))
-)
-
+$target = "unknown"
+$model = "unknown"
+$permsLabel = "unknown"
 $needsConfig = $false
-foreach ($btn in $chatButtons) {
-    if ($btn.Current.Name -match 'Session Target' -and $btn.Current.Name -notmatch 'Copilot CLI') {
-        $r = $btn.Current.BoundingRectangle
-        [Ghost]::Click($newRender, [int]($r.X + $r.Width/2), [int]($r.Y + $r.Height/2))
-        $needsConfig = $true
-        break
-    }
-}
 
-if ($needsConfig) {
-    Start-Sleep -Milliseconds 1500
-
-    $checkboxes = $desktop.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        (New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::CheckBox
-        ))
-    )
-    foreach ($cb in $checkboxes) {
-        if ($cb.Current.Name -eq 'Copilot CLI' -and $cb.Current.BoundingRectangle.Width -gt 0) {
-            $tog = $cb.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
-            $tog.Toggle()
-            break
-        }
-    }
-    Start-Sleep -Milliseconds 1000
-}
-
-# --- MODEL GUARD: Ensure Claude Opus 4.6 (fast mode) — max 2 attempts ---
-for ($modelAttempt = 1; $modelAttempt -le 2; $modelAttempt++) {
-    Start-Sleep -Milliseconds 500
-    $chatRootM = [System.Windows.Automation.AutomationElement]::FromHandle($newHwnd)
-    $mButtons = $chatRootM.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        (New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::Button
-        ))
-    )
-
-    $pickModelBtn = $null
-    $currentModelName = ""
-    foreach ($btn in $mButtons) {
-        if ($btn.Current.Name -match 'Pick Model') {
-            $pickModelBtn = $btn
-            $currentModelName = $btn.Current.Name
-            break
-        }
-    }
-
-    # Already correct or no button found — done
-    if (-not $pickModelBtn -or $currentModelName -match 'Opus.*fast') {
-        if ($pickModelBtn) { Write-Host "MODEL_GUARD: OK -- $currentModelName" }
+for ($guardPass = 1; $guardPass -le 2; $guardPass++) {
+    $buttons = Scan-ButtonsWithTimeout -Hwnd ([long]$newHwnd) -TimeoutMs 12000
+    if (-not $buttons) {
+        Write-Host "UIA_TIMEOUT: Button scan timed out (pass $guardPass)"
         break
     }
 
-    Write-Host "MODEL_GUARD: Wrong model '$currentModelName' -- attempt $modelAttempt/2..."
-    [Ghost]::SetForegroundWindow($newHwnd)
-    Start-Sleep -Milliseconds 300
+    # --- SESSION TARGET (pass 1 only) ---
+    if ($guardPass -eq 1) {
+        $stBtn = $buttons | Where-Object { $_.Name -match 'Session Target' } | Select-Object -First 1
+        if ($stBtn) {
+            if ($stBtn.Name -notmatch 'Copilot CLI') {
+                [Ghost]::SetForegroundWindow($newHwnd)
+                Start-Sleep -Milliseconds 200
+                [MouseClick]::ClickAt($stBtn.CX, $stBtn.CY)
+                Write-Host "SESSION_TARGET: clicked at $($stBtn.CX),$($stBtn.CY)"
+                Start-Sleep -Milliseconds 600
+                [System.Windows.Forms.SendKeys]::SendWait("CLI")
+                Start-Sleep -Milliseconds 300
+                [System.Windows.Forms.SendKeys]::SendWait(" ")
+                Start-Sleep -Milliseconds 200
+                [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+                Start-Sleep -Milliseconds 400
+                $target = "Set Session Target - Copilot CLI"
+                $needsConfig = $true
+            } else {
+                $target = $stBtn.Name
+            }
+        }
+    }
 
-    # Click Pick Model button to open quickpick
-    $pmr = $pickModelBtn.Current.BoundingRectangle
-    [Ghost]::SetForegroundWindow($newHwnd)
-    Start-Sleep -Milliseconds 400
-    [Ghost]::Click($newRender, [int]($pmr.X + $pmr.Width/2), [int]($pmr.Y + $pmr.Height/2))
-    Start-Sleep -Milliseconds 2000
+    # --- MODEL GUARD ---
+    $pmBtn = $buttons | Where-Object { $_.Name -match 'Pick Model' } | Select-Object -First 1
+    if ($pmBtn) {
+        $model = $pmBtn.Name
+        if ($model -notmatch 'Opus.*fast') {
+            Write-Host "MODEL_GUARD: Wrong model '$model' -- attempt $guardPass/2..."
+            [Ghost]::SetForegroundWindow($newHwnd)
+            Start-Sleep -Milliseconds 200
+            [MouseClick]::ClickAt($pmBtn.CX, $pmBtn.CY)
+            Start-Sleep -Milliseconds 1200
+            [System.Windows.Forms.SendKeys]::SendWait("fast")
+            Start-Sleep -Milliseconds 800
+            [System.Windows.Forms.SendKeys]::SendWait("{DOWN}{ENTER}")
+            Start-Sleep -Milliseconds 500
+            Write-Host "MODEL_GUARD: Selected Opus fast via keyboard filter"
+            continue  # Re-scan to verify model stuck
+        } else {
+            Write-Host "MODEL_GUARD: OK -- $model"
+        }
+    }
 
-    # Type "opus" to filter to Claude Opus models only (avoids "Grok Code Fast" false match)
-    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-    [System.Windows.Forms.SendKeys]::SendWait("opus")
-    Start-Sleep -Milliseconds 1500
+    # --- PERMISSION GUARD ---
+    $pBtn = $buttons | Where-Object { $_.Name -match 'Permissions' } | Select-Object -First 1
+    if ($pBtn) {
+        if ($pBtn.Name -match '(Autopilot|Bypass)') {
+            $permsLabel = "Autopilot"
+            Write-Host "PERMS_OK: $($pBtn.Name)"
+        } elseif ($pBtn.Name -match 'Default') {
+            # Click permission button with real mouse → dropdown opens
+            [Ghost]::SetForegroundWindow($newHwnd)
+            Start-Sleep -Milliseconds 200
+            [MouseClick]::ClickAt($pBtn.CX, $pBtn.CY)
+            Start-Sleep -Milliseconds 800
+            # Real keyboard DOWN+ENTER to select Autopilot (PostMessage ghost keys silently fail)
+            [System.Windows.Forms.SendKeys]::SendWait("{DOWN}{ENTER}")
+            Start-Sleep -Milliseconds 500
+            $permsLabel = "Autopilot (pending verify)"
+            Write-Host "PERMS_APPLIED_PENDING_VERIFY"
+        }
+    }
 
-    # First result should be Opus fast -- Down+Enter to select
-    [System.Windows.Forms.SendKeys]::SendWait("{DOWN}{ENTER}")
-    Start-Sleep -Milliseconds 1000
-    Write-Host "MODEL_GUARD: Selected Opus fast via keyboard filter"
+    break  # Done — no continue means model was OK
 }
 
-# --- PERMISSION GUARD: Set Bypass Approvals ---
-# Uses shared guard_bypass.ps1 (single source of truth)
-# No focus needed — uses UIA Expand + PostMessage ghost keys
+# --- POST-GUARD VISUAL VERIFICATION (mandatory — never trust reported values) ---
+$verifyButtons = Scan-ButtonsWithTimeout -Hwnd ([long]$newHwnd) -TimeoutMs 10000
+if ($verifyButtons) {
+    $vSession = $verifyButtons | Where-Object { $_.Name -match 'Session Target' } | Select-Object -First 1
+    $vModel   = $verifyButtons | Where-Object { $_.Name -match 'Pick Model' } | Select-Object -First 1
+    $vPerms   = $verifyButtons | Where-Object { $_.Name -match 'Permissions' } | Select-Object -First 1
 
-$guardScript = Join-Path $PSScriptRoot "guard_bypass.ps1"
-$guardOutput = & $guardScript -Hwnd $newHwnd 6>&1 2>&1 | Out-String
-Write-Host $guardOutput.Trim()
-$permsApplied = $guardOutput -match 'PERMS_FIXED|PERMS_APPLIED|PERMS_OK'
+    if ($vSession) { $target = $vSession.Name }
+    if ($vModel)   { $model = $vModel.Name }
+    if ($vPerms) {
+        if ($vPerms.Name -match '(Autopilot|Bypass)') {
+            $permsLabel = "Autopilot"
+            Write-Host "PERMS_VERIFIED: $($vPerms.Name)"
+        } else {
+            $permsLabel = "FAILED:$($vPerms.Name)"
+            Write-Host "PERMS_VERIFY_FAILED: Still shows '$($vPerms.Name)' -- Autopilot NOT applied"
+        }
+    }
 
-# --- Verify ---
-# guard_bypass.ps1 does its own retry verification with increasing delays.
-# UIA can return stale names, so we trust the guard output + visual confirmation.
-# Still read UIA for model/target reporting below.
-Start-Sleep -Milliseconds 1000
-$chatRoot3 = [System.Windows.Automation.AutomationElement]::FromHandle($newHwnd)
-$finalButtons = $chatRoot3.FindAll(
-    [System.Windows.Automation.TreeScope]::Descendants,
-    (New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Button
-    ))
-)
-
-$target = ""; $model = ""; $perms = ""
-foreach ($btn in $finalButtons) {
-    $name = $btn.Current.Name
-    if ($name -match 'Session Target|Delegate Session') { $target = $name }
-    if ($name -match 'Pick Model') { $model = $name }
-    if ($name -match 'Set Permissions') { $perms = $name }
+    Write-Host "VERIFY: session='$target' model='$model' perms='$permsLabel'"
+} else {
+    Write-Host "VERIFY_TIMEOUT: Could not re-scan buttons for verification"
 }
 
-# Final model guard check — fail loudly if still wrong
-if ($model -and $model -notmatch 'Opus.*fast') {
+# Final model guard check
+if ($model -and $model -notmatch 'Opus.*fast' -and $model -ne 'unknown') {
     Record-Failure "Model guard failed -- model is '$model'"
     Write-Host "ERROR: MODEL_GUARD_FAILED -- model is '$model', expected Claude Opus 4.6 (fast mode)"
 }
+
 
 # --- Restore orchestrator ---
 [Ghost]::SetForegroundWindow($orchHwnd)
@@ -681,5 +511,4 @@ Clear-Failures
 # --- Report ---
 $cursor = New-Object Ghost+POINT
 [Ghost]::GetCursorPos([ref]$cursor)
-$permsLabel = $(if ($permsApplied) { "Bypass Approvals" } else { $perms })
 Write-Host "OK HWND=$newHwnd pos=$newX,$newY | $target | $model | $permsLabel | cursor=$($cursor.X),$($cursor.Y)"
