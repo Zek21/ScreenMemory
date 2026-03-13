@@ -635,6 +635,7 @@ async def _ws_handler(websocket):
 
 async def _ws_push_loop():
     """Push updates to all WS clients every 3s."""
+    global _ws_clients
     while True:
         await asyncio.sleep(3)
         if not _ws_clients:
