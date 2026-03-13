@@ -347,18 +347,46 @@ if (-not $placed) {
 # --- Snapshot windows before creation ---
 $before = [Ghost]::GetVSCodeWindows()
 
-# --- FAST PATH: Command Palette (reliable, no UIA needed) ---
-# Command Palette is the fastest way to open a new chat window.
-# UIA Descendants scan can hang on complex VS Code DOM; Command Palette avoids this entirely.
-$editorRender = [Ghost]::FindRenderSurface($orchHwnd)
+# --- Open new chat window via dropdown button (next to chat sparkle icon) ---
+# Uses UIA to find the dropdown button, clicks it, then keyboard-navigates to "New Chat Window".
 [Ghost]::SetForegroundWindow($orchHwnd)
-Start-Sleep -Milliseconds 200
+Start-Sleep -Milliseconds 300
 Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
-[System.Windows.Forms.SendKeys]::SendWait("^+p")
+
+$buttons = Scan-ButtonsWithTimeout -Hwnd ([long]$orchHwnd) -TimeoutMs 12000
+if (-not $buttons) {
+    Record-Failure "UIA button scan timeout during dropdown search"
+    Write-Host "ERROR: UIA button scan timed out"
+    exit 1
+}
+
+# Primary: "More Actions" dropdown next to chat sparkle in title bar (top 45px)
+$chatDropdownBtn = $buttons | Where-Object {
+    $_.Name -eq 'More Actions' -and $_.CY -lt 45
+} | Select-Object -First 1
+
+# Fallback: "New Chat" chevron-down in chat panel header
+if (-not $chatDropdownBtn) {
+    $chatDropdownBtn = $buttons | Where-Object {
+        $_.Name -eq 'New Chat' -and $_.CY -gt 40 -and $_.CY -lt 90
+    } | Select-Object -Last 1
+}
+
+if (-not $chatDropdownBtn) {
+    Record-Failure "No chat dropdown button found via UIA"
+    Write-Host "ERROR: Cannot find chat dropdown button via UIA"
+    exit 1
+}
+
+# Click the dropdown to open the menu
+[MouseClick]::ClickAt($chatDropdownBtn.CX, $chatDropdownBtn.CY)
+Write-Host "DROPDOWN: Clicked '$($chatDropdownBtn.Name)' at $($chatDropdownBtn.CX),$($chatDropdownBtn.CY)"
 Start-Sleep -Milliseconds 800
-[System.Windows.Forms.SendKeys]::SendWait("Chat: New Chat Window")
-Start-Sleep -Milliseconds 1000
-[System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+
+# Navigate to "New Chat Window" in the dropdown
+# Menu: Open Chat, Open Inline Chat, Open Quick Chat, New Chat Editor, New Chat Window
+[System.Windows.Forms.SendKeys]::SendWait("{DOWN}{DOWN}{DOWN}{DOWN}{DOWN}{ENTER}")
+Start-Sleep -Milliseconds 300
 $launched = $true
 
 # --- Poll for new window (faster than fixed 4s wait) ---
