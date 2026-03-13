@@ -474,5 +474,35 @@
     "old_pid": 22344,
     "new_pid": 22344,
     "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_gemini_consultant_bridge_restart_1773376415",
+    "timestamp": "2026-03-13T12:33:35",
+    "what_happened": "Service gemini_consultant_bridge_restart died (PID 21660)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 21660)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "gemini_consultant_bridge_restart",
+    "timestamp": "2026-03-13T12:33:35.672109",
+    "old_pid": 21660,
+    "new_pid": 21660,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_consultant_bridge_restart_1773377426",
+    "timestamp": "2026-03-13T12:50:26",
+    "what_happened": "Service consultant_bridge_restart died (PID 22344)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 22344)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "consultant_bridge_restart",
+    "timestamp": "2026-03-13T12:50:26.724314",
+    "old_pid": 22344,
+    "new_pid": 22344,
+    "type": "auto_restart"
   }
 ]

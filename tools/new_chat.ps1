@@ -122,6 +122,11 @@ public class Ghost {
     [DllImport("user32.dll")] public static extern IntPtr FindWindowEx(IntPtr hwndParent, IntPtr hwndChildAfter, string lpszClass, string lpszWindow);
     [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
     public struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
     [StructLayout(LayoutKind.Sequential)]
@@ -134,6 +139,41 @@ public class Ghost {
         PostMessage(renderHwnd, 0x0201, (IntPtr)0x0001, lParam);
         System.Threading.Thread.Sleep(50);
         PostMessage(renderHwnd, 0x0202, IntPtr.Zero, lParam);
+    }
+
+    // PostMessage key press (no mouse, no focus steal)
+    public static void PostKey(IntPtr hwnd, ushort vk) {
+        PostMessage(hwnd, 0x0100, (IntPtr)vk, IntPtr.Zero);
+        System.Threading.Thread.Sleep(50);
+        PostMessage(hwnd, 0x0101, (IntPtr)vk, IntPtr.Zero);
+    }
+
+    // PostMessage character input (for typing into QuickInput pickers)
+    public static void PostChar(IntPtr hwnd, char c) {
+        PostMessage(hwnd, 0x0102, (IntPtr)c, IntPtr.Zero);  // WM_CHAR
+        System.Threading.Thread.Sleep(30);
+    }
+
+    public static void PostString(IntPtr hwnd, string text) {
+        foreach (char c in text) {
+            PostChar(hwnd, c);
+        }
+    }
+
+    // Force window to TRUE foreground via minimize+restore trick
+    public static bool ForceForeground(IntPtr target) {
+        ShowWindow(target, 6);  // SW_MINIMIZE
+        System.Threading.Thread.Sleep(400);
+        ShowWindow(target, 9);  // SW_RESTORE
+        System.Threading.Thread.Sleep(400);
+        uint tid = GetCurrentThreadId();
+        uint pid;
+        uint targetTid = GetWindowThreadProcessId(target, out pid);
+        AttachThreadInput(tid, targetTid, true);
+        bool ok = SetForegroundWindow(target);
+        AttachThreadInput(tid, targetTid, false);
+        System.Threading.Thread.Sleep(300);
+        return GetForegroundWindow() == target;
     }
 
     public delegate bool EnumChildWP(IntPtr h, IntPtr l);
@@ -172,22 +212,29 @@ public class Ghost {
 }
 "@
 
-# --- Set Autopilot permissions via UIA SetFocus + ExpandCollapsePattern + keyboard ---
-# NO mouse movement. Uses SetFocus + ExpandCollapsePattern to open the dropdown,
-# then keyboard DOWN+DOWN+ENTER to select Autopilot (3rd item).
-# TogglePattern changes UIA state but doesn't commit in VS Code -- keyboard selection does.
+# --- Set Autopilot permissions via ForceForeground + UIA Expand + PostMessage keys ---
+# NO mouse movement. Uses minimize+restore to force TRUE foreground, then UIA
+# SetFocus + ExpandCollapsePattern to visually open the dropdown, then PostMessage
+# END+ENTER to select Autopilot (last item). PostMessage keys navigate within the
+# open dropdown without requiring SendKeys foreground privileges.
+# NEVER use TogglePattern -- it desyncs UIA from visual state permanently.
 # MUST run in STA thread (call with powershell -STA -File).
 function Set-AutopilotPermissions {
     param([long]$Hwnd, [int]$TimeoutMs = 15000)
-    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
     $hwnd = [IntPtr]$Hwnd
-    [Ghost]::SetForegroundWindow($hwnd)
-    Start-Sleep -Milliseconds 500
+
+    # Step 1: Force TRUE foreground via minimize+restore trick
+    $fg = [Ghost]::ForceForeground($hwnd)
+    if (-not $fg) {
+        Write-Host "  WARN: ForceForeground failed for $Hwnd, trying SetForegroundWindow"
+        [Ghost]::SetForegroundWindow($hwnd)
+        Start-Sleep -Milliseconds 500
+    }
 
     $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
     if (-not $root) { return 'NO_ROOT' }
 
-    # Find the permissions button
+    # Find the permissions button (matches "Set Permissions", "Approvals", "Autopilot")
     $btnCond = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
         [System.Windows.Automation.ControlType]::Button
@@ -195,7 +242,7 @@ function Set-AutopilotPermissions {
     $btns = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
     $permBtn = $null
     foreach ($b in $btns) {
-        if ($b.Current.Name -match 'Permissions') {
+        if ($b.Current.Name -match 'Permissions|Approvals|Autopilot') {
             $permBtn = $b
             break
         }
@@ -203,26 +250,24 @@ function Set-AutopilotPermissions {
     if (-not $permBtn) { return 'NO_PERMS_BUTTON' }
     if ($permBtn.Current.Name -match 'Autopilot') { return 'ALREADY_AUTOPILOT' }
 
-    # SetFocus first (required for Expand to work from background context)
+    # Step 2: SetFocus + Expand to visually open dropdown
     $permBtn.SetFocus()
-    Start-Sleep -Milliseconds 400
+    Start-Sleep -Milliseconds 500
 
-    # Open dropdown via ExpandCollapsePattern
     try {
         $ec = $permBtn.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+        try { $ec.Collapse(); Start-Sleep -Milliseconds 300 } catch {}
         $ec.Expand()
     } catch {
         return "EXPAND_FAILED:$($_.Exception.Message)"
     }
-    Start-Sleep -Milliseconds 1200
+    Start-Sleep -Milliseconds 1000
 
-    # Select Autopilot via keyboard: DOWN DOWN ENTER (Autopilot is the 3rd item)
-    # Item order: Default Approvals, Bypass Approvals, Autopilot (Preview)
-    [System.Windows.Forms.SendKeys]::SendWait("{DOWN}")
-    Start-Sleep -Milliseconds 200
-    [System.Windows.Forms.SendKeys]::SendWait("{DOWN}")
-    Start-Sleep -Milliseconds 200
-    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    # Step 3: PostMessage END+ENTER to select Autopilot (last item in dropdown)
+    # END jumps to last item regardless of current selection position
+    [Ghost]::PostKey($hwnd, 0x23)  # VK_END
+    Start-Sleep -Milliseconds 300
+    [Ghost]::PostKey($hwnd, 0x0D)  # VK_RETURN
     Start-Sleep -Milliseconds 800
     return 'OK'
 }
@@ -576,6 +621,8 @@ for ($guardPass = 1; $guardPass -le 2; $guardPass++) {
                     if ($ub.Current.Name -match 'Session Target') { $stUia = $ub; break }
                 }
                 if ($stUia) {
+                    # Force foreground for keyboard input to work
+                    [Ghost]::ForceForeground($newHwnd) | Out-Null
                     try {
                         $stUia.SetFocus()
                         Start-Sleep -Milliseconds 300
@@ -588,11 +635,11 @@ for ($guardPass = 1; $guardPass -le 2; $guardPass++) {
                         [Ghost]::Click($renderST, $stBtn.CX, $stBtn.CY)
                     }
                     Start-Sleep -Milliseconds 600
-                    [System.Windows.Forms.SendKeys]::SendWait("CLI")
+                    [Ghost]::PostString($newHwnd, "CLI")
                     Start-Sleep -Milliseconds 300
-                    [System.Windows.Forms.SendKeys]::SendWait(" ")
+                    [Ghost]::PostChar($newHwnd, [char]' ')
                     Start-Sleep -Milliseconds 200
-                    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+                    [Ghost]::PostKey($newHwnd, 0x0D)  # ENTER
                     Start-Sleep -Milliseconds 400
                     $target = "Set Session Target - Copilot CLI"
                     $needsConfig = $true
@@ -623,6 +670,8 @@ for ($guardPass = 1; $guardPass -le 2; $guardPass++) {
                 if ($ub.Current.Name -match 'Pick Model') { $pmUia = $ub; break }
             }
             if ($pmUia) {
+                # Force foreground for keyboard input to work
+                [Ghost]::ForceForeground($newHwnd) | Out-Null
                 try {
                     $pmUia.SetFocus()
                     Start-Sleep -Milliseconds 300
@@ -636,9 +685,10 @@ for ($guardPass = 1; $guardPass -le 2; $guardPass++) {
                 }
             }
             Start-Sleep -Milliseconds 1200
-            [System.Windows.Forms.SendKeys]::SendWait("fast")
+            [Ghost]::PostString($newHwnd, "fast")
             Start-Sleep -Milliseconds 800
-            [System.Windows.Forms.SendKeys]::SendWait("{DOWN}{ENTER}")
+            [Ghost]::PostKey($newHwnd, 0x28)  # DOWN
+            [Ghost]::PostKey($newHwnd, 0x0D)  # ENTER
             Start-Sleep -Milliseconds 500
             Write-Host "MODEL_GUARD: Selected Opus fast via keyboard filter"
             continue  # Re-scan to verify model stuck
@@ -647,13 +697,13 @@ for ($guardPass = 1; $guardPass -le 2; $guardPass++) {
         }
     }
 
-    # --- PERMISSION GUARD (uses UIA TogglePattern on dropdown CheckBox items) ---
+    # --- PERMISSION GUARD (ForceForeground + UIA Expand + PostMessage END+ENTER) ---
     $pBtn = $buttons | Where-Object { $_.Name -match 'Permissions' } | Select-Object -First 1
     if ($pBtn) {
-        if ($pBtn.Name -match '(Autopilot|Bypass)') {
+        if ($pBtn.Name -match 'Autopilot') {
             $permsLabel = "Autopilot"
             Write-Host "PERMS_OK: $($pBtn.Name)"
-        } elseif ($pBtn.Name -match 'Default') {
+        } elseif ($pBtn.Name -match 'Default|Bypass') {
             $permsResult = Set-AutopilotPermissions -Hwnd ([long]$newHwnd)
             if ($permsResult -eq 'OK') {
                 $permsLabel = "Autopilot (pending verify)"
@@ -678,12 +728,12 @@ if ($verifyButtons) {
     if ($vSession) { $target = $vSession.Name }
     if ($vModel)   { $model = $vModel.Name }
     if ($vPerms) {
-        if ($vPerms.Name -match '(Autopilot|Bypass)') {
+        if ($vPerms.Name -match 'Autopilot') {
             $permsLabel = "Autopilot"
             Write-Host "PERMS_VERIFIED: $($vPerms.Name)"
         } else {
-            # Retry permissions via UIA TogglePattern
-            Write-Host "PERMS_RETRY: Still '$($vPerms.Name)' -- retrying via TogglePattern..."
+            # Retry permissions via ForceForeground + UIA Expand + PostMessage
+            Write-Host "PERMS_RETRY: Still '$($vPerms.Name)' -- retrying..."
             $retryResult = Set-AutopilotPermissions -Hwnd ([long]$newHwnd)
             Start-Sleep -Milliseconds 800
 
@@ -691,7 +741,7 @@ if ($verifyButtons) {
             $retryButtons = Scan-ButtonsWithTimeout -Hwnd ([long]$newHwnd) -TimeoutMs 8000
             if ($retryButtons) {
                 $rPerms = $retryButtons | Where-Object { $_.Name -match 'Permissions' } | Select-Object -First 1
-                if ($rPerms -and $rPerms.Name -match '(Autopilot|Bypass)') {
+                if ($rPerms -and $rPerms.Name -match 'Autopilot') {
                     $permsLabel = "Autopilot"
                     Write-Host "PERMS_RETRY_OK: $($rPerms.Name)"
                 } else {
