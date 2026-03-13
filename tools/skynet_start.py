@@ -397,7 +397,7 @@ def open_chat_window(orch_hwnd):
 
     try:
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            ["powershell", "-STA", "-NoProfile", "-ExecutionPolicy", "Bypass",
              "-File", script_path, "-Monitor", "2", "-SkipEmptyCheck"],
             capture_output=True, text=True, timeout=45, cwd=str(ROOT)
         )

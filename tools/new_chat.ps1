@@ -1,8 +1,10 @@
 # new_chat.ps1 - Opens a new detached Copilot CLI chat window via invisible automation
-# Uses ghost mouse (PostMessage) and UIA patterns — never moves the user's cursor.
+# Uses UIA patterns (ExpandCollapsePattern, InvokePattern, TogglePattern) and
+# PostMessage ghost clicks — never moves the user's cursor.
 # Enforces: no new window if an existing chat window has no first prompt yet.
 # Enforces: new windows are tiled, never overlapping existing chat windows.
-# Usage: powershell -ExecutionPolicy Bypass -File tools\new_chat.ps1
+# MUST be called with: powershell -STA -ExecutionPolicy Bypass -File tools\new_chat.ps1
+# The -STA flag is required for UIA COM operations to work correctly.
 
 param(
     [int]$Monitor = 2,  # 1=left, 2=right
@@ -169,6 +171,61 @@ public class Ghost {
     }
 }
 "@
+
+# --- Set Autopilot permissions via UIA SetFocus + ExpandCollapsePattern + keyboard ---
+# NO mouse movement. Uses SetFocus + ExpandCollapsePattern to open the dropdown,
+# then keyboard DOWN+DOWN+ENTER to select Autopilot (3rd item).
+# TogglePattern changes UIA state but doesn't commit in VS Code -- keyboard selection does.
+# MUST run in STA thread (call with powershell -STA -File).
+function Set-AutopilotPermissions {
+    param([long]$Hwnd, [int]$TimeoutMs = 15000)
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    $hwnd = [IntPtr]$Hwnd
+    [Ghost]::SetForegroundWindow($hwnd)
+    Start-Sleep -Milliseconds 500
+
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if (-not $root) { return 'NO_ROOT' }
+
+    # Find the permissions button
+    $btnCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button
+    )
+    $btns = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
+    $permBtn = $null
+    foreach ($b in $btns) {
+        if ($b.Current.Name -match 'Permissions') {
+            $permBtn = $b
+            break
+        }
+    }
+    if (-not $permBtn) { return 'NO_PERMS_BUTTON' }
+    if ($permBtn.Current.Name -match 'Autopilot') { return 'ALREADY_AUTOPILOT' }
+
+    # SetFocus first (required for Expand to work from background context)
+    $permBtn.SetFocus()
+    Start-Sleep -Milliseconds 400
+
+    # Open dropdown via ExpandCollapsePattern
+    try {
+        $ec = $permBtn.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+        $ec.Expand()
+    } catch {
+        return "EXPAND_FAILED:$($_.Exception.Message)"
+    }
+    Start-Sleep -Milliseconds 1200
+
+    # Select Autopilot via keyboard: DOWN DOWN ENTER (Autopilot is the 3rd item)
+    # Item order: Default Approvals, Bypass Approvals, Autopilot (Preview)
+    [System.Windows.Forms.SendKeys]::SendWait("{DOWN}")
+    Start-Sleep -Milliseconds 200
+    [System.Windows.Forms.SendKeys]::SendWait("{DOWN}")
+    Start-Sleep -Milliseconds 200
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    Start-Sleep -Milliseconds 800
+    return 'OK'
+}
 
 # --- UIA scan with timeout (prevents hangs with 4+ VS Code windows) ---
 function Scan-ButtonsWithTimeout {
@@ -347,46 +404,115 @@ if (-not $placed) {
 # --- Snapshot windows before creation ---
 $before = [Ghost]::GetVSCodeWindows()
 
-# --- Open new chat window via dropdown button (next to chat sparkle icon) ---
-# Uses UIA to find the dropdown button, clicks it, then keyboard-navigates to "New Chat Window".
+# --- Open new chat window via UIA ExpandCollapsePattern + InvokePattern (zero mouse) ---
+# Runs in STA runspace because UIA desktop scans require Single-Threaded Apartment
 [Ghost]::SetForegroundWindow($orchHwnd)
-Start-Sleep -Milliseconds 300
-Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 500
 
-$buttons = Scan-ButtonsWithTimeout -Hwnd ([long]$orchHwnd) -TimeoutMs 12000
-if (-not $buttons) {
-    Record-Failure "UIA button scan timeout during dropdown search"
-    Write-Host "ERROR: UIA button scan timed out"
+function Open-NewChatWindowUIA {
+    param([long]$OrchHwnd)
+    # Load UIA assemblies (main thread must be STA -- call with powershell -STA -File)
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
+
+    $hwnd = [IntPtr]$OrchHwnd
+    $null = [Ghost]::SetForegroundWindow($hwnd)
+    Start-Sleep -Milliseconds 500
+
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+    if (-not $root) { return 'NO_ROOT' }
+
+    # Targeted search: exact ClassName + Name + ControlType
+    $chevronCond = New-Object System.Windows.Automation.AndCondition(
+        (New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button
+        )),
+        (New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::NameProperty,
+            'New Chat'
+        )),
+        (New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ClassNameProperty,
+            'action-label codicon codicon-chevron-down'
+        ))
+    )
+    $chevronBtn = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $chevronCond)
+    # Fallback: any "New Chat" button with chevron in ClassName
+    if (-not $chevronBtn) {
+        $nameCond = New-Object System.Windows.Automation.AndCondition(
+            (New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::Button
+            )),
+            (New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::NameProperty,
+                'New Chat'
+            ))
+        )
+        $matches = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $nameCond)
+        foreach ($b in $matches) {
+            if ($b.Current.ClassName -match 'chevron') {
+                $chevronBtn = $b; break
+            }
+        }
+    }
+    if (-not $chevronBtn) { return 'NO_BUTTON' }
+
+    # Expand dropdown via UIA ExpandCollapsePattern (no mouse)
+    try {
+        $chevronBtn.SetFocus()
+        Start-Sleep -Milliseconds 300
+        $ec = $chevronBtn.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+        $ec.Expand()
+    } catch {
+        try {
+            $inv = $chevronBtn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+            $inv.Invoke()
+        } catch {
+            return "EXPAND_FAILED:$($_.Exception.Message)"
+        }
+    }
+    Start-Sleep -Milliseconds 800
+
+    # Find "New Chat Window" menu item via FocusedElement + ControlViewWalker (no keyboard needed)
+    $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+    if (-not $focused) { return 'NO_FOCUSED' }
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $child = $walker.GetFirstChild($focused)
+    $target = $null
+    $idx = 0
+    while ($child -ne $null -and $idx -lt 20) {
+        if ($child.Current.Name -eq 'New Chat Window') {
+            $target = $child
+            break
+        }
+        $child = $walker.GetNextSibling($child)
+        $idx++
+    }
+    if (-not $target) {
+        try { $ec.Collapse() } catch {}
+        return 'NO_MENU_ITEM'
+    }
+
+    # Invoke the menu item via InvokePattern (pure UIA, no mouse or keyboard)
+    try {
+        $menuInv = $target.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+        $menuInv.Invoke()
+    } catch {
+        try { $ec.Collapse() } catch {}
+        return "INVOKE_FAILED:$($_.Exception.Message)"
+    }
+    return 'OK'
+}
+
+$dropdownResult = Open-NewChatWindowUIA -OrchHwnd ([long]$orchHwnd)
+Write-Host "DROPDOWN: $dropdownResult"
+if ($dropdownResult -ne 'OK') {
+    Record-Failure "Dropdown open failed: $dropdownResult"
+    Write-Host "ERROR: Could not open new chat window via dropdown: $dropdownResult"
     exit 1
 }
-
-# Primary: "More Actions" dropdown next to chat sparkle in title bar (top 45px)
-$chatDropdownBtn = $buttons | Where-Object {
-    $_.Name -eq 'More Actions' -and $_.CY -lt 45
-} | Select-Object -First 1
-
-# Fallback: "New Chat" chevron-down in chat panel header
-if (-not $chatDropdownBtn) {
-    $chatDropdownBtn = $buttons | Where-Object {
-        $_.Name -eq 'New Chat' -and $_.CY -gt 40 -and $_.CY -lt 90
-    } | Select-Object -Last 1
-}
-
-if (-not $chatDropdownBtn) {
-    Record-Failure "No chat dropdown button found via UIA"
-    Write-Host "ERROR: Cannot find chat dropdown button via UIA"
-    exit 1
-}
-
-# Click the dropdown to open the menu
-[MouseClick]::ClickAt($chatDropdownBtn.CX, $chatDropdownBtn.CY)
-Write-Host "DROPDOWN: Clicked '$($chatDropdownBtn.Name)' at $($chatDropdownBtn.CX),$($chatDropdownBtn.CY)"
-Start-Sleep -Milliseconds 800
-
-# Navigate to "New Chat Window" in the dropdown
-# Menu: Open Chat, Open Inline Chat, Open Quick Chat, New Chat Editor, New Chat Window
-[System.Windows.Forms.SendKeys]::SendWait("{DOWN}{DOWN}{DOWN}{DOWN}{DOWN}{ENTER}")
-Start-Sleep -Milliseconds 300
 $launched = $true
 
 # --- Poll for new window (faster than fixed 4s wait) ---
@@ -436,19 +562,41 @@ for ($guardPass = 1; $guardPass -le 2; $guardPass++) {
         $stBtn = $buttons | Where-Object { $_.Name -match 'Session Target' } | Select-Object -First 1
         if ($stBtn) {
             if ($stBtn.Name -notmatch 'Copilot CLI') {
-                [Ghost]::SetForegroundWindow($newHwnd)
-                Start-Sleep -Milliseconds 200
-                [MouseClick]::ClickAt($stBtn.CX, $stBtn.CY)
-                Write-Host "SESSION_TARGET: clicked at $($stBtn.CX),$($stBtn.CY)"
-                Start-Sleep -Milliseconds 600
-                [System.Windows.Forms.SendKeys]::SendWait("CLI")
-                Start-Sleep -Milliseconds 300
-                [System.Windows.Forms.SendKeys]::SendWait(" ")
-                Start-Sleep -Milliseconds 200
-                [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
-                Start-Sleep -Milliseconds 400
-                $target = "Set Session Target - Copilot CLI"
-                $needsConfig = $true
+                # Open session target picker via UIA ExpandCollapsePattern (no mouse)
+                $uiaNewRoot = [System.Windows.Automation.AutomationElement]::FromHandle($newHwnd)
+                $uiaNewBtns = $uiaNewRoot.FindAll(
+                    [System.Windows.Automation.TreeScope]::Descendants,
+                    (New-Object System.Windows.Automation.PropertyCondition(
+                        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                        [System.Windows.Automation.ControlType]::Button
+                    ))
+                )
+                $stUia = $null
+                foreach ($ub in $uiaNewBtns) {
+                    if ($ub.Current.Name -match 'Session Target') { $stUia = $ub; break }
+                }
+                if ($stUia) {
+                    try {
+                        $stUia.SetFocus()
+                        Start-Sleep -Milliseconds 300
+                        $stExpand = $stUia.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+                        $stExpand.Expand()
+                        Write-Host "SESSION_TARGET: Opened picker via UIA ExpandCollapsePattern"
+                    } catch {
+                        Write-Host "SESSION_TARGET: ExpandCollapse failed, trying Ghost.Click fallback"
+                        $renderST = [Ghost]::FindRenderSurface($newHwnd)
+                        [Ghost]::Click($renderST, $stBtn.CX, $stBtn.CY)
+                    }
+                    Start-Sleep -Milliseconds 600
+                    [System.Windows.Forms.SendKeys]::SendWait("CLI")
+                    Start-Sleep -Milliseconds 300
+                    [System.Windows.Forms.SendKeys]::SendWait(" ")
+                    Start-Sleep -Milliseconds 200
+                    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+                    Start-Sleep -Milliseconds 400
+                    $target = "Set Session Target - Copilot CLI"
+                    $needsConfig = $true
+                }
             } else {
                 $target = $stBtn.Name
             }
@@ -461,9 +609,32 @@ for ($guardPass = 1; $guardPass -le 2; $guardPass++) {
         $model = $pmBtn.Name
         if ($model -notmatch 'Opus.*fast') {
             Write-Host "MODEL_GUARD: Wrong model '$model' -- attempt $guardPass/2..."
-            [Ghost]::SetForegroundWindow($newHwnd)
-            Start-Sleep -Milliseconds 200
-            [MouseClick]::ClickAt($pmBtn.CX, $pmBtn.CY)
+            # Open model picker via UIA ExpandCollapsePattern (no mouse)
+            $uiaNewRoot = [System.Windows.Automation.AutomationElement]::FromHandle($newHwnd)
+            $uiaNewBtns = $uiaNewRoot.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                (New-Object System.Windows.Automation.PropertyCondition(
+                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                    [System.Windows.Automation.ControlType]::Button
+                ))
+            )
+            $pmUia = $null
+            foreach ($ub in $uiaNewBtns) {
+                if ($ub.Current.Name -match 'Pick Model') { $pmUia = $ub; break }
+            }
+            if ($pmUia) {
+                try {
+                    $pmUia.SetFocus()
+                    Start-Sleep -Milliseconds 300
+                    $pmExpand = $pmUia.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+                    $pmExpand.Expand()
+                    Write-Host "MODEL_GUARD: Opened model picker via UIA ExpandCollapsePattern"
+                } catch {
+                    Write-Host "MODEL_GUARD: ExpandCollapse failed, trying Ghost.Click fallback"
+                    $renderModel = [Ghost]::FindRenderSurface($newHwnd)
+                    [Ghost]::Click($renderModel, $pmBtn.CX, $pmBtn.CY)
+                }
+            }
             Start-Sleep -Milliseconds 1200
             [System.Windows.Forms.SendKeys]::SendWait("fast")
             Start-Sleep -Milliseconds 800
@@ -476,23 +647,21 @@ for ($guardPass = 1; $guardPass -le 2; $guardPass++) {
         }
     }
 
-    # --- PERMISSION GUARD ---
+    # --- PERMISSION GUARD (uses UIA TogglePattern on dropdown CheckBox items) ---
     $pBtn = $buttons | Where-Object { $_.Name -match 'Permissions' } | Select-Object -First 1
     if ($pBtn) {
         if ($pBtn.Name -match '(Autopilot|Bypass)') {
             $permsLabel = "Autopilot"
             Write-Host "PERMS_OK: $($pBtn.Name)"
         } elseif ($pBtn.Name -match 'Default') {
-            # Click permission button with real mouse → dropdown opens
-            [Ghost]::SetForegroundWindow($newHwnd)
-            Start-Sleep -Milliseconds 200
-            [MouseClick]::ClickAt($pBtn.CX, $pBtn.CY)
-            Start-Sleep -Milliseconds 800
-            # Real keyboard DOWN+ENTER to select Autopilot (PostMessage ghost keys silently fail)
-            [System.Windows.Forms.SendKeys]::SendWait("{DOWN}{ENTER}")
-            Start-Sleep -Milliseconds 500
-            $permsLabel = "Autopilot (pending verify)"
-            Write-Host "PERMS_APPLIED_PENDING_VERIFY"
+            $permsResult = Set-AutopilotPermissions -Hwnd ([long]$newHwnd)
+            if ($permsResult -eq 'OK') {
+                $permsLabel = "Autopilot (pending verify)"
+                Write-Host "PERMS_APPLIED_PENDING_VERIFY"
+            } else {
+                $permsLabel = "FAILED"
+                Write-Host "PERMS_APPLY_FAILED: $permsResult"
+            }
         }
     }
 
@@ -513,8 +682,23 @@ if ($verifyButtons) {
             $permsLabel = "Autopilot"
             Write-Host "PERMS_VERIFIED: $($vPerms.Name)"
         } else {
-            $permsLabel = "FAILED:$($vPerms.Name)"
-            Write-Host "PERMS_VERIFY_FAILED: Still shows '$($vPerms.Name)' -- Autopilot NOT applied"
+            # Retry permissions via UIA TogglePattern
+            Write-Host "PERMS_RETRY: Still '$($vPerms.Name)' -- retrying via TogglePattern..."
+            $retryResult = Set-AutopilotPermissions -Hwnd ([long]$newHwnd)
+            Start-Sleep -Milliseconds 800
+
+            # Re-verify after retry
+            $retryButtons = Scan-ButtonsWithTimeout -Hwnd ([long]$newHwnd) -TimeoutMs 8000
+            if ($retryButtons) {
+                $rPerms = $retryButtons | Where-Object { $_.Name -match 'Permissions' } | Select-Object -First 1
+                if ($rPerms -and $rPerms.Name -match '(Autopilot|Bypass)') {
+                    $permsLabel = "Autopilot"
+                    Write-Host "PERMS_RETRY_OK: $($rPerms.Name)"
+                } else {
+                    $permsLabel = "FAILED:$($rPerms.Name)"
+                    Write-Host "PERMS_RETRY_FAILED: Still '$($rPerms.Name)'"
+                }
+            }
         }
     }
 
