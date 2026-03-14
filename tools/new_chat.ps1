@@ -277,7 +277,9 @@ function Scan-ButtonsWithTimeout {
 
 # --- Load config ---
 $orchConfig = Get-Content "D:\Prospects\ScreenMemory\data\orchestrator.json" | ConvertFrom-Json
-$orchHwnd = [IntPtr]$orchConfig.orchestrator_hwnd
+# Support both field names for compatibility
+$rawHwnd = if ($orchConfig.orchestrator_hwnd) { $orchConfig.orchestrator_hwnd } elseif ($orchConfig.hwnd) { $orchConfig.hwnd } else { 0 }
+$orchHwnd = [IntPtr]$rawHwnd
 
 # --- Find existing chat windows (detached, not the main editor) ---
 $allWindows = [Ghost]::GetVSCodeWindows()
