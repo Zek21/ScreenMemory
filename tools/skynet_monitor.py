@@ -106,6 +106,11 @@ MODEL_CHECK_INTERVAL = 60   # seconds between model checks
 ORCH_MODEL_CHECK_INTERVAL = 30  # orchestrator checked more frequently (security-critical)
 STUCK_PROCESSING_THRESHOLD = 600  # seconds in PROCESSING before auto-recovery attempt (increased from 180 to avoid killing workers mid-task)
 STUCK_DEDUP_WINDOW = 300          # suppress duplicate stuck alerts for 5 minutes
+MODEL_FIX_BACKOFF = 600     # 10 minutes between fix attempts per worker (prevents infinite retry)
+MODEL_FIX_MAX_ATTEMPTS = 3  # max consecutive fix attempts before giving up until restart
+
+# Per-worker model-fix attempt tracking: {worker_name: (attempt_count, last_attempt_ts)}
+_model_fix_attempts: dict = {}
 
 user32 = ctypes.windll.user32
 
@@ -386,10 +391,27 @@ def _check_worker_model(name: str, hwnd: int, h: dict, check_model: bool) -> boo
         issues = []
         if not is_model_correct(model_name): issues.append(f"model='{model_name}'")
         if not is_agent_cli(agent_name): issues.append(f"agent='{agent_name}'")
+
+        # Check per-worker backoff to prevent infinite retry loop when premium is exhausted
+        now = time.time()
+        attempt_count, last_attempt = _model_fix_attempts.get(name, (0, 0))
+        since_last = now - last_attempt
+        if attempt_count >= MODEL_FIX_MAX_ATTEMPTS and since_last < MODEL_FIX_BACKOFF:
+            # Already tried max times recently — skip fix, log once at INFO level
+            remaining = int(MODEL_FIX_BACKOFF - since_last)
+            log(f"{name.upper()}: model drift persists (fix skipped, {remaining}s backoff, attempt {attempt_count}/{MODEL_FIX_MAX_ATTEMPTS})", "INFO")
+            h["status"] = "MODEL_UNAVAILABLE"
+            return False
+        if since_last < MODEL_FIX_BACKOFF and attempt_count > 0:
+            # Within backoff window, still have attempts left — OK to try
+            pass
+
         log(f"{name.upper()}: DRIFT detected {'; '.join(issues)} -- auto-correcting", "FIX")
         _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
             "content": f"WORKER {name.upper()} drift: {'; '.join(issues)} -- auto-correcting to Opus fast"})
         fixed = fix_model_via_uia(hwnd, 0)
+        # Update attempt counter regardless of success
+        _model_fix_attempts[name] = (attempt_count + 1, now)
         if fixed:
             time.sleep(1)
             model_name, agent_name = get_model_and_agent_uia(hwnd)
@@ -397,11 +419,17 @@ def _check_worker_model(name: str, hwnd: int, h: dict, check_model: bool) -> boo
             log(f"{name.upper()}: after fix model='{model_name}' agent='{agent_name}'", "OK" if model_ok else "WARN")
             h["model"] = model_name
             h["agent"] = agent_name
-            _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "report",
-                "content": f"WORKER {name.upper()} fixed: model='{model_name}' agent='{agent_name}'"})
+            if model_ok:
+                # Successful fix — reset attempt counter
+                _model_fix_attempts[name] = (0, 0)
+                _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "report",
+                    "content": f"WORKER {name.upper()} fixed: model='{model_name}' agent='{agent_name}'"})
         try: metrics().record_model_guard(name, model_name, agent_name, model_ok, fixed=bool(not model_ok and fixed))
         except Exception as e: log(f"Failed to record model guard metrics for {name}: {e}", "WARN")
     else:
+        # Successful model check — reset attempt counter
+        if name in _model_fix_attempts:
+            _model_fix_attempts[name] = (0, 0)
         try: metrics().record_model_guard(name, model_name, agent_name, model_ok)
         except Exception as e: log(f"Failed to record model guard metrics for {name}: {e}", "WARN")
 

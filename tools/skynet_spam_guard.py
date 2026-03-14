@@ -109,8 +109,8 @@ SENDER_RATE_OVERRIDES = {
 
 # Pattern-specific windows (seconds)
 PATTERN_WINDOWS = {
-    "convene_gate_proposal": 900,
-    "convene_gate_vote": 86400,  # 24h -- same voter+gate_id is always a dupe
+    "convene_gate_proposal": 120,   # 2 min — was 900s (too aggressive, blocked legit re-proposals)
+    "convene_gate_vote": 86400,     # 24h -- same voter+gate_id is always a dupe
     "result_duplicate": 300,
     "daemon_health": 60,
     "knowledge_learning": 1800,
@@ -118,7 +118,8 @@ PATTERN_WINDOWS = {
 }
 
 # Auto-penalty amount per blocked spam message
-SPAM_PENALTY = 0.1
+# MUST be proportional to award (DEFAULT_AWARD=0.01), not 10x it
+SPAM_PENALTY = 0.02  # was 0.1 (10x award) — now 2x award, proportional
 
 
 class SpamGuard:

@@ -126,7 +126,8 @@ def reset_scores(reason: str = "manual_reset") -> dict:
     """
     with _lock:
         old = _load()
-        # Backup current scores
+        # Backup current scores — ensure DATA_DIR exists first
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         backup_path = DATA_DIR / f"worker_scores_backup_{ts}.json"
         backup_path.write_text(
@@ -171,11 +172,17 @@ def amnesty(targets: str = "all", categories: str = "spam_guard") -> dict:
             if entry.get("validator", "") not in cat_set:
                 continue
             worker = entry.get("worker", "")
+            if not worker:
+                continue
             if targets == "system" and worker not in SYSTEM_SENDERS:
                 continue
             if targets not in ("all", "system") and worker != targets:
                 continue
-            reversed_map[worker] = reversed_map.get(worker, 0) + entry.get("amount", 0)
+            # Use abs() to handle both positive deduction amounts and negative stored values
+            amt = entry.get("amount", None)
+            if amt is None:
+                continue  # Skip malformed history entries silently would hide data
+            reversed_map[worker] = reversed_map.get(worker, 0) + abs(float(amt))
 
         # Apply reversals
         for worker, amount in reversed_map.items():

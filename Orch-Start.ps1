@@ -316,14 +316,16 @@ try {
         $deadCount = 0
         $totalWorkers = ($workersList | Measure-Object).Count
 
-        Add-Type -TypeDefinition @"
+        if (-not ([System.Management.Automation.PSTypeName]'BootVerify').Type) {
+            Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 public class BootVerify {
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
 }
-"@ -ErrorAction SilentlyContinue
+"@
+        }
 
         foreach ($w in $workersList) {
             $wName = $w.name

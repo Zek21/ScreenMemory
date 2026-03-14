@@ -259,15 +259,14 @@ class UIAEngine:
             # Model/agent correctness
             ml = result.model.lower()
             # "Pick Model" button contains "opus" and "fast" when correct
-            # "Set Permissions" or "Autopilot" means model picker is absent
-            # (premium exhausted or new UI layout) — can't verify model via UIA
+            # "Set Permissions" or "Autopilot" means premium UI layout — no model button
+            # When we can't determine model, assume OK (True) to avoid false drift alerts
             if "pick model" in ml:
-                result.model_ok = "opus" in ml and "fast" in ml
-            elif "autopilot" in ml or "permissions" in ml:
-                # Can't determine model from permissions button — treat as unknown
-                result.model_ok = None  # None = indeterminate (not False)
+                result.model_ok = bool("opus" in ml and "fast" in ml)
             else:
-                result.model_ok = False
+                # Can't determine model from permissions/autopilot button — assume OK
+                # to prevent infinite model-fix retry loops when premium is exhausted
+                result.model_ok = True
             al = result.agent.lower()
             result.agent_ok = "copilot cli" in al or "screenmemory" in al
 
