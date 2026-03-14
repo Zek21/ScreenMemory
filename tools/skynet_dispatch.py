@@ -731,7 +731,7 @@ def load_orch_hwnd():
         except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
             log(f"Failed to parse orchestrator.json: {e}", "ERR")  # signed: beta
             return None
-        return data.get("orchestrator_hwnd")
+        return data.get("orchestrator_hwnd") or data.get("hwnd")
     return None
 
 
@@ -1569,6 +1569,29 @@ def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
                 if consecutive_unknown >= 3:
                     log(f"✗ {worker_name.upper()} delivery FAILED: {consecutive_unknown} consecutive UIA exceptions", "WARN")
                     return False
+        # State didn't change — text may be in input box but Enter didn't fire (INCIDENT 013 class)
+        # Use pyautogui as fallback to press Enter on the target window
+        try:
+            import pyautogui
+            rect = ctypes.wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            input_x = (rect.left + rect.right) // 2
+            input_y = rect.bottom - 80
+            pyautogui.click(input_x, input_y)
+            time.sleep(0.2)
+            pyautogui.press('enter')
+            log(f"⚡ {worker_name.upper()} pyautogui Enter fallback fired at ({input_x},{input_y})", "WARN")
+            # Quick verify after fallback
+            time.sleep(1.5)
+            try:
+                post = engine.get_state(hwnd)
+                if post != pre_state and post != "UNKNOWN":
+                    log(f"✓ {worker_name.upper()} delivery VERIFIED after pyautogui fallback: {pre_state} -> {post}", "OK")
+                    return True
+            except Exception:
+                pass
+        except Exception as e:
+            log(f"pyautogui Enter fallback failed for {worker_name}: {e}", "WARN")
         return False
     except Exception as e:
         log(f"Delivery verify error for {worker_name}: {e}", "WARN")
