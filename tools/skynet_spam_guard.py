@@ -393,18 +393,30 @@ class SpamGuard:
 
     def _auto_penalize(self, sender: str, reason: str):
         """Deduct SPAM_PENALTY from sender's score. Daemons are exempt."""
+        # Local fallback set — used if scoring module import fails
+        _LOCAL_SYSTEM_SENDERS = {
+            "monitor", "convene", "convene-gate", "convene_gate", "self_prompt",
+            "system", "overseer", "watchdog", "bus_relay", "learner",
+            "self_improve", "sse_daemon", "idle_monitor",
+            "skynet_self", "skynet_monitor", "skynet_learner", "skynet_watchdog",
+            "skynet_overseer", "skynet_bus_relay", "skynet_self_prompt",
+            "skynet_self_improve", "skynet_sse_daemon", "skynet_idle_monitor",
+            "bus_watcher", "ws_monitor", "bus_persist", "consultant_consumer",
+            "health_report", "worker_loop", "daemon_status",
+        }
+        # Check local set first — always works regardless of import
+        if sender in _LOCAL_SYSTEM_SENDERS:
+            return
         try:
             sys.path.insert(0, str(ROOT))
             from tools.skynet_scoring import adjust_score, SYSTEM_SENDERS
-            # Exempt daemon/system senders from score penalties — their
-            # heartbeats and health messages are legitimate, not spam.
             if sender in SYSTEM_SENDERS:
                 return
             adjust_score(sender, -SPAM_PENALTY, f"SPAM_BLOCKED: {reason}",
                          "spam_guard")
         except Exception:
             pass  # Scoring system unavailable -- still block the spam
-        # signed: delta
+        # signed: orchestrator
 
     def _log_spam(self, sender: str, fp: str, reason: str, message: dict):
         """Append to data/spam_log.json. Uses atomic write to prevent TOCTOU race."""

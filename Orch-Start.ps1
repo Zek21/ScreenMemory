@@ -304,6 +304,48 @@ if ($action -ne "none") {
     }
 }
 
+# -- Post-boot worker verification (MANDATORY) --  # signed: orchestrator
+Write-Status "Post-boot worker verification starting..." "SYS"
+try {
+    $workersJsonPath = Join-Path $repoRoot "data\workers.json"
+    if (Test-Path $workersJsonPath) {
+        $workersRaw = Get-Content $workersJsonPath -Raw | ConvertFrom-Json
+        # Handle both formats: {"workers": [...]} or flat list
+        $workersList = if ($workersRaw.workers) { $workersRaw.workers } else { $workersRaw }
+        $aliveCount = 0
+        $deadCount = 0
+        $totalWorkers = ($workersList | Measure-Object).Count
+
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class BootVerify {
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+}
+"@ -ErrorAction SilentlyContinue
+
+        foreach ($w in $workersList) {
+            $wName = $w.name
+            $wHwnd = [IntPtr]$w.hwnd
+            $isAlive = [BootVerify]::IsWindow($wHwnd)
+            $isVisible = [BootVerify]::IsWindowVisible($wHwnd)
+            if ($isAlive -and $isVisible) {
+                $aliveCount++
+                Write-Status "  $wName (HWND $($w.hwnd)): ALIVE + VISIBLE" "OK"
+            } else {
+                $deadCount++
+                Write-Status "  $wName (HWND $($w.hwnd)): alive=$isAlive visible=$isVisible" "WARN"
+            }
+        }
+        Write-Status "Worker verification: $aliveCount/$totalWorkers alive, $deadCount dead" $(if ($deadCount -gt 0) {"WARN"} else {"OK"})
+    } else {
+        Write-Status "workers.json not found -- skipping worker verification" "WARN"
+    }
+} catch {
+    Write-Status "Worker verification error: $_" "WARN"
+}
+
 # -- Ensure daemons (lightweight, no UIA) --
 
 # Helper: start daemon with cmdline-verified PID check, post-start verification, and 1 retry  # signed: beta

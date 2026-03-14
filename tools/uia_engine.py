@@ -179,7 +179,12 @@ class UIAEngine:
                 result.buttons.append(nm)
                 if "Pick Model" in nm:
                     result.model = nm
-                elif "Delegate Session" in nm:
+                elif "Set Permissions" in nm or "Autopilot" in nm:
+                    # New VS Code layout: "Set Permissions - Default Approvals"
+                    # or "Autopilot (Preview)" — means window is responsive
+                    if not result.model:
+                        result.model = nm  # use as model proxy if Pick Model absent
+                elif "Delegate Session" in nm or "Set Agent" in nm:
                     result.agent = nm
                 elif nm == "Cancel (Alt+Backspace)":
                     result.has_cancel = True
@@ -245,15 +250,26 @@ class UIAEngine:
                 result.state = "PROCESSING"
             elif result.edit_value.strip():
                 result.state = "TYPING"
-            elif result.model:  # model button visible = window is responsive
+            elif result.model or result.agent:
+                # Window is responsive if we found any status bar controls
                 result.state = "IDLE"
             else:
                 result.state = "UNKNOWN"
 
             # Model/agent correctness
             ml = result.model.lower()
-            result.model_ok = "opus" in ml and "fast" in ml
-            result.agent_ok = "copilot cli" in result.agent.lower()
+            # "Pick Model" button contains "opus" and "fast" when correct
+            # "Set Permissions" or "Autopilot" means model picker is absent
+            # (premium exhausted or new UI layout) — can't verify model via UIA
+            if "pick model" in ml:
+                result.model_ok = "opus" in ml and "fast" in ml
+            elif "autopilot" in ml or "permissions" in ml:
+                # Can't determine model from permissions button — treat as unknown
+                result.model_ok = None  # None = indeterminate (not False)
+            else:
+                result.model_ok = False
+            al = result.agent.lower()
+            result.agent_ok = "copilot cli" in al or "screenmemory" in al
 
         except Exception as e:
             result.error = str(e)

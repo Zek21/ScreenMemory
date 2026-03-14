@@ -80,7 +80,12 @@ SYSTEM_SENDERS = frozenset({
     "monitor", "convene", "convene-gate", "convene_gate", "self_prompt",
     "system", "overseer", "watchdog", "bus_relay", "learner",
     "self_improve", "sse_daemon", "idle_monitor",
-})  # signed: delta
+    "skynet_self", "skynet_monitor", "skynet_learner", "skynet_watchdog",
+    "skynet_overseer", "skynet_bus_relay", "skynet_self_prompt",
+    "skynet_self_improve", "skynet_sse_daemon", "skynet_idle_monitor",
+    "bus_watcher", "ws_monitor", "bus_persist", "consultant_consumer",
+    "health_report", "worker_loop", "daemon_status",
+})  # signed: orchestrator
 
 DEFAULT_AWARD = 0.01
 DEFAULT_DEDUCT = 0.005
@@ -112,6 +117,88 @@ _lock = threading.Lock()  # Guards all read-modify-write cycles on SCORES_FILE  
 
 def _empty_store() -> dict:
     return {"version": SCHEMA_VERSION, "scores": {}, "history": []}
+
+
+def reset_scores(reason: str = "manual_reset") -> dict:
+    """Reset ALL scores to zero with a clean slate. Backs up old scores first.
+
+    Returns the new empty score store.
+    """
+    with _lock:
+        old = _load()
+        # Backup current scores
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup_path = DATA_DIR / f"worker_scores_backup_{ts}.json"
+        backup_path.write_text(
+            json.dumps(old, indent=2, default=str), encoding="utf-8"
+        )
+        # Create fresh store with reset event in history
+        new_store = _empty_store()
+        new_store["history"].append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "worker": "ALL",
+            "action": "reset",
+            "amount": 0,
+            "task_id": reason,
+            "validator": "orchestrator",
+            "new_total": 0.0,
+        })
+        _save(new_store)
+        print(f"Scores RESET. Backup saved to {backup_path.name}")
+        return new_store
+
+
+def amnesty(targets: str = "all", categories: str = "spam_guard") -> dict:
+    """Reverse unfair spam_guard deductions for specified workers.
+
+    Args:
+        targets: Worker name, "all" for all workers, or "system" for system senders only.
+        categories: Comma-separated validator names to amnesty (default: "spam_guard").
+
+    Returns:
+        Dict of {worker: reversed_amount} for each amnestied worker.
+    """
+    cat_set = set(c.strip() for c in categories.split(","))
+    with _lock:
+        data = _load()
+        reversed_map = {}
+        history = data.get("history", [])
+
+        # Find all forced spam deductions in history
+        for entry in history:
+            if entry.get("action") != "deduct":
+                continue
+            if entry.get("validator", "") not in cat_set:
+                continue
+            worker = entry.get("worker", "")
+            if targets == "system" and worker not in SYSTEM_SENDERS:
+                continue
+            if targets not in ("all", "system") and worker != targets:
+                continue
+            reversed_map[worker] = reversed_map.get(worker, 0) + entry.get("amount", 0)
+
+        # Apply reversals
+        for worker, amount in reversed_map.items():
+            _ensure_worker(data, worker)
+            ws = data["scores"][worker]
+            ws["total"] = ws.get("total", 0) + amount
+            ws["awards"] = ws.get("awards", 0) + 1
+            data["history"].append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "worker": worker,
+                "action": "amnesty",
+                "amount": amount,
+                "task_id": f"amnesty_{categories}",
+                "validator": "orchestrator",
+                "new_total": ws["total"],
+            })
+
+        _save(data)
+        for worker, amount in sorted(reversed_map.items()):
+            print(f"  {worker}: reversed {amount:.3f} pts")
+        total_reversed = sum(reversed_map.values())
+        print(f"Amnesty complete: {len(reversed_map)} workers, {total_reversed:.3f} pts reversed")
+        return reversed_map
 
 
 def _load_protocol() -> dict:
@@ -1199,6 +1286,18 @@ def main():
         help="Actor that closed the final ticket for --zero-ticket-bonus",
     )
     parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Reset ALL scores to zero (backs up current scores first)",
+    )
+    parser.add_argument(
+        "--amnesty",
+        nargs="?",
+        const="all",
+        metavar="WORKER|all|system",
+        help="Reverse unfair spam_guard deductions (default: all workers)",
+    )
+    parser.add_argument(
         "--leaderboard",
         action="store_true",
         help="Show worker leaderboard",
@@ -1414,6 +1513,15 @@ def main():
         amt = args.amount if args.amount is not None else DEFAULT_INVALID_CLEANUP_AWARD
         result = award_invalid_cleanup_finder(args.invalid_cleanup, args.task_id, args.validator, amt)
         print(f"Awarded {amt} pts to {args.invalid_cleanup} for finding invalid cleanup (total: {result['total']})")
+
+    elif args.reset:
+        reset_scores("cli_reset")
+        print("All scores have been reset to zero.")
+
+    elif args.amnesty is not None:
+        target = args.amnesty
+        print(f"Running amnesty for: {target}")
+        amnesty(target)
 
     elif args.leaderboard:
         # Run cleanliness audit summary if available
