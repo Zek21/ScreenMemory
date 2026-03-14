@@ -204,6 +204,39 @@ DAEMON_REGISTRY = [
 # signed: beta
 
 
+def _disabled_sentinel_candidates(daemon: dict) -> list[Path]:
+    """Return plausible .disabled sentinel paths for a daemon."""
+    candidates: list[Path] = []
+
+    pid_file = daemon.get("pid_file")
+    if pid_file:
+        candidates.append((ROOT / pid_file).with_suffix(".disabled"))
+
+    name = daemon.get("name")
+    if name:
+        candidates.append(DATA_DIR / f"{name}.disabled")
+
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(candidate)
+    return unique
+    # signed: consultant
+
+
+def _get_disabled_sentinel(daemon: dict) -> Path | None:
+    """Return the first existing .disabled sentinel for a daemon, if any."""
+    for candidate in _disabled_sentinel_candidates(daemon):
+        if candidate.exists():
+            return candidate
+    return None
+    # signed: consultant
+
+
 def _pid_alive(pid: int) -> bool:
     """Check if a process with given PID is alive.
 
@@ -384,7 +417,15 @@ def check_daemon(daemon: dict) -> dict:
         "uptime_human": "",
         "last_heartbeat": None,
         "heartbeat_status": "unknown",
+        "disabled": False,
     }
+
+    disabled_file = _get_disabled_sentinel(daemon)
+    if disabled_file is not None:
+        result["disabled"] = True
+        result["disabled_file"] = disabled_file.relative_to(ROOT).as_posix()
+        return result
+    # signed: consultant
 
     # PID check — two-tier: PID file first, then process scan fallback
     pid_file = daemon.get("pid_file")
@@ -498,9 +539,10 @@ def print_status_table(results: list) -> None:
 
     alive_count = 0
     dead_count = 0
+    disabled_count = 0
     for r in results:
         crit_color = _criticality_color(r["criticality"])
-        status = _status_icon(r["alive"])
+        status = "\033[90mDIS \033[0m" if r.get("disabled") else _status_icon(r["alive"])
         pid_str = str(r["pid"]) if r["pid"] else "—"
         port_str = str(r["port"]) if r["port"] else "—"
         uptime_str = r["uptime_human"] if r["uptime_human"] else "—"
@@ -509,7 +551,9 @@ def print_status_table(results: list) -> None:
         print(f"  {r['label']:<28} {pid_str:>6} {port_str:>5} {status} {uptime_str:>10} "
               f"{crit_color}{r['criticality']:<13}{reset} {hb_str:<10}")
 
-        if r["alive"]:
+        if r.get("disabled"):
+            disabled_count += 1
+        elif r["alive"]:
             alive_count += 1
         else:
             dead_count += 1
@@ -517,7 +561,8 @@ def print_status_table(results: list) -> None:
     print("-" * 90)
     print(f"  Total: {len(results)} daemons | "
           f"\033[92m{alive_count} alive\033[0m | "
-          f"\033[91m{dead_count} dead\033[0m")
+          f"\033[91m{dead_count} dead\033[0m | "
+          f"\033[90m{disabled_count} disabled\033[0m")
     print()
     # signed: beta
 
@@ -533,6 +578,9 @@ def restart_dead_daemons(results: list) -> list:
     restarted = []
     for r in results:
         if r["alive"]:
+            continue
+        if r.get("disabled"):
+            restarted.append({"name": r["name"], "action": "skip", "reason": "disabled"})
             continue
         daemon = next((d for d in DAEMON_REGISTRY if d["name"] == r["name"]), None)
         if not daemon or not daemon.get("restart_cmd"):
@@ -588,7 +636,8 @@ def main():
             "summary": {
                 "total": len(results),
                 "alive": sum(1 for r in results if r["alive"]),
-                "dead": sum(1 for r in results if not r["alive"]),
+                "dead": sum(1 for r in results if not r["alive"] and not r.get("disabled")),
+                "disabled": sum(1 for r in results if r.get("disabled")),
             },
         }
         print(json.dumps(output, indent=2, default=str))

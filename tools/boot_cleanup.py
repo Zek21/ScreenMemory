@@ -20,6 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
+DISPATCH_MAX_AGE_HOURS = 2
 
 
 def _pid_alive(pid):
@@ -75,12 +76,12 @@ def scan_worker_hwnds():
     results = []
     for w in workers:
         hwnd = w.get("hwnd", 0)
-        alive = _hwnd_alive(hwnd)
+        alive = _hwnd_alive(hwnd) if hwnd else False
         results.append({
             "name": w.get("name", "unknown"),
             "hwnd": hwnd,
             "alive": alive,
-            "stale": not alive,
+            "stale": bool(hwnd and not alive),  # hwnd=0 is unassigned, not stale
         })
     return results
 
@@ -122,8 +123,9 @@ def scan_consultant_state():
     return results
 
 
-def scan_dispatch_log(max_age_hours=2):
+def scan_dispatch_log(max_age_hours=DISPATCH_MAX_AGE_HOURS):
     """Find stale dispatch log entries."""
+    max_age_seconds = max_age_hours * 3600
     dl = DATA / "dispatch_log.json"
     if not dl.exists():
         return []
@@ -133,7 +135,7 @@ def scan_dispatch_log(max_age_hours=2):
         if not isinstance(entries, list):
             return []
 
-        cutoff = time.time() - (max_age_hours * 3600)
+        cutoff = time.time() - max_age_seconds
         stale = []
         for e in entries:
             ts = e.get("timestamp", 0)
@@ -185,9 +187,10 @@ def clean(scan_results):
         dl = DATA / "dispatch_log.json"
         if dl.exists():
             try:
+                from tools.skynet_atomic import atomic_write_json
                 entries = json.load(open(dl))
                 if isinstance(entries, list):
-                    cutoff = time.time() - (2 * 3600)  # 2 hours
+                    cutoff = time.time() - (DISPATCH_MAX_AGE_HOURS * 3600)
                     kept = []
                     removed = 0
                     for e in entries:
@@ -202,8 +205,7 @@ def clean(scan_results):
                             kept.append(e)
                         else:
                             removed += 1
-                    with open(dl, "w") as f:
-                        json.dump(kept, f, indent=2, default=str)
+                    atomic_write_json(dl, kept)
                     if removed:
                         print(f"  🗑️  Cleaned {removed} stale dispatch log entries (kept {len(kept)})")
                         cleaned += removed
