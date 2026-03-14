@@ -91,12 +91,12 @@ Before modifying any file in this list, complete ALL checks:
 5. **Report Phase 1 status** — Backend version/uptime, GOD Console status, daemon count. Then proceed to Phase 2.
 
 **Phase 1 does NOT:**
-- Open worker windows (that's UIA-heavy and can hang)
+- Open worker windows (that's UIA-heavy and belongs in Phase 2)
 - Run `skynet_start.py` (that includes worker window management)
 - Perform any UI Automation operations
 
-### Phase 2: Orchestrator Role Assumption (`orchestrator-start` / `Orch-Start`)
-**This phase assumes Skynet infrastructure is running. It establishes the orchestrator's identity and operational awareness.**
+### Phase 2: Orchestrator Role Assumption + Worker Boot (`orchestrator-start` / `Orch-Start`)
+**This phase assumes Skynet infrastructure is running. It establishes the orchestrator's identity, operational awareness, AND opens worker windows as part of the boot sequence.**
 
 1. **Health check** — `Invoke-RestMethod http://localhost:8420/status`. If dead and trigger was `orchestrator-start`, warn user and attempt Phase 1 first. If trigger was `skynet-start`, Phase 1 already ran so this should succeed.
 2. **Announce orchestrator identity** — POST to bus: `{sender: "orchestrator", topic: "orchestrator", type: "identity_ack", content: "SKYNET ORCHESTRATOR LIVE"}`
@@ -109,13 +109,24 @@ Before modifying any file in this list, complete ALL checks:
    - Pending TODOs: `data/todos.json`
    - Worker registry: `data/workers.json`
 5. **Check consultant bridges** — `GET http://localhost:8422/health` (Codex), `GET http://localhost:8425/health` (Gemini). Note status, don't start them.
-6. **Report Ready** — Skynet version/uptime, worker count + states, engine count, pending bus alerts, pending TODO count, consultant status, any boot warnings.
+6. **Open worker windows (MANDATORY, sequential)** — If `workers.json` shows dead or missing workers, open them ONE AT A TIME using the Sequential Worker Boot Rule below. Worker windows are part of the boot sequence, not a separate step.
+7. **Report Ready** — Skynet version/uptime, worker count + states, engine count, pending bus alerts, pending TODO count, consultant status, any boot warnings.
 
-### Worker Window Management (Separate from Boot)
-**Worker windows are opened AFTER the orchestrator is online, NOT during infrastructure boot.** If `workers.json` shows 0 live workers:
-- Run `.\Orch-Start.ps1 -SkipInfra` (which handles worker windows via `skynet_start.py` with timeout protection)
-- Or open workers individually via `tools/new_chat.ps1`
-- Worker window opening is UIA-heavy and may hang — it must NEVER block infrastructure boot or orchestrator role assumption
+### Sequential Worker Boot Rule (MANDATORY)
+**Worker windows MUST be opened one at a time. You may NOT open the next worker until the previous one has been visually verified as correct and has started processing.**
+
+For each worker (alpha, beta, gamma, delta) in order:
+1. **Open window** — Use `tools/new_chat.ps1` or session restore to open a single worker window.
+2. **Visual verification** — Take a screenshot of the worker window and verify:
+   - Window is visible and correctly positioned in its grid slot
+   - Model is set to Claude Opus 4.6 (fast mode)
+   - Agent is set to Copilot CLI / ScreenMemory agent
+   - No error dialogs or stuck states are present
+3. **Dispatch identity prompt** — Send the worker its identity injection prompt via `skynet_dispatch.py`.
+4. **Confirm processing** — Wait for the worker to transition from IDLE to PROCESSING (verify via UIA scan or screenshot). The worker must be actively processing before proceeding.
+5. **Only then** — Move to the next worker. If a worker fails visual verification or does not start processing, retry once. If it fails again, log the failure and continue to the next worker.
+
+**NEVER open multiple worker windows simultaneously.** Each window must be individually verified before the next one is started. This prevents silent failures where windows open incorrectly but the boot proceeds without noticing.
 
 ### Post-Boot Operating Mode
 Once the boot protocol completes, the orchestrator enters its normal operating loop:
@@ -169,9 +180,9 @@ Once the boot protocol completes, the orchestrator enters its normal operating l
 - **PS1 string literals:** Never use Unicode em-dash (—) in PowerShell string literals — use double hyphen (--) instead. PS1 files without UTF-8 BOM will fail to parse em-dashes in strings with `MissingEndCurlyBrace` errors.
 - **Session restore: 2-attempt max.** When restoring sessions from the SESSIONS panel (right-click → "Open in New Window"), attempt at most 2 times. If both attempts fail, report failure immediately — do NOT keep retrying. This prevents infinite loops when the sessions panel is bugged. Fall back to opening a fresh window via `new_chat.ps1` instead.
 - **NEVER close working sessions.** The SESSIONS panel preserves full context. To restore a session: right-click it → "Open in New Window". Only use `new_chat.ps1` for brand new workers that don't have an existing session.
-- **`skynet-start` is the FULL cold-start trigger.** It runs Phase 1 (infrastructure boot: skynet.exe, GOD Console, daemons) FIRST, then Phase 2 (orchestrator role assumption: identity, knowledge acquisition, report). Phase 1 is fast (<15s), does NOT open worker windows, and does NOT involve UIA. Phase 1 MUST complete before Phase 2 begins. Worker windows are opened separately AFTER the orchestrator is online.
-- **`orchestrator-start` and `Orch-Start` are Phase 2 ONLY.** They assume Skynet infrastructure is already running. They perform orchestrator self-identification, knowledge acquisition, and enter CEO mode. If infrastructure is dead, they warn and attempt Phase 1 first, but their primary purpose is role assumption — not infrastructure boot. `Orch-Start.ps1` can be used for worker window management (via `-SkipInfra`) after the orchestrator is online.
-- **`skynet-start` ≠ `orchestrator-start`.** They are separate phases. `skynet-start` = Phase 1 + Phase 2. `orchestrator-start` = Phase 2 only. This separation ensures infrastructure boot never hangs on UIA worker window operations.
+- **`skynet-start` is the FULL cold-start trigger.** It runs Phase 1 (infrastructure boot: skynet.exe, GOD Console, daemons) FIRST, then Phase 2 (orchestrator role assumption + sequential worker boot: identity, knowledge acquisition, open worker windows one at a time with visual verification, report). Phase 1 is fast (<15s), does NOT open worker windows, and does NOT involve UIA. Phase 1 MUST complete before Phase 2 begins.
+- **`orchestrator-start` and `Orch-Start` are Phase 2 ONLY.** They assume Skynet infrastructure is already running. They perform orchestrator self-identification, knowledge acquisition, open worker windows (one at a time with visual verification per the Sequential Worker Boot Rule), and enter CEO mode. If infrastructure is dead, they warn and attempt Phase 1 first.
+- **`skynet-start` ≠ `orchestrator-start`.** They are separate phases. `skynet-start` = Phase 1 + Phase 2. `orchestrator-start` = Phase 2 only. Worker windows are opened in Phase 2 as part of boot, NOT as a separate step afterward.
 - **`CC-Start` means Codex Consultant bootstrap.** Run `CC-Start.ps1`. It may ensure shared Skynet infrastructure is up when needed, but its role stays consultant-only: bridge port `8422`, sender `consultant`, no worker command authority.
 - **`GC-Start` means Gemini Consultant bootstrap.** Run `GC-Start.ps1`. It may ensure shared Skynet infrastructure is up when needed, but its role stays consultant-only: bridge port `8425`, sender `gemini_consultant`, no worker command authority.
 

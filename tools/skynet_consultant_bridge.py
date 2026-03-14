@@ -139,13 +139,48 @@ def _reserved_hwnds() -> Dict[int, str]:
     return reserved
 
 
-def _consultant_hwnd_truth(raw: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _cached_surface_truth(raw: Dict[str, Any], source: str = "state") -> Dict[str, Any]:
+    return {
+        "hwnd": 0,
+        "hwnd_candidate": _normalize_hwnd(raw.get("hwnd_candidate") or raw.get("hwnd")),
+        "hwnd_alive": bool(raw.get("hwnd_alive")),
+        "hwnd_validation": str(raw.get("hwnd_validation") or "missing"),
+        "hwnd_reserved_role": raw.get("hwnd_reserved_role"),
+        "hwnd_source": str(raw.get("hwnd_source") or source),
+        "hwnd_markers": raw.get("hwnd_markers", []),
+        "hwnd_score": raw.get("hwnd_score"),
+        "visible_surface": bool(raw.get("visible_surface")),
+        "shared_parent_hwnd": _normalize_hwnd(raw.get("shared_parent_hwnd")),
+        "pane_slot": str(raw.get("pane_slot") or ""),
+        "pane_model": str(raw.get("pane_model") or ""),
+        "pane_session_target": str(raw.get("pane_session_target") or ""),
+        "pane_permissions": str(raw.get("pane_permissions") or ""),
+        "pane_markers": raw.get("pane_markers", []),
+    }  # signed: consultant
+
+
+def _has_cached_surface_metadata(raw: Dict[str, Any]) -> bool:
+    return bool(
+        raw.get("visible_surface")
+        or _normalize_hwnd(raw.get("shared_parent_hwnd"))
+        or raw.get("pane_slot")
+        or raw.get("pane_markers")
+        or raw.get("hwnd_markers")
+        or raw.get("hwnd_score") is not None
+    )  # signed: consultant
+
+
+def _consultant_hwnd_truth(raw: Optional[Dict[str, Any]] = None,
+                           discover_if_missing: bool = True) -> Dict[str, Any]:
     raw = raw if isinstance(raw, dict) else {}
     candidate = _normalize_hwnd(raw.get("hwnd"))
     source = "state"
     discovery: Dict[str, Any] = {}
     reserved = _reserved_hwnds()
-    if candidate <= 0 or candidate in reserved or not _window_alive(candidate):
+    cached_surface = candidate <= 0 and _has_cached_surface_metadata(raw)
+    if cached_surface:
+        return _cached_surface_truth(raw, source)
+    if (candidate <= 0 or candidate in reserved or not _window_alive(candidate)) and discover_if_missing:
         try:
             from tools.skynet_consultant_hwnd import discover_consultant_hwnd
 
@@ -157,6 +192,8 @@ def _consultant_hwnd_truth(raw: Optional[Dict[str, Any]] = None) -> Dict[str, An
         except Exception:
             discovery = {}
     if candidate <= 0:
+        if raw and not discovery:
+            return _cached_surface_truth(raw, source)
         return {
             "hwnd": 0,
             "hwnd_candidate": 0,
@@ -213,8 +250,9 @@ def _consultant_hwnd_truth(raw: Optional[Dict[str, Any]] = None) -> Dict[str, An
 
 
 def _resolve_prompt_routing(raw: Optional[Dict[str, Any]] = None,
-                            bridge_promptable: bool = True) -> Dict[str, Any]:
-    hwnd_truth = _consultant_hwnd_truth(raw)
+                            bridge_promptable: bool = True,
+                            discover_if_missing: bool = True) -> Dict[str, Any]:
+    hwnd_truth = _consultant_hwnd_truth(raw, discover_if_missing=discover_if_missing)
     if hwnd_truth["hwnd"] > 0:
         prompt_transport = "ghost_type"
         requires_hwnd = True
@@ -1009,7 +1047,13 @@ def build_live_state(interval_s: float = DEFAULT_INTERVAL_S,
 def get_consultant_view() -> Dict[str, Any]:
     profile = _load_profile()
     raw = _read_json(STATE_FILE)
-    routing = _resolve_prompt_routing(raw, bridge_promptable=bool(raw.get("accepts_prompts")))
+    # Status routes must stay responsive; rely on the heartbeat snapshot instead of
+    # forcing a fresh UIA consultant scan on every read.
+    routing = _resolve_prompt_routing(
+        raw,
+        bridge_promptable=bool(raw.get("accepts_prompts")),
+        discover_if_missing=False,
+    )
     view = _build_base_consultant_view(profile, raw, routing)
     _apply_liveness_status(view, raw)
     return view

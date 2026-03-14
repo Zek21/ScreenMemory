@@ -111,9 +111,9 @@ class TestDAGTopologicalSort:
         dag.add_edge("a", "b")
         dag.add_edge("b", "c")
         dag.add_edge("c", "a")  # cycle
-        order = dag.topological_sort()
-        # On cycle, returns all nodes but order != len(nodes) internally
-        assert len(order) == 3  # falls back to list(nodes.keys())
+        import pytest
+        with pytest.raises(ValueError):
+            dag.topological_sort()  # signed: delta
 
     def test_single_node_no_edges(self):
         dag = DAG()

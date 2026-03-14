@@ -256,9 +256,18 @@ def pending_count(worker: str, include_claimable: bool = True) -> int:
 
     When include_claimable is True, shared/unassigned backlog items count as
     stop-blocking work because the actor can proactively pull them.
+    Unrecognized statuses are treated as blocking (fail-safe against corruption).
     """
     items = list_todos(worker, include_claimable=include_claimable)
-    return sum(1 for t in items if t["status"] in ("pending", "active"))
+    count = 0
+    for t in items:
+        status = t.get("status", "unknown")
+        if status in ("pending", "active"):
+            count += 1
+        elif status not in VALID_STATUSES:
+            # Corrupted/unknown status -- treat as blocking to be safe
+            count += 1
+    return count  # signed: alpha
 
 
 def can_stop(worker: str, include_claimable: bool = True) -> bool:

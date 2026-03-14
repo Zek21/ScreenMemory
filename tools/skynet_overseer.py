@@ -219,7 +219,8 @@ class OverseerDaemon:
         if not idle_since:
             return
         idle_duration = time.time() - idle_since
-        last_result = self.last_bus_results.get(name, 0)
+        # Default to current time (not epoch 0) to avoid false positives on cold start
+        last_result = self.last_bus_results.get(name, time.time())  # signed: gamma
         has_pending = self._worker_has_pending_todos(name)
         if has_pending and idle_duration > IDLE_STALL_S and (time.time() - last_result) > IDLE_STALL_S:
             issues.append({

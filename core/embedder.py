@@ -51,27 +51,47 @@ class EmbeddingEngine:
         self._processor = None
         self._tokenizer = None
         self._provider = None
+        self._backend = None
+        self._device = None
         self._initialized = False
+        self._init_error: Optional[str] = None
 
         self._init_model(prefer_gpu)
 
     def _init_model(self, prefer_gpu: bool):
         """Initialize the embedding model."""
+        errors = []
         # Try transformers + ONNX Runtime first
         try:
             self._init_transformers(prefer_gpu)
             return
         except Exception as e:
+            errors.append(f"transformers: {e}")
             logger.warning(f"Transformers init failed: {e}")
+            # Clean up partial state from failed init
+            self._model = None
+            self._processor = None
+            self._device = None
 
         # Fallback: use Ollama embeddings
         try:
             self._init_ollama_embeddings()
             return
         except Exception as e:
+            errors.append(f"ollama: {e}")
             logger.warning(f"Ollama embeddings init failed: {e}")
 
-        logger.error("No embedding backend available")
+        self._init_error = "; ".join(errors)
+        logger.error(f"No embedding backend available: {self._init_error}")
+
+    def _ensure_initialized(self, operation: str = "embed"):
+        """Raise RuntimeError if the model is not loaded. Call before any embed operation."""
+        if not self._initialized:
+            msg = f"EmbeddingEngine.{operation}() called but no model is loaded"
+            if self._init_error:
+                msg += f" (init errors: {self._init_error})"
+            raise RuntimeError(msg)
+    # signed: gamma
 
     def _init_transformers(self, prefer_gpu: bool):
         """Initialize using HuggingFace Transformers."""
@@ -113,11 +133,14 @@ class EmbeddingEngine:
         logger.info("Using Ollama for text embeddings (image embeddings disabled)")
 
     def embed_image(self, image: Image.Image) -> Optional[np.ndarray]:
-        """Generate embedding vector from an image."""
-        if not self._initialized:
-            return None
+        """Generate embedding vector from an image.
+
+        Raises RuntimeError if no embedding backend is loaded.
+        """
+        self._ensure_initialized("embed_image")
 
         start = time.perf_counter()
+    # signed: gamma
 
         if self._backend == "transformers":
             return self._embed_image_transformers(image, start)
@@ -151,11 +174,14 @@ class EmbeddingEngine:
         return embedding
 
     def embed_text(self, text: str) -> Optional[np.ndarray]:
-        """Generate embedding vector from text (for search queries)."""
-        if not self._initialized:
-            return None
+        """Generate embedding vector from text (for search queries).
+
+        Raises RuntimeError if no embedding backend is loaded.
+        """
+        self._ensure_initialized("embed_text")
 
         start = time.perf_counter()
+    # signed: gamma
 
         if self._backend == "transformers":
             return self._embed_text_transformers(text, start)
@@ -221,9 +247,15 @@ class EmbeddingEngine:
         return embedding
 
     def embed_batch(self, images: List[Image.Image]) -> List[Optional[np.ndarray]]:
-        """Batch embed multiple images for efficiency."""
-        if not self._initialized or self._backend != "transformers":
+        """Batch embed multiple images for efficiency.
+
+        Raises RuntimeError if no embedding backend is loaded.
+        Uses single-image fallback for non-transformers backends.
+        """
+        self._ensure_initialized("embed_batch")
+        if self._backend != "transformers":
             return [self.embed_image(img) for img in images]
+    # signed: gamma
 
         import torch
 

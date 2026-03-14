@@ -72,7 +72,12 @@ class BM25Index:
         return re.findall(r'\b\w+\b', text.lower())
 
     def add_document(self, doc_id: str, content: str):
-        """Add or update a document in the index."""
+        """Add or update a document in the index.
+
+        Note: IDF is NOT rebuilt here. Call _rebuild_idf() after batch
+        insertions, or let search() handle it automatically via the
+        _dirty flag.
+        """
         tokens = self._tokenize(content)
         self._documents[doc_id] = content
         self._doc_lengths[doc_id] = len(tokens)
@@ -83,6 +88,30 @@ class BM25Index:
             tf[token] += 1
         self._tf[doc_id] = dict(tf)
         self._dirty = True
+
+    def batch_add_documents(self, documents: List[Tuple[str, str]]):
+        """Add multiple documents and rebuild IDF only once at the end.
+
+        This avoids the O(n^2) cost of rebuilding IDF on each insertion
+        when callers add many documents sequentially.
+
+        Args:
+            documents: List of (doc_id, content) tuples.
+        """
+        for doc_id, content in documents:
+            tokens = self._tokenize(content)
+            self._documents[doc_id] = content
+            self._doc_lengths[doc_id] = len(tokens)
+
+            tf = defaultdict(int)
+            for token in tokens:
+                tf[token] += 1
+            self._tf[doc_id] = dict(tf)
+
+        if documents:
+            self._dirty = True
+            self._rebuild_idf()
+    # signed: gamma
 
     def remove_document(self, doc_id: str):
         """Remove a document from the index."""
@@ -189,6 +218,21 @@ class HybridRetriever:
         # BM25 index
         self.bm25.add_document(doc_id, content)
         self._index_count += 1
+
+    def batch_index_documents(self, documents: List[Tuple[str, str]],
+                              metadata_list: List[Optional[dict]] = None):
+        """Index multiple documents with a single IDF rebuild.
+
+        Avoids O(n^2) IDF rebuilds when adding many documents.
+
+        Args:
+            documents: List of (doc_id, content) tuples.
+            metadata_list: Optional per-document metadata (unused currently,
+                           reserved for future vector/graph indexing).
+        """
+        self.bm25.batch_add_documents(documents)
+        self._index_count += len(documents)
+    # signed: gamma
 
     def search(self, query: str, limit: int = 10,
                methods: List[str] = None) -> List[FusedResult]:

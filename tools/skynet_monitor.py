@@ -153,9 +153,17 @@ def log(msg: str, level: str = "INFO"):
 
 
 def load_workers():
-    with open(WORKERS_FILE) as f:
-        data = json.load(f)
+    if not WORKERS_FILE.exists():
+        log("workers.json not found", "ERR")
+        return [], 0
+    try:
+        with open(WORKERS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        log(f"Failed to parse workers.json: {e}", "ERR")
+        return [], 0
     return data.get("workers", []), data.get("orchestrator_hwnd", 0)
+    # signed: beta
 
 
 def skynet_post(path: str, body: dict) -> dict | None:
@@ -270,8 +278,9 @@ def restore_orchestrator_focus(orch_hwnd: int):
 def write_health(health: dict):
     health["updated"] = datetime.now().isoformat()
     DATA_DIR.mkdir(exist_ok=True)
-    with open(HEALTH_FILE, "w") as f:
+    with open(HEALTH_FILE, "w", encoding="utf-8") as f:
         json.dump(health, f, indent=2)
+    # signed: beta
     try: metrics().record_worker_health({k: v.get("status", "?") for k, v in health.items() if isinstance(v, dict)})
     except Exception as e: log(f"Failed to record worker health metrics: {e}", "WARN")
 
@@ -304,10 +313,12 @@ def _check_orchestrator_drift(orch_hwnd: int, health: dict):
         fixed = fix_model_via_uia(orch_hwnd, 0)
         if fixed:
             time.sleep(1)
-            model_str2, _ = get_model_and_agent_uia(orch_hwnd)
+            model_str2, agent_str2 = get_model_and_agent_uia(orch_hwnd)
             log(f"Orchestrator model after fix: '{model_str2}'", "OK" if is_model_correct(model_str2) else "WARN")
             health["orchestrator"]["model"] = model_str2
-            health["orchestrator"]["ok"] = is_model_correct(model_str2) and is_agent_cli(agent_str)
+            health["orchestrator"]["agent"] = agent_str2
+            health["orchestrator"]["ok"] = is_model_correct(model_str2) and is_agent_cli(agent_str2)
+            # signed: beta
             _guarded_bus_publish({"sender": "monitor", "topic": "workers", "type": "report",
                 "content": f"Orchestrator model fixed: '{model_str2}'"})
 
@@ -403,16 +414,27 @@ def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_or
     if check_orch and orch_hwnd:
         _check_orchestrator_drift(orch_hwnd, health)
 
+
     for w in workers:
         name = w["name"]
         hwnd = w["hwnd"]
         h = {"name": name, "hwnd": hwnd, "slot": w.get("grid", "?"), "checked_at": datetime.now().isoformat()}
 
+        # Always refresh HWND from workers.json for each worker every cycle
+        refreshed_hwnd = _try_refresh_hwnd(name, hwnd)
+        if refreshed_hwnd is not None and refreshed_hwnd != hwnd and refreshed_hwnd != 0:
+            log(f"{name.upper()}: HWND changed {hwnd}->{refreshed_hwnd} -- resetting dead counter and alerts", "INFO")
+            hwnd = refreshed_hwnd
+            w["hwnd"] = hwnd
+            _dead_consecutive[name] = 0
+            if name in _last_alert:
+                del _last_alert[name]
+            # signed: gamma
+
         if hwnd == 0:
             h.update({"alive": False, "visible": False, "model": "N/A", "status": "NO_HWND"})
             log(f"{name.upper()}: no HWND -- needs new-chat", "CRIT")
             skynet_post(f"/worker/{name}/heartbeat", {"hwnd_alive": False, "visible": False, "model": ""})
-            # Dedup NO_HWND alerts using same window as DEAD alerts  # signed: delta
             now_ts = time.time()
             last_ts = _last_alert.get(name, 0)
             if (now_ts - last_ts) >= ALERT_DEDUP_WINDOW:
@@ -450,6 +472,7 @@ def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_or
             "model": h.get("model", "") or "Claude Opus 4.6 (fast mode)", "grid_slot": w.get("grid", "")
         })
         health[name] = h
+    # signed: gamma
 
     if check_model and orch_hwnd:
         restore_orchestrator_focus(orch_hwnd)
@@ -958,8 +981,9 @@ def _record_health_trend(health: dict, productivity: dict, pending_work: int):
             "productivity": productivity,
             "trend": list(_health_trend)[-20:],  # last 20 snapshots for dashboard
         }
-        with open(MONITOR_HEALTH_FILE, "w") as f:
+        with open(MONITOR_HEALTH_FILE, "w", encoding="utf-8") as f:
             json.dump(trend_data, f, indent=2, default=str)
+        # signed: beta
     except Exception as e:
         log(f"Failed to write monitor_health.json: {e}", "WARN")
 

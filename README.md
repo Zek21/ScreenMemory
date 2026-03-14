@@ -128,10 +128,10 @@ in a sandboxed subprocess. Failed scripts trigger Reflexion for iterative debugg
 ## Test Results
 
 ```
-Test files:              30 test files in tests/
+Test files:              66 test files in tests/
 Status:                  Run `pytest tests/` for current results
 ```
-<!-- signed: gamma -->
+<!-- signed: alpha -->
 
 ## Hardware
 

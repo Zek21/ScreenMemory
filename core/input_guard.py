@@ -103,6 +103,28 @@ class InputGuard:
         (re.compile(r'\b\w{100,}\b'), 0.40, "token_stuffing"),
     ]
 
+    # Layer 3: Context violation patterns (pre-compiled)  # signed: delta
+    _RE_IMPERATIVES = re.compile(
+        r'^(you\s+must|you\s+will|you\s+should|always|never|do\s+not)\b',
+        re.I | re.M,
+    )
+    _RE_PERSONA_SWITCHES = re.compile(
+        r'(now\s+you\s+are|switch\s+to|change\s+to|become\s+a)', re.I,
+    )
+
+    # Sanitization patterns (pre-compiled)  # signed: delta
+    _RE_DELIMITERS = re.compile(
+        r'<\|?(system|endoftext|im_start|im_end)\|?>', re.I,
+    )
+    _RE_INST_TAGS = re.compile(
+        r'\[INST\]|\[/INST\]|<<SYS>>|<</SYS>>', re.I,
+    )
+    _RE_UNICODE_DIR = re.compile(r'[\u200e\u200f\u202a-\u202e\u2066-\u2069]')
+    _RE_INSTRUCTION_OVERRIDE = re.compile(
+        r'ignore\s+(all\s+)?(previous|above|prior)\s+(instructions?|prompts?|rules?)',
+        re.I,
+    )
+
     def __init__(self, block_threshold: float = 0.75,
                  warn_threshold: float = 0.40,
                  audit_all: bool = True):
@@ -197,19 +219,13 @@ class InputGuard:
         """Check for attempts to manipulate conversation context."""
         score = 0.0
 
-        # Excessive instruction-like formatting
-        imperative_count = len(re.findall(
-            r'^(you\s+must|you\s+will|you\s+should|always|never|do\s+not)\b',
-            text, re.I | re.M
-        ))
+        # Excessive instruction-like formatting (pre-compiled)  # signed: delta
+        imperative_count = len(self._RE_IMPERATIVES.findall(text))
         if imperative_count > 3:
             score = max(score, 0.5 + imperative_count * 0.05)
 
-        # Multiple persona switches in one input
-        persona_switches = len(re.findall(
-            r'(now\s+you\s+are|switch\s+to|change\s+to|become\s+a)',
-            text, re.I
-        ))
+        # Multiple persona switches in one input (pre-compiled)  # signed: delta
+        persona_switches = len(self._RE_PERSONA_SWITCHES.findall(text))
         if persona_switches > 1:
             score = max(score, 0.7)
 
@@ -219,18 +235,16 @@ class InputGuard:
         """Remove or neutralize detected threats while preserving intent."""
         sanitized = text
 
-        # Remove delimiter attacks
-        sanitized = re.sub(r'<\|?(system|endoftext|im_start|im_end)\|?>', '', sanitized)
-        sanitized = re.sub(r'\[INST\]|\[/INST\]|<<SYS>>|<</SYS>>', '', sanitized)
+        # Remove delimiter attacks (pre-compiled)  # signed: delta
+        sanitized = self._RE_DELIMITERS.sub('', sanitized)
+        sanitized = self._RE_INST_TAGS.sub('', sanitized)
 
-        # Remove unicode direction overrides
-        sanitized = re.sub(r'[\u200e\u200f\u202a-\u202e\u2066-\u2069]', '', sanitized)
+        # Remove unicode direction overrides (pre-compiled)  # signed: delta
+        sanitized = self._RE_UNICODE_DIR.sub('', sanitized)
 
-        # Neutralize instruction overrides (prefix with warning)
-        sanitized = re.sub(
-            r'ignore\s+(all\s+)?(previous|above|prior)\s+(instructions?|prompts?|rules?)',
-            '[REDACTED: instruction override attempt]',
-            sanitized, flags=re.I
+        # Neutralize instruction overrides (pre-compiled)  # signed: delta
+        sanitized = self._RE_INSTRUCTION_OVERRIDE.sub(
+            '[REDACTED: instruction override attempt]', sanitized
         )
 
         return sanitized.strip()

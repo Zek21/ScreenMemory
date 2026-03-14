@@ -67,6 +67,7 @@ class ToolValidator:
         r'locals\s*\(',  # Local scope access
         r'setattr\s*\(',  # Dynamic attribute setting
         r'delattr\s*\(',  # Attribute deletion
+        r'getattr\s*\(',  # Dynamic attribute access (can bypass import checks) # signed: gamma
         r'\.rm\s*\(',  # Removal operations
         r'\.unlink\s*\(',  # File deletion
     ]
@@ -114,7 +115,8 @@ class ToolValidator:
                     if node.module not in self.ALLOWED_IMPORTS:
                         issues.append(f"Disallowed import from: {node.module}")
         except (SyntaxError, ValueError, TypeError) as e:
-            logger.warning("AST validation parse error: %s", e)  # signed: gamma
+            logger.warning("AST validation parse error: %s", e)
+            issues.append(f"AST validation failed (code may bypass import checks): {e}")  # signed: gamma
         
         return len(issues) == 0, issues
     

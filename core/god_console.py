@@ -206,7 +206,7 @@ class AgentOverride:
 class SystemAwareness:
     """Collects system-wide context for GOD visibility."""
 
-    def __init__(self, db_path: str = str(DB_PATH)):
+    def __init__(self, db_path: str = str(DB_PATH)) -> None:  # signed: delta
         self.db_path = db_path
         self._start_time = time.time()
 
@@ -479,7 +479,7 @@ class SystemAwareness:
             warnings.append(f"Anomaly detection error: {exc}")
         return warnings
 
-    def _check_duplicate_processes(self, warnings):
+    def _check_duplicate_processes(self, warnings: list) -> None:  # signed: delta
         proc_map = self.get_process_map()
         from collections import Counter
         proc_names = [k.split("_")[0] if not k.startswith("pid_") else k for k in proc_map]
@@ -488,7 +488,7 @@ class SystemAwareness:
             if count > 1 and name != "_error":
                 warnings.append(f"Duplicate processes: {count} instances of {name}")
 
-    def _check_idle_agents_with_pending(self, warnings):
+    def _check_idle_agents_with_pending(self, warnings: list) -> None:  # signed: delta
         agent_status = self.get_live_agent_status()
         now = time.time()
         for agent, data in agent_status.get("agents", {}).items():
@@ -503,7 +503,7 @@ class SystemAwareness:
                     )
 
     @staticmethod
-    def _parse_idle_minutes(updated, now):
+    def _parse_idle_minutes(updated: Optional[Any], now: float) -> float:  # signed: delta
         if not updated:
             return 0
         try:
@@ -513,7 +513,7 @@ class SystemAwareness:
             return 0
 
     @staticmethod
-    def _check_memory_usage(warnings):
+    def _check_memory_usage(warnings: list) -> None:  # signed: delta
         try:
             import psutil
             mem = psutil.virtual_memory()
@@ -522,7 +522,7 @@ class SystemAwareness:
         except ImportError:
             pass
 
-    def _check_stale_results(self, warnings):
+    def _check_stale_results(self, warnings: list) -> None:  # signed: delta
         agent_status = self.get_live_agent_status()
         now = time.time()
         results = agent_status.get("results", {})
@@ -540,7 +540,7 @@ class SystemAwareness:
                 warnings.append("No agent results in last 10 minutes -- pipeline may be stalled")
 
     @staticmethod
-    def _result_is_recent(rdata, now, window=600):
+    def _result_is_recent(rdata: dict, now: float, window: int = 600) -> bool:  # signed: delta
         latest = rdata.get("latest") or {}
         ts = latest.get("timestamp") or latest.get("completed_at")
         if not ts:
@@ -551,7 +551,7 @@ class SystemAwareness:
             return False
 
     @staticmethod
-    def _check_stale_orchestrator(warnings):
+    def _check_stale_orchestrator(warnings: list) -> None:  # signed: delta
         orch_file = AGENT_QUEUE_DIR / "orch_thinking.json"
         if not orch_file.exists():
             return
@@ -588,20 +588,20 @@ class SystemAwareness:
             return f"\n=== GOD BRIEFING ===\nError generating briefing: {exc}\n===================\n"
 
     @staticmethod
-    def _briefing_system_line(agents_data, tasks):
+    def _briefing_system_line(agents_data: dict, tasks: dict) -> str:  # signed: delta
         agent_count = len(agents_data.get("agents", {}))
         pending = len(agents_data.get("god_queue", []))
         done = tasks.get("total", 0)
         return f"SYSTEM: {agent_count} agents | {pending} pending approvals | {done} tasks completed"
 
     @staticmethod
-    def _briefing_health_line(resources):
+    def _briefing_health_line(resources: dict) -> str:  # signed: delta
         cpu = resources.get("cpu_percent", "?")
         mem_info = resources.get("memory", {})
         return f"HEALTH: CPU {cpu}% | RAM {mem_info.get('used_gb', '?')}/{mem_info.get('total_gb', '?')} GB | Disk {resources.get('disk', {}).get('percent', '?')}%"
 
     @staticmethod
-    def _briefing_agents_line(agents_data):
+    def _briefing_agents_line(agents_data: dict) -> str:  # signed: delta
         parts = [f"{name}={data.get('status', 'UNKNOWN').upper()}" for name, data in agents_data.get("agents", {}).items()]
         return "AGENTS: " + (" ".join(parts) if parts else "none detected")
 
@@ -625,7 +625,7 @@ class GodConsole:
         state = god.get_system_state()                 # GOD sees everything
     """
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None) -> None:  # signed: delta
         self.db_path = db_path or str(DB_PATH)
         self.lock = threading.Lock()
         self.awareness = SystemAwareness(self.db_path)
@@ -669,7 +669,7 @@ class GodConsole:
         );
     """
 
-    def _init_db(self):
+    def _init_db(self) -> None:  # signed: delta
         """Initialize all GOD console tables."""
         with sqlite3.connect(self.db_path, check_same_thread=False) as conn:
             conn.executescript(self._SCHEMA_SQL)
@@ -800,7 +800,7 @@ class GodConsole:
             """, (limit,))
             return [PendingApproval.from_row(row) for row in cursor]
 
-    def _expire_stale(self):
+    def _expire_stale(self) -> None:  # signed: delta
         """Mark expired approvals."""
         now = time.time()
         with self.lock:
@@ -970,7 +970,7 @@ class GodConsole:
         agent_id: str,
         action: AgentAction,
         reason: str,
-    ):
+    ) -> None:  # signed: delta
         """Write an override signal to the agent's live queue file."""
         live_file = AGENT_QUEUE_DIR / f"{agent_id}_live.json"
         try:
@@ -1063,7 +1063,7 @@ class GodConsole:
         message: str,
         agent_id: str = "",
         traceback_str: str = "",
-    ):
+    ) -> None:  # signed: delta
         """Log a system error for GOD visibility."""
         error_id = f"err_{uuid4().hex[:12]}"
         with self.lock:
@@ -1084,7 +1084,7 @@ class GodConsole:
         description: str = "",
         duration_ms: float = 0.0,
         error: str = "",
-    ):
+    ) -> None:  # signed: delta
         """Log a completed task for GOD visibility."""
         task_id = f"task_{uuid4().hex[:12]}"
         with self.lock:

@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -51,7 +52,7 @@ DAEMONS = {
     "bus_relay":    ("bus_relay.pid",     ["skynet_bus_relay.py"],              "Bus message relay"),
     "sse_daemon":   ("sse_daemon.pid",   ["skynet_sse_daemon.py"],             "SSE real-time streamer"),
     "learner":      ("learner.pid",      ["skynet_learner.py", "--daemon"],    "Learning engine"),
-    "overseer":     ("overseer.pid",     ["skynet_overseer.py"],               "Autonomous overseer"),
+    "overseer":     ("overseer.pid",     ["skynet_overseer.py", "start"],      "Autonomous overseer"),
     "realtime":     ("realtime.pid",     ["skynet_realtime.py"],               "Real-time state writer"),
 }
 # signed: delta
@@ -67,13 +68,89 @@ def _alive(pid: int) -> bool:
 # signed: delta
 
 
+def _realtime_fallback_status(max_age_s: float = 5.0) -> dict:
+    """Accept fresh realtime.json written by sse_daemon as a live fallback."""
+    result = {
+        "ok": False,
+        "age_s": None,
+        "sse_pid": None,
+        "reason": "missing_realtime_state",
+    }
+    state_file = DATA / "realtime.json"
+    if not state_file.exists():
+        return result
+
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except Exception:
+        result["reason"] = "unreadable_realtime_state"
+        return result
+
+    age_s = None
+    timestamp = state.get("timestamp")
+    if isinstance(timestamp, (int, float)):
+        age_s = max(0.0, time.time() - float(timestamp))
+    elif isinstance(state.get("last_update"), str):
+        try:
+            from datetime import datetime
+            age_s = max(0.0, time.time() - datetime.fromisoformat(state["last_update"]).timestamp())
+        except ValueError:
+            age_s = None
+
+    if age_s is None:
+        result["reason"] = "missing_realtime_timestamp"
+        return result
+
+    result["age_s"] = round(age_s, 1)
+    if age_s > max_age_s:
+        result["reason"] = "stale_realtime_state"
+        return result
+
+    sse_pid_path = DATA / "sse_daemon.pid"
+    if not sse_pid_path.exists():
+        result["reason"] = "missing_sse_pid"
+        return result
+
+    try:
+        sse_pid = int(sse_pid_path.read_text().strip())
+    except (ValueError, OSError):
+        result["reason"] = "invalid_sse_pid"
+        return result
+
+    result["sse_pid"] = sse_pid
+    if not _alive(sse_pid):
+        result["reason"] = "dead_sse_pid"
+        return result
+
+    result["ok"] = True
+    result["reason"] = "fresh_realtime_via_sse_daemon"
+    return result
+# signed: consultant
+
+
 def check_daemon(name: str) -> dict:
     """Check one daemon. Returns {name, pid, alive, pid_file, stale}."""
     pid_file_name, _, desc = DAEMONS[name]
     pid_path = DATA / pid_file_name
     result = {"name": name, "description": desc, "pid": None,
-              "alive": False, "stale": False, "pid_file": str(pid_path)}
+              "alive": False, "stale": False, "disabled": False, "pid_file": str(pid_path)}
     if not pid_path.exists():
+        disabled_file = DATA / f"{name}.disabled"
+        if disabled_file.exists():
+            result["disabled"] = True
+            result["detail"] = f"disabled via {disabled_file.name}"
+            return result
+        if name == "realtime":
+            fallback = _realtime_fallback_status()
+            if fallback["ok"]:
+                result["alive"] = True
+                result["fallback"] = True
+                result["fallback_pid"] = fallback["sse_pid"]
+                result["age_s"] = fallback["age_s"]
+                result["detail"] = (
+                    f"fresh realtime.json via sse_daemon PID {fallback['sse_pid']} "
+                    f"(age {fallback['age_s']:.1f}s)"
+                )
         return result
     try:
         pid = int(pid_path.read_text().strip())
@@ -91,8 +168,17 @@ def check_daemon(name: str) -> dict:
 
 def fix_daemon(name: str) -> bool:
     """Start a dead daemon. Returns True on success. Respects .disabled sentinel."""
+    if name == "realtime":
+        fallback = _realtime_fallback_status()
+        if fallback["ok"]:
+            print(
+                "  realtime: FALLBACK_OK -- skipping fix "
+                f"(fresh realtime.json via sse_daemon PID {fallback['sse_pid']}, age={fallback['age_s']:.1f}s)"
+            )
+            return True
+
     # Check disabled sentinel -- do not restart disabled daemons
-    disabled_file = ROOT / "data" / f"{name}.disabled"
+    disabled_file = DATA / f"{name}.disabled"
     if disabled_file.exists():
         print(f"  {name}: DISABLED -- skipping fix (remove {disabled_file} to enable)")
         return False
@@ -258,19 +344,23 @@ def main():
         sys.exit(0 if result["ok"] else 1)
 
     results = {name: check_daemon(name) for name in DAEMONS}
-    alive_count = sum(1 for r in results.values() if r["alive"])
+    healthy_count = sum(1 for r in results.values() if r["alive"] or r.get("disabled"))
     total = len(DAEMONS)
-    dead_names = [n for n, r in results.items() if not r["alive"]]
+    dead_names = [n for n, r in results.items() if not r["alive"] and not r.get("disabled")]
 
     if args.json:
-        print(json.dumps({"daemons": results, "alive": alive_count,
-                          "total": total, "healthy": alive_count == total}))
+        print(json.dumps({"daemons": results, "alive": healthy_count,
+                          "total": total, "healthy": healthy_count == total}))
     else:
-        print(f"\n  Skynet Daemon Health ({alive_count}/{total})\n  {'='*40}")
+        print(f"\n  Skynet Daemon Health ({healthy_count}/{total})\n  {'='*40}")
         for name, r in results.items():
-            icon = "OK" if r["alive"] else ("STALE" if r["stale"] else "DOWN")
+            if r.get("disabled"):
+                icon = "DISABLED"
+            else:
+                icon = "OK" if r["alive"] else ("STALE" if r["stale"] else "DOWN")
             pid_s = str(r["pid"]) if r["pid"] else "-"
-            print(f"  {icon:>5}  {name:<15} PID {pid_s:>7}  {r['description']}")
+            detail = f" [{r['detail']}]" if r.get("detail") else ""
+            print(f"  {icon:>8}  {name:<15} PID {pid_s:>7}  {r['description']}{detail}")
         print()
 
     fixed = 0
@@ -284,7 +374,7 @@ def main():
                 fixed += 1
         print(f"  Fixed {fixed}/{len(dead_names)}\n")
 
-    sys.exit(0 if alive_count + fixed >= total else 1)
+    sys.exit(0 if healthy_count + fixed >= total else 1)
 
 
 if __name__ == "__main__":

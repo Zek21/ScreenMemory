@@ -141,6 +141,43 @@ function Wait-HealthyEndpoint([int]$port, [string]$url, [int]$maxSeconds = 40) {
     return $false
 }
 
+function Test-GodConsoleTruth([int]$timeoutSec = 5) {
+    foreach ($url in @(
+        "http://127.0.0.1:8421/leadership",
+        "http://localhost:8421/leadership",
+        "http://127.0.0.1:8421/dashboard/data",
+        "http://localhost:8421/dashboard/data"
+    )) {
+        try {
+            $resp = Invoke-RestMethod $url -TimeoutSec $timeoutSec
+            if ($url -like "*/leadership") {
+                if ($null -ne $resp.orchestrator -or $null -ne $resp.leadership_total -or $null -ne $resp.timestamp) {
+                    return [pscustomobject]@{
+                        url = $url
+                        payload = $resp
+                    }
+                }
+            } elseif ($null -ne $resp.status -or $null -ne $resp.consultants -or $null -ne $resp.timestamp) {
+                return [pscustomobject]@{
+                    url = $url
+                    payload = $resp
+                }
+            }
+        } catch {}
+    }
+    return $null
+}  # signed: consultant -- consultant/dashboard truth requires live GOD payloads, not a transient port-open alone
+
+function Wait-GodConsoleTruth([int]$maxSeconds = 15, [int]$timeoutSec = 5) {
+    $deadline = (Get-Date).AddSeconds($maxSeconds)
+    do {
+        $truth = Test-GodConsoleTruth $timeoutSec
+        if ($null -ne $truth) { return $truth }
+        Start-Sleep -Seconds 1
+    } while ((Get-Date) -lt $deadline)
+    return $null
+}
+
 Add-Type -Name "CCUser32" -Namespace "Win32CC" -MemberDefinition @"
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
@@ -380,23 +417,21 @@ if ($status) {
 
 # ── Phase 2: GOD Console ────────────────────────────────
 
-$godUp = Test-Port 8421
+$godTruth = Test-GodConsoleTruth 3
+$godUp = ($null -ne $godTruth)
 if ($godUp) {
-    Write-Status "GOD Console already running on port 8421" "OK"
+    Write-Status "GOD Console already serving live dashboard truth via $($godTruth.url)" "OK"
 } else {
     Write-Status "GOD Console not running -- starting..." "SYS"
     $godScript = Join-Path $repoRoot "god_console.py"
     if (Test-Path $godScript) {
         Start-Process -FilePath $python -ArgumentList $godScript -WorkingDirectory $repoRoot -WindowStyle Hidden
-        for ($i = 0; $i -lt 10; $i++) {
-            Start-Sleep -Seconds 1
-            if (Test-Port 8421) {
-                Write-Status "GOD Console started" "OK"
-                $godUp = $true
-                break
-            }
+        $godTruth = Wait-GodConsoleTruth 15 3
+        if ($null -ne $godTruth) {
+            Write-Status "GOD Console started and returned live dashboard truth via $($godTruth.url)" "OK"
+            $godUp = $true
         }
-        if (-not $godUp) { Write-Status "GOD Console failed to start within 10s" "WARN" }
+        if (-not $godUp) { Write-Status "GOD Console failed live truth verification within 15s" "WARN" }
     } else {
         Write-Status "god_console.py not found" "ERR"
     }
@@ -673,7 +708,8 @@ if ($skynetUp) {
 
 # ── Always open dashboard ────────────────────────────────
 
-if ($godUp -or (Test-Port 8421)) {
+$godTruth = if ($godUp) { $godTruth } else { Test-GodConsoleTruth 3 }
+if ($null -ne $godTruth) {
     Write-Status "Opening dashboard..." "SYS"
     try { Start-Process "http://localhost:8421/dashboard" | Out-Null } catch {}
 } else {

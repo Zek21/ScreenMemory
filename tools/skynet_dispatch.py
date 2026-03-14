@@ -1222,7 +1222,15 @@ def ghost_type_to_worker(hwnd, text, orch_hwnd, render_hwnd=None):
         return False
     dispatch_file_path = str(dispatch_file).replace("\\", "\\\\")
     ps = _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path, render_hwnd=render_hwnd)
-    return _execute_ghost_dispatch(ps, hwnd, orch_hwnd)
+    try:
+        return _execute_ghost_dispatch(ps, hwnd, orch_hwnd)
+    finally:
+        # Always clean up temp file even if dispatch fails/times out (prevents resource leak)
+        try:
+            dispatch_file.unlink(missing_ok=True)
+        except Exception:
+            pass  # Best-effort cleanup; PS script may have already removed it
+        # signed: alpha
 
 
 def _dispatch_to_orchestrator(task, self_id, orch_hwnd):
@@ -1437,8 +1445,16 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
     elif pre_state == "PROCESSING":
         log(f"{worker_name.upper()} is PROCESSING -- dispatching immediately (VS Code queues)", "SYS")
 
-    enriched_task = enrich_task(worker_name, task)
-    full_task = build_context_preamble(worker_name, enriched_task, context) if context else build_preamble(worker_name) + enriched_task
+    try:
+        enriched_task = enrich_task(worker_name, task)
+    except Exception as e:
+        log(f"Enrichment failed for {worker_name.upper()}: {e} -- dispatching raw task", "WARN")
+        enriched_task = task  # Fall back to unenriched task
+    try:
+        full_task = build_context_preamble(worker_name, enriched_task, context) if context else build_preamble(worker_name) + enriched_task
+    except Exception as e:
+        log(f"Preamble build failed for {worker_name.upper()}: {e} -- dispatching raw task", "WARN")
+        full_task = enriched_task  # Fall back to task without preamble  # signed: alpha
 
     if not _validate_target_hwnd(hwnd, worker_name):
         _log_dispatch(worker_name, task, pre_state, False, hwnd)

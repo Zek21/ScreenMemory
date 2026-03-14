@@ -254,20 +254,46 @@ function Set-AutopilotPermissions {
     $permBtn.SetFocus()
     Start-Sleep -Milliseconds 500
 
+    $expandOK = $false
     try {
         $ec = $permBtn.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
         try { $ec.Collapse(); Start-Sleep -Milliseconds 300 } catch {}
         $ec.Expand()
+        $expandOK = $true
     } catch {
-        return "EXPAND_FAILED:$($_.Exception.Message)"
+        # Fallback: Ghost.Click on the permissions button bounding rect
+        try {
+            $rect = $permBtn.Current.BoundingRectangle
+            $cx = [int]($rect.X + $rect.Width / 2)
+            $cy = [int]($rect.Y + $rect.Height / 2)
+            $render = [Ghost]::FindRenderSurface($hwnd)
+            if ($render -ne [IntPtr]::Zero) {
+                [Ghost]::Click($render, $cx, $cy)
+            } else {
+                [Ghost]::Click($hwnd, $cx, $cy)
+            }
+            $expandOK = $true
+            Write-Host "  PERMS: Ghost.Click fallback at ($cx,$cy)"
+        } catch {
+            return "EXPAND_FAILED:$($_.Exception.Message)"
+        }
     }
+    if (-not $expandOK) { return 'EXPAND_FAILED:All methods exhausted' }
     Start-Sleep -Milliseconds 1000
 
-    # Step 3: PostMessage END+ENTER to select Autopilot (last item in dropdown)
-    # END jumps to last item regardless of current selection position
-    [Ghost]::PostKey($hwnd, 0x23)  # VK_END
-    Start-Sleep -Milliseconds 300
-    [Ghost]::PostKey($hwnd, 0x0D)  # VK_RETURN
+    # Step 3: Select Autopilot (last item in dropdown)
+    # SendKeys uses SendInput (hardware-level) — works with Chromium quickpick
+    try {
+        [System.Windows.Forms.SendKeys]::SendWait("{END}")
+        Start-Sleep -Milliseconds 300
+        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    } catch {
+        # Fallback to PostMessage on render widget
+        $renderPerms = [Ghost]::FindRenderSurface($hwnd)
+        [Ghost]::PostKey($renderPerms, 0x23)  # VK_END
+        Start-Sleep -Milliseconds 300
+        [Ghost]::PostKey($renderPerms, 0x0D)  # VK_RETURN
+    }
     Start-Sleep -Milliseconds 800
     return 'OK'
 }
@@ -505,19 +531,41 @@ function Open-NewChatWindowUIA {
     if (-not $chevronBtn) { return 'NO_BUTTON' }
 
     # Expand dropdown via UIA ExpandCollapsePattern (no mouse)
+    $expandOK = $false
     try {
         $chevronBtn.SetFocus()
         Start-Sleep -Milliseconds 300
         $ec = $chevronBtn.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
         $ec.Expand()
+        $expandOK = $true
     } catch {
         try {
             $inv = $chevronBtn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
             $inv.Invoke()
+            $expandOK = $true
         } catch {
-            return "EXPAND_FAILED:$($_.Exception.Message)"
+            # Fallback 3: PostMessage ghost-click on chevron bounding rect center
+            try {
+                $rect = $chevronBtn.Current.BoundingRectangle
+                $cx = [int]($rect.X + $rect.Width / 2)
+                $cy = [int]($rect.Y + $rect.Height / 2)
+                $render = [Ghost]::FindRenderSurface($hwnd)
+                if ($render -ne [IntPtr]::Zero) {
+                    [Ghost]::Click($render, $cx, $cy)
+                    $expandOK = $true
+                    Write-Host "DROPDOWN: Ghost.Click fallback at ($cx,$cy)"
+                } else {
+                    # Last resort: PostMessage click directly on main hwnd
+                    [Ghost]::Click($hwnd, $cx, $cy)
+                    $expandOK = $true
+                    Write-Host "DROPDOWN: Ghost.Click direct on hwnd at ($cx,$cy)"
+                }
+            } catch {
+                return "EXPAND_FAILED:$($_.Exception.Message)"
+            }
         }
     }
+    if (-not $expandOK) { return 'EXPAND_FAILED:All methods exhausted' }
     Start-Sleep -Milliseconds 800
 
     # Find "New Chat Window" menu item via FocusedElement + ControlViewWalker (no keyboard needed)
@@ -635,11 +683,22 @@ for ($guardPass = 1; $guardPass -le 2; $guardPass++) {
                         [Ghost]::Click($renderST, $stBtn.CX, $stBtn.CY)
                     }
                     Start-Sleep -Milliseconds 600
-                    [Ghost]::PostString($newHwnd, "CLI")
-                    Start-Sleep -Milliseconds 300
-                    [Ghost]::PostChar($newHwnd, [char]' ')
-                    Start-Sleep -Milliseconds 200
-                    [Ghost]::PostKey($newHwnd, 0x0D)  # ENTER
+                    # Clipboard paste — PostMessage WM_CHAR doesn't reach Chromium quickpick
+                    try {
+                        [System.Windows.Forms.Clipboard]::SetText("Copilot CLI")
+                        Start-Sleep -Milliseconds 100
+                        [System.Windows.Forms.SendKeys]::SendWait("^v")   # Ctrl+V paste
+                        Start-Sleep -Milliseconds 500
+                        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+                        Write-Host "SESSION_TARGET: Pasted 'Copilot CLI' via clipboard + SendKeys"
+                    } catch {
+                        Write-Host "SESSION_TARGET: SendKeys failed, trying PostString fallback"
+                        [Ghost]::PostString($newRender, "CLI")
+                        Start-Sleep -Milliseconds 300
+                        [Ghost]::PostChar($newRender, [char]' ')
+                        Start-Sleep -Milliseconds 200
+                        [Ghost]::PostKey($newRender, 0x0D)  # ENTER
+                    }
                     Start-Sleep -Milliseconds 400
                     $target = "Set Session Target - Copilot CLI"
                     $needsConfig = $true
@@ -656,46 +715,31 @@ for ($guardPass = 1; $guardPass -le 2; $guardPass++) {
         $model = $pmBtn.Name
         if ($model -notmatch 'Opus.*fast') {
             Write-Host "MODEL_GUARD: Wrong model '$model' -- attempt $guardPass/2..."
-            # Open model picker via UIA ExpandCollapsePattern (no mouse)
-            $uiaNewRoot = [System.Windows.Automation.AutomationElement]::FromHandle($newHwnd)
-            $uiaNewBtns = $uiaNewRoot.FindAll(
-                [System.Windows.Automation.TreeScope]::Descendants,
-                (New-Object System.Windows.Automation.PropertyCondition(
-                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                    [System.Windows.Automation.ControlType]::Button
-                ))
-            )
-            $pmUia = $null
-            foreach ($ub in $uiaNewBtns) {
-                if ($ub.Current.Name -match 'Pick Model') { $pmUia = $ub; break }
-            }
-            if ($pmUia) {
-                # Force foreground for keyboard input to work
-                [Ghost]::ForceForeground($newHwnd) | Out-Null
-                try {
-                    $pmUia.SetFocus()
-                    Start-Sleep -Milliseconds 300
-                    $pmExpand = $pmUia.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-                    $pmExpand.Expand()
-                    Write-Host "MODEL_GUARD: Opened model picker via UIA ExpandCollapsePattern"
-                } catch {
-                    Write-Host "MODEL_GUARD: ExpandCollapse failed, trying Ghost.Click fallback"
-                    $renderModel = [Ghost]::FindRenderSurface($newHwnd)
-                    [Ghost]::Click($renderModel, $pmBtn.CX, $pmBtn.CY)
-                }
-            }
-            Start-Sleep -Milliseconds 1200
-            [Ghost]::PostString($newHwnd, "fast")
-            Start-Sleep -Milliseconds 800
-            [Ghost]::PostKey($newHwnd, 0x28)  # DOWN
-            [Ghost]::PostKey($newHwnd, 0x0D)  # ENTER
-            Start-Sleep -Milliseconds 500
-            Write-Host "MODEL_GUARD: Selected Opus fast via keyboard filter"
+            # Use pyautogui to select Opus fast (chromium quickpick workaround)
+            $pmCX = $pmBtn.CX
+            $pmCY = $pmBtn.CY
+            $pyScript = @"
+import pyautogui
+import time
+# Click Pick Model button (dynamic UIA center coordinates)
+pyautogui.click($pmCX, $pmCY)
+time.sleep(1.2)
+pyautogui.typewrite('opus', interval=0.08)
+time.sleep(0.5)
+pyautogui.press('down')
+pyautogui.press('enter')
+time.sleep(0.7)
+"@
+            $pyPath = "D:\Prospects\ScreenMemory\data\model_guard_pyautogui.py"
+            Set-Content -Path $pyPath -Value $pyScript
+            python $pyPath
+            Write-Host "MODEL_GUARD: Selected Opus fast via pyautogui subprocess (chromium quickpick workaround, dynamic coordinates)"
             continue  # Re-scan to verify model stuck
         } else {
             Write-Host "MODEL_GUARD: OK -- $model"
         }
     }
+    # signed: alpha
 
     # --- PERMISSION GUARD (ForceForeground + UIA Expand + PostMessage END+ENTER) ---
     $pBtn = $buttons | Where-Object { $_.Name -match 'Permissions' } | Select-Object -First 1

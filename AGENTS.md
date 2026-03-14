@@ -1,3 +1,16 @@
+### INCIDENT 013 -- VS Code Quickpick Unreachable via Win32 APIs (2026-03-14)
+
+**What failed:** All Win32 input methods (PostMessage WM_CHAR, SendInput, keybd_event, clipboard paste, ghost-type) cannot reach Chromium-rendered quickpick overlays in VS Code. Attempts to select models via keyboard, clipboard, or simulated input are ignored by the quickpick.
+
+**Root cause:** VS Code quickpick is rendered inside the Chromium compositor, creating NO Windows-native controls. It is invisible to UIA, Win32, and all native input APIs. The overlay is not a real window/control, so input events never reach it.
+
+**What works:** pyautogui real mouse clicks and typewrite (hardware-level input that goes through the OS input queue) reliably interact with the quickpick. pyautogui.click() on the picker button, pyautogui.typewrite() to filter, pyautogui.press('down') and pyautogui.press('enter') to select.
+
+**The fix:** In `tools/new_chat.ps1`, the model guard now uses a Python subprocess with pyautogui to click the Pick Model button, type 'opus', and select Claude Opus 4.6 fast. This bypasses all Win32/clipboard/ghost-type limitations and works reliably.
+
+**Architecture Knowledge Registry:** VS Code overlays rendered by Chromium are unreachable by Win32, UIA, or clipboard-based input. Only hardware-level mouse/keyboard events (pyautogui, real input) can interact with them. All future automation must use pyautogui or equivalent for Chromium overlays.
+
+<!-- signed: alpha -->
 # ScreenMemory Agent Notes
 
 ## THE TRUTH PRINCIPLE — Rule #0 (Supreme, Inviolable)
@@ -480,16 +493,28 @@ The orchestrator is a continuous operations loop, not a request-response system.
 2. Start `god_console.py` if port 8421 is closed (wait up to 10s)
 3. Start daemons (self-prompt, self-improve, bus-relay, learner) — check PID files, start dead ones
 4. Announce infra online on bus
-5. Phase 1 does NOT open worker windows (UIA-heavy, can hang)
+5. Phase 1 does NOT open worker windows (that belongs in Phase 2)
 
-**Phase 2 — Orchestrator Role (`orchestrator-start` / `Orch-Start`):**
+**Phase 2 — Orchestrator Role + Worker Boot (`orchestrator-start` / `Orch-Start`):**
 1. Self-identify (HWND detection, update `data/orchestrator.json`)
 2. Announce orchestrator identity on bus
 3. Open dashboard
 4. Knowledge acquisition (bus, status, profiles, config, TODOs, workers)
-5. Report ready to user
+5. Check consultant bridges
+6. **Open worker windows (MANDATORY, sequential)** — per the Sequential Worker Boot Rule below
+7. Report ready to user
 
-**Worker windows** are opened AFTER Phase 2, separately, via `Orch-Start.ps1 -SkipInfra` or `new_chat.ps1`.
+### Sequential Worker Boot Rule (MANDATORY)
+**Worker windows MUST be opened one at a time. You may NOT open the next worker until the previous one has been visually verified as correct and has started processing.**
+
+For each worker (alpha, beta, gamma, delta) in order:
+1. **Open window** — Use `tools/new_chat.ps1` or session restore to open a single worker window.
+2. **Visual verification** — Take a screenshot and verify: window visible in correct grid slot, model is Claude Opus 4.6 (fast mode), agent is Copilot CLI / ScreenMemory, no errors.
+3. **Dispatch identity prompt** — Send worker its identity injection via `skynet_dispatch.py`.
+4. **Confirm processing** — Wait for IDLE → PROCESSING transition (UIA scan or screenshot). Worker must be actively processing before proceeding.
+5. **Only then** — Move to the next worker. If verification fails, retry once. If it fails again, log and continue.
+
+**NEVER open multiple worker windows simultaneously.** Each window must be individually verified before the next one is started.
 
 `CC-Start` and `GC-Start` do not enter this autonomous orchestrator loop. They remain consultant sessions.
 

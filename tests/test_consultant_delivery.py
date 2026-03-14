@@ -437,18 +437,28 @@ class TestConsultantBootstrapTruth(unittest.TestCase):
     def test_cc_start_god_console_probe_checks_ipv4_and_ipv6_loopback(self):
         script = Path("CC-Start.ps1").read_text(encoding="utf-8")
         self.assertIn('@("127.0.0.1", "localhost", "::1")', script)
+        self.assertIn("function Test-GodConsoleTruth", script)
+        self.assertIn("http://127.0.0.1:8421/leadership", script)
+        self.assertIn("http://localhost:8421/dashboard/data", script)
+        self.assertIn("failed live truth verification within 15s", script)
 
     def test_gc_start_requires_bridge_health_before_live_claim(self):
         script = Path("GC-Start.ps1").read_text(encoding="utf-8")
         self.assertIn("http://127.0.0.1:8425/health", script)
         self.assertIn("started and passed /health + live heartbeat truth on port 8425", script)
         self.assertIn("failed live truth verification within 40s", script)
-        self.assertIn('"Gemini Consultant"', script)
-        self.assertIn('"Gemini 3.1 Pro (Preview)"', script)
+        self.assertIn("Gemini Consultant", script)
+        self.assertIn("Gemini 3.1 Pro (Preview)", script)
+        self.assertIn("function Quote-Arg", script)
+        self.assertIn("-ArgumentList $bridgeArgString", script)
 
     def test_gc_start_god_console_probe_checks_ipv4_and_ipv6_loopback(self):
         script = Path("GC-Start.ps1").read_text(encoding="utf-8")
         self.assertIn('@("127.0.0.1", "localhost", "::1")', script)
+        self.assertIn("function Test-GodConsoleTruth", script)
+        self.assertIn("http://127.0.0.1:8421/leadership", script)
+        self.assertIn("http://localhost:8421/dashboard/data", script)
+        self.assertIn("failed live truth verification within 15s", script)
 
 
 if __name__ == "__main__":

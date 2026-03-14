@@ -108,18 +108,18 @@ def _http_post(url: str, data: dict, timeout: float = 5.0):
 
 
 def _guarded_bus_publish(msg: dict) -> bool:
-    """Publish to Skynet bus via SpamGuard. Returns True on success."""  # signed: alpha
+    """Publish to Skynet bus via SpamGuard. Returns True on success.
+
+    No raw fallback — bypassing SpamGuard costs -1.0 score per anti-spam rules.
+    If guarded_publish fails, we log and return False rather than risk penalty.
+    """  # signed: delta
     try:
         from tools.skynet_spam_guard import guarded_publish
         guarded_publish(msg)
         return True
     except Exception as e:
-        logger.warning("guarded_publish failed: %s — trying raw fallback", e)
-        try:
-            result = _http_post("http://localhost:8420/bus/publish", msg, timeout=3)
-            return result is not None
-        except Exception:
-            return False
+        logger.warning("guarded_publish failed: %s — message dropped (no raw fallback)", e)
+        return False
 
 
 def _process_prompt(base_url: str, consultant_id: str, prompt: dict) -> bool:

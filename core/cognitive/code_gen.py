@@ -38,7 +38,7 @@ import textwrap
 import tempfile
 import subprocess
 import logging
-from typing import Optional, List, Dict, Tuple
+from typing import Any, Optional, List, Dict, Tuple  # signed: delta
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -113,7 +113,7 @@ class CodeGenerator:
     Uses templates and task-specific patterns.
     """
 
-    def __init__(self, vlm_analyzer=None):
+    def __init__(self, vlm_analyzer: Optional[Any] = None) -> None:  # signed: delta
         self.vlm = vlm_analyzer
         self._templates = self._load_templates()
 
@@ -325,7 +325,7 @@ class CodeGenerator:
         ''')
 
     def _gen_generic(self, task: str, ctx: dict) -> str:
-        """Generate a generic task script."""
+        """Generate a generic task script (fallback for tasks not matching specific templates)."""  # signed: alpha
         return textwrap.dedent(f'''\
             """Auto-generated script.
             Task: {task}
@@ -413,7 +413,7 @@ class SandboxExecutor:
     """
 
     def __init__(self, timeout_seconds: int = 30, max_output_chars: int = 50000,
-                 working_dir: Optional[str] = None):
+                 working_dir: Optional[str] = None) -> None:  # signed: delta
         self.timeout = timeout_seconds
         self.max_output = max_output_chars
         self.working_dir = working_dir or tempfile.gettempdir()
@@ -458,7 +458,7 @@ class SandboxExecutor:
             except Exception:
                 pass
 
-    def _build_execution_result(self, result, elapsed):
+    def _build_execution_result(self, result: subprocess.CompletedProcess, elapsed: float) -> ExecutionResult:  # signed: delta
         """Build ExecutionResult from subprocess.CompletedProcess."""
         stdout = result.stdout[:self.max_output]
         stderr = result.stderr[:self.max_output]
@@ -477,7 +477,7 @@ class SandboxExecutor:
         return exec_result
 
     @staticmethod
-    def _try_parse_json_output(stdout):
+    def _try_parse_json_output(stdout: str) -> Optional[Any]:  # signed: delta
         """Try to parse JSON from the last line of stdout."""
         if not stdout.strip():
             return None
@@ -508,8 +508,8 @@ class DynamicCodeEngine:
     in the research paper.
     """
 
-    def __init__(self, vlm_analyzer=None, memory=None,
-                 timeout: int = 30, max_retries: int = 3):
+    def __init__(self, vlm_analyzer: Optional[Any] = None, memory: Optional[Any] = None,
+                 timeout: int = 30, max_retries: int = 3) -> None:  # signed: delta
         self.generator = CodeGenerator(vlm_analyzer=vlm_analyzer)
         self.validator = ScriptValidator()
         self.executor = SandboxExecutor(timeout_seconds=timeout)
@@ -543,20 +543,20 @@ class DynamicCodeEngine:
         return ExecutionResult(success=False, stderr=f"All {self.max_retries} attempts failed",
                               error_type="max_retries_exceeded")
 
-    def _record_attempt(self, task, attempt, result):
+    def _record_attempt(self, task: str, attempt: int, result: ExecutionResult) -> None:  # signed: delta
         self._execution_history.append({
             "task": task, "attempt": attempt, "success": result.success,
             "elapsed_ms": result.elapsed_ms, "error": result.error_type,
             "output_length": len(result.stdout),
         })
 
-    def _store_success_memory(self, task, result):
+    def _store_success_memory(self, task: str, result: ExecutionResult) -> None:  # signed: delta
         if self.memory:
             self.memory.store_episodic(
                 f"Code execution success: {task[:60]} ({result.elapsed_ms:.0f}ms)",
                 tags=["codegen", "success"], source_action="dynamic_code", importance=0.7)
 
-    def _store_failure_memory(self, attempt, result):
+    def _store_failure_memory(self, attempt: int, result: ExecutionResult) -> None:  # signed: delta
         if self.memory:
             self.memory.store_episodic(
                 f"Code execution failed (attempt {attempt}): {result.error_type} - {result.stderr[:80]}",

@@ -102,10 +102,9 @@ class DXGICapture:
         )
 
         user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(callback), 0)
-        monitors = monitors_list
 
-        logger.info(f"Found {len(monitors)} monitors: {[(m.width, m.height, m.primary) for m in monitors]}")
-        return monitors
+        logger.info(f"Found {len(monitors_list)} monitors: {[(m.width, m.height, m.primary) for m in monitors_list]}")  # signed: alpha
+        return monitors_list
 
     def _init_dxgi(self):
         """
@@ -155,17 +154,17 @@ class DXGICapture:
         )
 
     def _capture_pil(self, monitor_index: int, start: float) -> CaptureResult:
-        """Capture using PIL ImageGrab (fallback)."""
+        """Capture using PIL ImageGrab (fallback)."""  # signed: delta
         from PIL import ImageGrab
 
         if monitor_index == -1:
-            # All monitors
             img = ImageGrab.grab(all_screens=True)
-        elif monitor_index < len(self.monitors):
+        elif 0 <= monitor_index < len(self.monitors):
+            # Only compute bbox for valid specific monitor index
             mon = self.monitors[monitor_index]
-            bbox = (mon.x, mon.y, mon.x + mon.width, mon.y + mon.height)
-            img = ImageGrab.grab(bbox=bbox)
+            img = ImageGrab.grab(bbox=(mon.x, mon.y, mon.x + mon.width, mon.y + mon.height))
         else:
+            # Invalid index — grab primary without bbox calculation
             img = ImageGrab.grab()
 
         elapsed = (time.perf_counter() - start) * 1000

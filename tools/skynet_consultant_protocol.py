@@ -222,7 +222,8 @@ def _queue_plan_via_bridge_http(consultant_id: str, prompt: str, prompt_type: st
                     return {
                         "target": f"consultant:{consultant_id}",
                         "method": "bridge_http_retry",
-                        "success": True,
+                        "success": False,  # queued != delivered -- TRUTH PRINCIPLE (INCIDENT 011) # signed: gamma
+                        "delivery_status": "queued",
                         "detail": f"prompt_id={prompt_info.get('id', 'unknown')}, port={port}",
                     }
             except Exception as exc:

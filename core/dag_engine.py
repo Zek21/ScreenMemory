@@ -135,10 +135,19 @@ class DAG:
         return ready
 
     def topological_sort(self) -> List[str]:
-        """Return nodes in topological order."""
+        """Return nodes in topological order.
+
+        FEEDBACK edges are excluded from the in-degree calculation because they
+        represent intentional cycles (Generator-Critic loops) that are handled
+        separately by _handle_feedback(). Only SEQUENTIAL, CONDITIONAL, and
+        PARALLEL edges contribute to dependency ordering.
+
+        Raises ValueError if a real (non-feedback) cycle is detected.
+        """  # signed: gamma
         in_degree = defaultdict(int)
         for edge in self.edges:
-            in_degree[edge.target] += 1
+            if edge.edge_type != EdgeType.FEEDBACK:
+                in_degree[edge.target] += 1
 
         queue = [nid for nid in self.nodes if in_degree[nid] == 0]
         order = []
@@ -147,13 +156,19 @@ class DAG:
             nid = queue.pop(0)
             order.append(nid)
             for child in self._adjacency.get(nid, []):
-                in_degree[child] -= 1
-                if in_degree[child] == 0:
-                    queue.append(child)
+                # Only decrement for non-feedback edges
+                edge_types = [e.edge_type for e in self.edges
+                              if e.source == nid and e.target == child]
+                if EdgeType.FEEDBACK not in edge_types:
+                    in_degree[child] -= 1
+                    if in_degree[child] == 0:
+                        queue.append(child)
 
         if len(order) != len(self.nodes):
-            logger.error("DAG has cycles — cannot topologically sort")
-            return list(self.nodes.keys())
+            missing = set(self.nodes.keys()) - set(order)
+            raise ValueError(
+                f"DAG has non-feedback cycles involving nodes: {missing}"
+            )  # signed: gamma
 
         return order
 
@@ -194,7 +209,30 @@ class DAGExecutor:
         self._execution_log: List[dict] = []
 
     def execute(self, dag: DAG, context: ExecutionContext) -> ExecutionContext:
-        """Execute the DAG in topological order with retry and feedback support."""
+        """Execute the DAG in topological order with retry and feedback support.
+
+        Execution flow:
+        1. Compute topological sort to determine node execution order.
+        2. For each node in order:
+           a. Check conditional edges via _should_execute() — skip if unmet.
+           b. Execute the node via _execute_node() with retry logic.
+           c. On success: store output in context.node_outputs for downstream nodes.
+           d. On failure: record error, then attempt feedback loops
+              (Generator-Critic pattern) via _handle_feedback().
+        3. Record full execution trace (timing, stats, errors).
+
+        Context propagation: Each node receives the shared ExecutionContext,
+        which accumulates node_outputs as a dict keyed by node_id. Downstream
+        nodes can read upstream results via context.node_outputs[upstream_id].
+
+        Args:
+            dag: The DAG to execute (nodes + edges + topology).
+            context: Shared execution context carrying query, outputs, and state.
+
+        Returns:
+            The same ExecutionContext, now populated with all node outputs and errors.
+        """
+        # signed: beta
         t0 = time.perf_counter()
         logger.info(f"DAG execution starting: {dag.name} ({len(dag.nodes)} nodes)")
 
@@ -223,7 +261,24 @@ class DAGExecutor:
         return context
 
     def _execute_node(self, node: DAGNode, context: ExecutionContext) -> bool:
-        """Execute a single node with retry logic."""
+        """Execute a single node with automatic retry and exponential backoff.
+
+        Retry logic:
+        - Attempts up to node.max_retries + 1 total executions (1 initial + N retries).
+        - On first attempt: status set to RUNNING. On retries: status set to RETRYING.
+        - If node.handler is None, a default pass-through output is generated.
+        - On exception: logs warning, waits min(30s, 2^attempt) seconds, then retries.
+        - After all attempts exhausted: status set to FAILED, returns False.
+
+        Args:
+            node: The DAGNode to execute. Must have handler (callable or None),
+                max_retries, and timeout_seconds configured.
+            context: Shared ExecutionContext passed to the node's handler.
+
+        Returns:
+            True if the node completed successfully, False if all retries exhausted.
+        """
+        # signed: beta
         for attempt in range(node.max_retries + 1):
             node.status = NodeStatus.RUNNING if attempt == 0 else NodeStatus.RETRYING
             node.start_time = time.time()
@@ -248,6 +303,7 @@ class DAGExecutor:
 
             except Exception as e:
                 node.error = str(e)
+                node.traceback = traceback.format_exc()  # signed: gamma
                 node.end_time = time.time()
                 logger.warning(f"Node {node.id} attempt {attempt + 1} failed: {e}")
 
@@ -262,7 +318,21 @@ class DAGExecutor:
         return False
 
     def _should_execute(self, node_id: str, dag: DAG, context: ExecutionContext) -> bool:
-        """Check if conditional edges allow execution."""
+        """Check if conditional edges allow this node to execute.
+
+        Evaluates all incoming CONDITIONAL edges. If any condition callable
+        returns False (or raises), the node is skipped. SEQUENTIAL and PARALLEL
+        edges do not block execution — only CONDITIONAL edges are checked.
+
+        Args:
+            node_id: ID of the node being considered for execution.
+            dag: The containing DAG (for edge lookup).
+            context: Execution context (provides source node outputs for conditions).
+
+        Returns:
+            True if all conditions pass (or no conditional edges exist), False otherwise.
+        """
+        # signed: beta
         incoming = [e for e in dag.edges if e.target == node_id]
 
         for edge in incoming:
@@ -278,7 +348,25 @@ class DAGExecutor:
 
     def _handle_feedback(self, node_id: str, node: DAGNode, dag: DAG,
                          context: ExecutionContext, feedback_count: int) -> int:
-        """Handle feedback loops (Generator-Critic pattern) on node failure."""
+        """Handle feedback loops (Generator-Critic pattern) on node failure.
+
+        When a node fails, this checks for incoming FEEDBACK edges. If found
+        and the feedback budget is not exhausted, the source nodes are reset
+        to PENDING with the failure error injected into their metadata, then
+        re-executed. This implements the Generator-Critic loop where a critic's
+        failure triggers the generator to retry with error context.
+
+        Args:
+            node_id: ID of the failed node.
+            node: The failed DAGNode (error stored in node.error).
+            dag: The containing DAG (for FEEDBACK edge lookup).
+            context: Execution context for re-running feedback targets.
+            feedback_count: Current number of feedback loops already executed.
+
+        Returns:
+            Updated feedback_count (incremented if a loop was triggered).
+        """
+        # signed: beta
         feedback_targets = [
             e.source for e in dag.edges
             if e.target == node_id and e.edge_type == EdgeType.FEEDBACK

@@ -267,18 +267,42 @@ def _find_daemon_process(daemon: dict) -> int:
 
 
 def _read_pid(pid_file_path: str) -> int:
-    """Read PID from a file. Returns 0 if unreadable.
+    """Read PID from a file. Returns 0 if file absent, logs warning on corruption.
+
+    Distinguishes 'no PID file' (returns 0) from 'corrupted PID file' (returns 0
+    with warning logged). Corrupted files are renamed to .bad to prevent repeated
+    false-negative daemon status checks from stale garbage data.
 
     Reference: docs/DAEMON_ARCHITECTURE.md Section 7: PID Management
     """
     try:
         p = ROOT / pid_file_path
-        if p.exists():
-            return int(p.read_text().strip())
-    except (ValueError, OSError):
-        pass
-    return 0
-    # signed: beta
+        if not p.exists():
+            return 0
+        content = p.read_text(encoding="utf-8", errors="replace").strip()
+        if not content:
+            print(f"[WARN] PID file {pid_file_path} is empty -- renaming to .bad")
+            try:
+                p.rename(p.with_suffix(".bad"))
+            except OSError:
+                pass
+            return 0
+        pid = int(content)
+        if pid <= 0:
+            print(f"[WARN] PID file {pid_file_path} contains non-positive value: {pid}")
+            return 0
+        return pid
+    except ValueError:
+        print(f"[WARN] PID file {pid_file_path} contains non-integer data: {content[:50]!r}")
+        try:
+            p.rename(p.with_suffix(".bad"))
+        except (OSError, NameError):
+            pass
+        return 0
+    except OSError as e:
+        print(f"[WARN] Cannot read PID file {pid_file_path}: {e}")
+        return 0
+    # signed: gamma
 
 
 def _check_url(url: str, timeout: float = 3.0) -> bool:

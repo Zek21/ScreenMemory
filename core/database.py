@@ -8,6 +8,7 @@ import time
 import sqlite3
 import struct
 import logging
+import threading
 from typing import Optional, List, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,6 +48,7 @@ class ScreenMemoryDB:
             raise ValueError(f"embedding_dim must be an integer between 1 and 10000, got {embedding_dim!r}")
         self.embedding_dim = embedding_dim
         self._encryption_key = encryption_key
+        self._local = threading.local()  # thread-local connection pool  # signed: delta
 
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
 
@@ -76,6 +78,15 @@ class ScreenMemoryDB:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        return conn
+
+    def get_connection(self) -> sqlite3.Connection:
+        """Return a thread-local connection. Reuses per-thread connections
+        instead of creating a new one per operation."""  # signed: delta
+        conn = getattr(self._local, 'conn', None)
+        if conn is None:
+            conn = self._connect(self.db_path, self._encryption_key)
+            self._local.conn = conn
         return conn
 
     def _init_schema(self):
@@ -379,8 +390,15 @@ class ScreenMemoryDB:
         return result
 
     def close(self):
-        """Close database connection."""
+        """Close database connection and thread-local connections."""  # signed: delta
         self.conn.close()
+        tl_conn = getattr(self._local, 'conn', None)
+        if tl_conn is not None:
+            try:
+                tl_conn.close()
+            except Exception:
+                pass
+            self._local.conn = None
 
     def __enter__(self):
         return self

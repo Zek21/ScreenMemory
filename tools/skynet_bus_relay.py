@@ -31,7 +31,8 @@ QUEUE_FILE = DATA_DIR / "bus_relay_queue.json"
 WORKERS_FILE = DATA_DIR / "workers.json"
 ORCH_FILE = DATA_DIR / "orchestrator.json"
 
-sys.path.insert(0, str(ROOT / "tools"))
+# Allow absolute imports like `from tools...` when launched as `python tools/...`.
+sys.path.insert(0, str(ROOT))
 
 SKYNET_URL = "http://localhost:8420"
 POLL_INTERVAL = 3.0  # Must be >= 2.0s to prevent CPU spin

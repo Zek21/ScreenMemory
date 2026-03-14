@@ -125,11 +125,32 @@ class DifficultyEstimator:
         r'first.*second.*third|multiple|several|across)\b', re.I)
 
     def __init__(self, history_weight: float = 0.3):
+        """Initialize the estimator.
+
+        Args:
+            history_weight: Weight given to historical estimates when blending
+                scores for repeated queries. Range 0.0-1.0, where higher values
+                give more influence to prior estimates. Default 0.3.
+        """
+        # signed: beta
         self._history: Dict[str, DifficultySignal] = {}
         self._history_weight = history_weight
 
     def estimate(self, query: str) -> DifficultySignal:
-        """Estimate difficulty of a query using feature extraction."""
+        """Estimate difficulty of a natural-language query using heuristic feature extraction.
+
+        Extracts lexical, domain, reasoning, constraint, and ambiguity features,
+        computes a raw 0-1 complexity score, maps it to a QueryDifficulty level,
+        and optionally blends with historical estimates for the same query.
+
+        Args:
+            query: The natural-language task description to classify.
+
+        Returns:
+            DifficultySignal with level, confidence, complexity_score, domain_tags,
+            reasoning_depth, tool/debate requirements, and estimated token budget.
+        """
+        # signed: beta
         t0 = time.perf_counter()
 
         features = self._extract_features(query)
@@ -163,7 +184,17 @@ class DifficultyEstimator:
         return signal
 
     def _extract_features(self, query: str) -> dict:
-        """Extract all signal features from a query."""
+        """Extract all signal features from a query for complexity scoring.
+
+        Args:
+            query: Raw query text to analyze.
+
+        Returns:
+            Dict with keys: token_count (int), sentence_count (int),
+            domains (List[str]), domain_density (int), reasoning_hits (int),
+            multi_hop_hits (int), constraint_hits (int), ambiguity_hits (int).
+        """
+        # signed: beta
         tokens = query.split()
         sentence_count = max(1, len(re.split(r'[.!?]+', query)))
         domains = []
@@ -186,7 +217,18 @@ class DifficultyEstimator:
 
     @staticmethod
     def _compute_raw_score(features: dict) -> float:
-        """Compute the raw complexity score (0-1) from extracted features."""
+        """Compute a weighted complexity score from extracted features.
+
+        Weights: length 15%, domain diversity 25%, reasoning depth 30%,
+        constraint density 20%, ambiguity penalty 10%.
+
+        Args:
+            features: Dict from _extract_features().
+
+        Returns:
+            Float in range [0.0, 1.0] — higher means more complex.
+        """
+        # signed: beta
         length_score = min(1.0, features["token_count"] / 200)
         domain_score = min(1.0, len(features["domains"]) / 3)
         reasoning_score = min(1.0, (features["reasoning_hits"] + features["multi_hop_hits"]) / 4)
@@ -200,7 +242,18 @@ class DifficultyEstimator:
 
     @staticmethod
     def _score_to_level(raw_score: float) -> "QueryDifficulty":
-        """Map raw score to a difficulty level."""
+        """Map a raw 0-1 score to a discrete QueryDifficulty level.
+
+        Thresholds: <0.15 TRIVIAL, <0.35 SIMPLE, <0.55 MODERATE,
+        <0.80 COMPLEX, >=0.80 ADVERSARIAL.
+
+        Args:
+            raw_score: Float in [0.0, 1.0] from _compute_raw_score().
+
+        Returns:
+            QueryDifficulty enum member.
+        """
+        # signed: beta
         if raw_score < 0.15:
             return QueryDifficulty.TRIVIAL
         elif raw_score < 0.35:
@@ -211,8 +264,22 @@ class DifficultyEstimator:
             return QueryDifficulty.COMPLEX
         return QueryDifficulty.ADVERSARIAL
 
-    def _blend_history(self, query: str, raw_score: float, confidence: float):
-        """Blend score with historical data for the same query."""
+    def _blend_history(self, query: str, raw_score: float, confidence: float) -> Tuple[float, float]:
+        """Blend current score with cached historical estimate for the same query.
+
+        Uses MD5 hash of lowered query text as cache key. If a prior estimate
+        exists, the raw_score is weighted-averaged with the historical score
+        (weight controlled by self._history_weight), and confidence is boosted.
+
+        Args:
+            query: Original query text (hashed for lookup).
+            raw_score: Current raw complexity score.
+            confidence: Current confidence value.
+
+        Returns:
+            Tuple of (blended_raw_score, blended_confidence).
+        """
+        # signed: beta
         query_hash = hashlib.md5(query.lower().encode()).hexdigest()[:8]
         if query_hash in self._history:
             prev = self._history[query_hash]
@@ -221,8 +288,19 @@ class DifficultyEstimator:
         return raw_score, confidence
 
     def update_from_feedback(self, query: str, actual_difficulty: QueryDifficulty,
-                             success: bool):
-        """Update estimates based on execution outcomes (self-adjusting policy)."""
+                             success: bool) -> None:
+        """Update cached estimates using execution outcome feedback.
+
+        Adjusts the stored complexity score toward the actual difficulty level
+        (70% prior + 30% actual) and boosts confidence by 0.15. This enables
+        the estimator to self-calibrate over time.
+
+        Args:
+            query: The original query text (used to look up cached estimate).
+            actual_difficulty: The true difficulty observed during execution.
+            success: Whether the execution succeeded (logged for audit).
+        """
+        # signed: beta
         query_hash = hashlib.md5(query.lower().encode()).hexdigest()[:8]
         if query_hash in self._history:
             prev = self._history[query_hash]

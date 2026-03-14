@@ -199,6 +199,7 @@ def _build_state(sse_data: dict, update_count: int, last_tick_time: float) -> di
         elif msg_type == "alert":
             pending_alerts.append(msg)
 
+    now = datetime.now(timezone.utc)
     return {
         "workers": workers,
         "bus_recent": bus_recent,
@@ -210,7 +211,8 @@ def _build_state(sse_data: dict, update_count: int, last_tick_time: float) -> di
         "tasks_failed": sse_data.get("tasks_failed", 0),
         "uptime_s": round(sse_data.get("uptime_s", 0), 1),
         "orch_thinking": sse_data.get("orch_thinking", [])[-5:],
-        "last_update": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now.timestamp(),  # epoch float for orch_realtime staleness check  # signed: beta
+        "last_update": now.isoformat(),
         "update_count": update_count,
         "latency_ms": latency_ms,
     }

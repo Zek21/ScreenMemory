@@ -48,3 +48,6 @@ comtypes>=1.1.14
 # Optional: Advanced OCR fallback
 # doctr[torch]>=0.9
 # paddleocr>=2.7
+
+# Hardware-level input automation
+pyautogui>=0.9

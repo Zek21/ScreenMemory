@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -85,6 +86,68 @@ def _pid_alive(pid: int) -> bool:
     except (OSError, ProcessLookupError):
         return False
 # signed: delta
+
+
+def _realtime_fallback_truth(max_age_s: float = 5.0) -> Dict:
+    """Treat fresh realtime.json + live sse_daemon as valid realtime truth."""
+    state_file = DATA / "realtime.json"
+    sse_pid_file = DATA / "sse_daemon.pid"
+    result = {
+        "ok": False,
+        "age_s": None,
+        "sse_pid": None,
+        "reason": "missing_realtime_state",
+    }
+
+    if not state_file.exists():
+        return result
+
+    try:
+        state = json.loads(state_file.read_text())
+    except Exception:
+        result["reason"] = "unreadable_realtime_state"
+        return result
+
+    age_s = None
+    timestamp = state.get("timestamp")
+    if isinstance(timestamp, (int, float)):
+        age_s = max(0.0, time.time() - float(timestamp))
+    else:
+        last_update = state.get("last_update")
+        if isinstance(last_update, str):
+            try:
+                age_s = max(0.0, time.time() - datetime.fromisoformat(last_update).timestamp())
+            except ValueError:
+                age_s = None
+
+    if age_s is None:
+        result["reason"] = "missing_realtime_timestamp"
+        return result
+
+    result["age_s"] = round(age_s, 1)
+    if age_s > max_age_s:
+        result["reason"] = "stale_realtime_state"
+        return result
+
+    if not sse_pid_file.exists():
+        result["reason"] = "missing_sse_pid"
+        return result
+
+    try:
+        sse_pid = int(sse_pid_file.read_text().strip())
+    except ValueError:
+        result["reason"] = "invalid_sse_pid"
+        return result
+
+    result["sse_pid"] = sse_pid
+    if not _pid_alive(sse_pid):
+        result["reason"] = "dead_sse_pid"
+        return result
+
+    result["ok"] = True
+    result["reason"] = "fresh_realtime_via_sse_daemon"
+    return result
+# signed: consultant
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -187,7 +250,7 @@ def check_entities() -> Dict:
     if orch_file.exists():
         try:
             orch = json.loads(orch_file.read_text())
-            hwnd = orch.get("hwnd", 0)
+            hwnd = orch.get("orchestrator_hwnd", 0) or orch.get("hwnd", 0)  # signed: delta
             if hwnd:
                 result["details"].append(f"orchestrator.json: OK (HWND={hwnd})")
             else:
@@ -343,9 +406,25 @@ def check_daemon_ecosystem() -> Dict:
                 result["details"].append(f"{daemon_name}: PID file corrupt")
                 result["failures"].append(f"{daemon_name} PID file unreadable")
         else:
+            if daemon_name == "skynet_realtime":
+                fallback = _realtime_fallback_truth()
+                if fallback["ok"]:
+                    result["details"].append(
+                        f"{daemon_name}: FALLBACK_OK (fresh realtime.json via sse_daemon PID {fallback['sse_pid']}, age={fallback['age_s']:.1f}s)"
+                    )
+                    running += 1
+                    continue
+                result["details"].append(
+                    f"{daemon_name}: no PID file (fallback={fallback['reason']})"
+                )
+                result["failures"].append(
+                    "Critical daemon skynet_realtime has no PID file and no live sse_daemon fallback"
+                )
+                continue
+
             result["details"].append(f"{daemon_name}: no PID file")
             # Not all daemons are mandatory; only warn, don't fail
-            if daemon_name in ("skynet_monitor", "skynet_realtime"):
+            if daemon_name == "skynet_monitor":
                 result["failures"].append(f"Critical daemon {daemon_name} has no PID file")
 
     result["summary"] = f"{running}/{total} daemons running"

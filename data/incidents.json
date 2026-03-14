@@ -45,6 +45,17 @@
     "timestamp": "2026-03-11T02:28:04.999377",
     "old_pid": 0,
     "new_pid": 0,
+      {
+        "id": "INCIDENT_013",
+        "title": "VS Code Quickpick Unreachable via Win32 APIs",
+        "date": "2026-03-14",
+        "severity": "HIGH",
+        "category": "delivery_failures",
+        "what_happened": "During skynet-start boot, the model guard in new_chat.ps1 could not type into VS Code quickpick dropdown because ALL Win32 input methods (PostMessage, SendInput, keybd_event, clipboard paste, ghost-type, AttachThreadInput) fail to reach Chromium-rendered overlays.",
+        "fix": "pyautogui (real hardware mouse/keyboard) is the ONLY method that works.",
+        "rule": "For VS Code quickpick/dropdown interactions, always use pyautogui, never Win32 APIs.",
+        "signature": "# signed: delta"
+      }
     "type": "auto_restart"
   },
   {
@@ -501,6 +512,141 @@
   {
     "id": "consultant_bridge_restart",
     "timestamp": "2026-03-13T12:50:26.724314",
+    "old_pid": 22344,
+    "new_pid": 22344,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_consultant_bridge_restart_1773378989",
+    "timestamp": "2026-03-13T13:16:29",
+    "what_happened": "Service consultant_bridge_restart died (PID 22344)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 22344)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "consultant_bridge_restart",
+    "timestamp": "2026-03-13T13:16:29.269763",
+    "old_pid": 22344,
+    "new_pid": 22344,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_gemini_consultant_bridge_restart_1773379610",
+    "timestamp": "2026-03-13T13:26:50",
+    "what_happened": "Service gemini_consultant_bridge_restart died (PID 21660)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 21660)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "gemini_consultant_bridge_restart",
+    "timestamp": "2026-03-13T13:26:50.672593",
+    "old_pid": 21660,
+    "new_pid": 21660,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_gemini_consultant_bridge_restart_1773379929",
+    "timestamp": "2026-03-13T13:32:09",
+    "what_happened": "Service gemini_consultant_bridge_restart died (PID 21660)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 21660)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "gemini_consultant_bridge_restart",
+    "timestamp": "2026-03-13T13:32:09.766197",
+    "old_pid": 21660,
+    "new_pid": 21660,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_consultant_bridge_restart_1773380172",
+    "timestamp": "2026-03-13T13:36:12",
+    "what_happened": "Service consultant_bridge_restart died (PID 22344)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 22344)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "consultant_bridge_restart",
+    "timestamp": "2026-03-13T13:36:12.084799",
+    "old_pid": 22344,
+    "new_pid": 22344,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_gemini_consultant_bridge_restart_1773380192",
+    "timestamp": "2026-03-13T13:36:32",
+    "what_happened": "Service gemini_consultant_bridge_restart died (PID 21660)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 21660)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "gemini_consultant_bridge_restart",
+    "timestamp": "2026-03-13T13:36:32.601074",
+    "old_pid": 21660,
+    "new_pid": 21660,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_consultant_bridge_restart_1773391928",
+    "timestamp": "2026-03-13T16:52:08",
+    "what_happened": "Service consultant_bridge_restart died (PID 22344)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 22344)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "consultant_bridge_restart",
+    "timestamp": "2026-03-13T16:52:08.355968",
+    "old_pid": 22344,
+    "new_pid": 22344,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_sse_daemon_restart_1773437782",
+    "timestamp": "2026-03-14T05:36:22",
+    "what_happened": "Service sse_daemon_restart died (PID 0)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 0)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "sse_daemon_restart",
+    "timestamp": "2026-03-14T05:36:22.262662",
+    "old_pid": 0,
+    "new_pid": 0,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_sse_daemon_restart_1773448889",
+    "timestamp": "2026-03-14T08:41:29",
+    "what_happened": "Service sse_daemon_restart died (PID 0)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 0)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "sse_daemon_restart",
+    "timestamp": "2026-03-14T08:41:29.781034",
+    "old_pid": 0,
+    "new_pid": 0,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_consultant_bridge_restart_1773453333",
+    "timestamp": "2026-03-14T13:36:32",
+    "what_happened": "Service consultant_bridge_restart died (PID 22344)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 22344)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "consultant_bridge_restart",
+    "timestamp": "2026-03-14T13:36:32.601074",
     "old_pid": 22344,
     "new_pid": 22344,
     "type": "auto_restart"

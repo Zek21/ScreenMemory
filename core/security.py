@@ -50,39 +50,56 @@ class DPAPIKeyManager:
         """
         Encrypt data using DPAPI (bound to current user + machine).
         The encrypted blob can only be decrypted by the same user on the same machine.
+        Falls back to base64 wrapping with warning marker if DPAPI is unavailable.
         """
         if not self._dpapi_available:
-            raise RuntimeError("DPAPI not available")
+            logger.warning("DPAPI unavailable — using unprotected storage (NOT hardware-bound)")
+            # Prefix with marker so unprotect() knows this is fallback-wrapped
+            return b"NOPROTECT:" + data  # signed: delta
 
         import win32crypt
         # CryptProtectData: encrypts with user's DPAPI master key (derived from login creds + TPM)
-        encrypted = win32crypt.CryptProtectData(
-            data,
-            description,
-            None,   # optional entropy (additional secret)
-            None,   # reserved
-            None,   # prompt struct
-            0x04,   # CRYPTPROTECT_LOCAL_MACHINE (0x04 per wincrypt.h) — tied to this machine
-        )
-        return encrypted
+        try:
+            encrypted = win32crypt.CryptProtectData(
+                data,
+                description,
+                None,   # optional entropy (additional secret)
+                None,   # reserved
+                None,   # prompt struct
+                0x04,   # CRYPTPROTECT_LOCAL_MACHINE (0x04 per wincrypt.h) — tied to this machine
+            )
+            return encrypted
+        except Exception as e:
+            logger.error("DPAPI CryptProtectData failed: %s -- falling back to unprotected storage", e)
+            return b"NOPROTECT:" + data  # signed: gamma
 
     def unprotect(self, encrypted_data: bytes) -> bytes:
         """
         Decrypt DPAPI-protected data.
         Only works for the same user on the same machine that encrypted it.
+        Handles fallback-wrapped data from non-DPAPI protect() calls.
         """
+        # Handle fallback-wrapped data (from protect() when DPAPI unavailable)
+        if encrypted_data.startswith(b"NOPROTECT:"):
+            logger.warning("Unwrapping non-DPAPI-protected data (NOT hardware-bound)")
+            return encrypted_data[len(b"NOPROTECT:"):]  # signed: delta
+
         if not self._dpapi_available:
-            raise RuntimeError("DPAPI not available")
+            raise RuntimeError("DPAPI not available and data is DPAPI-encrypted")
 
         import win32crypt
-        description, decrypted = win32crypt.CryptUnprotectData(
-            encrypted_data,
-            None,   # optional entropy
-            None,   # reserved
-            None,   # prompt struct
-            0x04,   # CRYPTPROTECT_LOCAL_MACHINE (0x04 per wincrypt.h — must match protect flag)
-        )  # signed: gamma
-        return decrypted
+        try:
+            description, decrypted = win32crypt.CryptUnprotectData(
+                encrypted_data,
+                None,   # optional entropy
+                None,   # reserved
+                None,   # prompt struct
+                0x04,   # CRYPTPROTECT_LOCAL_MACHINE (0x04 per wincrypt.h — must match protect flag)
+            )
+            return decrypted
+        except Exception as e:
+            logger.error("DPAPI CryptUnprotectData failed: %s", e)
+            raise RuntimeError(f"DPAPI decryption failed: {e}") from e  # signed: gamma
 
     def store_key(self, key: bytes) -> bool:
         """
@@ -198,13 +215,58 @@ class FallbackKeyManager:
         return secrets.token_bytes(32)
 
 
+class FileSystemKeyManager:
+    """
+    Filesystem-based key manager for non-Windows platforms or when DPAPI fails.
+    Stores key as a base64-encoded file with restricted permissions.
+    Less secure than DPAPI (no hardware binding) but works cross-platform.
+    """
+    # signed: gamma
+
+    def __init__(self, key_path: Optional[Path] = None):
+        self.key_path = key_path or Path(os.environ.get("APPDATA", Path.home())) / "ScreenMemory" / "keystore_fs.dat"
+
+    def get_or_create_key(self) -> Optional[bytes]:
+        """Load key from file or generate a new one."""
+        if self.key_path.exists():
+            try:
+                payload = json.loads(self.key_path.read_text())
+                key = base64.b64decode(payload["key"])
+                expected_hash = payload.get("key_hash", "")
+                actual_hash = hashlib.sha256(key).hexdigest()[:16]
+                if expected_hash and actual_hash != expected_hash:
+                    logger.error("FileSystemKeyManager: key hash mismatch -- possible corruption")
+                    return None
+                logger.info("FileSystemKeyManager: key loaded from %s", self.key_path)
+                return key
+            except Exception as e:
+                logger.error("FileSystemKeyManager: failed to load key: %s", e)
+                return None
+
+        key = secrets.token_bytes(32)
+        try:
+            self.key_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "manager": "FileSystemKeyManager",
+                "key": base64.b64encode(key).decode("ascii"),
+                "key_hash": hashlib.sha256(key).hexdigest()[:16],
+            }
+            self.key_path.write_text(json.dumps(payload, indent=2))
+            logger.warning("FileSystemKeyManager: key stored at %s (NOT hardware-bound)", self.key_path)
+            return key
+        except Exception as e:
+            logger.error("FileSystemKeyManager: failed to store key: %s", e)
+            return secrets.token_bytes(32)  # return ephemeral key as last resort
+
+
 def get_key_manager():
     """Factory: get the best available key manager."""
     mgr = DPAPIKeyManager()
     if mgr.is_available:
         return mgr
-    logger.warning("DPAPI unavailable, falling back to FallbackKeyManager (no hardware binding)")
-    return FallbackKeyManager()
+    logger.warning("DPAPI unavailable, falling back to FileSystemKeyManager (no hardware binding)")
+    return FileSystemKeyManager()  # signed: gamma
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -336,14 +337,25 @@ class TestConsultantBridgeDiscovery(unittest.TestCase):
         self.assertEqual(state["hwnd_source"], "discovery")
         self.assertIn("content:cc-start", state["hwnd_markers"])
 
-    def test_build_view_exposes_shared_surface_when_reserved_window_contains_consultant(self):
+    def test_build_live_state_uses_cached_shared_surface_without_probe(self):
+        # signed: consultant
         import tools.skynet_consultant_bridge as bridge
 
         with tempfile.TemporaryDirectory() as tmpdir:
             state_file = Path(tmpdir) / "consultant_state.json"
             task_file = Path(tmpdir) / "consultant_task_state.json"
             registry_file = Path(tmpdir) / "consultant_registry.json"
-            state_file.write_text(json.dumps({}), encoding="utf-8")
+            state_file.write_text(json.dumps({
+                "accepts_prompts": True,
+                "transport": "cc-start-bridge",
+                "prompt_transport": "bridge_queue",
+                "visible_surface": True,
+                "shared_parent_hwnd": 8132014,
+                "pane_slot": "right",
+                "pane_markers": ["pane_header:codex", "pane_action:cc-start"],
+                "hwnd_markers": ["right:pane_header:codex", "right:pane_action:cc-start"],
+                "hwnd_score": 8,
+            }), encoding="utf-8")
 
             old_state = bridge.STATE_FILE
             old_task = bridge.TASK_FILE
@@ -352,23 +364,66 @@ class TestConsultantBridgeDiscovery(unittest.TestCase):
             bridge.TASK_FILE = task_file
             bridge.REGISTRY_FILE = registry_file
             try:
-                with patch.object(bridge, "_window_alive", return_value=False), \
-                     patch.object(bridge, "_reserved_hwnds", return_value={8132014: "orchestrator"}), \
-                     patch("tools.skynet_consultant_hwnd.discover_consultant_hwnd", return_value={
-                         "accepted": False,
-                         "hwnd": 0,
-                         "visible_surface": True,
-                         "shared_parent_hwnd": 8132014,
-                         "pane_slot": "right",
-                         "pane_model": "",
-                         "pane_session_target": "",
-                         "pane_permissions": "",
-                         "pane_markers": ["pane_header:codex", "pane_action:run cc-start bootstrap"],
-                         "best_candidate": {
-                             "markers": ["right:pane_header:codex", "right:pane_action:run cc-start bootstrap"],
-                             "score": 8,
-                         },
-                     }):
+                with patch.object(bridge, "_load_worker_snapshot", return_value={
+                    "source": "realtime.json",
+                    "summary": {"total": 4, "available": 4, "busy": 0, "offline": 0},
+                    "workers": {},
+                    "available_workers": ["alpha", "beta", "gamma", "delta"],
+                    "busy_workers": [],
+                    "offline_workers": [],
+                }), \
+                     patch.object(bridge, "_load_score_summary", return_value={"total": 0.0}), \
+                     patch.object(bridge, "_latest_consultant_message", return_value=None), \
+                     patch.object(bridge, "_http_get", return_value={"status": "ok"}), \
+                     patch("tools.skynet_consultant_hwnd.discover_consultant_hwnd", side_effect=AssertionError("probe should not run")):
+                    state = bridge.build_live_state(api_port=8422)
+            finally:
+                bridge.STATE_FILE = old_state
+                bridge.TASK_FILE = old_task
+                bridge.REGISTRY_FILE = old_registry
+
+        self.assertEqual(state["hwnd"], 0)
+        self.assertEqual(state["prompt_transport"], "bridge_queue")
+        self.assertEqual(state["hwnd_source"], "state")
+        self.assertEqual(state["shared_parent_hwnd"], 8132014)
+        self.assertEqual(state["pane_slot"], "right")
+
+    def test_build_view_uses_cached_shared_surface_metadata_without_probe(self):
+        # signed: consultant
+        import tools.skynet_consultant_bridge as bridge
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "consultant_state.json"
+            task_file = Path(tmpdir) / "consultant_task_state.json"
+            registry_file = Path(tmpdir) / "consultant_registry.json"
+            state_file.write_text(json.dumps({
+                "accepts_prompts": True,
+                "transport": "cc-start-bridge",
+                "prompt_transport": "bridge_queue",
+                "visible_surface": True,
+                "shared_parent_hwnd": 8132014,
+                "pane_slot": "right",
+                "pane_model": "",
+                "pane_session_target": "",
+                "pane_permissions": "",
+                "pane_markers": ["pane_header:codex", "pane_action:cc-start"],
+                "hwnd_markers": ["right:pane_header:codex", "right:pane_action:cc-start"],
+                "hwnd_score": 8,
+                "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+                "stale_after_s": 8,
+                "bridge_pid": 12345,
+            }), encoding="utf-8")
+
+            old_state = bridge.STATE_FILE
+            old_task = bridge.TASK_FILE
+            old_registry = bridge.REGISTRY_FILE
+            bridge.STATE_FILE = state_file
+            bridge.TASK_FILE = task_file
+            bridge.REGISTRY_FILE = registry_file
+            try:
+                with patch.object(bridge, "_reserved_hwnds", return_value={8132014: "orchestrator"}), \
+                     patch.object(bridge, "_pid_alive", return_value=True), \
+                     patch("tools.skynet_consultant_hwnd.discover_consultant_hwnd", side_effect=AssertionError("probe should not run")):
                     view = bridge.get_consultant_view()
             finally:
                 bridge.STATE_FILE = old_state
@@ -379,6 +434,8 @@ class TestConsultantBridgeDiscovery(unittest.TestCase):
         self.assertTrue(view["visible_surface"])
         self.assertEqual(view["shared_parent_hwnd"], 8132014)
         self.assertEqual(view["pane_slot"], "right")
+        self.assertEqual(view["prompt_transport"], "bridge_queue")
+        self.assertEqual(view["status"], "LIVE")
 
     def test_refresh_registry_persists_shared_surface_metadata(self):
         import tools.skynet_consultant_bridge as bridge

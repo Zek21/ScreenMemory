@@ -96,21 +96,33 @@ class TestDPAPIKeyManager:
         k2 = mgr.generate_key()
         assert k1 != k2
 
-    def test_protect_raises_without_dpapi(self):
-        """protect() raises RuntimeError when DPAPI unavailable."""
+    def test_protect_fallback_without_dpapi(self):
+        """protect() falls back to NOPROTECT wrapping when DPAPI unavailable."""
+        # signed: gamma — fixed incorrect test (protect does NOT raise, it wraps)
         from core.security import DPAPIKeyManager
         mgr = DPAPIKeyManager.__new__(DPAPIKeyManager)
+        mgr.key_path = Path("/tmp/test")
         mgr._dpapi_available = False
-        with pytest.raises(RuntimeError, match="DPAPI not available"):
-            mgr.protect(b"test data")
+        result = mgr.protect(b"test data")
+        assert result == b"NOPROTECT:test data"
 
-    def test_unprotect_raises_without_dpapi(self):
-        """unprotect() raises RuntimeError when DPAPI unavailable."""
+    def test_unprotect_raises_without_dpapi_on_encrypted(self):
+        """unprotect() raises RuntimeError on non-NOPROTECT data when DPAPI unavailable."""
+        # signed: gamma
         from core.security import DPAPIKeyManager
         mgr = DPAPIKeyManager.__new__(DPAPIKeyManager)
         mgr._dpapi_available = False
         with pytest.raises(RuntimeError, match="DPAPI not available"):
             mgr.unprotect(b"encrypted data")
+
+    def test_unprotect_unwraps_noprotect_data(self):
+        """unprotect() handles NOPROTECT-wrapped data from fallback protect()."""
+        # signed: gamma
+        from core.security import DPAPIKeyManager
+        mgr = DPAPIKeyManager.__new__(DPAPIKeyManager)
+        mgr._dpapi_available = False
+        wrapped = b"NOPROTECT:my secret data"
+        assert mgr.unprotect(wrapped) == b"my secret data"
 
     def test_protect_unprotect_roundtrip(self, mock_win32crypt):
         """Data survives protect → unprotect round-trip."""
