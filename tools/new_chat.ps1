@@ -221,81 +221,15 @@ public class Ghost {
 # MUST run in STA thread (call with powershell -STA -File).
 function Set-AutopilotPermissions {
     param([long]$Hwnd, [int]$TimeoutMs = 15000)
-    $hwnd = [IntPtr]$Hwnd
-
-    # Step 1: Force TRUE foreground via minimize+restore trick
-    $fg = [Ghost]::ForceForeground($hwnd)
-    if (-not $fg) {
-        Write-Host "  WARN: ForceForeground failed for $Hwnd, trying SetForegroundWindow"
-        [Ghost]::SetForegroundWindow($hwnd)
-        Start-Sleep -Milliseconds 500
-    }
-
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-    if (-not $root) { return 'NO_ROOT' }
-
-    # Find the permissions button (matches "Set Permissions", "Approvals", "Autopilot")
-    $btnCond = New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Button
-    )
-    $btns = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
-    $permBtn = $null
-    foreach ($b in $btns) {
-        if ($b.Current.Name -match 'Permissions|Approvals|Autopilot') {
-            $permBtn = $b
-            break
-        }
-    }
-    if (-not $permBtn) { return 'NO_PERMS_BUTTON' }
-    if ($permBtn.Current.Name -match 'Autopilot') { return 'ALREADY_AUTOPILOT' }
-
-    # Step 2: SetFocus + Expand to visually open dropdown
-    $permBtn.SetFocus()
-    Start-Sleep -Milliseconds 500
-
-    $expandOK = $false
-    try {
-        $ec = $permBtn.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-        try { $ec.Collapse(); Start-Sleep -Milliseconds 300 } catch {}
-        $ec.Expand()
-        $expandOK = $true
-    } catch {
-        # Fallback: Ghost.Click on the permissions button bounding rect
-        try {
-            $rect = $permBtn.Current.BoundingRectangle
-            $cx = [int]($rect.X + $rect.Width / 2)
-            $cy = [int]($rect.Y + $rect.Height / 2)
-            $render = [Ghost]::FindRenderSurface($hwnd)
-            if ($render -ne [IntPtr]::Zero) {
-                [Ghost]::Click($render, $cx, $cy)
-            } else {
-                [Ghost]::Click($hwnd, $cx, $cy)
-            }
-            $expandOK = $true
-            Write-Host "  PERMS: Ghost.Click fallback at ($cx,$cy)"
-        } catch {
-            return "EXPAND_FAILED:$($_.Exception.Message)"
-        }
-    }
-    if (-not $expandOK) { return 'EXPAND_FAILED:All methods exhausted' }
-    Start-Sleep -Milliseconds 1000
-
-    # Step 3: Select Autopilot (last item in dropdown)
-    # SendKeys uses SendInput (hardware-level) — works with Chromium quickpick
-    try {
-        [System.Windows.Forms.SendKeys]::SendWait("{END}")
-        Start-Sleep -Milliseconds 300
-        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
-    } catch {
-        # Fallback to PostMessage on render widget
-        $renderPerms = [Ghost]::FindRenderSurface($hwnd)
-        [Ghost]::PostKey($renderPerms, 0x23)  # VK_END
-        Start-Sleep -Milliseconds 300
-        [Ghost]::PostKey($renderPerms, 0x0D)  # VK_RETURN
-    }
-    Start-Sleep -Milliseconds 800
-    return 'OK'
+    # Delegate to guard_bypass.ps1 -- single source of truth for permission switching.
+    # Uses pyautogui for Chromium overlays (INCIDENT 013). # signed: orchestrator
+    $scriptDir = Split-Path -Parent $MyInvocation.ScriptName
+    $guardScript = Join-Path $scriptDir "guard_bypass.ps1"
+    $result = & powershell -NoProfile -ExecutionPolicy Bypass -File $guardScript -Hwnd $Hwnd 2>&1
+    $output = ($result | Out-String).Trim()
+    Write-Host "  guard_bypass: $output"
+    if ($output -match 'PERMS_OK|PERMS_FIXED') { return 'OK' }
+    return "FAILED:$output"
 }
 
 # --- UIA scan with timeout (prevents hangs with 4+ VS Code windows) ---

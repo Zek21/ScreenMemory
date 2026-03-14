@@ -669,45 +669,46 @@ def guard_model(hwnd, orch_hwnd):
 
 
 def guard_permissions(hwnd, orch_hwnd):
-    """Ensure a chat window has Bypass Approvals set.
+    """Ensure a chat window has Bypass/Autopilot permissions set.
     
-    Calls tools/guard_bypass.ps1 — the single source of truth for permission
-    switching. Uses the same Ghost class and PostMessage approach as new_chat.ps1.
+    Calls tools/guard_bypass.ps1 which uses pyautogui for Chromium overlays
+    (PostMessage does NOT work on Chromium -- INCIDENT 013).
     
-    SetForegroundWindow is called from Python (which has foreground rights)
-    because subprocess PowerShell cannot steal focus on Windows.
+    Retry up to 3 attempts. guard_bypass.ps1 handles its own retry loop,
+    but we add an outer retry here for robustness.
+    # signed: orchestrator
     """
     import ctypes
-    # Rule 0.015: Pre-fire screenshot before permission change  # signed: orchestrator
-    _capture_prefire_screenshot_start(hwnd, "guard_permissions")
-
-    # Give worker window real OS focus from orchestrator process
-    ctypes.windll.user32.SetForegroundWindow(hwnd)
-    time.sleep(0.4)
 
     script_path = str(ROOT / "tools" / "guard_bypass.ps1")
-    try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-File", script_path, "-Hwnd", str(hwnd)],
-            capture_output=True, text=True, timeout=20
-        )
-        out = r.stdout.strip()
-        if "PERMS_FIXED" in out:
-            log(f"Permissions: Bypass Approvals set for HWND={hwnd}", "OK")
-        elif "PERMS_OK" in out:
-            log(f"Permissions: HWND={hwnd} already Bypass Approvals", "OK")
-        elif "PERMS_FAILED" in out:
-            perm_state = out.split("PERMS_FAILED:")[-1].strip() if "PERMS_FAILED:" in out else "unknown"
-            log(f"Permissions: FAILED to set Bypass for HWND={hwnd} (still '{perm_state}')", "WARN")
-        else:
-            log(f"Permissions: Unexpected result for HWND={hwnd}: {out[:100]}", "WARN")
-    except Exception as e:
-        log(f"Permissions guard failed for HWND={hwnd}: {e}", "WARN")
-    finally:
-        # Restore orchestrator focus from Python (has foreground rights)
-        ctypes.windll.user32.SetForegroundWindow(orch_hwnd)
-        time.sleep(0.2)
+    max_outer = 2
+    
+    for attempt in range(1, max_outer + 1):
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", script_path, "-Hwnd", str(hwnd)],
+                capture_output=True, text=True, timeout=30
+            )
+            out = r.stdout.strip()
+            if "PERMS_FIXED" in out:
+                log(f"Permissions: Bypass/Autopilot set for HWND={hwnd}", "OK")
+                return True
+            elif "PERMS_OK" in out:
+                log(f"Permissions: HWND={hwnd} already Bypass/Autopilot", "OK")
+                return True
+            elif "PERMS_FAILED" in out:
+                log(f"Permissions: FAILED attempt {attempt} for HWND={hwnd}: {out[:200]}", "WARN")
+            else:
+                log(f"Permissions: Unexpected result attempt {attempt} for HWND={hwnd}: {out[:200]}", "WARN")
+        except Exception as e:
+            log(f"Permissions guard failed attempt {attempt} for HWND={hwnd}: {e}", "WARN")
+        
+        if attempt < max_outer:
+            time.sleep(2)
+    
+    log(f"Permissions: ALL attempts exhausted for HWND={hwnd}", "ERR")
+    return False
 
 
 def _build_prompt_text(worker_name, boot_memories=None):
@@ -1769,6 +1770,12 @@ def _pid_matches_script(pid, script_path):
 def _start_daemon_safe(script_path, pid_file, label, extra_args=None):
     """Start a daemon only if not already running (PID file guard).
     Returns the Popen object or None if already running / failed."""
+    disabled_file = pid_file.with_suffix(".disabled")
+    if disabled_file.exists():
+        log(f"{label} disabled via {disabled_file.name} -- skipping", "WARN")
+        return None
+    # signed: consultant
+
     running, pid = _is_daemon_running(pid_file)
     if running:
         if _pid_matches_script(pid, script_path):

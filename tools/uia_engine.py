@@ -268,7 +268,10 @@ class UIAEngine:
                 # to prevent infinite model-fix retry loops when premium is exhausted
                 result.model_ok = True
             al = result.agent.lower()
-            result.agent_ok = "copilot cli" in al or "screenmemory" in al
+            # VS Code renamed "Copilot CLI" to "Agent" in newer versions
+            # "Delegate Session - Local" is the old UI element name for CLI mode
+            result.agent_ok = ("copilot cli" in al or "screenmemory" in al 
+                               or "- agent" in al or "delegate session" in al)
 
         except Exception as e:
             result.error = str(e)
