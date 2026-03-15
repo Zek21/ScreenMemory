@@ -601,13 +601,13 @@ def restart_dead_daemons(results: list) -> list:
             # Re-check
             new_status = check_daemon(daemon)
             if new_status["alive"]:
-                print(f"    \033[92m✓ {r['label']} restarted (PID {new_status['pid']})\033[0m")
+                print(f"    \033[92m[OK] {r['label']} restarted (PID {new_status['pid']})\033[0m")  # signed: beta
                 restarted.append({"name": r["name"], "action": "restarted", "pid": new_status["pid"]})
             else:
                 print(f"    \033[93m? {r['label']} started but not yet verified\033[0m")
                 restarted.append({"name": r["name"], "action": "started_unverified"})
         except Exception as e:
-            print(f"    \033[91m✗ {r['label']} restart failed: {e}\033[0m")
+            print(f"    \033[91m[FAIL] {r['label']} restart failed: {e}\033[0m")  # signed: beta
             restarted.append({"name": r["name"], "action": "failed", "error": str(e)})
 
     return restarted

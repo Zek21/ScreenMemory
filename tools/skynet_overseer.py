@@ -21,15 +21,13 @@ Usage:
 
 import argparse
 import ctypes
-import ctypes.wintypes
 import json
 import os
-import signal
+import signal  # signed: gamma (removed unused ctypes.wintypes, urllib.error)
 import subprocess
 import sys
 import time
 import urllib.request
-import urllib.error
 from collections import deque
 from datetime import datetime
 from pathlib import Path

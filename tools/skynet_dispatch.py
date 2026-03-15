@@ -213,8 +213,7 @@ def mark_dispatch_received(worker_name):
 
 def send_heartbeat(worker_name, status="IDLE", current_task=""):
     """POST heartbeat to Skynet backend for worker health tracking."""
-    from urllib.request import urlopen, Request
-    from urllib.error import URLError
+    from urllib.request import urlopen, Request  # signed: gamma
     body = json.dumps({"status": status, "current_task": current_task[:120]}).encode()
     try:
         req = Request(
@@ -2103,7 +2102,7 @@ def fan_out(tasks_by_worker, workers=None, orch_hwnd=None, delay=2.0):
 
 def get_worker_statuses(skynet_url="http://localhost:8420"):
     """Query /worker/{name}/status + UIA state for all workers in parallel. No screenshots needed."""
-    import urllib.request, urllib.error
+    import urllib.request  # signed: gamma
     workers = load_workers()
 
     # Parallel UIA scan across all workers simultaneously

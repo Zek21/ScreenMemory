@@ -20,13 +20,12 @@ import argparse
 import json
 import os
 import signal
-import sys
-import threading
+import threading  # signed: gamma (removed unused sys)
 import time
 from datetime import datetime, timezone
 from http.client import HTTPConnection
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Optional  # signed: gamma (removed unused Any, Dict, List)
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"

@@ -290,8 +290,7 @@ _ORCH_PANE_EMPTY_RESULT = {
 
 def _scan_left_pane_elements(hwnd: int) -> tuple:
     """Enumerate UIA elements in the left pane band. Returns (left_model, left_agent, left_names)."""
-    import comtypes
-    import comtypes.client  # noqa: F401
+    import comtypes  # signed: gamma (removed unused comtypes.client)
     from comtypes.gen import UIAutomationClient as UIA
 
     try:

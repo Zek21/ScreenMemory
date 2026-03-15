@@ -117,8 +117,7 @@ def _slot_name(index: int, total: int) -> str:
 
 def _scan_window_bands(hwnd: int, band_count: int = 3) -> List[Dict[str, Any]]:
     try:
-        import comtypes
-        import comtypes.client  # noqa: F401
+        import comtypes  # signed: gamma (removed unused comtypes.client)
         from comtypes.gen import UIAutomationClient as UIA
     except Exception:
         return []

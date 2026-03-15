@@ -24,8 +24,7 @@ import signal
 import subprocess
 import sys
 import time
-import urllib.request
-import urllib.error
+import urllib.request  # signed: gamma (removed unused urllib.error)
 from datetime import datetime
 from pathlib import Path
 
@@ -104,8 +103,7 @@ def _load_config_overrides():
 
 _load_config_overrides()
 
-import ctypes
-import ctypes.wintypes
+import ctypes  # signed: gamma (removed unused ctypes.wintypes)
 user32 = ctypes.windll.user32
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -414,8 +412,7 @@ def _get_orchestrator_pane_truth(hwnd):
         return truth
 
     try:
-        import comtypes
-        import comtypes.client  # noqa: F401
+        import comtypes  # signed: gamma (removed unused comtypes.client; noqa was masking dead import)
         from comtypes.gen import UIAutomationClient as UIA
 
         try:

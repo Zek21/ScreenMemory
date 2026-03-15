@@ -17,8 +17,7 @@ Usage:
     # results = {"alpha": "response text...", "beta": "response text..."}
 """
 
-import ctypes
-import ctypes.wintypes
+import ctypes  # signed: gamma (removed unused ctypes.wintypes)
 import json
 import subprocess
 import sys
@@ -153,8 +152,7 @@ def get_conversation_hash(hwnd):
 def _get_listitem_snapshot(hwnd):
     """Get all ListItem (y, name) tuples from a window. Shared by all extraction functions."""
     try:
-        import comtypes
-        import comtypes.client
+        import comtypes  # signed: gamma (removed unused comtypes.client)
         from comtypes.gen import UIAutomationClient as UIA
 
         try:

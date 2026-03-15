@@ -141,8 +141,7 @@ def _load_workers():
 def _get_listitem_snapshot(hwnd):
     """Get all ListItem (y, name) tuples from a window via COM UIA."""
     try:
-        import comtypes
-        import comtypes.client
+        import comtypes  # signed: gamma (removed unused comtypes.client)
 
         try:
             comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)

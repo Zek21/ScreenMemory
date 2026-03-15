@@ -16,8 +16,7 @@ import json
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
+import urllib.request  # signed: gamma (removed unused urllib.error)
 from datetime import datetime, timezone
 from pathlib import Path
 

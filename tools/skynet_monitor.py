@@ -19,15 +19,13 @@ Usage:
 import argparse
 import collections
 import ctypes
-import ctypes.wintypes
 import hashlib
 import json
 import os
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
+import urllib.request  # signed: gamma (removed unused ctypes.wintypes, urllib.error)
 from datetime import datetime
 from pathlib import Path
 

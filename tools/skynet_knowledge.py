@@ -18,9 +18,8 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from urllib.request import Request, urlopen
-from urllib.error import URLError
+from typing import Any, Dict, List, Optional  # signed: gamma (removed unused Request, URLError)
+from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))

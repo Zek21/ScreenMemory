@@ -20,8 +20,8 @@ import sys
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from urllib.request import Request, urlopen
+from typing import List  # signed: gamma (removed unused Any, Dict, Optional)
+from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))

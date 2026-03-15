@@ -34,8 +34,7 @@ import ctypes.wintypes
 import atexit
 from pathlib import Path
 from datetime import datetime
-from urllib.request import Request, urlopen
-from urllib.error import URLError
+from urllib.request import Request, urlopen  # signed: gamma (removed unused URLError)
 
 # Force UTF-8 output on Windows to handle emoji and box-drawing characters
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
