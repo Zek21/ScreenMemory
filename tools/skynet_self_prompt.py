@@ -46,13 +46,15 @@ DISPATCH_LOCK_FILE = DATA_DIR / "dispatch_active.lock"
 BOOT_IN_PROGRESS_FILE = DATA_DIR / "boot_in_progress.json"
 HEALTH_FILE = DATA_DIR / "self_prompt_health.json"
 DELIVERED_FILE = DATA_DIR / "self_prompt_delivered.json"
+DELIVERY_EVIDENCE_FILE = DATA_DIR / "self_prompt_delivery_evidence.json"
+DELIVERY_SCREENSHOT_DIR = DATA_DIR / "self_prompt_delivery_screenshots"
 BUS_URL = "http://localhost:8420"
 DAEMON_NAME = "self_prompt"
-DAEMON_VERSION = "1.2.0"
+DAEMON_VERSION = "1.2.1"
 
 # Defaults (overridden by brain_config.json -> self_prompt section)
 LOOP_INTERVAL = 300
-MIN_PROMPT_GAP = 900
+MIN_PROMPT_GAP = 300
 PROMPT_THRESHOLD = 50
 IDLE_WORKER_THRESHOLD = 90    # raised: 30s was too aggressive, workers need time
 ORCH_INACTIVE_THRESHOLD = 45
@@ -61,7 +63,7 @@ HEALTH_REPORT_INTERVAL = 300  # report health to bus every 5 min
 MAX_CONSECUTIVE_PROMPTS = 3   # stop after N prompts without orchestrator action
 REPEATED_STATE_SUPPRESSION_S = 900  # suppress repeated no-change prompts for 15 minutes  # signed: consultant
 
-ALL_IDLE_INTERVAL = 900
+ALL_IDLE_INTERVAL = 300
 BOOT_PROMPT_ENABLED = False
 
 # Self-prompt generation is template-only. Ollama is removed from the live pipeline.  # signed: consultant
@@ -184,6 +186,162 @@ def _save_json(path, data):
     Path(path).write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
 
+def _format_local_timestamp(ts):
+    """Return a local ISO timestamp for epoch seconds, or None when unknown."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromtimestamp(float(ts)).astimezone().isoformat(timespec="seconds")
+    except Exception:
+        return None
+
+
+def _ascii_excerpt(text, max_chars=240):
+    return str(text or "")[:max_chars].encode("ascii", "replace").decode("ascii")
+
+
+def _normalize_visible_text(text):
+    lowered = str(text or "").lower()
+    lowered = lowered.replace("[self-prompt", " self prompt ")
+    lowered = lowered.replace("[self-prom", " self prom ")
+    lowered = lowered.replace("self-prompt", "self prompt")
+    lowered = lowered.replace("|", " ")
+    lowered = re.sub(r"[^a-z0-9: ]+", " ", lowered)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def _prompt_visibility_signals(prompt_text):
+    """Build conservative text markers for screenshot OCR proof."""
+    prompt_text = str(prompt_text or "")
+    normalized = _normalize_visible_text(prompt_text)
+    signals = []
+
+    for marker in ("self prompt", "self prom", "skynet intel"):
+        if marker in normalized:
+            signals.append(marker)
+
+    stamp_match = re.search(r"\[SELF-PROMPT\s+([^\]]+)\]", prompt_text, re.I)
+    if stamp_match:
+        stamp = stamp_match.group(1).strip()
+        try:
+            stamp_dt = datetime.fromisoformat(stamp)
+            signals.extend([
+                stamp_dt.strftime("%H:%M"),
+                stamp_dt.strftime("%H %M"),
+                stamp_dt.strftime("%Y %m %d"),
+            ])
+        except Exception:
+            pass
+
+    parts = [part.strip() for part in prompt_text.split("||")]
+    if len(parts) > 1:
+        action_norm = _normalize_visible_text(re.sub(r"\(\d+/\d+\)\s*$", "", parts[1]))
+        action_words = [w for w in action_norm.split() if len(w) >= 4]
+        if action_words:
+            signals.append(" ".join(action_words[:5]))
+            signals.append(" ".join(action_words[:3]))
+
+    if len(parts) > 2:
+        loop_norm = _normalize_visible_text(parts[2])
+        for phrase in ("poll bus", "check worker states", "collect results", "repeat until todos"):
+            if phrase in loop_norm:
+                signals.append(phrase)
+
+    deduped = []
+    for signal in signals:
+        signal = signal.strip()
+        if signal and signal not in deduped:
+            deduped.append(signal)
+    return deduped
+
+
+def _match_prompt_visibility_text(ocr_text, prompt_text):
+    """Decide whether OCR text proves the current self-prompt is visibly rendered."""
+    normalized_ocr = _normalize_visible_text(ocr_text)
+    signals = _prompt_visibility_signals(prompt_text)
+    matched = [signal for signal in signals if signal and signal in normalized_ocr]
+
+    header_hit = any(signal in matched for signal in ("self prompt", "self prom"))
+    time_hit = any(re.fullmatch(r"\d{2}:\d{2}|\d{2} \d{2}", signal) for signal in matched)
+    content_hit = any(
+        signal in matched
+        for signal in ("skynet intel", "poll bus", "check worker states", "collect results", "repeat until todos")
+    ) or any(
+        signal in matched and len(signal.split()) >= 3 and not re.fullmatch(r"\d{4} \d{2} \d{2}", signal)
+        for signal in signals
+    )
+
+    screenshot_verified = bool(header_hit and (time_hit or content_hit))
+    proof_level = "screenshot" if screenshot_verified else "unproven"
+    return {
+        "screenshot_verified": screenshot_verified,
+        "proof_level": proof_level,
+        "matched_signals": matched,
+        "signals": signals,
+        "ocr_excerpt": _ascii_excerpt(ocr_text, max_chars=400),
+    }
+
+
+def _proof_match_score(proof):
+    """Rank screenshot proofs so the strongest visible match wins."""
+    if not isinstance(proof, dict):
+        return (-1, -1, -1, -1)
+    matched = list(proof.get("matched_signals") or [])
+    time_hit = any(re.fullmatch(r"\d{2}:\d{2}|\d{2} \d{2}", signal) for signal in matched)
+    content_hits = sum(
+        1
+        for signal in matched
+        if signal in {"skynet intel", "poll bus", "check worker states", "collect results", "repeat until todos"}
+        or (len(str(signal).split()) >= 3 and not re.fullmatch(r"\d{4} \d{2} \d{2}", str(signal)))
+    )
+    return (
+        1 if proof.get("screenshot_verified") else 0,
+        1 if time_hit else 0,
+        int(content_hits),
+        len(matched),
+    )
+
+
+def _prefer_delivery_proof(*proofs):
+    """Pick the strongest screenshot proof from multiple capture attempts."""
+    best = None
+    best_score = (-1, -1, -1, -1)
+    for proof in proofs:
+        if not isinstance(proof, dict):
+            continue
+        score = _proof_match_score(proof)
+        if score > best_score:
+            best = proof
+            best_score = score
+    return best or {}
+
+
+def _health_snapshot_age_s(health):
+    """Return health snapshot age in seconds, or None if unknown."""
+    if not isinstance(health, dict):
+        return None
+    stamp = health.get("timestamp")
+    if not stamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(stamp))
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        now = datetime.now(parsed.tzinfo)
+        return max(0, int((now - parsed).total_seconds()))
+    except Exception:
+        return None
+
+
+def _health_snapshot_is_fresh(health):
+    """Treat the daemon heartbeat as stale if the health file lags too long."""
+    age_s = _health_snapshot_age_s(health)
+    if age_s is None:
+        return False
+    freshness_budget = max(90, int(float(LOOP_INTERVAL) * 3))
+    return age_s <= freshness_budget
+
+
 def _get_worker_state(hwnd):
     """Get worker state via UIA engine (uses singleton)."""
     try:
@@ -216,6 +374,108 @@ def _get_orch_hwnd():
         if data:
             return data.get("orchestrator_hwnd", 0)
         return 0
+
+
+def _get_orchestrator_pane_truth(hwnd):
+    """Inspect the left orchestrator pane inside a shared VS Code window.
+
+    Returns whether the shared-window override is safe: the orchestrator pane
+    is strongly identified on the left side, and whether that left pane
+    currently holds draft text that would make self-prompt delivery unsafe.
+    """  # signed: consultant
+    truth = {
+        "shared_orchestrator": False,
+        "left_pane_typing": False,
+        "left_model_ok": False,
+        "left_agent_ok": False,
+        "markers": [],
+    }
+    if not hwnd:
+        return truth
+
+    try:
+        try:
+            from skynet_delivery import _get_orchestrator_pane_signals
+        except Exception:
+            from tools.skynet_delivery import _get_orchestrator_pane_signals
+        pane = _get_orchestrator_pane_signals(hwnd) or {}
+    except Exception:
+        return truth
+
+    truth["left_model_ok"] = bool(pane.get("left_model_ok"))
+    truth["left_agent_ok"] = bool(pane.get("left_agent_ok"))
+    truth["markers"] = list(pane.get("markers") or [])
+    truth["shared_orchestrator"] = bool(
+        (truth["left_agent_ok"] and truth["markers"])
+        or (truth["left_model_ok"] and truth["markers"])
+        or (truth["left_model_ok"] and truth["left_agent_ok"])
+    )
+    if not truth["shared_orchestrator"]:
+        return truth
+
+    try:
+        import comtypes
+        import comtypes.client  # noqa: F401
+        from comtypes.gen import UIAutomationClient as UIA
+
+        try:
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+        except OSError:
+            pass
+
+        uia = comtypes.CoCreateInstance(
+            comtypes.GUID("{ff48dba4-60ef-4201-aa87-54103eef594e}"),
+            interface=UIA.IUIAutomation,
+            clsctx=comtypes.CLSCTX_INPROC_SERVER,
+        )
+        root = uia.ElementFromHandle(ctypes.c_void_p(hwnd))
+        if not root:
+            return truth
+
+        win_rect = root.CurrentBoundingRectangle
+        left_band_max_x = win_rect.left + min(340, int((win_rect.right - win_rect.left) * 0.40))
+        edit_cond = uia.CreatePropertyCondition(30003, 50004)  # ControlType=Edit  # signed: consultant
+        edits = root.FindAll(4, edit_cond)
+
+        for i in range(edits.Length):
+            el = edits.GetElement(i)
+            try:
+                rect = el.CurrentBoundingRectangle
+                if rect.left < 0 or rect.right > left_band_max_x:
+                    continue
+                name = str(el.CurrentName or "")
+                if "terminal input" in name.lower():
+                    continue
+                vp = el.GetCurrentPattern(10002)  # ValuePattern  # signed: consultant
+                val_pattern = vp.QueryInterface(UIA.IUIAutomationValuePattern)
+                value = str(val_pattern.CurrentValue or "").strip()
+                if value:
+                    truth["left_pane_typing"] = True
+                    break
+            except Exception:
+                continue
+    except Exception:
+        return truth
+
+    return truth
+
+
+def _orch_typing_should_block(orch_hwnd, orch_state):
+    """Return True only when the orchestrator pane itself is actively typing.
+
+    In shared windows, a consultant/right pane draft can make the top-level
+    window look TYPING even when the left orchestrator pane is clear. That must
+    not suppress legitimate self-prompts to the orchestrator pane.
+    """  # signed: consultant
+    if orch_state != "TYPING":
+        return False, "orch_not_typing"
+
+    pane_truth = _get_orchestrator_pane_truth(orch_hwnd)
+    if pane_truth["shared_orchestrator"] and not pane_truth["left_pane_typing"]:
+        return False, "shared_window_false_positive"
+    if pane_truth["left_pane_typing"]:
+        return True, "orch_left_pane_typing"
+    return True, "orch_typing"
 
 
 def _update_last_action(reason="prompt_sent"):
@@ -314,6 +574,112 @@ def _verify_orch_delivery(orch_hwnd, pre_state, timeout_s=8):
     # signed: gamma
 
 
+def _capture_delivery_screenshot_proof(orch_hwnd, prompt_text, attempt, proof_reason):
+    """Capture a pane-local screenshot after delivery and OCR it for visible proof."""
+    evidence = {
+        "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "attempt": int(attempt),
+        "proof_reason": str(proof_reason or ""),
+        "screenshot_verified": False,
+        "proof_level": "unproven",
+        "screenshot_path": "",
+        "window_screenshot_path": "",
+        "crop_label": "",
+        "ocr_available": False,
+        "matched_signals": [],
+        "signals": _prompt_visibility_signals(prompt_text),
+        "ocr_excerpt": "",
+        "prompt_hash": hashlib.md5(str(prompt_text or "").encode("utf-8")).hexdigest()[:12],
+    }
+
+    try:
+        from tools.chrome_bridge.winctl import Desktop
+    except Exception:
+        try:
+            from chrome_bridge.winctl import Desktop
+        except Exception as e:
+            evidence["ocr_excerpt"] = f"screenshot_unavailable: {e}"
+            _save_json(DELIVERY_EVIDENCE_FILE, evidence)
+            return evidence
+
+    try:
+        from PIL import Image
+        from core.ocr import OCREngine
+    except Exception as e:
+        evidence["ocr_excerpt"] = f"ocr_import_failed: {e}"
+        _save_json(DELIVERY_EVIDENCE_FILE, evidence)
+        return evidence
+
+    try:
+        DELIVERY_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        window_path = DELIVERY_SCREENSHOT_DIR / f"orch_window_attempt{attempt}_{stamp}.png"
+        Desktop().screenshot(path=str(window_path), window=orch_hwnd)
+        evidence["window_screenshot_path"] = str(window_path)
+
+        img = Image.open(window_path)
+        shared = bool(_get_orchestrator_pane_truth(orch_hwnd).get("shared_orchestrator"))
+        ocr = OCREngine()
+        evidence["ocr_available"] = bool(ocr.is_available)
+        if not ocr.is_available:
+            evidence["ocr_excerpt"] = "ocr_unavailable"
+            _save_json(DELIVERY_EVIDENCE_FILE, evidence)
+            return evidence
+
+        candidate_specs = []
+        if shared:
+            candidate_specs.extend([
+                ("shared_pane_focus", 0.42, 0.52, 0.98),
+                ("shared_bottom_half", 0.50, 0.45, 1.00),
+                ("shared_bottom_third", 0.50, 0.62, 1.00),
+                ("shared_bottom_band", 0.56, 0.74, 1.00),
+            ])
+        else:
+            candidate_specs.extend([
+                ("full_pane_focus", 0.92, 0.52, 0.98),
+                ("full_bottom_half", 0.92, 0.45, 1.00),
+                ("full_bottom_third", 0.92, 0.62, 1.00),
+            ])
+
+        best_match = {}
+        best_crop = None
+        best_label = ""
+        seen_boxes = set()
+        for label, x_frac, y_start, y_end in candidate_specs:
+            x2 = max(1, int(img.width * x_frac))
+            y1 = max(0, int(img.height * y_start))
+            y2 = max(y1 + 1, int(img.height * y_end))
+            box = (0, y1, x2, min(img.height, y2))
+            if box in seen_boxes:
+                continue
+            seen_boxes.add(box)
+            crop = img.crop(box)
+            result = ocr.extract(crop, min_confidence=0.35)
+            match = _match_prompt_visibility_text(result.full_text, prompt_text)
+            candidate = dict(match)
+            candidate["crop_label"] = label
+            if _proof_match_score(candidate) > _proof_match_score(best_match):
+                best_match = candidate
+                best_crop = crop
+                best_label = label
+
+        if best_crop is not None:
+            crop_path = DELIVERY_SCREENSHOT_DIR / f"orch_pane_attempt{attempt}_{best_label}_{stamp}.png"
+            best_crop.save(crop_path)
+            evidence["screenshot_path"] = str(crop_path)
+            evidence["crop_label"] = best_label
+        evidence.update(best_match)
+
+        existing = sorted(DELIVERY_SCREENSHOT_DIR.glob("orch_*_attempt*.png"))
+        for old in existing[:-40]:
+            old.unlink(missing_ok=True)
+    except Exception as e:
+        evidence["ocr_excerpt"] = f"visual_proof_failed: {_ascii_excerpt(e)}"
+
+    _save_json(DELIVERY_EVIDENCE_FILE, evidence)
+    return evidence
+
+
 def _send_self_prompt(orch_hwnd, prompt_text):
     """Type a prompt into the orchestrator's chat window with delivery verification.
 
@@ -339,9 +705,55 @@ def _send_self_prompt(orch_hwnd, prompt_text):
                     time.sleep(3)
                 continue
 
+            time.sleep(0.8)
+            early_proof = _capture_delivery_screenshot_proof(orch_hwnd, prompt_text, attempt, "post_send_preverify")
+
+            block_typing, block_reason = _orch_typing_should_block(orch_hwnd, pre_state)
+            if pre_state == "TYPING" and not block_typing and block_reason == "shared_window_false_positive":
+                proof = _prefer_delivery_proof(
+                    early_proof,
+                    _capture_delivery_screenshot_proof(orch_hwnd, prompt_text, attempt, "shared_window_bypass"),
+                )
+                _save_json(DELIVERY_EVIDENCE_FILE, proof)
+                if proof.get("screenshot_verified"):
+                    log(f"Attempt {attempt}: screenshot proof OK ({proof.get('screenshot_path')})", "OK")
+                else:
+                    log(
+                        f"Attempt {attempt}: screenshot proof missing after shared-window bypass "
+                        f"({proof.get('screenshot_path') or 'no_path'})",
+                        "WARN",
+                    )
+                log("Attempt %d: delivery OK with shared-window verification bypass" % attempt, "OK")
+                return True
+
             verified = _verify_orch_delivery(orch_hwnd, pre_state, timeout_s=8)
+            proof = _prefer_delivery_proof(
+                early_proof,
+                _capture_delivery_screenshot_proof(
+                    orch_hwnd,
+                    prompt_text,
+                    attempt,
+                    "state_change" if verified else "state_unchanged",
+                ),
+            )
+            _save_json(DELIVERY_EVIDENCE_FILE, proof)
+            if proof.get("screenshot_verified"):
+                log(f"Attempt {attempt}: screenshot proof OK ({proof.get('screenshot_path')})", "OK")
             if verified:
+                if not proof.get("screenshot_verified"):
+                    log(
+                        f"Attempt {attempt}: state verified but screenshot proof missing "
+                        f"({proof.get('screenshot_path') or 'no_path'})",
+                        "WARN",
+                    )
                 log(f"Attempt {attempt}: delivery OK + verified ({elapsed_ms}ms)", "OK")
+                return True
+
+            if proof.get("screenshot_verified"):
+                log(
+                    f"Attempt {attempt}: screenshot proof OK despite unchanged state ({elapsed_ms}ms)",
+                    "OK",
+                )
                 return True
 
             log(f"Attempt {attempt}: delivery OK but state unchanged ({elapsed_ms}ms, pre={pre_state})", "WARN")
@@ -546,6 +958,13 @@ class SelfPromptDaemon:
         self.last_dispatch_check_count = 0
         self.last_cycle_complete_time = 0.0
         self.all_idle_since = 0.0
+        self.missed_fire_eligible_at = 0.0
+        self.missed_fire_detected_at = 0.0
+        self.missed_fire_reason = ""
+        self.missed_fire_tags = []
+        self.missed_fire_score = 0
+        self.missed_fire_alerted_at = 0.0
+        self.missed_fire_consultant_notified = False
 
         self._init_intelligence()
         self._load_persistent_state()
@@ -1246,10 +1665,14 @@ class SelfPromptDaemon:
 
         actions.sort(key=lambda x: x[0], reverse=True)
         top_action = actions[0][1] if actions else "System needs attention."
+        loop_clause = (
+            "Loop: poll bus -> check worker states -> dispatch the highest-priority real work -> "
+            "collect results -> repeat until TODOs and queued tasks are zero."
+        )
         prompt_counter = f"({self.consecutive_prompts + 1}/{self.max_consecutive})"
         return self._format_prompt(
             stamp,
-            f"Skynet Intel: {status_line} || {top_action} {prompt_counter}",
+            f"Skynet Intel: {status_line} || {top_action} {prompt_counter} || {loop_clause}",
         )
 
     def _prompt_timestamp(self):
@@ -1473,6 +1896,7 @@ class SelfPromptDaemon:
     def _build_actions(self, perception, patterns, new_results, new_alerts, pending_todos, orch_todos, idle_workers):
         """Build prioritized action list for the prompt."""
         actions = []
+        pending_task_count = int(perception.get("pending_tasks", 0) or 0)
 
         if self.cot.has_conclusions():
             for c in self.cot.critical_conclusions()[:1]:
@@ -1499,8 +1923,15 @@ class SelfPromptDaemon:
             senders = list({r.get("sender", "?").title() for r in new_results})
             actions.append((70, f"{len(new_results)} result(s) from {','.join(senders[:3])} ready for synthesis."))
 
-        if idle_workers and pending_todos > 0:
-            actions.append((40, f"{len(idle_workers)} idle worker(s), {pending_todos} tasks queued."))
+        if idle_workers and pending_todos > 0 and pending_task_count > 0:
+            actions.append((
+                40,
+                f"Dispatch idle workers: {pending_todos} pending TODO(s), {pending_task_count} queued task(s)."
+            ))
+        elif idle_workers and pending_todos > 0:
+            actions.append((40, f"Dispatch idle workers on {pending_todos} pending TODO(s)."))
+        elif idle_workers and pending_task_count > 0:
+            actions.append((40, f"Dispatch idle workers on {pending_task_count} queued task(s)."))
         elif idle_workers and not pending_todos and not new_results:
             actions.append((20, f"{len(idle_workers)} idle worker(s), no pending work."))
 
@@ -1662,9 +2093,99 @@ class SelfPromptDaemon:
         except Exception:
             pass  # never crash the daemon for a health write
 
+    def _missed_fire_grace_s(self):
+        """Allow one or two loop cycles before declaring a missed eligible fire."""
+        return max(45.0, float(LOOP_INTERVAL) * 2.0)
+
+    def _next_eligible_at(self):
+        """Earliest timestamp when self-prompt delivery becomes allowed again."""
+        if not self.all_idle_since:
+            return 0.0
+        quiet_ready_at = self.all_idle_since + max(1.0, float(ALL_IDLE_INTERVAL))
+        gap_ready_at = self.last_prompt_time + max(1.0, float(MIN_PROMPT_GAP)) if self.last_prompt_time else 0.0
+        return max(quiet_ready_at, gap_ready_at)
+
+    def _clear_missed_fire_watch(self):
+        self.missed_fire_eligible_at = 0.0
+        self.missed_fire_detected_at = 0.0
+        self.missed_fire_reason = ""
+        self.missed_fire_tags = []
+        self.missed_fire_score = 0
+        self.missed_fire_alerted_at = 0.0
+        self.missed_fire_consultant_notified = False
+
+    def _arm_missed_fire_watch(self, now, reason, score=0, reasons=None):
+        eligible_at = self._next_eligible_at()
+        if not eligible_at or not reason:
+            return
+        tags = [str(tag) for tag in (reasons or []) if tag]
+        if (
+            self.missed_fire_eligible_at
+            and abs(self.missed_fire_eligible_at - eligible_at) < 1.0
+            and self.missed_fire_reason == reason
+        ):
+            if tags:
+                self.missed_fire_tags = tags
+            self.missed_fire_score = max(int(score or 0), int(self.missed_fire_score or 0))
+            return
+        self.missed_fire_eligible_at = eligible_at
+        self.missed_fire_detected_at = now
+        self.missed_fire_reason = str(reason)
+        self.missed_fire_tags = tags
+        self.missed_fire_score = int(score or 0)
+        self.missed_fire_alerted_at = 0.0
+        self.missed_fire_consultant_notified = False
+
+    def _notify_consultant_watch(self, content):
+        try:
+            try:
+                from tools.skynet_delivery import deliver_to_consultant
+            except Exception:
+                from skynet_delivery import deliver_to_consultant
+            return deliver_to_consultant("consultant", content, sender="self_prompt", msg_type="alert")
+        except Exception as e:
+            return {"success": False, "detail": f"consultant_watch_notify_failed: {e}"}
+
+    def _maybe_alert_missed_fire(self, now):
+        if not self.missed_fire_eligible_at or not self.missed_fire_reason or self.missed_fire_alerted_at:
+            return False
+
+        grace_s = self._missed_fire_grace_s()
+        deadline = self.missed_fire_eligible_at + grace_s
+        if now < deadline:
+            return False
+
+        overdue_s = max(0, int(now - deadline))
+        eligible_iso = _format_local_timestamp(self.missed_fire_eligible_at) or "unknown"
+        last_attempt_iso = _format_local_timestamp(self.last_prompt_time) or "never"
+        reason_list = ",".join(self.missed_fire_tags[:3]) if self.missed_fire_tags else "unknown"
+        content = _versioned_signal(
+            "SELF_PROMPT_MISSED_FIRE",
+            f"eligible_at={eligible_iso} overdue={overdue_s}s reason={self.missed_fire_reason} "
+            f"last_attempt={last_attempt_iso} score={int(self.missed_fire_score)} reasons={reason_list}"
+        )
+
+        _post_bus("orchestrator", "alert", content)
+        consultant_result = self._notify_consultant_watch(content)
+        self.missed_fire_consultant_notified = bool((consultant_result or {}).get("success"))
+        self.missed_fire_alerted_at = now
+        log(
+            f"Missed-fire alert posted (reason={self.missed_fire_reason}, overdue={overdue_s}s, "
+            f"consultant_notified={self.missed_fire_consultant_notified})",
+            "WARN",
+        )
+        return True
+
     def _build_health_payload(self, now=None, orch_hwnd=None):
         now = time.time() if now is None else now
         orch_hwnd = _get_orch_hwnd() if orch_hwnd is None else orch_hwnd
+        next_eligible_at = self._next_eligible_at()
+        grace_s = self._missed_fire_grace_s()
+        missed_fire_pending = bool(self.missed_fire_eligible_at and self.missed_fire_reason)
+        missed_fire_overdue_s = 0
+        delivery_evidence = _load_json(DELIVERY_EVIDENCE_FILE) or {}
+        if missed_fire_pending:
+            missed_fire_overdue_s = max(0, int(now - (self.missed_fire_eligible_at + grace_s)))
         return {
             "daemon": DAEMON_NAME,
             "daemon_version": DAEMON_VERSION,
@@ -1673,10 +2194,31 @@ class SelfPromptDaemon:
             "sent": self.prompts_sent,
             "failed": self.prompts_failed,
             "last_sent_timestamp": getattr(self, 'last_prompt_time', 0.0),
+            "last_prompt_attempt_iso": _format_local_timestamp(getattr(self, 'last_prompt_time', 0.0)),
             "min_prompt_gap_s": int(MIN_PROMPT_GAP),
             "all_idle_interval_s": int(ALL_IDLE_INTERVAL),
             "repeated_state_suppression_s": int(REPEATED_STATE_SUPPRESSION_S),
             "boot_prompt_enabled": bool(BOOT_PROMPT_ENABLED),
+            "all_idle_since_timestamp": float(self.all_idle_since or 0.0),
+            "all_idle_since_iso": _format_local_timestamp(self.all_idle_since),
+            "next_eligible_timestamp": float(next_eligible_at or 0.0),
+            "next_eligible_iso": _format_local_timestamp(next_eligible_at),
+            "eligible_now": bool(next_eligible_at and now >= next_eligible_at and self._all_idle_window_ready(now)),
+            "missed_fire_grace_s": int(grace_s),
+            "missed_fire_pending": missed_fire_pending,
+            "missed_fire_reason": self.missed_fire_reason or None,
+            "missed_fire_score": int(self.missed_fire_score or 0),
+            "missed_fire_tags": list(self.missed_fire_tags),
+            "missed_fire_detected_at": float(self.missed_fire_detected_at or 0.0),
+            "missed_fire_detected_iso": _format_local_timestamp(self.missed_fire_detected_at),
+            "missed_fire_alerted_at": float(self.missed_fire_alerted_at or 0.0),
+            "missed_fire_alerted_iso": _format_local_timestamp(self.missed_fire_alerted_at),
+            "missed_fire_consultant_notified": bool(self.missed_fire_consultant_notified),
+            "missed_fire_overdue_s": int(missed_fire_overdue_s),
+            "last_visual_proof": delivery_evidence.get("proof_level") or "unknown",
+            "last_visual_screenshot_verified": bool(delivery_evidence.get("screenshot_verified")),
+            "last_visual_screenshot_path": delivery_evidence.get("screenshot_path") or None,
+            "last_visual_captured_at": delivery_evidence.get("captured_at") or None,
             "orchestrator_hwnd": orch_hwnd,
             "pid": os.getpid(),
             "uptime_s": int(now - getattr(self, '_start_time', now)),
@@ -1710,8 +2252,9 @@ class SelfPromptDaemon:
             return False, ["boot_in_progress"], "", 0
 
         orch_state = _get_worker_state(orch_hwnd)
-        if orch_state == "TYPING":
-            return False, ["orch_typing"], "", 0
+        block_typing, block_reason = _orch_typing_should_block(orch_hwnd, orch_state)
+        if block_typing:
+            return False, [block_reason], "", 0
 
         # Full Chain-of-Thought Pipeline
         perception = self._perceive()
@@ -1784,7 +2327,10 @@ class SelfPromptDaemon:
             orch_hwnd = _get_orch_hwnd()
             if not orch_hwnd or not _is_window_alive(orch_hwnd):
                 return 0
-            if _get_worker_state(orch_hwnd) == "TYPING":
+            orch_state = _get_worker_state(orch_hwnd)
+            block_typing, block_reason = _orch_typing_should_block(orch_hwnd, orch_state)
+            if block_typing:
+                log(f"Queued directive blocked: {block_reason}", "INFO")
                 return 0
 
             delivered = 0
@@ -1796,6 +2342,7 @@ class SelfPromptDaemon:
                     break
 
             if delivered > 0:
+                self._clear_missed_fire_watch()
                 ORCH_QUEUE_FILE.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
             return delivered
         except Exception as e:
@@ -1844,13 +2391,16 @@ class SelfPromptDaemon:
 
         live_snapshot = self._fetch_worker_status_snapshot()
         if not self._refresh_all_idle_window(now, live_snapshot):
+            self._clear_missed_fire_watch()
             return False
 
         if not self._all_idle_window_ready(now):
+            self._clear_missed_fire_watch()
             return False
 
         effective_gap = max(1.0, float(MIN_PROMPT_GAP))
         if now - self.last_prompt_time < effective_gap:
+            self._clear_missed_fire_watch()
             return False
 
         # Consecutive prompt limiter
@@ -1864,22 +2414,35 @@ class SelfPromptDaemon:
 
         should, reasons, prompt, total_score = self._scan_triggers()
         if not should:
+            block_reason = str(reasons[0]) if reasons else ""
+            if block_reason in {"dispatch_active", "boot_in_progress", "orch_window_dead", "orch_typing", "orch_left_pane_typing"}:
+                self._arm_missed_fire_watch(now, block_reason, total_score, reasons)
+                self._maybe_alert_missed_fire(now)
+            else:
+                self._clear_missed_fire_watch()
             return False
 
         orch_hwnd = _get_orch_hwnd()
         if not orch_hwnd:
+            self._arm_missed_fire_watch(now, "orch_window_dead", total_score, reasons)
+            self._maybe_alert_missed_fire(now)
             log("No orchestrator HWND", "ERROR")
             return False
 
-        if self._check_orch_typing(orch_hwnd):
+        block_typing, block_reason = self._check_orch_typing(orch_hwnd)
+        if block_typing:
+            self._arm_missed_fire_watch(now, block_reason, total_score, reasons)
+            self._maybe_alert_missed_fire(now)
             return False
 
         if self._is_duplicate_prompt(prompt, now):
+            self._clear_missed_fire_watch()
             return False
 
         pre_fire_now = time.time()
         pre_fire_snapshot = self._fetch_worker_status_snapshot()
         if not self._refresh_all_idle_window(pre_fire_now, pre_fire_snapshot):
+            self._clear_missed_fire_watch()
             log(
                 "Aborting self-prompt: live worker state changed before fire "
                 f"({self._format_worker_snapshot(pre_fire_snapshot)})",
@@ -1887,6 +2450,7 @@ class SelfPromptDaemon:
             )
             return False
         if not self._all_idle_window_ready(pre_fire_now):
+            self._clear_missed_fire_watch()
             log("Aborting self-prompt: all-idle window not yet satisfied at fire time", "WARN")
             return False
 
@@ -1894,6 +2458,12 @@ class SelfPromptDaemon:
         log(f"Prompt: {prompt[:120]}...")
 
         ok = _send_self_prompt(orch_hwnd, prompt)
+        if ok:
+            self._clear_missed_fire_watch()
+        else:
+            failed_at = time.time()
+            self._arm_missed_fire_watch(failed_at, "delivery_failed", total_score, reasons)
+            self._maybe_alert_missed_fire(failed_at)
         self._record_prompt_delivery(ok, now, prompt, reasons, total_score)
         return ok
 
@@ -1903,14 +2473,18 @@ class SelfPromptDaemon:
             sys.path.insert(0, str(ROOT / "tools"))
             from uia_engine import get_engine
             orch_state = get_engine().get_state(orch_hwnd)
-            if orch_state == "TYPING":
-                log("Orchestrator TYPING -- skipping prompt (collision guard)")
-                return True
+            block_typing, block_reason = _orch_typing_should_block(orch_hwnd, orch_state)
+            if block_typing:
+                log(f"Orchestrator typing gate active ({block_reason}) -- skipping prompt")
+                return True, block_reason
+            if orch_state == "TYPING" and block_reason == "shared_window_false_positive":
+                log("Shared-window typing detected in a non-orchestrator pane -- continuing", "INFO")
             if orch_state == "PROCESSING":
                 log("Orchestrator PROCESSING -- queuing prompt (VS Code will queue)")
         except Exception as e:
             log(f"State check failed: {e} -- prompting anyway", "WARN")
-        return False
+            return False, "state_check_failed"
+        return False, "orch_not_typing"
 
     def _is_duplicate_prompt(self, prompt, now):
         """Anti-spam: suppress identical text quickly and repeated no-change states longer."""
@@ -1932,6 +2506,10 @@ class SelfPromptDaemon:
     def _record_prompt_delivery(self, ok, now, prompt, reasons, total_score):
         """Record prompt delivery outcome and update tracking state."""
         prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:12]
+        delivery_evidence = _load_json(DELIVERY_EVIDENCE_FILE) or {}
+        proof_level = "none"
+        if ok:
+            proof_level = delivery_evidence.get("proof_level") or "state_only"
         self.last_prompt_time = now
         self.last_prompt_hash = prompt_hash
         self.last_prompt_hash_time = now
@@ -1942,6 +2520,11 @@ class SelfPromptDaemon:
             "score": total_score,
             "prompt": prompt[:200],
             "delivered": ok,
+            "proof_level": proof_level,
+            "screenshot_verified": bool(delivery_evidence.get("screenshot_verified")),
+            "screenshot_path": delivery_evidence.get("screenshot_path") or "",
+            "ocr_excerpt": delivery_evidence.get("ocr_excerpt") or "",
+            "matched_signals": list(delivery_evidence.get("matched_signals") or []),
         })
         _update_last_action("self_prompt_sent")
 
@@ -1955,7 +2538,7 @@ class SelfPromptDaemon:
                 self.last_cycle_complete_time = now
             log(f"Prompt DELIVERED (consecutive {self.consecutive_prompts}/{self.max_consecutive})")
             _post_bus("orchestrator", "self_prompt",
-                      f"Self-prompt sent (score={total_score}, {self.consecutive_prompts}/{self.max_consecutive}): {', '.join(reasons)}")
+                      f"Self-prompt sent (score={total_score}, {self.consecutive_prompts}/{self.max_consecutive}, proof={proof_level}): {', '.join(reasons)}")
         else:
             self.prompts_failed += 1
             log("Prompt FAILED to deliver", "ERROR")
@@ -2041,6 +2624,7 @@ class SelfPromptDaemon:
                 f"({self._format_worker_snapshot(snapshot)})"
             )
         self.all_idle_since = 0.0
+        self._clear_missed_fire_watch()
         return False
 
     def _all_idle_window_ready(self, now):
@@ -2112,6 +2696,7 @@ class SelfPromptDaemon:
                 log(f"Delivered {queued_delivered} queued directive(s)")
             else:
                 self.check_and_prompt(deliver_queue_first=False)
+            self._write_health_file()
             self._consecutive_loop_errors = 0  # reset on success  # signed: beta
         except (ConnectionError, TimeoutError, OSError) as e:
             self._consecutive_loop_errors += 1
@@ -2131,6 +2716,11 @@ class SelfPromptDaemon:
             if self._consecutive_loop_errors % self._DEGRADED_THRESHOLD == 0:
                 _post_bus("orchestrator", "alert",
                           f"DAEMON_DEGRADED self_prompt {self._consecutive_loop_errors} consecutive errors: {e}")
+        finally:
+            try:
+                self._write_health_file()
+            except Exception:
+                pass
         # signed: beta
 
 
@@ -2152,8 +2742,37 @@ def _action_status():
     """Show last self-prompt log entry and daemon PID."""
     log_data = _load_json(LOG_FILE)
     health = _load_json(HEALTH_FILE) or {}
+    evidence = _load_json(DELIVERY_EVIDENCE_FILE) or {}
     print(f"{DAEMON_NAME} v{health.get('daemon_version', DAEMON_VERSION)}")
     print(f"Skynet version: {health.get('skynet_version') or _get_skynet_version() or 'unavailable'}")
+    if health:
+        health_age_s = _health_snapshot_age_s(health)
+        freshness = "fresh" if _health_snapshot_is_fresh(health) else "stale"
+        print(
+            "Health snapshot: "
+            f"{health.get('timestamp') or 'unknown'} "
+            f"({health_age_s if health_age_s is not None else 'unknown'}s old, {freshness})"
+        )
+        print(f"Last prompt attempt: {health.get('last_prompt_attempt_iso') or 'unknown'}")
+        print(f"Next eligible: {health.get('next_eligible_iso') or 'not primed'}")
+        print(
+            "Visual proof: "
+            f"{health.get('last_visual_proof') or 'unknown'} "
+            f"verified={bool(health.get('last_visual_screenshot_verified'))}"
+        )
+        if evidence:
+            print(f"Visual screenshot: {evidence.get('screenshot_path') or 'none'}")
+            if evidence.get("matched_signals"):
+                print(f"Matched signals: {', '.join(evidence.get('matched_signals')[:4])}")
+            if evidence.get("ocr_excerpt"):
+                print(f"OCR excerpt: {evidence.get('ocr_excerpt')}")
+        if health.get("missed_fire_pending"):
+            print(
+                "Missed-fire watch: "
+                f"reason={health.get('missed_fire_reason') or 'unknown'} "
+                f"overdue={int(health.get('missed_fire_overdue_s') or 0)}s "
+                f"consultant_notified={bool(health.get('missed_fire_consultant_notified'))}"
+            )
     if log_data and isinstance(log_data, list) and len(log_data) > 0:
         print(json.dumps(log_data[-1], indent=2))
         print(f"\nTotal prompts logged: {len(log_data)}")

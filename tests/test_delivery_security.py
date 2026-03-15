@@ -27,6 +27,7 @@ from skynet_delivery import (
     _ghost_type,
     _load_orch_hwnd,
     _load_worker_hwnd,
+    _resolve_orchestrator_render_hwnd,
     deliver,
     DeliveryTarget,
 )
@@ -208,6 +209,63 @@ class TestDeliverRejectsStaleOrchestratorHWND(unittest.TestCase):
         result = deliver(DeliveryTarget.ORCHESTRATOR, "test")
         self.assertFalse(result["success"])
         self.assertIn("No orchestrator HWND", result["detail"])
+
+
+class TestResolveOrchestratorRenderHwnd(unittest.TestCase):
+    @patch("skynet_delivery._get_orchestrator_pane_signals", return_value={
+        "left_model": "Pick Model, Claude Opus 4.6 (fast mode)",
+        "left_agent": "Delegate Session - Copilot CLI",
+        "left_model_ok": True,
+        "left_agent_ok": True,
+        "markers": ["dispatch"],
+        "reject_markers": [],
+    })
+    @patch("skynet_delivery._enumerate_render_widgets", return_value=[55555])
+    @patch("skynet_delivery.ctypes.windll.user32.GetWindowRect")
+    def test_single_full_window_render_widget_is_used(self, mock_get_rect, _mock_widgets, _mock_pane):
+        def fake_get_rect(hwnd, rect_ptr):
+            rect = rect_ptr._obj
+            mapping = {
+                11111: (0, 0, 978, 1032),
+                55555: (0, 0, 978, 1032),
+            }
+            left, top, right, bottom = mapping[int(hwnd)]
+            rect.left = left
+            rect.top = top
+            rect.right = right
+            rect.bottom = bottom
+            return 1
+
+        mock_get_rect.side_effect = fake_get_rect
+        self.assertEqual(_resolve_orchestrator_render_hwnd(11111), 55555)
+
+    @patch("skynet_delivery._get_orchestrator_pane_signals", return_value={
+        "left_model": "Pick Model, Claude Opus 4.6 (fast mode)",
+        "left_agent": "Delegate Session - Copilot CLI",
+        "left_model_ok": True,
+        "left_agent_ok": True,
+        "markers": ["dispatch"],
+        "reject_markers": [],
+    })
+    @patch("skynet_delivery._enumerate_render_widgets", return_value=[55555, 66666])
+    @patch("skynet_delivery.ctypes.windll.user32.GetWindowRect")
+    def test_left_render_widget_still_wins_when_present(self, mock_get_rect, _mock_widgets, _mock_pane):
+        def fake_get_rect(hwnd, rect_ptr):
+            rect = rect_ptr._obj
+            mapping = {
+                11111: (0, 0, 1000, 1000),
+                55555: (0, 0, 470, 1000),
+                66666: (530, 0, 1000, 1000),
+            }
+            left, top, right, bottom = mapping[int(hwnd)]
+            rect.left = left
+            rect.top = top
+            rect.right = right
+            rect.bottom = bottom
+            return 1
+
+        mock_get_rect.side_effect = fake_get_rect
+        self.assertEqual(_resolve_orchestrator_render_hwnd(11111), 55555)
 
 
 class TestLoadOrchestratorHwndHardening(unittest.TestCase):

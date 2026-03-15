@@ -133,8 +133,14 @@ def wait_for_result(key: str, timeout: float = 90.0) -> Optional[dict]:
 # ─── SSE Parser ────────────────────────────────────────
 
 def _sse_connect(host: str, port: int):
-    """Connect to SSE stream, return HTTPConnection and response."""
-    conn = HTTPConnection(host, port, timeout=10)
+    """Connect to SSE stream, return HTTPConnection and response.
+
+    Uses a 60s socket timeout to avoid premature disconnects on idle SSE
+    streams.  The Go backend sends 1 Hz ticks, but during quiet periods the
+    gap can stretch beyond the old 10 s timeout, triggering false
+    reconnection storms that the watchdog then interprets as daemon death.
+    """
+    conn = HTTPConnection(host, port, timeout=60)  # was 10 -- too aggressive for SSE
     conn.request("GET", "/stream", headers={
         "Accept": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -142,7 +148,7 @@ def _sse_connect(host: str, port: int):
     resp = conn.getresponse()
     if resp.status != 200:
         raise ConnectionError(f"SSE returned HTTP {resp.status}")
-    return conn, resp
+    return conn, resp  # signed: gamma
 
 
 def _parse_sse_line(line: str) -> Optional[dict]:
@@ -341,6 +347,8 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
             print(f"[sse-daemon] Disconnected (network, {_consecutive_errors}x): {e}. Reconnecting in {backoff}s...", flush=True)
             if _consecutive_errors % _DEGRADED_THRESHOLD == 0:
                 _post_degraded_alert(f"sse_daemon {_consecutive_errors} consecutive errors: {e}")
+            if _sse_shutdown:
+                break  # honour signal received during stream read  # signed: gamma
             time.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
         except Exception as e:
@@ -348,6 +356,8 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
             print(f"[sse-daemon] Error ({_consecutive_errors}x): {e}. Reconnecting in {backoff}s...", flush=True)
             if _consecutive_errors % _DEGRADED_THRESHOLD == 0:
                 _post_degraded_alert(f"sse_daemon {_consecutive_errors} consecutive errors: {e}")
+            if _sse_shutdown:
+                break  # honour signal received during error handling  # signed: gamma
             time.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
         finally:

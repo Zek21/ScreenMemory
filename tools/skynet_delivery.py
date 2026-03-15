@@ -365,6 +365,114 @@ def _get_orchestrator_pane_signals(hwnd: int) -> dict:
     }
 
 
+def _enumerate_render_widgets(hwnd: int) -> list[int]:
+    """Collect all Chrome render widgets under a VS Code top-level window."""  # signed: consultant
+    widgets: list[int] = []
+    user32 = ctypes.windll.user32
+
+    def walk(parent: int) -> None:
+        child = int(user32.FindWindowExW(parent, 0, None, None) or 0)
+        while child:
+            buf = ctypes.create_unicode_buffer(256)
+            try:
+                user32.GetClassNameW(child, buf, 256)
+                if buf.value.startswith("Chrome_RenderWidgetHost"):
+                    widgets.append(child)
+            except Exception:
+                pass
+            walk(child)
+            child = int(user32.FindWindowExW(parent, child, None, None) or 0)
+
+    try:
+        walk(int(hwnd))
+    except Exception:
+        return []
+    return widgets
+
+
+def _resolve_orchestrator_render_hwnd(hwnd: int) -> int:
+    """Prefer the left-side render widget for shared orchestrator windows."""  # signed: consultant
+    pane_signals = _get_orchestrator_pane_signals(hwnd)
+    pane_override = bool(
+        (pane_signals.get("left_agent_ok") and pane_signals.get("markers"))
+        or (pane_signals.get("left_model_ok") and pane_signals.get("markers"))
+        or (pane_signals.get("left_model_ok") and pane_signals.get("left_agent_ok"))
+    )
+    if not pane_override:
+        return 0
+
+    try:
+        top_rect = ctypes.wintypes.RECT()
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(top_rect)):
+            return 0
+        wnd_mid_x = top_rect.left + ((top_rect.right - top_rect.left) / 2.0)
+    except Exception:
+        return 0
+
+    widgets = _enumerate_render_widgets(hwnd)
+    if len(widgets) == 1:
+        return int(widgets[0])
+
+    best_hwnd = 0
+    best_area = -1
+    best_center = None
+    for render_hwnd in widgets:
+        try:
+            rect = ctypes.wintypes.RECT()
+            if not ctypes.windll.user32.GetWindowRect(render_hwnd, ctypes.byref(rect)):
+                continue
+            width = rect.right - rect.left
+            height = rect.bottom - rect.top
+            if width <= 0 or height <= 0:
+                continue
+            center_x = rect.left + (width / 2.0)
+            if center_x >= wnd_mid_x:
+                continue
+            area = width * height
+            if area > best_area or (area == best_area and (best_center is None or center_x < best_center)):
+                best_hwnd = int(render_hwnd)
+                best_area = area
+                best_center = center_x
+        except Exception:
+            continue
+    return best_hwnd
+
+
+def _focus_shared_orchestrator_pane(hwnd: int) -> bool:
+    """Focus the left orchestrator pane in a shared VS Code window."""  # signed: consultant
+    pane_signals = _get_orchestrator_pane_signals(hwnd)
+    pane_override = bool(
+        (pane_signals.get("left_agent_ok") and pane_signals.get("markers"))
+        or (pane_signals.get("left_model_ok") and pane_signals.get("markers"))
+        or (pane_signals.get("left_model_ok") and pane_signals.get("left_agent_ok"))
+    )
+    if not pane_override:
+        return False
+
+    screenshot_path = _capture_prefire_screenshot(hwnd, "orchestrator_focus")
+    if not screenshot_path:
+        return False
+
+    try:
+        import pyautogui
+
+        rect = ctypes.wintypes.RECT()
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return False
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        if width <= 0 or height <= 0:
+            return False
+
+        focus_x = rect.left + int(width * 0.18)
+        focus_y = rect.top + int(height * 0.93)
+        pyautogui.click(focus_x, focus_y)
+        time.sleep(0.2)
+        return True
+    except Exception:
+        return False
+
+
 def _score_title_and_content(title_lower: str, content_lower: str) -> tuple[int, bool]:
     """Score based on title/content marker matches. Returns (score, strong_signal)."""
     score = 0
@@ -668,7 +776,7 @@ def _consultant_hwnd_is_valid(state: dict, consultant_id: str) -> bool:
 
 
 def _ghost_type(hwnd: int, text: str, orch_hwnd: int = 0,
-                target_label: str = "") -> bool:
+                target_label: str = "", render_hwnd: int = 0) -> bool:
     """Deliver text to a window via UIA ghost-type. Returns True on success.
 
     Performs HWND security validation before ghost-typing:
@@ -708,7 +816,7 @@ def _ghost_type(hwnd: int, text: str, orch_hwnd: int = 0,
 
     try:
         from skynet_dispatch import ghost_type_to_worker
-        return ghost_type_to_worker(hwnd, text, orch_hwnd or hwnd)
+        return ghost_type_to_worker(hwnd, text, orch_hwnd or hwnd, render_hwnd=render_hwnd or None)
     except Exception:
         return False
 
@@ -820,12 +928,14 @@ def _deliver_to_orch_hwnd(content: str) -> dict:
     if not hwnd:
         return {"target": "orchestrator", "method": "failed",
                 "success": False, "detail": "No orchestrator HWND"}
-    ok = _ghost_type(hwnd, content, hwnd, target_label="orchestrator")
+    render_hwnd = _resolve_orchestrator_render_hwnd(hwnd)
+    focused_left_pane = _focus_shared_orchestrator_pane(hwnd)
+    ok = _ghost_type(hwnd, content, hwnd, target_label="orchestrator", render_hwnd=render_hwnd)
     return {
         "target": "orchestrator",
         "method": DeliveryMethod.DIRECT_PROMPT.value,
         "success": ok,
-        "detail": f"HWND={hwnd}, len={len(content)}",
+        "detail": f"HWND={hwnd}, render={render_hwnd or 0}, focused_left_pane={focused_left_pane}, len={len(content)}",
     }
 
 

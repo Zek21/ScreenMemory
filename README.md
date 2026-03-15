@@ -267,6 +267,9 @@ All tools live under `tools/` and follow the `skynet_*.py` naming convention.
 | Level 1 | Genesis | Manual dispatch, single worker, basic bus messaging |
 | Level 2 | Awakening | Self-awareness, GOD Console, engine metrics, collective intelligence |
 | Level 3 | Production | Crash resilience, composite IQ tracking, request logging, truth audit enforcement |
+| Level 3.1 | Hardening | Dispatch result tracking, fair deduction rule, false DEAD debounce, anti-spam system |
+| Level 3.5 | Sprint 2 | Delivery pipeline defense-in-depth, architecture verification, multi-pane Chrome disambiguation |
+<!-- signed: alpha -->
 
 ---
 
