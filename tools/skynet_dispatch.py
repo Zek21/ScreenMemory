@@ -339,7 +339,10 @@ def _enrich_difficulty(task):
 
 
 def _enrich_learnings(task):
-    """Recall relevant learnings from LearningStore. Returns section string or None."""
+    """Recall relevant learnings from LearningStore. Returns section string or None.
+
+    Content per entry capped at 100 chars to keep total enrichment under budget.
+    """  # signed: beta
     try:
         from core.learning_store import LearningStore
         store = LearningStore()
@@ -349,15 +352,18 @@ def _enrich_learnings(task):
             for i, f in enumerate(facts, 1):
                 content = f.content if hasattr(f, 'content') else str(f)
                 conf = f.confidence if hasattr(f, 'confidence') else 0
-                lines.append(f"{i}. {content[:150]} (confidence: {conf:.2f})")
+                lines.append(f"{i}. {content[:100]} (confidence: {conf:.2f})")
             return "[LEARNINGS] " + "; ".join(lines)
-    except (ImportError, OSError, AttributeError, TypeError, ValueError):  # signed: beta
+    except (ImportError, OSError, AttributeError, TypeError, ValueError):
         pass
     return None
 
 
 def _enrich_context(task):
-    """Retrieve relevant context from HybridRetriever. Returns section string or None."""
+    """Retrieve relevant context from HybridRetriever. Returns section string or None.
+
+    Content per entry capped at 100 chars to keep total enrichment under budget.
+    """  # signed: beta
     try:
         from core.hybrid_retrieval import HybridRetriever
         retriever = HybridRetriever()
@@ -367,15 +373,18 @@ def _enrich_context(task):
             for i, r in enumerate(results, 1):
                 content = r.content if hasattr(r, 'content') else str(r)
                 score = r.score if hasattr(r, 'score') else 0
-                lines.append(f"{i}. {content[:150]} (relevance: {score:.2f})")
+                lines.append(f"{i}. {content[:100]} (relevance: {score:.2f})")
             return "[CONTEXT] " + "; ".join(lines)
-    except (ImportError, OSError, AttributeError, TypeError, ValueError):  # signed: beta
+    except (ImportError, OSError, AttributeError, TypeError, ValueError):
         pass
     return None
 
 
 def _enrich_worker_states(worker_name):
-    """Fetch other worker states from /status. Returns section string or None."""
+    """Fetch other worker states from /status. Returns compact section string or None.
+
+    Shows only name=status (no task excerpts) to keep enrichment lean.
+    """  # signed: beta
     try:
         status = _fetch_json_quiet(f"{BUS_URL}/status")
         if not status or not isinstance(status, dict):
@@ -386,18 +395,16 @@ def _enrich_worker_states(worker_name):
             for name, info in agents.items():
                 if name.lower() != worker_name.lower():
                     st = info.get("status", "?") if isinstance(info, dict) else "?"
-                    task_short = str(info.get("current_task", ""))[:40] if isinstance(info, dict) else ""
-                    states.append(f"{name}={st}({task_short})" if task_short else f"{name}={st}")
+                    states.append(f"{name}={st}")
         elif isinstance(agents, list):
             for a in agents:
                 name = a.get("name", "?")
                 if name.lower() != worker_name.lower():
                     st = a.get("status", "?")
-                    task_short = str(a.get("current_task", ""))[:40]
-                    states.append(f"{name}={st}({task_short})" if task_short else f"{name}={st}")
+                    states.append(f"{name}={st}")
         if states:
             return f"[WORKERS] {', '.join(states)}"
-    except (ImportError, OSError, AttributeError, TypeError, ValueError, KeyError):  # signed: beta
+    except (ImportError, OSError, AttributeError, TypeError, ValueError, KeyError):
         pass
     return None
 
@@ -438,6 +445,7 @@ def enrich_task(worker_name, task):
     """Enrich a task with INTELLIGENCE: difficulty, learnings, context, worker states.
 
     Each enrichment engine is lazily imported and try/except wrapped.
+    Total enrichment block is capped at 1200 chars to keep dispatch payload lean.
     Returns enriched task string (intelligence block + result reminder + original task).
     """  # signed: beta
     sections = [s for s in (
@@ -456,6 +464,10 @@ def enrich_task(worker_name, task):
         return reminder + " " + task
 
     context_block = "--- SKYNET INTELLIGENCE ---\n" + " | ".join(sections) + "\n---\n"
+    # Cap enrichment block to keep total payload under 3000 chars  # signed: beta
+    _MAX_ENRICHMENT = 1200
+    if len(context_block) > _MAX_ENRICHMENT:
+        context_block = context_block[:_MAX_ENRICHMENT - 4] + "...\n"
     return context_block + reminder + " " + task
 
 

@@ -89,8 +89,12 @@ def _resolve_real_python():
     import os as _os
     env = _os.environ.copy()
     site_packages = str(venv_dir / "Lib" / "site-packages")
+    repo_root = str(ROOT)  # Repo root needed for 'from tools.X' imports in spawned daemons
     existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{site_packages};{existing}" if existing else site_packages
+    parts = [site_packages, repo_root]
+    if existing:
+        parts.append(existing)
+    env["PYTHONPATH"] = ";".join(parts)  # signed: alpha
     env["VIRTUAL_ENV"] = str(venv_dir)
     return base_python, env
 
@@ -1021,6 +1025,7 @@ def _try_restart_daemon(daemon_name: str, pid_file: Path, script_path: Path, now
         import subprocess as sp
         sp.Popen(
             [_REAL_PYTHON, str(script_path)],
+            cwd=str(ROOT),  # Ensure daemons run from repo root for relative imports  # signed: alpha
             env=_DAEMON_ENV,
             creationflags=BACKGROUND_SPAWN_FLAGS,
             stdout=sp.DEVNULL, stderr=sp.DEVNULL,
@@ -1085,8 +1090,7 @@ def _auto_restart_stale_daemons():
                     return True
         except Exception:
             pass
-        return False  # signed: beta
-        return False
+        return False  # signed: alpha (removed duplicate return)
 
     sse_alive = _sse_pid_alive()
     if not sse_alive and _check_realtime_daemon().get("alive"):

@@ -29,16 +29,8 @@ MESSAGES_ENDPOINT = f"{BUS_URL}/bus/messages"
 DEFAULT_TIMEOUT = 5
 
 
-def bus_post(message: dict, timeout: int = DEFAULT_TIMEOUT) -> bool:
-    """POST a pre-formatted message dict to the Skynet bus.
-
-    Args:
-        message: Dict with sender, topic, type, content fields.
-        timeout: HTTP timeout in seconds.
-
-    Returns:
-        True on success, False on failure.
-    """
+def _raw_bus_post(message: dict, timeout: int = DEFAULT_TIMEOUT) -> bool:
+    """Low-level POST to bus. Only used as fallback when SpamGuard is unavailable."""
     try:
         data = json.dumps(message).encode("utf-8")
         req = urllib.request.Request(
@@ -51,6 +43,28 @@ def bus_post(message: dict, timeout: int = DEFAULT_TIMEOUT) -> bool:
             return r.status == 200
     except Exception:
         return False
+
+
+def bus_post(message: dict, timeout: int = DEFAULT_TIMEOUT) -> bool:
+    """POST a message dict to the Skynet bus via SpamGuard.
+
+    Uses guarded_publish() for spam filtering and rate limiting.
+    Falls back to raw urllib only if SpamGuard cannot be imported.
+
+    Args:
+        message: Dict with sender, topic, type, content fields.
+        timeout: HTTP timeout in seconds.
+
+    Returns:
+        True on success, False on failure.
+    """
+    try:
+        from tools.skynet_spam_guard import guarded_publish
+        result = guarded_publish(message)
+        return bool(result and result.get("allowed", False))
+    except ImportError:
+        return _raw_bus_post(message, timeout)
+    # signed: gamma
 
 
 def bus_post_fields(

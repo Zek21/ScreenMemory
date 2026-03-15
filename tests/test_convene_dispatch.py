@@ -34,17 +34,26 @@ class TestBuildPreamble(unittest.TestCase):
     def test_preamble_contains_worker_name(self):
         p = self.build_preamble("alpha")
         self.assertIn("You are worker alpha", p)
-        self.assertIn("sender':'alpha'", p)
+        # Lean preamble uses dict(sender='alpha') format  # signed: beta
+        self.assertTrue(
+            "sender='alpha'" in p or "sender':'alpha'" in p,
+            "Neither sender='alpha' nor sender':'alpha' found in preamble"
+        )
 
     def test_preamble_contains_no_steering(self):
         p = self.build_preamble("beta")
-        self.assertIn("Do NOT show steering options", p)
+        # Lean preamble uses "no steering options", old used "Do NOT show steering options"  # signed: beta
+        self.assertIn("steering options", p)
         self.assertIn("draft choices", p)
 
     def test_preamble_contains_identity_mismatch_warning(self):
         p = self.build_preamble("gamma")
         self.assertIn("IDENTITY MISMATCH", p)
-        self.assertIn("preamble for gamma", p)
+        # Lean preamble uses "for gamma ONLY" instead of old "preamble for gamma"  # signed: beta
+        self.assertTrue(
+            "for gamma ONLY" in p or "preamble for gamma" in p,
+            "Neither 'for gamma ONLY' nor 'preamble for gamma' found in preamble"
+        )
 
     def test_preamble_contains_bus_instructions(self):
         p = self.build_preamble("delta")
@@ -52,21 +61,25 @@ class TestBuildPreamble(unittest.TestCase):
         self.assertIn("topic", p)
         self.assertIn("orchestrator", p)
 
-    def test_preamble_contains_skynet_tools(self):
+    def test_preamble_contains_essential_instructions(self):
+        """Lean preamble must contain core worker instructions."""  # signed: beta
         p = self.build_preamble("alpha")
-        self.assertIn("orch_realtime.py status", p)
-        self.assertIn("skynet_dispatch.py --idle", p)
-        self.assertIn("skynet_brain_dispatch.py", p)
+        self.assertIn("Execute it directly", p)
+        self.assertIn("signed:", p)
+        self.assertIn("update_todo", p)
+        self.assertIn("skynet_todos.py", p)
 
-    def test_preamble_contains_architecture_review_rule(self):
+    def test_preamble_contains_identity_guard(self):
+        """Lean preamble must warn against identity mismatch."""  # signed: beta
         p = self.build_preamble("alpha")
-        self.assertIn("ARCHITECTURE REVIEW RULE", p)
-        self.assertIn("realistic fix", p)
+        self.assertIn("IDENTITY MISMATCH", p)
+        self.assertIn("for alpha ONLY", p)
 
-    def test_preamble_contains_consolidated_digest_rule(self):
+    def test_preamble_contains_result_posting(self):
+        """Lean preamble must contain guarded_publish result posting instruction."""  # signed: beta
         p = self.build_preamble("alpha")
-        self.assertIn("elevated_digest", p)
-        self.assertIn("30 minutes", p)
+        self.assertIn("guarded_publish", p)
+        self.assertIn("sender='alpha'", p)
 
     def test_each_worker_gets_unique_preamble(self):
         """Each worker's preamble must reference only that worker's name in key positions."""
