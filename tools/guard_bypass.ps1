@@ -77,9 +77,12 @@ for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
     $pyScript = @"
 import pyautogui, time
 pyautogui.FAILSAFE = False
+# Press Escape first to dismiss any stale picker/overlay
+pyautogui.press('escape')
+time.sleep(0.3)
 # Click the Permissions button to open dropdown (also focuses window)
 pyautogui.click($cx, $cy)
-time.sleep(1.0)
+time.sleep(1.5)
 # Type 'bypass' to filter to 'Bypass Approvals', then select
 pyautogui.typewrite('bypass', interval=0.05)
 time.sleep(0.5)
@@ -103,6 +106,19 @@ print('PYAUTOGUI_DONE')
     Write-Host "PERMS_VERIFY_FAILED attempt $attempt (still: $($permAfter.Name))"
 
     if ($attempt -lt $maxAttempts) {
+        # Clean up any leaked text in chat input before retry.
+        # If the dropdown didn't open, typewrite('bypass') may have typed into the chat.
+        # Escape closes any stale picker, Ctrl+A selects all input text, Backspace clears it.
+        python -c "
+import pyautogui, time
+pyautogui.FAILSAFE = False
+pyautogui.press('escape')
+time.sleep(0.3)
+pyautogui.hotkey('ctrl', 'a')
+time.sleep(0.1)
+pyautogui.press('backspace')
+time.sleep(0.3)
+"
         Start-Sleep -Seconds 2
     }
 }
