@@ -33,7 +33,7 @@ function Find-PermissionButton {
             return @{
                 Button = $btn
                 Name   = $n
-                IsOK   = ($n -match 'Autopilot|Bypass')
+                IsOK   = ($n -match 'Bypass')
                 Rect   = $btn.Current.BoundingRectangle
             }
         }
@@ -65,10 +65,11 @@ for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         exit 0
     }
 
-    Write-Host "PERMS_CURRENT: $($perm.Name) -- switching to Autopilot..."
+    Write-Host "PERMS_CURRENT: $($perm.Name) -- switching to Bypass Approvals..."
 
-    # --- Use pyautogui to click the permission button (INCIDENT 013 fix) ---
-    # Chromium quickpick overlays only respond to hardware-level input
+    # --- Use pyautogui to click Permissions button + type to filter (INCIDENT 013) ---
+    # Chromium quickpick overlays need hardware-level input AND window focus.
+    # pyautogui.click() both opens the picker and focuses the window.
     $rect = $perm.Rect
     $cx = [int]($rect.X + $rect.Width / 2)
     $cy = [int]($rect.Y + $rect.Height / 2)
@@ -76,14 +77,12 @@ for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
     $pyScript = @"
 import pyautogui, time
 pyautogui.FAILSAFE = False
-# Click the Permissions button to open dropdown
+# Click the Permissions button to open dropdown (also focuses window)
 pyautogui.click($cx, $cy)
 time.sleep(1.0)
-# Select the bottom option (Autopilot/Bypass) -- it's below Default
-pyautogui.press('down')
-time.sleep(0.2)
-pyautogui.press('down')
-time.sleep(0.2)
+# Type 'bypass' to filter to 'Bypass Approvals', then select
+pyautogui.typewrite('bypass', interval=0.05)
+time.sleep(0.5)
 pyautogui.press('enter')
 time.sleep(0.8)
 print('PYAUTOGUI_DONE')

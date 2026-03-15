@@ -591,54 +591,30 @@ for ($guardPass = 1; $guardPass -le 2; $guardPass++) {
         $stBtn = $buttons | Where-Object { $_.Name -match 'Session Target' } | Select-Object -First 1
         if ($stBtn) {
             if ($stBtn.Name -notmatch 'Copilot CLI') {
-                # Open session target picker via UIA ExpandCollapsePattern (no mouse)
-                $uiaNewRoot = [System.Windows.Automation.AutomationElement]::FromHandle($newHwnd)
-                $uiaNewBtns = $uiaNewRoot.FindAll(
-                    [System.Windows.Automation.TreeScope]::Descendants,
-                    (New-Object System.Windows.Automation.PropertyCondition(
-                        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                        [System.Windows.Automation.ControlType]::Button
-                    ))
-                )
-                $stUia = $null
-                foreach ($ub in $uiaNewBtns) {
-                    if ($ub.Current.Name -match 'Session Target') { $stUia = $ub; break }
-                }
-                if ($stUia) {
-                    # Force foreground for keyboard input to work
-                    [Ghost]::ForceForeground($newHwnd) | Out-Null
-                    try {
-                        $stUia.SetFocus()
-                        Start-Sleep -Milliseconds 300
-                        $stExpand = $stUia.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-                        $stExpand.Expand()
-                        Write-Host "SESSION_TARGET: Opened picker via UIA ExpandCollapsePattern"
-                    } catch {
-                        Write-Host "SESSION_TARGET: ExpandCollapse failed, trying Ghost.Click fallback"
-                        $renderST = [Ghost]::FindRenderSurface($newHwnd)
-                        [Ghost]::Click($renderST, $stBtn.CX, $stBtn.CY)
-                    }
-                    Start-Sleep -Milliseconds 600
-                    # Clipboard paste — PostMessage WM_CHAR doesn't reach Chromium quickpick
-                    try {
-                        [System.Windows.Forms.Clipboard]::SetText("Copilot CLI")
-                        Start-Sleep -Milliseconds 100
-                        [System.Windows.Forms.SendKeys]::SendWait("^v")   # Ctrl+V paste
-                        Start-Sleep -Milliseconds 500
-                        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
-                        Write-Host "SESSION_TARGET: Pasted 'Copilot CLI' via clipboard + SendKeys"
-                    } catch {
-                        Write-Host "SESSION_TARGET: SendKeys failed, trying PostString fallback"
-                        [Ghost]::PostString($newRender, "CLI")
-                        Start-Sleep -Milliseconds 300
-                        [Ghost]::PostChar($newRender, [char]' ')
-                        Start-Sleep -Milliseconds 200
-                        [Ghost]::PostKey($newRender, 0x0D)  # ENTER
-                    }
-                    Start-Sleep -Milliseconds 400
-                    $target = "Set Session Target - Copilot CLI"
-                    $needsConfig = $true
-                }
+                # Use pyautogui to click Session Target button and select Copilot CLI
+                # Same approach as Model Guard — click opens picker AND focuses window
+                # UIA ExpandCollapse doesn't maintain focus for subsequent keyboard input
+                $stCX = $stBtn.CX
+                $stCY = $stBtn.CY
+                $pyScript = @"
+import pyautogui, time
+pyautogui.FAILSAFE = False
+# Click Session Target button (opens picker + focuses worker window)
+pyautogui.click($stCX, $stCY)
+time.sleep(1.0)
+# Type 'cli' to filter to 'Copilot CLI', then select
+pyautogui.typewrite('cli', interval=0.05)
+time.sleep(0.5)
+pyautogui.press('enter')
+time.sleep(0.5)
+"@
+                $pyPath = "D:\Prospects\ScreenMemory\data\session_target_pyautogui.py"
+                Set-Content -Path $pyPath -Value $pyScript
+                python $pyPath
+                Write-Host "SESSION_TARGET: Selected 'Copilot CLI' via pyautogui (chromium quickpick workaround)"
+                Start-Sleep -Milliseconds 400
+                $target = "Set Session Target - Copilot CLI"
+                $needsConfig = $true
             } else {
                 $target = $stBtn.Name
             }
@@ -680,13 +656,13 @@ time.sleep(0.7)
     # --- PERMISSION GUARD (ForceForeground + UIA Expand + PostMessage END+ENTER) ---
     $pBtn = $buttons | Where-Object { $_.Name -match 'Permissions' } | Select-Object -First 1
     if ($pBtn) {
-        if ($pBtn.Name -match 'Autopilot') {
-            $permsLabel = "Autopilot"
+        if ($pBtn.Name -match 'Bypass') {
+            $permsLabel = "Bypass Approvals"
             Write-Host "PERMS_OK: $($pBtn.Name)"
-        } elseif ($pBtn.Name -match 'Default|Bypass') {
+        } elseif ($pBtn.Name -match 'Default|Autopilot') {
             $permsResult = Set-AutopilotPermissions -Hwnd ([long]$newHwnd)
             if ($permsResult -eq 'OK') {
-                $permsLabel = "Autopilot (pending verify)"
+                $permsLabel = "Bypass (pending verify)"
                 Write-Host "PERMS_APPLIED_PENDING_VERIFY"
             } else {
                 $permsLabel = "FAILED"
@@ -708,11 +684,11 @@ if ($verifyButtons) {
     if ($vSession) { $target = $vSession.Name }
     if ($vModel)   { $model = $vModel.Name }
     if ($vPerms) {
-        if ($vPerms.Name -match 'Autopilot') {
-            $permsLabel = "Autopilot"
+        if ($vPerms.Name -match 'Bypass') {
+            $permsLabel = "Bypass Approvals"
             Write-Host "PERMS_VERIFIED: $($vPerms.Name)"
         } else {
-            # Retry permissions via ForceForeground + UIA Expand + PostMessage
+            # Retry permissions via guard_bypass.ps1
             Write-Host "PERMS_RETRY: Still '$($vPerms.Name)' -- retrying..."
             $retryResult = Set-AutopilotPermissions -Hwnd ([long]$newHwnd)
             Start-Sleep -Milliseconds 800
@@ -721,8 +697,8 @@ if ($verifyButtons) {
             $retryButtons = Scan-ButtonsWithTimeout -Hwnd ([long]$newHwnd) -TimeoutMs 8000
             if ($retryButtons) {
                 $rPerms = $retryButtons | Where-Object { $_.Name -match 'Permissions' } | Select-Object -First 1
-                if ($rPerms -and $rPerms.Name -match 'Autopilot') {
-                    $permsLabel = "Autopilot"
+                if ($rPerms -and $rPerms.Name -match 'Bypass') {
+                    $permsLabel = "Bypass Approvals"
                     Write-Host "PERMS_RETRY_OK: $($rPerms.Name)"
                 } else {
                     $permsLabel = "FAILED:$($rPerms.Name)"
