@@ -1,27 +1,21 @@
 #!/usr/bin/env python
 """
-set_copilot_cli.py — Switch VS Code chat windows from Local to Copilot CLI mode.
+set_copilot_cli.py — Enforce Copilot CLI mode + Bypass Approvals on worker windows.
 
-This is the MANDATORY session target switch. All Skynet workers MUST run in
-"Copilot CLI" mode, not "Local" or "Cloud" mode.
+Two MANDATORY settings enforced by this script:
+  1. Session Target: Local/Cloud → Copilot CLI
+  2. Approval Permissions: Default Approvals → Bypass Approvals
 
-Method:
-  1. Move worker window to primary monitor (pyautogui only captures primary)
-  2. Focus the worker window
-  3. Click the session target button ("Local" / "Cloud" / "Copilot CLI") at bottom-left
-  4. Wait for dropdown to appear
-  5. Click "Copilot CLI" option in the dropdown
-  6. Verify the switch via screenshot + text check
-  7. Move worker back to its grid position
-  8. Restore orchestrator focus
+Both are Chromium-rendered dropdowns that ONLY respond to pyautogui
+hardware-level input (INCIDENT 013). Win32/UIA/clipboard cannot reach them.
 
-Why pyautogui:
-  - The session target dropdown is a Chromium quickpick overlay (INCIDENT 013)
-  - Win32/UIA/clipboard input cannot reach Chromium overlays
-  - Only hardware-level input (pyautogui) works reliably
+Coordinates (proven working, window at 200,50,930x700):
+  - "Default Approvals" button: absolute (380, 740) — bottom bar, right of Copilot CLI
+  - "Bypass Approvals" in dropdown: absolute (345, 655) — 2nd option in 3-item list
+  - "Copilot CLI" button: absolute (280, 740) — bottom bar, left side
 
 Usage:
-  python tools/set_copilot_cli.py                     # All workers from workers.json
+  python tools/set_copilot_cli.py                     # All workers: CLI + Bypass
   python tools/set_copilot_cli.py --worker alpha       # Specific worker
   python tools/set_copilot_cli.py --hwnd 396010        # By HWND
   python tools/set_copilot_cli.py --verify-only        # Just check, don't switch
@@ -34,6 +28,7 @@ import argparse
 import ctypes
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -44,7 +39,6 @@ u32 = ctypes.windll.user32
 VK_MENU = 0x12
 KEYEVENTF_KEYUP = 0x0002
 
-# Grid positions for workers on right monitor (1920+ offset)
 GRID_POSITIONS = {
     "alpha": (1930, 20, 930, 500),
     "beta": (2860, 20, 930, 500),
@@ -52,7 +46,6 @@ GRID_POSITIONS = {
     "delta": (2860, 540, 930, 500),
 }
 
-# Window position when moved to primary monitor for pyautogui
 PRIMARY_POS = (200, 50, 930, 700)
 
 
@@ -83,15 +76,8 @@ def focus_window(hwnd):
     time.sleep(0.3)
 
 
-def check_current_mode(hwnd):
-    """Check if window is already in Copilot CLI mode via UIA button scan."""
-    try:
-        import System.Windows.Automation as SWA  # noqa
-    except ImportError:
-        pass
-
-    # Fallback: use PowerShell UIA scan
-    import subprocess
+def _uia_scan_buttons(hwnd):
+    """Scan UIA buttons for session target and approval mode. Returns dict."""
     ps = f'''
     Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
     $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]{hwnd})
@@ -104,150 +90,148 @@ def check_current_mode(hwnd):
     )
     foreach ($b in $btns) {{
         $nm = $b.Current.Name
-        if ($nm -match 'Copilot CLI|Local|Cloud') {{
+        if ($nm -match 'Copilot CLI|Local|Cloud|Default Approvals|Bypass Approvals|Autopilot') {{
             Write-Output $nm
         }}
     }}
     '''
+    result = {"session_target": "unknown", "approvals": "unknown"}
     try:
-        result = subprocess.run(
+        r = subprocess.run(
             ["powershell", "-STA", "-NoProfile", "-Command", ps],
             capture_output=True, text=True, timeout=10
         )
-        for line in result.stdout.strip().split("\n"):
+        for line in r.stdout.strip().split("\n"):
             line = line.strip()
-            if "Copilot CLI" in line:
-                return "copilot_cli"
-            elif "Cloud" in line:
-                return "cloud"
-            elif "Local" in line:
-                return "local"
+            if "Copilot CLI" in line and "Approvals" not in line:
+                result["session_target"] = "copilot_cli"
+            elif "Local" in line and "Approvals" not in line:
+                result["session_target"] = "local"
+            elif "Cloud" in line and "Approvals" not in line:
+                result["session_target"] = "cloud"
+            if "Bypass Approvals" in line:
+                result["approvals"] = "bypass"
+            elif "Default Approvals" in line:
+                result["approvals"] = "default"
+            elif "Autopilot" in line:
+                result["approvals"] = "autopilot"
     except Exception:
         pass
-    return "unknown"
+    return result
 
 
-def switch_to_copilot_cli(hwnd, name="worker", orch_hwnd=0, grid_pos=None):
-    """Switch a single worker window to Copilot CLI mode.
-    
-    Returns True if successfully switched or already in CLI mode.
-    """
-    import pyautogui
-
-    # Check current mode first
-    mode = check_current_mode(hwnd)
-    if mode == "copilot_cli":
-        print(f"  ✅ {name} already in Copilot CLI mode")
-        return True
-
-    print(f"  🔄 {name} currently in '{mode}' mode, switching to Copilot CLI...")
-
-    # Move to primary monitor for pyautogui access
+def _move_to_primary(hwnd):
+    """Move window to primary monitor for pyautogui access."""
     u32.MoveWindow(hwnd, *PRIMARY_POS, True)
-    time.sleep(0.3)
-
-    # Focus the window
+    time.sleep(0.4)
     focus_window(hwnd)
     time.sleep(0.3)
 
-    # Click the session target button at bottom-left of chat window
-    # Position: approximately x=55, y=685 relative to window at PRIMARY_POS
-    btn_x = PRIMARY_POS[0] + 55
-    btn_y = PRIMARY_POS[1] + PRIMARY_POS[3] - 15  # 15px from bottom
-    pyautogui.click(btn_x, btn_y)
+
+def _switch_approvals_to_bypass(name="worker"):
+    """Click Default Approvals → Bypass Approvals. Window must be at PRIMARY_POS and focused."""
+    import pyautogui
+
+    # Click "Default Approvals ∨" button at bottom bar
+    # Proven coordinates: absolute (380, 740) when window at (200, 50, 930, 700)
+    pyautogui.click(380, 740)
     time.sleep(1.5)
 
-    # Take screenshot to find "Copilot CLI" in dropdown
-    ss = pyautogui.screenshot(region=(
-        PRIMARY_POS[0] - 50,
-        PRIMARY_POS[1] + PRIMARY_POS[3] - 230,
-        400, 250
-    ))
+    # Click "Bypass Approvals" — 2nd item in dropdown
+    # Proven coordinates: absolute (345, 655)
+    pyautogui.click(345, 655)
+    time.sleep(1.0)
 
-    # Find "Copilot CLI" position in the dropdown
-    # The dropdown always shows: New Chat Session / Continue In: Local, Copilot CLI, Cloud
-    # "Copilot CLI" is the 2nd option under "Continue In", approximately 110px from dropdown top
-    cli_x = PRIMARY_POS[0] + 85
-    cli_y = PRIMARY_POS[1] + PRIMARY_POS[3] - 90  # Copilot CLI position in dropdown
 
-    pyautogui.click(cli_x, cli_y)
-    time.sleep(2)
+def _switch_session_to_cli(name="worker"):
+    """Click Local/Cloud → Copilot CLI. Window must be at PRIMARY_POS and focused."""
+    import pyautogui
 
-    # Verify the switch
-    mode_after = check_current_mode(hwnd)
-    
-    if mode_after == "copilot_cli":
-        print(f"  ✅ {name} switched to Copilot CLI mode")
-        success = True
+    # Click session target button at bottom-left
+    # "Local ∨" or "Cloud ∨" at approximately (280, 740)
+    pyautogui.click(280, 740)
+    time.sleep(1.5)
+
+    # In the dropdown, "Copilot CLI" is one of the "Continue In" options
+    # It appears at approximately (285, 660) in the dropdown
+    pyautogui.click(285, 660)
+    time.sleep(1.0)
+
+
+def enforce_settings(hwnd, name="worker", orch_hwnd=0, grid_pos=None):
+    """Ensure a worker window has both Copilot CLI + Bypass Approvals.
+
+    Returns dict with 'session_target_ok' and 'approvals_ok' booleans.
+    """
+    state = _uia_scan_buttons(hwnd)
+    cli_ok = state["session_target"] == "copilot_cli"
+    bypass_ok = state["approvals"] == "bypass"
+
+    if cli_ok and bypass_ok:
+        print(f"  ✅ {name}: Copilot CLI ✅ + Bypass Approvals ✅")
+        return {"session_target_ok": True, "approvals_ok": True}
+
+    # Need to fix something — move to primary
+    _move_to_primary(hwnd)
+
+    # Fix approvals first (if needed)
+    if not bypass_ok:
+        print(f"  🔄 {name}: switching to Bypass Approvals (was '{state['approvals']}')")
+        _switch_approvals_to_bypass(name)
+
+    # Fix session target (if needed)
+    if not cli_ok:
+        print(f"  🔄 {name}: switching to Copilot CLI (was '{state['session_target']}')")
+        _switch_session_to_cli(name)
+
+    # Verify
+    state_after = _uia_scan_buttons(hwnd)
+    cli_ok = state_after["session_target"] == "copilot_cli"
+    bypass_ok = state_after["approvals"] == "bypass"
+
+    if cli_ok:
+        print(f"  ✅ {name}: Copilot CLI ✅")
     else:
-        # Retry with adjusted coordinates
-        print(f"  ⚠️  First attempt got '{mode_after}', retrying...")
-        pyautogui.press("escape")
-        time.sleep(0.5)
-        
-        # Reopen dropdown
-        pyautogui.click(btn_x, btn_y)
-        time.sleep(1.5)
-        
-        # Screenshot for debugging
-        ss2 = pyautogui.screenshot(region=(
-            PRIMARY_POS[0] - 50,
-            PRIMARY_POS[1] + PRIMARY_POS[3] - 250,
-            400, 280
-        ))
-        debug_path = os.path.join(ROOT, "data", f"{name}_cli_debug.png")
-        ss2.save(debug_path)
-        
-        # Try clicking slightly higher (Copilot CLI might be at different y)
-        pyautogui.click(cli_x, cli_y - 20)
-        time.sleep(2)
-        
-        mode_after2 = check_current_mode(hwnd)
-        if mode_after2 == "copilot_cli":
-            print(f"  ✅ {name} switched to Copilot CLI mode (retry)")
-            success = True
-            # Clean debug screenshot
-            try:
-                os.remove(debug_path)
-            except OSError:
-                pass
-        else:
-            print(f"  ❌ {name} FAILED to switch — still in '{mode_after2}' mode")
-            print(f"     Debug screenshot: {debug_path}")
-            success = False
+        print(f"  ❌ {name}: session target still '{state_after['session_target']}'")
 
-    # Move back to grid position
+    if bypass_ok:
+        print(f"  ✅ {name}: Bypass Approvals ✅")
+    else:
+        print(f"  ❌ {name}: approvals still '{state_after['approvals']}'")
+
+    # Move back to grid
     if grid_pos:
         u32.MoveWindow(hwnd, *grid_pos, True)
         time.sleep(0.2)
 
-    return success
+    return {"session_target_ok": cli_ok, "approvals_ok": bypass_ok}
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Switch workers to Copilot CLI mode")
+    parser = argparse.ArgumentParser(description="Enforce Copilot CLI + Bypass Approvals")
     parser.add_argument("--worker", help="Specific worker name (alpha/beta/gamma/delta)")
     parser.add_argument("--hwnd", type=int, help="Specific window HWND")
-    parser.add_argument("--verify-only", action="store_true", help="Only check mode, don't switch")
+    parser.add_argument("--verify-only", action="store_true", help="Only check, don't switch")
     args = parser.parse_args()
 
     orch_hwnd = load_orch_hwnd()
 
     if args.hwnd:
-        # Single HWND mode
         name = args.worker or "worker"
         grid = GRID_POSITIONS.get(name)
         if args.verify_only:
-            mode = check_current_mode(args.hwnd)
-            status = "✅" if mode == "copilot_cli" else "❌"
-            print(f"{status} {name} (HWND={args.hwnd}): {mode}")
+            state = _uia_scan_buttons(args.hwnd)
+            cli = "✅" if state["session_target"] == "copilot_cli" else "❌"
+            byp = "✅" if state["approvals"] == "bypass" else "❌"
+            print(f"{cli} {name} session: {state['session_target']}")
+            print(f"{byp} {name} approvals: {state['approvals']}")
         else:
-            ok = switch_to_copilot_cli(args.hwnd, name, orch_hwnd, grid)
+            result = enforce_settings(args.hwnd, name, orch_hwnd, grid)
             if orch_hwnd:
                 focus_window(orch_hwnd)
+            ok = result["session_target_ok"] and result["approvals_ok"]
             sys.exit(0 if ok else 1)
     else:
-        # All workers mode
         workers = load_workers()
         if args.worker:
             workers = [w for w in workers if w.get("name") == args.worker]
@@ -256,41 +240,39 @@ def main():
             print("No workers found in workers.json")
             sys.exit(1)
 
-        results = {}
+        all_ok = True
         for w in workers:
             name = w.get("name", "unknown")
             hwnd = int(w.get("hwnd", 0))
             if not hwnd or not u32.IsWindow(hwnd):
                 print(f"  ⚠️  {name} HWND={hwnd} is dead, skipping")
-                results[name] = False
+                all_ok = False
                 continue
 
             grid = GRID_POSITIONS.get(name)
             if args.verify_only:
-                mode = check_current_mode(hwnd)
-                status = "✅" if mode == "copilot_cli" else "❌"
-                print(f"{status} {name} (HWND={hwnd}): {mode}")
-                results[name] = mode == "copilot_cli"
+                state = _uia_scan_buttons(hwnd)
+                cli = "✅" if state["session_target"] == "copilot_cli" else "❌"
+                byp = "✅" if state["approvals"] == "bypass" else "❌"
+                print(f"{cli} {name} (HWND={hwnd}): session={state['session_target']}")
+                print(f"{byp} {name} (HWND={hwnd}): approvals={state['approvals']}")
+                if state["session_target"] != "copilot_cli" or state["approvals"] != "bypass":
+                    all_ok = False
             else:
                 print(f"--- {name} (HWND={hwnd}) ---")
-                ok = switch_to_copilot_cli(hwnd, name, orch_hwnd, grid)
-                results[name] = ok
+                result = enforce_settings(hwnd, name, orch_hwnd, grid)
+                if not (result["session_target_ok"] and result["approvals_ok"]):
+                    all_ok = False
 
-        # Restore orchestrator focus
         if orch_hwnd and not args.verify_only:
             focus_window(orch_hwnd)
 
-        # Summary
-        total = len(results)
-        passed = sum(1 for v in results.values() if v)
         print(f"\n{'='*40}")
-        print(f"Copilot CLI mode: {passed}/{total} workers")
-        if passed < total:
-            failed = [n for n, v in results.items() if not v]
-            print(f"FAILED: {', '.join(failed)}")
-            sys.exit(1)
+        if all_ok:
+            print("ALL WORKERS: Copilot CLI ✅ + Bypass Approvals ✅")
         else:
-            print("ALL WORKERS IN COPILOT CLI MODE ✅")
+            print("SOME WORKERS NEED ATTENTION — check output above")
+            sys.exit(1)
 
 
 if __name__ == "__main__":

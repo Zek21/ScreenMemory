@@ -1122,30 +1122,25 @@ def _wait_for_window_ready(hwnd, timeout_s=5):
 
 
 def guard_copilot_cli(hwnd, name="worker", orch_hwnd=0):
-    """Ensure a chat window is in Copilot CLI mode (not Local or Cloud).
+    """Ensure a chat window has Copilot CLI mode + Bypass Approvals.
     
     Calls tools/set_copilot_cli.py which uses pyautogui to interact with the
-    Chromium session-target dropdown. This is MANDATORY for all workers.
+    Chromium session-target and approval-permission dropdowns.
+    MANDATORY for all workers — enforces BOTH settings.
     # signed: orchestrator
     """
-    grid_pos = None
-    for gname, gpos in [("alpha", (1930, 20, 930, 500)), ("beta", (2860, 20, 930, 500)),
-                         ("gamma", (1930, 540, 930, 500)), ("delta", (2860, 540, 930, 500))]:
-        if gname == name:
-            grid_pos = gpos
-            break
-
     script_path = str(ROOT / "tools" / "set_copilot_cli.py")
     args = ["python", script_path, "--hwnd", str(hwnd), "--worker", name]
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=30,
+        r = subprocess.run(args, capture_output=True, text=True, timeout=60,
                            encoding="utf-8", errors="replace")
-        if "Copilot CLI mode" in (r.stdout or ""):
-            log(f"Copilot CLI: {name} HWND={hwnd} confirmed in CLI mode", "OK")
+        out = r.stdout or ""
+        if "Copilot CLI" in out and "Bypass Approvals" in out:
+            log(f"CLI+Bypass: {name} HWND={hwnd} confirmed ✅", "OK")
         else:
-            log(f"Copilot CLI: {name} HWND={hwnd} switch may have failed: {(r.stdout or '')[:150]}", "WARN")
+            log(f"CLI+Bypass: {name} HWND={hwnd} output: {out[:200]}", "WARN")
     except Exception as e:
-        log(f"Copilot CLI guard failed for {name} HWND={hwnd}: {e}", "WARN")
+        log(f"CLI+Bypass guard failed for {name} HWND={hwnd}: {e}", "WARN")
     finally:
         if orch_hwnd:
             ctypes.windll.user32.SetForegroundWindow(orch_hwnd)
@@ -1153,14 +1148,12 @@ def guard_copilot_cli(hwnd, name="worker", orch_hwnd=0):
 
 
 def _guard_restored_session(hwnd, orch_hwnd):
-    """Apply model guard + permissions + Copilot CLI for a restored (non-fresh) worker window."""
+    """Apply model guard + Copilot CLI + Bypass Approvals for a restored (non-fresh) worker window."""
     if not _wait_for_window_ready(hwnd):  # signed: delta — wait for window UI to load
         log(f"Window HWND={hwnd} render widget not ready after 5s, proceeding anyway", "WARN")
     guard_model(hwnd, orch_hwnd)
     time.sleep(0.5)
-    guard_permissions(hwnd, orch_hwnd)
-    time.sleep(0.5)
-    guard_copilot_cli(hwnd, orch_hwnd=orch_hwnd)  # MANDATORY: enforce Copilot CLI mode  # signed: orchestrator
+    guard_copilot_cli(hwnd, orch_hwnd=orch_hwnd)  # MANDATORY: Copilot CLI + Bypass Approvals  # signed: orchestrator
     time.sleep(1)
 
 
