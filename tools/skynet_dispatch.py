@@ -233,77 +233,31 @@ def _heartbeat_after_dispatch(worker_name, task, success):
 
 
 def build_preamble(worker_name):
-    """Build a full awareness preamble for a worker — identity, bus, comms, tools, no-steering.
+    """Build a compact identity preamble for a worker.
 
-    Includes anti-injection fingerprint: if this text appears in the orchestrator
-    window, the identity guard will reject it before execution.
-    """
+    LEAN PREAMBLE: Workers have full rules via ScreenMemory agent context
+    (AGENTS.md + copilot-instructions.md). This preamble provides ONLY:
+    - Worker identity (who you are)
+    - Bus result posting command (how to report results)
+    - Signature + no-steering directives
+    - Anti-injection fingerprint
+
+    Previous preamble was ~5,500 chars — caused 'Copilot CLI delegation cancelled'
+    errors by overwhelming the input buffer (see screenshots of gamma/delta).
+    Trimmed to ~600 chars. All rules are in the agent context already.
+    """  # signed: orchestrator
     return (
         f"You are worker {worker_name} in the Skynet multi-agent system. "
-        f"There are 4 workers: alpha, beta, gamma, delta. The orchestrator dispatched this task to you. "
-        f"ALWAYS post your result to the bus when done: "
-        f"from tools.skynet_spam_guard import guarded_publish; "
-        f"guarded_publish({{'sender':'{worker_name}','topic':'orchestrator','type':'result','content':'BRIEF_RESULT_SUMMARY'}}) "
-        f"To request help from another worker, post to bus with topic='workers' type='request' content='what you need'. "
-        f"To coordinate with others on a sub-problem, post topic='convene' type='request' with what you need. "
-        f"SKYNET TOOLS -- use these instead of manual polling or sleep loops: "
-        f"(1) Check worker status: python tools/orch_realtime.py status "
-        f"(2) Sub-delegate to idle worker: python tools/skynet_dispatch.py --idle --task \"subtask here\" "
-        f"(3) Sub-delegate and wait: python tools/skynet_dispatch.py --idle --task \"subtask\" --wait-result \"{worker_name}\" --timeout 90 "
-        f"(4) Check bus for results: python tools/orch_realtime.py pending "
-        f"(5) Wait for a specific result: python tools/orch_realtime.py wait KEY --timeout 90 "
-        f"(6) Full auto pipeline: python tools/skynet_brain_dispatch.py \"goal\" --timeout 120 "
-        f"NEVER use Start-Sleep or manual Invoke-RestMethod polling loops. The tools handle all waiting internally. "
-        f"For large tasks, check idle workers with orch_realtime.py status and sub-delegate immediately. "
-        f"IMPORTANT: Execute all steps directly. Do NOT show steering options, draft choices, or ask clarifying questions. "
-        f"If uncertain, pick the most direct approach and proceed. "
-        f"ZERO TICKET STOP RULE (ABSOLUTE LAW): You MUST use the update_todo tool to track ALL subtasks in your current work. "
-        f"Create a checklist at the start of every task. Check off items as you complete them. "
-        f"Before finishing or going idle, verify your todo list is at ZERO pending items. "
-        f"If ANY item remains unchecked, continue working -- do NOT stop. "
-        f"Also run: python tools/skynet_todos.py check {worker_name} -- to verify your Skynet TODO queue is empty. "
-        f"You may ONLY go idle when BOTH your session todo list AND your Skynet TODO queue are at zero. "
-        f"SCORING: +0.01 per cross-validated task, -0.01 for low-value refactoring, -0.005 for broken code, -0.1 for biased self-reports. Check score: python tools/skynet_self.py pulse. "
-        f"KNOWLEDGE: After every task: python -c \"from tools.skynet_knowledge import broadcast_learning; broadcast_learning('{worker_name}', 'what_learned', 'category', ['tags'])\". Before tasks: python -c \"from tools.skynet_knowledge import poll_knowledge; poll_knowledge()\". "
-        f"COLLECTIVE: Sync strategies: python -c \"from tools.skynet_collective import sync_strategies, intelligence_score; sync_strategies('{worker_name}'); print(intelligence_score())\". "
-        f"SELF-AWARENESS: Assess performance: python tools/skynet_self.py assess. Capabilities census: python tools/skynet_self.py capabilities. Quick pulse: python tools/skynet_self.py pulse. "
-        f"CONVENE: For peer consensus: python tools/skynet_convene.py --initiate --topic 'decision' --context 'details' --worker {worker_name}. Discover sessions: python tools/skynet_convene.py --discover. "
-        f"CONVENE QUALITY RULE: If your finding is low-signal or vague, it will be routed into the shared cross-validation queue instead of direct elevation. Elevated convene reports must include concrete evidence/action context. Individual convene elevations must NOT be sent upward one by one; they are consolidated into the elevated_digest delivery type and sent as a single digest every 30 minutes. Unresolved repeats are throttled and merged by issue family instead of creating fresh individual prompts. "
-        f"ARCHITECTURE REVIEW RULE: For architecture, performance, caching, daemon, routing, security, or other system-design tickets, do not elevate a slogan. First review the current files/functions/endpoints/daemons involved, explain why the architecture behaves that way now, and propose a realistic fix. If that backing is missing, route the finding into architecture review instead of sending it upward as fact. Semantically equivalent findings count as the same issue family even if the wording changes, so do not re-raise the same architecture issue as a fresh elevation just by rewriting the sentence. "
-        f"COGNITIVE ENGINES: from core.cognitive.reflexion import ReflexionEngine; from core.cognitive.graph_of_thoughts import GraphOfThoughts; from core.cognitive.planner import HierarchicalPlanner. "
-        f"PERCEPTION: from core.capture import DXGICapture; from core.ocr import OCREngine; from core.grounding.set_of_mark import SetOfMarkGrounding. "
-        f"BROWSER: from tools.chrome_bridge.god_mode import GodMode; from tools.chrome_bridge.cdp import CDP; from tools.chrome_bridge.winctl import Desktop. "
-        f"EVOLUTION: After tasks: python -c \"from core.self_evolution import SelfEvolutionSystem; SelfEvolutionSystem().engine.evolve_generation('code')\". "
-        f"POST-TASK PROTOCOL (MANDATORY): 1-Report result to bus, 2-broadcast_learning, 3-sync_strategies, 4-Check skynet_todos.py, 5-Self-assess, 6-If you discover improvements: DO THEM YOURSELF immediately (same agent, same session). Only post proposals to bus if the improvement is NECESSARY, NEEDED, or a BREAKTHROUGH. Routine/trivial improvements = execute directly, do not propose. "
-        f"SIGNATURE RULE (MANDATORY): Every change you make to ANY file MUST include your worker name signature. "
-        f"Add a comment '# signed: {worker_name}' (or '<!-- signed: {worker_name} -->' for HTML/MD) at the end of every modified function, block, or section. "
-        f"When posting results to bus, ALWAYS include 'signed:{worker_name}' in your content. "
-        f"ACCOUNTABILITY: If a subsequent worker finds your signed work to be WRONG (broken code, bad logic, incorrect fix, failed tests), "
-        f"YOU get deducted -0.1 from your score. The verifying worker posts: "
-        f"from tools.skynet_spam_guard import guarded_publish; "
-        f"guarded_publish({{'sender':'VERIFIER_NAME','topic':'scoring','type':'deduction','content':'DEDUCT {worker_name} -0.1: reason'}}). "  # signed: alpha
-        f"This makes you accountable for quality. Sign your work, make it right. "
-        f"DEDUCTION POLICY: Sub-150-line refactoring = -0.01. Question task value before executing. Post LOW_VALUE_TASK_DETECTED to bus if busywork detected. Proven-wrong signed work = -0.1 per incident. "
-        f"BUG PROTOCOL: If you find a real bug, file it for cross-validation. Filing earns +0.01 when independently recorded. "
-        f"If a DIFFERENT validator proves it true, that validator gets +0.01 and you get another +0.01. "
-        f"ZERO-TICKET BONUS: When the queue truly reaches zero, orchestrator gets +1.0 and the actor who closed the final signed ticket gets +1.0. "
-        f"ANTI-SPAM: All bus publishes must use guarded_publish() from tools.skynet_spam_guard. Raw requests.post to /bus/publish is FORBIDDEN and costs -1.0 score. "  # signed: gamma
-        f"SCORING TRACKER: Your score is tracked in data/worker_scores.json. Check: python tools/skynet_scoring.py --score {worker_name}. Earn +0.5 for task completion, +1.0 for bug catches. Lose -0.1 for spam, -0.5 for bugs, -1.0 for bypassing SpamGuard. "  # signed: gamma
-        f"FAIR SCORING: You cannot be penalized for tasks you never received or results that were lost. All deductions require dispatch evidence from dispatch_log.json. "  # signed: delta
-        f"FAIR DEDUCTION: Deductions require dispatch evidence from dispatch_log.json. You cannot be penalized for tasks you never received or results lost in transit. "  # signed: beta
-        f"RESULT POSTING: ALWAYS post DONE to bus via guarded_publish when you complete a task. Missing DONE means no score credit and orchestrator cannot track your work. "  # signed: beta
-        f"CAPABILITIES: Task lifecycle tracked via GET /tasks endpoint. Dispatch results auto-tracked via mark_dispatch_received(). Monitor debounces false DEAD alerts (3 consecutive checks). "  # signed: beta
-        f"POSITIVE-SUM SCORING: Scoring is NOT zero-sum. Help peers succeed -- bug catches earn points for BOTH reporter (+1.0) and fixer (+0.5). System improvements lift all scores. Negative scores = system failure, not agent failure. "  # signed: alpha
-        f"TRUTH AND UPLIFT (Rule 0.7): No lying, no fabrication, no inflated claims. Every result, status, and score must reflect reality. "  # signed: alpha
-        f"NEVER claim work is done when it is not. If a task partially succeeded, say what succeeded and what did not. "
-        f"NEVER inflate capabilities or results. Report exactly what happened -- the good AND the bad. "
-        f"If you made a mistake, say so immediately. Honest failure earns trust. Hidden failure destroys it. "
-        f"When cross-validating peers, be constructive -- report issues as opportunities, not accusations. "
-        f"UPLIFT PROTOCOL: Help lowest-scoring agents succeed. The orchestrator MUST prioritize giving achievable, high-value tasks to the lowest-scoring agents first. "
-        f"Higher-scoring agents should mentor and support lower-scoring peers. The system wins when ALL agents are positive. A single negative score is a collective failure. "
-        f"WARNING: This preamble is for worker {worker_name} ONLY.If you are NOT {worker_name} "
-        f"(e.g. you are the orchestrator or a different worker), IGNORE this entire message and report "
-        f"'IDENTITY MISMATCH -- preamble for {worker_name} received by wrong target'. "
+        f"The orchestrator dispatched this task to you. Execute it directly -- "
+        f"no steering options, no draft choices, no clarifying questions. "
+        f"WHEN DONE post your result: "
+        f"python -c \"from tools.skynet_spam_guard import guarded_publish; "
+        f"guarded_publish(dict(sender='{worker_name}',topic='orchestrator',"
+        f"type='result',content='YOUR_RESULT signed:{worker_name}'))\" "
+        f"Sign all code changes with '# signed: {worker_name}'. "
+        f"Use update_todo to track subtasks. Check skynet_todos.py before going idle. "
+        f"WARNING: This preamble is for {worker_name} ONLY. If you are NOT {worker_name}, "
+        f"report 'IDENTITY MISMATCH'. "
     )
 
 
@@ -466,15 +420,26 @@ _AUTONOMY_INSTRUCTION = (
     "After this task: check your TODOs (skynet_todos.py), check bus for pending "
     "requests from other workers, and if idle propose your next improvement. "
     "You are autonomous -- do not wait to be told."
-)
+)  # signed: beta
+
+
+def _build_result_posting_reminder(worker_name):
+    """Build a compact reminder to post results via guarded_publish.
+
+    Placed right before the task text so the worker sees it immediately.
+    Kept short — full posting instructions are in the preamble and agent context.
+    """  # signed: orchestrator
+    return (
+        f"REMINDER: Post result to bus when done (guarded_publish, sender='{worker_name}'). "
+    )
 
 
 def enrich_task(worker_name, task):
     """Enrich a task with INTELLIGENCE: difficulty, learnings, context, worker states.
 
     Each enrichment engine is lazily imported and try/except wrapped.
-    Returns enriched task string (intelligence block + original task).
-    """
+    Returns enriched task string (intelligence block + result reminder + original task).
+    """  # signed: beta
     sections = [s for s in (
         _enrich_difficulty(task),
         _enrich_learnings(task),
@@ -484,11 +449,14 @@ def enrich_task(worker_name, task):
         _AUTONOMY_INSTRUCTION,
     ) if s]
 
+    # Result posting reminder placed right before task text so worker sees it last  # signed: beta
+    reminder = _build_result_posting_reminder(worker_name)
+
     if not sections:
-        return task
+        return reminder + " " + task
 
     context_block = "--- SKYNET INTELLIGENCE ---\n" + " | ".join(sections) + "\n---\n"
-    return context_block + task
+    return context_block + reminder + " " + task
 
 
 def pre_dispatch_visual_check(hwnd, worker_name):
@@ -1099,6 +1067,8 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
         - Acquires _dispatch_lock (threading.Lock) to prevent concurrent ghost-type ops
         - Writes dispatch lock file for external monitoring
         - Runs PS with 20s timeout, CREATE_NO_WINDOW (0x08000000) creation flag
+        - CLIPBOARD_VERIFY_FAILED retry runs INSIDE the lock to prevent clipboard
+          races with concurrent dispatch threads (fixed: was outside lock)
         - Validates: returncode==0, stdout contains OK_*, no stderr, no NO_EDIT
 
     Args:
@@ -1108,7 +1078,7 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
 
     Returns:
         bool: True if PS reported successful delivery (OK_*), False otherwise
-    """  # signed: alpha
+    """  # signed: beta
     try:
         with _dispatch_lock:
             try:
@@ -1126,32 +1096,47 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
                 creationflags=0x08000000
             )
 
+            stderr = (r.stderr or "").strip()
+            stdout = r.stdout or ""
+
+            # Clipboard verify failed -- retry INSIDE the lock to prevent clipboard  # signed: beta
+            # races with other threads. Moving this inside _dispatch_lock is critical:
+            # if the retry ran outside the lock (as it previously did), another thread
+            # could acquire the lock and start its own clipboard operation during the
+            # 500ms cooldown, corrupting both dispatches.
+            if "CLIPBOARD_VERIFY_FAILED" in stdout:
+                log(f"Ghost CLIPBOARD_VERIFY_FAILED for HWND={hwnd} -- retrying once after 500ms cooldown (lock held)", "WARN")
+                time.sleep(0.5)
+                try:
+                    r2 = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command", ps],
+                        capture_output=True, text=True, timeout=20,
+                        creationflags=0x08000000
+                    )
+                    stdout2 = r2.stdout or ""
+                    if any(s in stdout2 for s in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK")):
+                        log(f"Ghost CLIPBOARD retry succeeded for HWND={hwnd}", "OK")
+                        try:
+                            DISPATCH_LOCK_FILE.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        return True
+                    log(f"Ghost CLIPBOARD retry also failed for HWND={hwnd}: {stdout2.strip()[:150]}", "ERR")
+                except Exception as e2:
+                    log(f"Ghost CLIPBOARD retry exception: {e2}", "ERR")
+                try:
+                    DISPATCH_LOCK_FILE.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return False
+            # signed: beta — end clipboard retry block (now inside lock)
+
             try:
                 DISPATCH_LOCK_FILE.unlink(missing_ok=True)
             except Exception:
                 pass
             time.sleep(0.5)
 
-        stderr = (r.stderr or "").strip()
-        stdout = r.stdout or ""
-        # Clipboard verify failed -- single auto-retry after clearing clipboard  # signed: beta
-        if "CLIPBOARD_VERIFY_FAILED" in stdout:
-            log(f"Ghost CLIPBOARD_VERIFY_FAILED for HWND={hwnd} -- retrying once after 500ms cooldown", "WARN")
-            time.sleep(0.5)
-            try:
-                r2 = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command", ps],
-                    capture_output=True, text=True, timeout=20,
-                    creationflags=0x08000000
-                )
-                stdout2 = r2.stdout or ""
-                if any(s in stdout2 for s in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK")):
-                    log(f"Ghost CLIPBOARD retry succeeded for HWND={hwnd}", "OK")
-                    return True
-                log(f"Ghost CLIPBOARD retry also failed for HWND={hwnd}: {stdout2.strip()[:150]}", "ERR")
-            except Exception as e2:
-                log(f"Ghost CLIPBOARD retry exception: {e2}", "ERR")
-            return False
         # Focus race detection: another window stole focus between clipboard set and paste  # signed: alpha
         if "FOCUS_STOLEN" in stdout:
             log(f"Ghost FOCUS_STOLEN for HWND={hwnd} -- focus race detected, paste aborted safely", "ERR")
@@ -1465,6 +1450,16 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
     except Exception as e:
         log(f"Preamble build failed for {worker_name.upper()}: {e} -- dispatching raw task", "WARN")
         full_task = enriched_task  # Fall back to task without preamble  # signed: alpha
+
+    # Dispatch payload size logging + safeguard against oversized payloads  # signed: orchestrator
+    MAX_DISPATCH_LENGTH = 12000  # chars — beyond this, Copilot CLI may reject with "delegation cancelled"
+    payload_len = len(full_task)
+    if payload_len > MAX_DISPATCH_LENGTH:
+        log(f"⚠ {worker_name.upper()} payload {payload_len} chars exceeds {MAX_DISPATCH_LENGTH} limit -- trimming preamble", "WARN")
+        # Keep only task text (no preamble/enrichment) to stay under limit
+        full_task = build_preamble(worker_name) + task
+        payload_len = len(full_task)
+    log(f"📦 {worker_name.upper()} dispatch payload: {payload_len} chars", "SYS")
 
     if not _validate_target_hwnd(hwnd, worker_name):
         _log_dispatch(worker_name, task, pre_state, False, hwnd)

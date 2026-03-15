@@ -120,7 +120,10 @@ FAILURE_SIGNALS = [
 # ─── Bus Helpers ───────────────────────────────────────
 
 def bus_post(sender: str, topic: str, msg_type: str, content: str) -> bool:
-    """POST a message to the Skynet bus (SpamGuard first, raw fallback)."""
+    """POST a message to the Skynet bus via SpamGuard (MANDATORY).
+    Raw fallback removed to prevent SpamGuard bypass -- all bus posts
+    must go through guarded_publish() per Anti-Spam Rule 0.4.
+    """  # signed: alpha
     payload = {
         "sender": sender, "topic": topic,
         "type": msg_type, "content": content,
@@ -129,18 +132,11 @@ def bus_post(sender: str, topic: str, msg_type: str, content: str) -> bool:
         from tools.skynet_spam_guard import guarded_publish
         guarded_publish(payload)
         return True
-    except Exception:
-        pass
-    # Raw fallback for when SpamGuard is unavailable  # signed: alpha
-    try:
-        data = json.dumps(payload).encode()
-        req = Request(
-            f"{BUS_URL}/bus/publish", data=data, method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-        with urlopen(req, timeout=5) as r:
-            return r.status == 200
-    except Exception:
+    except ImportError:
+        logger.warning("SpamGuard unavailable -- bus post suppressed to prevent bypass")
+        return False
+    except Exception as e:
+        logger.warning(f"SpamGuard rejected bus post: {e}")
         return False
 
 

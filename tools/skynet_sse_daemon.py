@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import signal
+import sys
 import threading  # signed: gamma (removed unused sys)
 import time
 from datetime import datetime, timezone
@@ -32,6 +33,14 @@ DATA_DIR = ROOT / "data"
 STATE_FILE = DATA_DIR / "realtime.json"
 CONSUMED_FILE = DATA_DIR / "realtime_consumed.json"
 PID_FILE = DATA_DIR / "sse_daemon.pid"
+HEARTBEAT_FILE = DATA_DIR / "sse_daemon_heartbeat.json"  # signed: beta
+
+# Max buffer size to prevent unbounded memory growth from malformed SSE data
+_MAX_BUF_SIZE = 1024 * 1024  # 1 MB  # signed: beta
+
+# Staleness threshold: if no SSE tick processed in this many seconds while
+# connected, proactively reconnect rather than waiting for socket timeout
+_TICK_STALENESS_S = 90  # signed: beta
 
 _lock = threading.Lock()
 
@@ -231,7 +240,11 @@ def _init_pid_guard(pid_file: Path) -> bool:
 
 
 def _process_tick(buf, last_tick, update_count, output, verbose, last_status_print):
-    """Process SSE lines from buffer. Returns (remaining_buf, last_tick, update_count, last_status_print)."""
+    """Process SSE lines from buffer. Returns (remaining_buf, last_tick, update_count, last_status_print).
+
+    Errors in individual tick processing are caught and logged — they do NOT
+    propagate up, so a malformed SSE payload cannot kill the connection.
+    """  # signed: beta
     while "\n" in buf:
         line, buf = buf.split("\n", 1)
         data = _parse_sse_line(line)
@@ -241,9 +254,15 @@ def _process_tick(buf, last_tick, update_count, output, verbose, last_status_pri
         tick_time = time.time()
         update_count += 1
 
-        with _lock:
-            state = _build_state(data, update_count, last_tick)
-            _atomic_write(output, state)
+        try:
+            with _lock:
+                state = _build_state(data, update_count, last_tick)
+                _atomic_write(output, state)
+        except Exception as e:
+            # Log and skip this tick — do NOT crash the connection  # signed: beta
+            print(f"[sse-daemon] WARN: tick#{update_count} processing error (skipped): {e}", flush=True)
+            last_tick = tick_time
+            continue
 
         last_tick = tick_time
 
@@ -283,11 +302,42 @@ def _post_degraded_alert(content):
     # signed: beta
 
 
+def _write_heartbeat(status: str = "alive", extra: dict | None = None):
+    """Write a daemon heartbeat file so external health checks can verify
+    the daemon process is alive even during SSE reconnect cycles.
+
+    This is independent of realtime.json (which only updates on successful
+    SSE ticks). The watchdog/monitor can check this file to distinguish
+    'daemon alive but reconnecting' from 'daemon actually dead'.
+    """
+    try:
+        hb = {
+            "pid": os.getpid(),
+            "status": status,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "epoch": time.time(),
+        }
+        if extra:
+            hb.update(extra)
+        _atomic_write(HEARTBEAT_FILE, hb)
+    except Exception:
+        pass  # heartbeat write is best-effort, never crash for it
+    # signed: beta
+
+
 # ─── Main Daemon Loop ─────────────────────────────────
 
 def run_daemon(host: str = "127.0.0.1", port: int = 8420,
                output: Path = STATE_FILE, verbose: bool = False):
-    """Main SSE event loop. Connects, parses ticks, writes state atomically."""
+    """Main SSE event loop. Connects, parses ticks, writes state atomically.
+
+    Resilience features (signed: beta):
+    - Tick processing errors are caught per-tick, not per-connection
+    - Staleness self-detection: reconnects if no tick in _TICK_STALENESS_S
+    - Buffer size cap prevents unbounded memory growth
+    - Daemon heartbeat file written independently of SSE data
+    - Response object properly closed alongside connection
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # ── Signal handlers for graceful shutdown ──
@@ -313,40 +363,77 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
     last_status_print = 0
     _consecutive_errors = 0  # signed: beta
     _DEGRADED_THRESHOLD = 10  # signed: beta
+    _heartbeat_interval = 5.0  # write heartbeat every 5s  # signed: beta
+    _last_heartbeat = 0.0  # signed: beta
 
     print(f"[sse-daemon] Connecting to SSE at {host}:{port}/stream", flush=True)
     print(f"[sse-daemon] Writing state to {output}", flush=True)
+    _write_heartbeat("starting")  # signed: beta
 
     while True:
         conn = None
+        resp = None  # track response for proper cleanup  # signed: beta
         try:
             conn, resp = _sse_connect(host, port)
             backoff = 0.5  # reset to fast reconnect on success  # signed: alpha
             _consecutive_errors = 0  # reset on successful connect  # signed: beta
             print(f"[sse-daemon] SSE connected, streaming...", flush=True)
+            _write_heartbeat("connected")  # signed: beta
 
             buf = ""
             last_tick = time.time()
 
             while True:
+                # ── Staleness self-detection ──  # signed: beta
+                # If no tick processed in _TICK_STALENESS_S, the stream is
+                # likely dead (TCP alive but server stopped sending). Break
+                # and reconnect proactively instead of waiting for socket
+                # timeout (60s), which would leave realtime.json stale.
+                if time.time() - last_tick > _TICK_STALENESS_S:
+                    print(f"[sse-daemon] No tick in {_TICK_STALENESS_S}s -- stale stream, reconnecting", flush=True)
+                    _write_heartbeat("stale_reconnect")
+                    break  # signed: beta
+
                 chunk = resp.read(4096)
                 if not chunk:
                     # Clean stream end — reconnect immediately with minimal delay
                     print("[sse-daemon] SSE stream ended (clean). Reconnecting in 0.5s...", flush=True)
+                    _write_heartbeat("stream_ended")  # signed: beta
                     time.sleep(0.5)
                     break  # skip exception handler, go straight to reconnect  # signed: alpha
+
                 buf += chunk.decode("utf-8", errors="replace")
+
+                # ── Buffer size cap ──  # signed: beta
+                # If malformed data arrives without newlines, buf could grow
+                # unbounded. Cap at _MAX_BUF_SIZE and discard the excess.
+                if len(buf) > _MAX_BUF_SIZE:
+                    print(f"[sse-daemon] WARN: buffer exceeded {_MAX_BUF_SIZE} bytes, truncating", flush=True)
+                    # Keep the tail (most recent data) which is more likely to
+                    # contain the start of the next valid SSE line
+                    buf = buf[-(_MAX_BUF_SIZE // 2):]  # signed: beta
+
                 buf, last_tick, update_count, last_status_print = _process_tick(
                     buf, last_tick, update_count, output, verbose, last_status_print)
 
+                # ── Periodic heartbeat ──  # signed: beta
+                now = time.time()
+                if now - _last_heartbeat >= _heartbeat_interval:
+                    _write_heartbeat("streaming", {"update_count": update_count,
+                                                   "consecutive_errors": _consecutive_errors})
+                    _last_heartbeat = now
+
         except KeyboardInterrupt:
             print("\n[sse-daemon] Shutting down.", flush=True)
+            _write_heartbeat("shutdown")  # signed: beta
             from tools.skynet_pid_guard import release_pid_guard
             release_pid_guard(PID_FILE)  # signed: gamma
             break
         except (ConnectionError, TimeoutError, OSError) as e:
             _consecutive_errors += 1
             print(f"[sse-daemon] Disconnected (network, {_consecutive_errors}x): {e}. Reconnecting in {backoff}s...", flush=True)
+            _write_heartbeat("reconnecting", {"error": str(e)[:200],
+                                              "consecutive_errors": _consecutive_errors})  # signed: beta
             if _consecutive_errors % _DEGRADED_THRESHOLD == 0:
                 _post_degraded_alert(f"sse_daemon {_consecutive_errors} consecutive errors: {e}")
             if _sse_shutdown:
@@ -356,6 +443,8 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
         except Exception as e:
             _consecutive_errors += 1
             print(f"[sse-daemon] Error ({_consecutive_errors}x): {e}. Reconnecting in {backoff}s...", flush=True)
+            _write_heartbeat("error", {"error": str(e)[:200],
+                                       "consecutive_errors": _consecutive_errors})  # signed: beta
             if _consecutive_errors % _DEGRADED_THRESHOLD == 0:
                 _post_degraded_alert(f"sse_daemon {_consecutive_errors} consecutive errors: {e}")
             if _sse_shutdown:
@@ -363,6 +452,12 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
             time.sleep(backoff)
             backoff = min(backoff * 2, max_backoff)
         finally:
+            # Close BOTH response and connection to prevent resource leaks  # signed: beta
+            if resp:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
             if conn:
                 try:
                     conn.close()

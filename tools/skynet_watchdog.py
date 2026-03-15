@@ -943,7 +943,12 @@ def _check_skynet_backend(now, last_check, status):
 
 
 def _check_sse_daemon(now, last_check, status):
-    """Check SSE daemon health via PID file and realtime.json freshness."""
+    """Check SSE daemon health via PID file, heartbeat file, and realtime.json freshness.
+
+    Uses cross-platform PID liveness check (kernel32.OpenProcess on Windows)
+    instead of broken os.kill(pid, 0) which always fails for Windows bg daemons.
+    Also checks the daemon heartbeat file as a secondary liveness signal.
+    """  # signed: beta
     if now - last_check < SSE_CHECK_INTERVAL:
         return last_check
     sse_ok = False
@@ -951,11 +956,33 @@ def _check_sse_daemon(now, last_check, status):
     if sse_pid_file.exists():
         try:
             sse_pid_val = int(sse_pid_file.read_text().strip())
-            import os
-            os.kill(sse_pid_val, 0)
-            sse_ok = True
+            if sse_pid_val > 0:
+                if sys.platform == "win32":
+                    import ctypes
+                    kernel32 = ctypes.windll.kernel32
+                    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, sse_pid_val)
+                    if handle:
+                        kernel32.CloseHandle(handle)
+                        sse_ok = True
+                else:
+                    import os as _os
+                    _os.kill(sse_pid_val, 0)
+                    sse_ok = True
         except (OSError, ValueError):
             pass
+    # Secondary: check daemon heartbeat file (written every 5s)  # signed: beta
+    if not sse_ok:
+        hb_file = DATA_DIR / "sse_daemon_heartbeat.json"
+        if hb_file.exists():
+            try:
+                hb = json.loads(hb_file.read_text(encoding="utf-8"))
+                age = time.time() - hb.get("epoch", 0)
+                if age < 30:
+                    sse_ok = True
+            except Exception:
+                pass
+    # Tertiary: check realtime.json freshness  # signed: beta
     if not sse_ok:
         rt_file = DATA_DIR / "realtime.json"
         if rt_file.exists():

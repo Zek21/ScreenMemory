@@ -36,6 +36,7 @@ DATA_DIR = ROOT / "data"
 WORKERS_FILE = DATA_DIR / "workers.json"
 HEALTH_FILE = DATA_DIR / "worker_health.json"
 PID_FILE = DATA_DIR / "monitor.pid"
+BOOT_IN_PROGRESS_FILE = DATA_DIR / "boot_in_progress.json"  # signed: alpha
 SKYNET_URL = "http://localhost:8420"
 
 
@@ -56,13 +57,17 @@ def _cleanup_monitor_pid_guard():
 
 
 def _guarded_bus_publish(msg: dict) -> dict | None:
-    """Route bus publishes through SpamGuard. Falls back to skynet_post on import failure."""
+    """Route bus publishes through SpamGuard (MANDATORY).
+    Raw fallback only on ImportError (SpamGuard module missing).
+    Other exceptions (rate limit, dedup block) are respected, not bypassed.
+    """  # signed: alpha
     try:
         from tools.skynet_spam_guard import guarded_publish
         return guarded_publish(msg)
-    except Exception:
+    except ImportError:
         return skynet_post("/bus/publish", msg)
-    # signed: beta
+    except Exception:
+        return None  # SpamGuard rejected -- respect the block
 
 
 # Resolve real Python interpreter to avoid venv trampoline double-process.
@@ -104,6 +109,7 @@ MODEL_CHECK_INTERVAL = 60   # seconds between model checks
 ORCH_MODEL_CHECK_INTERVAL = 30  # orchestrator checked more frequently (security-critical)
 STUCK_PROCESSING_THRESHOLD = 600  # seconds in PROCESSING before auto-recovery attempt (increased from 180 to avoid killing workers mid-task)
 STUCK_DEDUP_WINDOW = 300          # suppress duplicate stuck alerts for 5 minutes
+HEARTBEAT_CYCLE_INTERVAL = 10    # post heartbeat every N cycles (~5min at 30s interval)  # signed: alpha
 MODEL_FIX_BACKOFF = 600     # 10 minutes between fix attempts per worker (prevents infinite retry)
 MODEL_FIX_MAX_ATTEMPTS = 3  # max consecutive fix attempts before giving up until restart
 
@@ -199,6 +205,11 @@ ALERT_DEDUP_WINDOW = 300  # suppress same DEAD alert for 5 minutes after first p
 # Dispatch lock file path — suppress DEAD alerts during active dispatch
 _DISPATCH_LOCK_FILE = DATA_DIR / "dispatch_active.lock"
 
+# Boot grace period — suppress DEAD alerts during boot window  # signed: alpha
+BOOT_GRACE_PERIOD = 300  # boot lock valid for up to 5 minutes (matches skynet_self_prompt.py)
+MONITOR_STARTUP_GRACE = 90  # suppress DEAD alerts for 90s after monitor starts
+_monitor_start_time: float = time.time()  # track when this monitor instance started
+
 def _is_dispatch_active() -> bool:
     """Check if a dispatch is currently in progress (lock file exists and is fresh)."""
     try:
@@ -214,6 +225,34 @@ def _is_dispatch_active() -> bool:
     except Exception:
         pass
     return False
+
+
+def _is_boot_in_progress() -> bool:
+    """Check if a boot sequence is currently running (boot lock file exists and is fresh).
+
+    The boot lock file (data/boot_in_progress.json) is created by skynet_start.py
+    during worker window opening. During boot, worker HWNDs may be registered in
+    workers.json but windows aren't yet visible — which looks like DEAD to the
+    monitor. This function prevents false DEAD alerts during that window.
+    """  # signed: alpha
+    try:
+        if BOOT_IN_PROGRESS_FILE.exists():
+            boot_age = time.time() - BOOT_IN_PROGRESS_FILE.stat().st_mtime
+            if boot_age < BOOT_GRACE_PERIOD:
+                return True
+            # Stale lock — boot probably crashed; ignore it
+    except Exception:
+        pass
+    return False
+
+
+def _is_in_startup_grace() -> bool:
+    """Check if monitor is still in its startup grace period.
+
+    When the monitor starts, workers may still be booting. Suppress DEAD alerts
+    for MONITOR_STARTUP_GRACE seconds after the monitor process starts.
+    """  # signed: alpha
+    return (time.time() - _monitor_start_time) < MONITOR_STARTUP_GRACE
 
 
 def _try_refresh_hwnd(name: str, current_hwnd: int) -> int | None:
@@ -253,8 +292,30 @@ def is_model_correct(model_str: str) -> bool:
 
 
 def is_agent_cli(agent_str: str) -> bool:
-    """Check if delegate/agent label is Copilot CLI."""
-    return "copilot cli" in agent_str.lower()
+    """Check if delegate/agent label indicates a valid Copilot CLI session.
+
+    VS Code uses different UIA button names across versions:
+    - 'Delegate Session - Copilot CLI'   (older VS Code)
+    - 'Delegate Session - Local'         (current VS Code, CLI mode)
+    - 'Set Agent (Ctrl+.) - Agent'       (newer VS Code agent naming)
+    - 'screenmemory'                     (custom agent attached)
+    All of these are valid CLI-mode indicators. Only labels containing
+    'edits' indicate a non-CLI mode that needs correction.
+    """  # signed: alpha
+    lower = agent_str.lower()
+    # Reject empty/unknown
+    if not lower:
+        return False
+    # Explicit rejection: Edits mode is NOT CLI
+    if "edits" in lower:
+        return False
+    # Accept any of the known valid agent label patterns
+    # Must match uia_engine.py agent_ok logic to prevent correction cycles
+    return ("copilot cli" in lower
+            or "delegate session" in lower
+            or "- agent" in lower
+            or "screenmemory" in lower
+            or "set agent" in lower)
 
 
 def fix_model_via_uia(hwnd: int, render_hwnd: int) -> bool:
@@ -335,6 +396,24 @@ def _check_worker_dead(name: str, hwnd: int, alive: bool, visible: bool, h: dict
         health[name] = h
         return True  # skip further processing
 
+    # Suppress false DEAD alerts during boot window or monitor startup grace period  # signed: alpha
+    if _is_boot_in_progress():
+        log(f"{name.upper()}: visibility check failed but boot in progress -- suppressed", "WARN")
+        _dead_consecutive[name] = 0
+        h.update({"model": "CHECKING", "status": "BOOT_IN_PROGRESS"})
+        skynet_post(f"/worker/{name}/heartbeat", {"hwnd_alive": True, "visible": False, "model": "BOOTING"})
+        health[name] = h
+        return True
+
+    if _is_in_startup_grace():
+        log(f"{name.upper()}: visibility check failed but monitor in startup grace -- suppressed", "WARN")
+        _dead_consecutive[name] = 0
+        h.update({"model": "CHECKING", "status": "STARTUP_GRACE"})
+        skynet_post(f"/worker/{name}/heartbeat", {"hwnd_alive": True, "visible": False, "model": "STARTUP_GRACE"})
+        health[name] = h
+        return True
+    # end boot/startup suppression  # signed: alpha
+
     _dead_consecutive[name] = _dead_consecutive.get(name, 0) + 1
     consecutive = _dead_consecutive[name]
 
@@ -384,6 +463,15 @@ def _check_worker_model(name: str, hwnd: int, h: dict, check_model: bool) -> boo
     model_ok = is_model_correct(model_name) and is_agent_cli(agent_name)
     h["model"] = model_name
     h["agent"] = agent_name
+
+    # Cross-check: if UIA engine says agent_ok but monitor disagrees, log for debugging  # signed: alpha
+    try:
+        from tools.uia_engine import get_engine
+        uia_scan = get_engine().scan(hwnd)
+        if uia_scan.agent_ok and not is_agent_cli(agent_name):
+            log(f"{name.upper()}: UIA says agent_ok=True for '{agent_name}' but is_agent_cli() disagrees -- possible label mismatch", "WARN")
+    except Exception:
+        pass
 
     if not model_ok:
         issues = []
@@ -890,15 +978,31 @@ def _try_restart_daemon(daemon_name: str, pid_file: Path, script_path: Path, now
         return False
 
     def _pid_file_is_alive(pf: Path) -> bool:
+        """Check if PID in file is alive using cross-platform method.
+        Uses kernel32.OpenProcess on Windows (os.kill(pid, 0) is broken
+        for background daemons on Windows — always fails with WinError 87).
+        """  # signed: beta
         try:
             if pf.exists():
                 pid = int(pf.read_text().strip())
-                import os
-                os.kill(pid, 0)
-                return True
+                if pid <= 0:
+                    return False
+                if sys.platform == "win32":
+                    import ctypes
+                    kernel32 = ctypes.windll.kernel32
+                    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                    if handle:
+                        kernel32.CloseHandle(handle)
+                        return True
+                    return False
+                else:
+                    import os
+                    os.kill(pid, 0)
+                    return True
         except (OSError, ValueError):
             pass
-        return False
+        return False  # signed: beta
 
     # Double-check: sleep 2s then re-check PID (daemon may be starting)
     import time as _t
@@ -947,14 +1051,41 @@ def _auto_restart_stale_daemons():
     sse_pid_file = DATA_DIR / "sse_daemon.pid"
 
     def _sse_pid_alive():
+        """Check SSE daemon PID using cross-platform method.
+        Uses kernel32.OpenProcess on Windows (os.kill broken for bg daemons).
+        Also checks heartbeat file as secondary liveness signal.
+        """  # signed: beta
         try:
             if sse_pid_file.exists():
                 pid = int(sse_pid_file.read_text().strip())
-                import os
-                os.kill(pid, 0)
-                return True
+                if pid <= 0:
+                    return False
+                if sys.platform == "win32":
+                    import ctypes
+                    kernel32 = ctypes.windll.kernel32
+                    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                    if handle:
+                        kernel32.CloseHandle(handle)
+                        return True
+                    return False
+                else:
+                    import os
+                    os.kill(pid, 0)
+                    return True
         except (OSError, ValueError):
             pass
+        # Secondary check: SSE daemon heartbeat file  # signed: beta
+        hb_file = DATA_DIR / "sse_daemon_heartbeat.json"
+        try:
+            if hb_file.exists():
+                hb = json.loads(hb_file.read_text(encoding="utf-8"))
+                age = time.time() - hb.get("epoch", 0)
+                if age < 30:  # heartbeat within last 30s = alive
+                    return True
+        except Exception:
+            pass
+        return False  # signed: beta
         return False
 
     sse_alive = _sse_pid_alive()
@@ -1159,7 +1290,9 @@ def _run_monitor_cycle(workers, orch_hwnd, args, cycle, now, last_model_check, l
 def _handle_periodic_tasks(cycle, health, workers, productivity, pending_work, now,
                            last_daemon_restart_check, DAEMON_CHECK_INTERVAL):
     """Handle periodic bus heartbeats, intelligence metrics, and daemon restarts."""
-    if cycle % 6 == 0:
+    # Heartbeat every HEARTBEAT_CYCLE_INTERVAL cycles (~5min at 30s)  # signed: alpha
+    # Was cycle%6 (~3min) -- reduced frequency to avoid flooding 100-message ring buffer
+    if cycle % HEARTBEAT_CYCLE_INTERVAL == 0:
         alive_count = sum(1 for h in health.values() if isinstance(h, dict) and h.get("alive"))
         prod_summary = "; ".join(f"{n}={p.get('tasks_per_hour', 0):.1f}t/h" for n, p in productivity.items())
         _guarded_bus_publish({
@@ -1192,12 +1325,14 @@ def _handle_periodic_tasks(cycle, health, workers, productivity, pending_work, n
 
 def _run_monitor(args):
     """Inner monitor loop, called from main() after PID guard."""
-    global _workers_mtime
+    global _workers_mtime, _monitor_start_time
+    _monitor_start_time = time.time()  # reset startup grace timer to actual loop start  # signed: alpha
 
     workers, orch_hwnd = load_workers()
     _workers_mtime = WORKERS_FILE.stat().st_mtime if WORKERS_FILE.exists() else 0
     log(f"Skynet Monitor starting -- watching {len(workers)} workers", "INFO")
     log(f"HWND check every {args.hwnd_interval}s | Model check every {args.model_interval}s", "INFO")
+    log(f"Boot suppression: grace={MONITOR_STARTUP_GRACE}s, boot_lock={BOOT_GRACE_PERIOD}s, debounce={DEAD_DEBOUNCE_THRESHOLD}x", "INFO")  # signed: alpha
 
     if args.once:
         health = run_check(workers, orch_hwnd, check_model=True)
