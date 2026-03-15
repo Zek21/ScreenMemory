@@ -492,7 +492,7 @@ def check_all_daemons() -> list:
 def _format_uptime(seconds: float) -> str:
     """Format seconds into human-readable uptime string."""
     if seconds <= 0:
-        return "—"
+        return "--"  # signed: gamma (ASCII-safe, was U+2014 em-dash)
     s = int(seconds)
     if s < 60:
         return f"{s}s"
@@ -543,10 +543,10 @@ def print_status_table(results: list) -> None:
     for r in results:
         crit_color = _criticality_color(r["criticality"])
         status = "\033[90mDIS \033[0m" if r.get("disabled") else _status_icon(r["alive"])
-        pid_str = str(r["pid"]) if r["pid"] else "—"
-        port_str = str(r["port"]) if r["port"] else "—"
-        uptime_str = r["uptime_human"] if r["uptime_human"] else "—"
-        hb_str = r["heartbeat_status"][:8] if r["heartbeat_status"] else "—"
+        pid_str = str(r["pid"]) if r["pid"] else "--"
+        port_str = str(r["port"]) if r["port"] else "--"
+        uptime_str = r["uptime_human"] if r["uptime_human"] else "--"
+        hb_str = r["heartbeat_status"][:8] if r["heartbeat_status"] else "--"  # signed: gamma
 
         print(f"  {r['label']:<28} {pid_str:>6} {port_str:>5} {status} {uptime_str:>10} "
               f"{crit_color}{r['criticality']:<13}{reset} {hb_str:<10}")
@@ -620,7 +620,7 @@ def main():
     Reference: docs/DAEMON_ARCHITECTURE.md for full daemon ecosystem details.
     """
     parser = argparse.ArgumentParser(
-        description="Skynet Daemon Status — check all daemons in the ecosystem",
+        description="Skynet Daemon Status -- check all daemons in the ecosystem",  # signed: gamma
         epilog="Reference: docs/DAEMON_ARCHITECTURE.md",
     )
     parser.add_argument("--json", action="store_true", help="Machine-readable JSON output")
@@ -648,7 +648,7 @@ def main():
     if args.restart_dead:
         dead = [r for r in results if not r["alive"]]
         if not dead:
-            print("  All daemons are alive — nothing to restart.")
+            print("  All daemons are alive -- nothing to restart.")  # signed: gamma
         else:
             print(f"  Restarting {len(dead)} dead daemon(s)...")
             restart_results = restart_dead_daemons(results)
