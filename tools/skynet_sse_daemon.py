@@ -309,8 +309,8 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
         return
 
     update_count = 0
-    backoff = 2.0
-    max_backoff = 30.0
+    backoff = 0.5  # fast initial reconnect (was 2.0)  # signed: alpha
+    max_backoff = 10.0  # cap reconnect delay (was 30.0)  # signed: alpha
     last_status_print = 0
     _consecutive_errors = 0  # signed: beta
     _DEGRADED_THRESHOLD = 10  # signed: beta
@@ -322,7 +322,7 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
         conn = None
         try:
             conn, resp = _sse_connect(host, port)
-            backoff = 2.0
+            backoff = 0.5  # reset to fast reconnect on success  # signed: alpha
             _consecutive_errors = 0  # reset on successful connect  # signed: beta
             print(f"[sse-daemon] SSE connected, streaming...", flush=True)
 
@@ -332,7 +332,10 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
             while True:
                 chunk = resp.read(4096)
                 if not chunk:
-                    raise ConnectionError("SSE stream ended")
+                    # Clean stream end — reconnect immediately with minimal delay
+                    print("[sse-daemon] SSE stream ended (clean). Reconnecting in 0.5s...", flush=True)
+                    time.sleep(0.5)
+                    break  # skip exception handler, go straight to reconnect  # signed: alpha
                 buf += chunk.decode("utf-8", errors="replace")
                 buf, last_tick, update_count, last_status_print = _process_tick(
                     buf, last_tick, update_count, output, verbose, last_status_print)
