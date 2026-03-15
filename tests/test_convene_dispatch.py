@@ -73,8 +73,16 @@ class TestBuildPreamble(unittest.TestCase):
         for name in ["alpha", "beta", "gamma", "delta"]:
             p = self.build_preamble(name)
             self.assertIn(f"You are worker {name}", p)
-            self.assertIn(f"sender':'{name}'", p)
-            self.assertIn(f"for worker {name} ONLY", p)
+            # Preamble may use dict(sender='name') or {'sender':'name'} format  # signed: beta
+            self.assertTrue(
+                f"sender='{name}'" in p or f"sender':'{name}'" in p,
+                f"Neither sender='{name}' nor sender':'{name}' found in preamble for {name}"
+            )
+            # Lean preamble uses "for {name} ONLY", old used "for worker {name} ONLY"  # signed: beta
+            self.assertTrue(
+                f"for {name} ONLY" in p or f"for worker {name} ONLY" in p,
+                f"Neither 'for {name} ONLY' nor 'for worker {name} ONLY' found in preamble"
+            )
             # Must not contain another worker's identity claim
             for other in ["alpha", "beta", "gamma", "delta"]:
                 if other != name:
