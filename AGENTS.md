@@ -34,6 +34,23 @@
 **Rule:** This will NEVER happen again. The boot sequence now enforces Copilot CLI mode automatically. If a worker is detected in "Local" or "Cloud" mode during boot, it is switched immediately. No human intervention required.
 
 <!-- signed: orchestrator -->
+
+### INCIDENT 015 -- Beta Stuck on Unappliable Patch in Agent Apply Mode (2026-03-15)
+
+**What failed:** During Wave 1 of the mega-upgrade session, Beta was dispatched an implementation task and attempted to apply code changes via VS Code Copilot CLI's "Apply" mechanism. The generated patch could not be applied to the target file, leaving Beta stuck in an unrecoverable Apply state. The worker could neither proceed (patch rejected) nor automatically recover (no fallback path). The orchestrator had to intervene.
+
+**Root cause:** VS Code's Copilot CLI Agent Apply mode generates diffs against the file state at generation time. In a multi-worker environment where multiple agents may edit overlapping files concurrently, the file can change between patch generation and patch application — making the diff unappliable. The Apply mechanism has no automatic retry, no re-generation, and no graceful fallback. A stuck Apply blocks the entire worker session.
+
+**What works:** Workers operating in Copilot CLI mode (not Agent/Edits mode) use the `edit` tool for file changes, which performs string-match replacements and fails gracefully with a clear error. This approach is immune to stale-diff problems because each edit targets a unique string match, not a line-number-based patch.
+
+**The fix:** All workers are mandated to use **Copilot CLI mode** (enforced by `tools/set_copilot_cli.py` at boot per INCIDENT 014). Copilot CLI uses `edit`/`create` tools for file changes instead of Agent Apply patches. The model guard and session-target guard in `skynet_start.py` prevent workers from being in Agent or Edits mode where Apply failures can occur.
+
+**Architecture Knowledge Registry:** VS Code Agent Apply mode is unsafe in multi-worker concurrent editing scenarios. Copilot CLI mode with `edit` tool is the correct file modification mechanism for Skynet workers. If a worker is ever detected in Agent or Edits mode, it must be switched to Copilot CLI immediately. The `skynet_monitor.py` daemon's `agent_ok` check enforces this — any value other than Copilot CLI triggers auto-correction.
+
+**Rule:** Workers MUST remain in Copilot CLI mode at all times. Agent mode and Edits mode are FORBIDDEN for Skynet workers because their Apply mechanism is fragile and non-recoverable in concurrent environments.
+
+<!-- signed: alpha -->
+
 # ScreenMemory Agent Notes
 
 ## THE TRUTH PRINCIPLE — Rule #0 (Supreme, Inviolable)

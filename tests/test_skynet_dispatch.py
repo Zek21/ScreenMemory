@@ -811,6 +811,7 @@ class TestDispatchToWorkerFlow:
             "record": patch.object(dispatch, "_record_dispatch_outcome"),
             "log_d": patch.object(dispatch, "_log_dispatch"),
             "steer": patch.object(dispatch, "clear_steering_and_send", return_value=False),
+            "verify": patch.object(dispatch, "_verify_delivery", return_value=True),  # signed: gamma — fixes retry loop in happy path
             "sleep": patch("time.sleep"),
         }
         self.mocks = {k: p.start() for k, p in self._patches.items()}
