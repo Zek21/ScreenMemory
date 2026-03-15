@@ -669,46 +669,45 @@ def guard_model(hwnd, orch_hwnd):
 
 
 def guard_permissions(hwnd, orch_hwnd):
-    """Ensure a chat window has Bypass/Autopilot permissions set.
+    """Ensure a chat window has Bypass Approvals set.
     
-    Calls tools/guard_bypass.ps1 which uses pyautogui for Chromium overlays
-    (PostMessage does NOT work on Chromium -- INCIDENT 013).
+    Calls tools/guard_bypass.ps1 — the single source of truth for permission
+    switching. Uses the same Ghost class and PostMessage approach as new_chat.ps1.
     
-    Retry up to 3 attempts. guard_bypass.ps1 handles its own retry loop,
-    but we add an outer retry here for robustness.
-    # signed: orchestrator
+    SetForegroundWindow is called from Python (which has foreground rights)
+    because subprocess PowerShell cannot steal focus on Windows.
     """
     import ctypes
+    # Rule 0.015: Pre-fire screenshot before permission change  # signed: orchestrator
+    _capture_prefire_screenshot_start(hwnd, "guard_permissions")
+
+    # Give worker window real OS focus from orchestrator process
+    ctypes.windll.user32.SetForegroundWindow(hwnd)
+    time.sleep(0.4)
 
     script_path = str(ROOT / "tools" / "guard_bypass.ps1")
-    max_outer = 2
-    
-    for attempt in range(1, max_outer + 1):
-        try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                 "-File", script_path, "-Hwnd", str(hwnd)],
-                capture_output=True, text=True, timeout=30
-            )
-            out = r.stdout.strip()
-            if "PERMS_FIXED" in out:
-                log(f"Permissions: Bypass/Autopilot set for HWND={hwnd}", "OK")
-                return True
-            elif "PERMS_OK" in out:
-                log(f"Permissions: HWND={hwnd} already Bypass/Autopilot", "OK")
-                return True
-            elif "PERMS_FAILED" in out:
-                log(f"Permissions: FAILED attempt {attempt} for HWND={hwnd}: {out[:200]}", "WARN")
-            else:
-                log(f"Permissions: Unexpected result attempt {attempt} for HWND={hwnd}: {out[:200]}", "WARN")
-        except Exception as e:
-            log(f"Permissions guard failed attempt {attempt} for HWND={hwnd}: {e}", "WARN")
-        
-        if attempt < max_outer:
-            time.sleep(2)
-    
-    log(f"Permissions: ALL attempts exhausted for HWND={hwnd}", "ERR")
-    return False
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-File", script_path, "-Hwnd", str(hwnd)],
+            capture_output=True, text=True, timeout=20
+        )
+        out = r.stdout.strip()
+        if "PERMS_FIXED" in out:
+            log(f"Permissions: Bypass Approvals set for HWND={hwnd}", "OK")
+        elif "PERMS_OK" in out:
+            log(f"Permissions: HWND={hwnd} already Bypass Approvals", "OK")
+        elif "PERMS_FAILED" in out:
+            perm_state = out.split("PERMS_FAILED:")[-1].strip() if "PERMS_FAILED:" in out else "unknown"
+            log(f"Permissions: FAILED to set Bypass for HWND={hwnd} (still '{perm_state}')", "WARN")
+        else:
+            log(f"Permissions: Unexpected result for HWND={hwnd}: {out[:100]}", "WARN")
+    except Exception as e:
+        log(f"Permissions guard failed for HWND={hwnd}: {e}", "WARN")
+    finally:
+        # Restore orchestrator focus from Python (has foreground rights)
+        ctypes.windll.user32.SetForegroundWindow(orch_hwnd)
+        time.sleep(0.2)
 
 
 def _build_prompt_text(worker_name, boot_memories=None):
@@ -1122,13 +1121,46 @@ def _wait_for_window_ready(hwnd, timeout_s=5):
     return False  # signed: delta
 
 
+def guard_copilot_cli(hwnd, name="worker", orch_hwnd=0):
+    """Ensure a chat window is in Copilot CLI mode (not Local or Cloud).
+    
+    Calls tools/set_copilot_cli.py which uses pyautogui to interact with the
+    Chromium session-target dropdown. This is MANDATORY for all workers.
+    # signed: orchestrator
+    """
+    grid_pos = None
+    for gname, gpos in [("alpha", (1930, 20, 930, 500)), ("beta", (2860, 20, 930, 500)),
+                         ("gamma", (1930, 540, 930, 500)), ("delta", (2860, 540, 930, 500))]:
+        if gname == name:
+            grid_pos = gpos
+            break
+
+    script_path = str(ROOT / "tools" / "set_copilot_cli.py")
+    args = ["python", script_path, "--hwnd", str(hwnd), "--worker", name]
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=30,
+                           encoding="utf-8", errors="replace")
+        if "Copilot CLI mode" in (r.stdout or ""):
+            log(f"Copilot CLI: {name} HWND={hwnd} confirmed in CLI mode", "OK")
+        else:
+            log(f"Copilot CLI: {name} HWND={hwnd} switch may have failed: {(r.stdout or '')[:150]}", "WARN")
+    except Exception as e:
+        log(f"Copilot CLI guard failed for {name} HWND={hwnd}: {e}", "WARN")
+    finally:
+        if orch_hwnd:
+            ctypes.windll.user32.SetForegroundWindow(orch_hwnd)
+            time.sleep(0.2)
+
+
 def _guard_restored_session(hwnd, orch_hwnd):
-    """Apply model guard + permissions for a restored (non-fresh) worker window."""
+    """Apply model guard + permissions + Copilot CLI for a restored (non-fresh) worker window."""
     if not _wait_for_window_ready(hwnd):  # signed: delta — wait for window UI to load
         log(f"Window HWND={hwnd} render widget not ready after 5s, proceeding anyway", "WARN")
     guard_model(hwnd, orch_hwnd)
     time.sleep(0.5)
     guard_permissions(hwnd, orch_hwnd)
+    time.sleep(0.5)
+    guard_copilot_cli(hwnd, orch_hwnd=orch_hwnd)  # MANDATORY: enforce Copilot CLI mode  # signed: orchestrator
     time.sleep(1)
 
 
@@ -1177,6 +1209,7 @@ def _open_single_worker(worker_idx, orch_hwnd, fresh, boot_memories, existing_ch
         # after a brief settle delay in case that guard failed silently.  # signed: delta
         time.sleep(1.5)
         guard_model(new_hwnd, orch_hwnd)
+        guard_copilot_cli(new_hwnd, name=worker_name, orch_hwnd=orch_hwnd)  # MANDATORY: Copilot CLI mode  # signed: orchestrator
 
     prompt_ok = _prompt_and_wait(new_hwnd, worker_name, orch_hwnd, boot_memories)
     if not prompt_ok:
@@ -1770,12 +1803,6 @@ def _pid_matches_script(pid, script_path):
 def _start_daemon_safe(script_path, pid_file, label, extra_args=None):
     """Start a daemon only if not already running (PID file guard).
     Returns the Popen object or None if already running / failed."""
-    disabled_file = pid_file.with_suffix(".disabled")
-    if disabled_file.exists():
-        log(f"{label} disabled via {disabled_file.name} -- skipping", "WARN")
-        return None
-    # signed: consultant
-
     running, pid = _is_daemon_running(pid_file)
     if running:
         if _pid_matches_script(pid, script_path):

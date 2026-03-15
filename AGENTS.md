@@ -10,7 +10,30 @@
 
 **Architecture Knowledge Registry:** VS Code overlays rendered by Chromium are unreachable by Win32, UIA, or clipboard-based input. Only hardware-level mouse/keyboard events (pyautogui, real input) can interact with them. All future automation must use pyautogui or equivalent for Chromium overlays.
 
-<!-- signed: alpha -->
+### INCIDENT 014 -- Workers Opened in Local Mode Instead of Copilot CLI (2026-03-14)
+
+**What failed:** All 4 workers were opened in "Local" session-target mode instead of "Copilot CLI" (bypass) mode. This is a RECURRING issue — the user has explicitly requested Copilot CLI mode multiple times across multiple sessions.
+
+**Root cause:** VS Code's "New Chat Window" defaults to "Local" session target. Neither `new_chat.ps1`, `skynet_start.py`, nor the manual boot sequence had any step to enforce "Copilot CLI" session target after opening a window. The existing `guard_bypass.ps1` handles the *approval permissions* (Default → Autopilot), NOT the *session target* (Local → Copilot CLI). These are TWO SEPARATE settings.
+
+**The fix:** Created `tools/set_copilot_cli.py` — a pyautogui-based script that clicks the session-target dropdown (bottom-left of chat window) and selects "Copilot CLI". Integrated into `skynet_start.py` via `guard_copilot_cli()` which runs automatically for both fresh and restored worker windows. Added to Sequential Worker Boot Rule in AGENTS.md as step 3 (MANDATORY, NON-NEGOTIABLE).
+
+**Permanent enforcement:**
+1. `tools/set_copilot_cli.py` — standalone script for switching workers to Copilot CLI mode
+2. `skynet_start.py` `guard_copilot_cli()` — called automatically during boot for every worker
+3. `_guard_restored_session()` — includes `guard_copilot_cli()` alongside model and permissions guards
+4. Fresh window path — calls `guard_copilot_cli()` after `guard_model()`
+5. Sequential Worker Boot Rule (AGENTS.md) — step 3 is now "MANDATORY: Switch to Copilot CLI mode"
+
+**Two separate settings that must BOTH be enforced:**
+| Setting | What It Controls | Script | Default | Required |
+|---------|-----------------|--------|---------|----------|
+| Session Target | Local vs Copilot CLI vs Cloud | `set_copilot_cli.py` | Local ❌ | Copilot CLI ✅ |
+| Approval Permissions | Default Approvals vs Autopilot | `guard_bypass.ps1` / `set_autopilot.py` | Default ❌ | Autopilot ✅ |
+
+**Rule:** This will NEVER happen again. The boot sequence now enforces Copilot CLI mode automatically. If a worker is detected in "Local" or "Cloud" mode during boot, it is switched immediately. No human intervention required.
+
+<!-- signed: orchestrator -->
 # ScreenMemory Agent Notes
 
 ## THE TRUTH PRINCIPLE — Rule #0 (Supreme, Inviolable)
@@ -510,9 +533,10 @@ The orchestrator is a continuous operations loop, not a request-response system.
 For each worker (alpha, beta, gamma, delta) in order:
 1. **Open window** — Use `tools/new_chat.ps1` or session restore to open a single worker window.
 2. **Visual verification** — Take a screenshot and verify: window visible in correct grid slot, model is Claude Opus 4.6 (fast mode), agent is Copilot CLI / ScreenMemory, no errors.
-3. **Dispatch identity prompt** — Send worker its identity injection via `skynet_dispatch.py`.
-4. **Confirm processing** — Wait for IDLE → PROCESSING transition (UIA scan or screenshot). Worker must be actively processing before proceeding.
-5. **Only then** — Move to the next worker. If verification fails, retry once. If it fails again, log and continue.
+3. **MANDATORY: Switch to Copilot CLI mode** — Run `python tools/set_copilot_cli.py --worker NAME --hwnd HWND` to switch the session target from "Local" to "Copilot CLI". This is NON-NEGOTIABLE. Workers opened via "New Chat Window" default to "Local" mode. The `set_copilot_cli.py` script uses pyautogui (hardware-level input) to click the session target dropdown and select "Copilot CLI". Verification is built into the script. **If this step is skipped, the worker operates in degraded Local mode which the user has explicitly forbidden.**
+4. **Dispatch identity prompt** — Send worker its identity injection via `skynet_dispatch.py`.
+5. **Confirm processing** — Wait for IDLE → PROCESSING transition (UIA scan or screenshot). Worker must be actively processing before proceeding.
+6. **Only then** — Move to the next worker. If verification fails, retry once. If it fails again, log and continue.
 
 **NEVER open multiple worker windows simultaneously.** Each window must be individually verified before the next one is started.
 
