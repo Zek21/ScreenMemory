@@ -891,6 +891,8 @@ foreach ($e in $allEdits) {{
         $name = ""
         try {{ $name = [string]$e.Current.Name }} catch {{}}
         if ($r.Width -lt 20 -or $r.Height -lt 10) {{ continue }}
+        # Skip VS Code accessibility placeholder (not a real chat input)
+        if ($name -match 'not accessible|screen reader') {{ continue }}
         $score = [int]$r.Y
         if ($r.X -lt $leftBandMaxX) {{ $score += 2000 }}
         if ($name -notmatch 'Terminal input') {{ $score += 500 }}
