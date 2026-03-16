@@ -8,9 +8,10 @@
 > communication architecture changes. Created per Rule 0.8 (Mandatory Architecture Knowledge)
 > following INCIDENT 012.
 >
-> **Line Number Notice (Level 3.5):** `skynet_dispatch.py` grew from ~1500 to 2053 lines.
-> Key function locations updated below. Minor inline references (e.g., `L710`) may be
+> **Line Number Notice (Level 3.5+):** `skynet_dispatch.py` grew from ~1500 to 2397 lines.
+> Key function locations updated below. Minor inline references may be
 > approximate — always verify with `grep -n` before citing.
+> Last verified: 2026-03-16.
 
 ---
 
@@ -91,10 +92,10 @@ an entire delivery architecture on false assumptions. The fix required:
     │  ROUTING DECISION   │
     │                     │
     │  worker_name ==     │
-    │  "orchestrator"? ──►──── _dispatch_to_orchestrator() (L975)
+    │  "orchestrator"? ──►──── _dispatch_to_orchestrator() (L1267)
     │  "consultant" /     │        └── skynet_delivery.deliver_to_orchestrator()
     │  "gemini_consultant"│
-    │    ? ──────────────►──── _dispatch_to_consultant() (L1008)
+    │    ? ──────────────►──── _dispatch_to_consultant() (L1300)
     │  else (worker) ────►──── Continue below ▼
     └─────────────────────┘
                │
@@ -180,7 +181,7 @@ an entire delivery architecture on false assumptions. The fix required:
                            │
                            ▼
     ┌─────────────────────────────────────────────────────────┐
-    │  DELIVERY VERIFICATION — _verify_delivery() (L1238)     │
+    │  DELIVERY VERIFICATION — _verify_delivery() (L1554)     │
     │                                                         │
     │  If pre_state was PROCESSING → auto-verified (queued)   │
     │  Otherwise: poll UIA every 0.5s for up to 8s            │
@@ -347,9 +348,9 @@ Two paths exist:
 3. `SendKeys ^V` + 300ms delay + `HardwareEnter()`
 4. `SetForegroundWindow(orchHwnd)` — restore orchestrator focus
 
-### `_execute_ghost_dispatch()` — Subprocess Runner (L1070)
+### `_execute_ghost_dispatch()` — Subprocess Runner (L1094)
 
-**File:** `tools/skynet_dispatch.py`, **Line:** 1070
+**File:** `tools/skynet_dispatch.py`, **Line:** 1094
 
 Runs the generated PowerShell under a threading lock (`_dispatch_lock`) to prevent
 concurrent clipboard operations. Key behaviors:
@@ -747,7 +748,7 @@ False (L1278 — cannot verify = failed).
 | Constant | Value | Location | Purpose |
 |----------|-------|----------|---------|
 | PS timeout | 20s | L912 | Maximum subprocess execution time |
-| Verify timeout | 8s | L1238 | Default delivery verification window |
+| Verify timeout | 8s | L1554 | Default delivery verification window |
 | Verify poll interval | 0.5s | L1257 | UIA state check frequency |
 | Clipboard verify retries | 3 | L814 | Clipboard SetText verification attempts |
 | Clipboard verify delay | 50ms/100ms | L816,824 | Delays between clipboard checks |
@@ -768,7 +769,7 @@ False (L1278 — cannot verify = failed).
 
 | File | Key Functions | Purpose |
 |------|---------------|---------|
-| `tools/skynet_dispatch.py` | `dispatch_to_worker()` L1131, `ghost_type_to_worker()` L948, `_build_ghost_type_ps()` L704, `_execute_ghost_dispatch()` L897, `_verify_delivery()` L1238, `_dispatch_to_consultant()` L1008, `load_consultant_hwnd()` L992, `pre_dispatch_visual_check()` L495, `build_preamble()` L236, `clear_steering_and_send()` L636, `mark_dispatch_received()` L190, `load_workers()` L681, `load_orch_hwnd()` L693 | Primary dispatch pipeline — ALL prompt delivery flows through this file |
+| `tools/skynet_dispatch.py` | `dispatch_to_worker()` L1423, `ghost_type_to_worker()` L1200, `_build_ghost_type_ps()` L741, `_execute_ghost_dispatch()` L1094, `_verify_delivery()` L1554, `_dispatch_to_consultant()` L1300, `load_consultant_hwnd()` L1284, `pre_dispatch_visual_check()` L481, `build_preamble()` L242, `clear_steering_and_send()` L656, `mark_dispatch_received()` L197, `load_workers()` L707, `load_orch_hwnd()` L725 | Primary dispatch pipeline — ALL prompt delivery flows through this file |
 
 ### Unified Delivery System
 

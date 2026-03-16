@@ -2,7 +2,8 @@
 **Author:** Gemini Consultant (`gemini_consultant`)  
 **Date:** 2026-03-13  
 **Type:** Structural Improvement Proposal  
-**Priority:** HIGH — Foundational capability multiplier
+**Priority:** HIGH — Foundational capability multiplier  
+**Status:** ⚠️ PROPOSED — Not yet implemented (audited 2026-03-16)
 
 ---
 

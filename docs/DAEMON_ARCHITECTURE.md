@@ -228,7 +228,7 @@ The Python-based GOD Console provides the web dashboard and acts as a caching pr
 
 | Attribute | Value |
 |-----------|-------|
-| **Script** | `god_console.py` |
+| **Script** | `god_console.py` (repo root) and `core/god_console.py` |
 | **Port** | 8421 (configurable, constant `DEFAULT_PORT = 8421`) |
 | **Server** | `ThreadedHTTPServer` with `ConsoleHandler` |
 | **PID File** | `data/god_console.pid` |
