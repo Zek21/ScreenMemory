@@ -2293,6 +2293,25 @@ def _execute_dispatch_mode(args, workers, orch_hwnd):
         log(f"Dispatched to idle worker: {target}" if target else "No idle worker available",
             "OK" if target else "ERR")
         return target
+    if getattr(args, "moa", False) and args.task:
+        # P2.05: Mixture of Agents dispatch — signed: alpha
+        from tools.skynet_moa import MoADispatch
+        moa = MoADispatch()
+        n = getattr(args, "moa_n", 3)
+        result = moa.dispatch_moa(args.task, n_workers=n, timeout=args.timeout)
+        log(f"MoA dispatched to {result.get('n_workers', 0)} workers, "
+            f"state={result.get('state')}", "OK")
+        return result
+    if getattr(args, "debate", False) and args.task:
+        # P2.06: Red Team / Blue Team adversarial debate — signed: beta
+        from tools.skynet_debate import dispatch_debate
+        debate_rounds = getattr(args, "debate_rounds", 3)
+        result = dispatch_debate(args.task, rounds=debate_rounds)
+        log(f"Debate {result['session_id']} dispatched: "
+            f"{len(result['dispatched'])} rounds to "
+            f"{len(set(d['worker'] for d in result['dispatched']))} workers",
+            "OK")
+        return result
     if args.all and args.task:
         return dispatch_to_all(args.task, workers, orch_hwnd, args.delay)
     if args.worker and args.task:
@@ -2310,6 +2329,8 @@ Modes (fastest first):
   --blast        Parallel broadcast to ALL idle workers, no preamble. Max speed.
   --parallel     Parallel broadcast to ALL workers with steering preamble.
   --smart        Auto-route to best idle worker(s). Use --n for multiple.
+  --moa          Mixture of Agents: same task to N workers with different personas,
+                 collect responses, synthesize. Use --moa-n (default 3).
   --worker NAME  Target specific identity (worker, orchestrator, consultant).
   --idle         Dispatch to first available idle worker.
   --all          Sequential broadcast (legacy, slower).
@@ -2334,13 +2355,17 @@ Examples:
     parser.add_argument("--batch", type=str, help="JSON file with worker->[task list] mapping (consolidates same-worker tasks)")
     parser.add_argument("--delay", type=float, default=2.0, help="Delay between dispatches for sequential modes (seconds)")
     parser.add_argument("--idle", action="store_true", help="Dispatch task to first idle worker")
+    parser.add_argument("--moa", action="store_true", help="Mixture of Agents: dispatch to N workers with different personas, collect+synthesize")
+    parser.add_argument("--moa-n", type=int, default=3, help="Number of MoA workers/personas (1-4, default 3)")
     parser.add_argument("--exclude", type=str, help="Comma-separated worker names to exclude")
     parser.add_argument("--bus-status", action="store_true", help="Poll bus and print recent messages + worker statuses")
     parser.add_argument("--open-project", type=str, help="Open a project dir in VS Code Insiders with its venv")
     parser.add_argument("--state", type=str, help="Get UIA state of a specific worker (e.g. --state gamma)")
     parser.add_argument("--state-all", action="store_true", help="Get UIA state of ALL workers (parallel scan)")
+    parser.add_argument("--debate", action="store_true", help="Run task through Red Team/Blue Team adversarial debate")
+    parser.add_argument("--debate-rounds", type=int, default=3, help="Number of debate rounds (default 3)")
     parser.add_argument("--wait-result", type=str, help="After dispatch, wait for bus result matching this key")
-    parser.add_argument("--timeout", type=float, default=90, help="Timeout for --wait-result (default 90s)")
+    parser.add_argument("--timeout", type=float, default=90, help="Timeout for --wait-result (default 90s)")  # signed: beta
     args = parser.parse_args()
 
     workers = load_workers()
