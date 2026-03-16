@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	_ "net/http/pprof" // P1.06: profiling endpoints on :6060 — signed: alpha
 	"os"
 	"os/signal"
 	"syscall"
@@ -55,8 +56,17 @@ func main() {
 	// Startup thoughts
 	srv.addThought("system", "SKYNET v2 ONLINE — all workers spawned")
 	srv.addThought("system", fmt.Sprintf("Bus capacity: %d | Workers: %d | Port: %d", ringSize, len(workers), cfg.Port))
+	// P1.06: pprof profiling on localhost-only debug port — signed: alpha
+	go func() {
+		log.Println("[pprof] Debug endpoints on http://127.0.0.1:6060/debug/pprof/")
+		if err := http.ListenAndServe("127.0.0.1:6060", nil); err != nil {
+			log.Printf("[pprof] Failed to start: %v", err)
+		}
+	}()
+
 	httpServer := &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.Port),
+		// P1.08: Bind to localhost only — blocks external network access — signed: alpha
+		Addr:         fmt.Sprintf("127.0.0.1:%d", cfg.Port),
 		Handler:      srv.Handler(),
 		ReadTimeout: 5 * time.Second,
 		// WriteTimeout must be 0 for SSE/stream endpoints (long-lived connections).
@@ -66,7 +76,7 @@ func main() {
 
 	// Start server
 	go func() {
-		log.Printf("[http] Listening on :%d", cfg.Port)
+		log.Printf("[http] Listening on 127.0.0.1:%d", cfg.Port)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[http] Fatal: %v", err)
 		}

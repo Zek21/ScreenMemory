@@ -144,7 +144,7 @@ MAX_LOG_SIZE = 1_000_000  # 1MB -- rotate log file to prevent unbounded growth  
 
 def log(msg: str, level: str = "INFO"):
     ts = datetime.now().strftime("%H:%M:%S")
-    prefix = {"INFO": "[INFO]", "OK": "[OK]  ", "WARN": "[WARN]", "ERR": "[ERR] ", "CRIT": "[CRIT]", "FIX": "[FIX] "}.get(level, "     ")
+    prefix = {"INFO": "[INFO]", "OK": "[OK]  ", "WARN": "[WARN]", "ERR": "[ERR] ", "CRIT": "[CRIT]", "FIX": "[FIX] ", "DEBUG": "[DBG] "}.get(level, "     ")  # signed: beta
     line = f"[{ts}] {prefix} {msg}"
     try:
         print(line, flush=True)
@@ -156,13 +156,13 @@ def log(msg: str, level: str = "INFO"):
         if LOG_FILE.exists() and LOG_FILE.stat().st_size > MAX_LOG_SIZE:
             content = LOG_FILE.read_text(encoding="utf-8", errors="replace")
             LOG_FILE.write_text(content[-500_000:], encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[DBG] Log rotation failed: {e}")  # signed: beta
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {prefix} {msg}\n")
-    except Exception:
-        pass  # signed: alpha
+    except Exception as e:
+        print(f"[DBG] Log write failed: {e}")  # signed: beta
 
 
 def load_workers():
@@ -226,8 +226,8 @@ def _is_dispatch_active() -> bool:
                 lock_time = _dt.fromisoformat(ts)
                 age = (_dt.now() - lock_time).total_seconds()
                 return age < 15  # dispatch lock valid for 15 seconds
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"Dispatch lock check failed: {e}", "DEBUG")  # signed: beta
     return False
 
 
@@ -245,8 +245,8 @@ def _is_boot_in_progress() -> bool:
             if boot_age < BOOT_GRACE_PERIOD:
                 return True
             # Stale lock — boot probably crashed; ignore it
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"Boot lock check failed: {e}", "DEBUG")  # signed: beta
     return False
 
 
@@ -270,8 +270,8 @@ def _try_refresh_hwnd(name: str, current_hwnd: int) -> int | None:
                 if new_hwnd != current_hwnd:
                     return new_hwnd
                 return None
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"HWND refresh failed for {name}: {e}", "DEBUG")  # signed: beta
     return None
     # signed: delta
 
@@ -474,8 +474,8 @@ def _check_worker_model(name: str, hwnd: int, h: dict, check_model: bool) -> boo
         uia_scan = get_engine().scan(hwnd)
         if uia_scan.agent_ok and not is_agent_cli(agent_name):
             log(f"{name.upper()}: UIA says agent_ok=True for '{agent_name}' but is_agent_cli() disagrees -- possible label mismatch", "WARN")
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"{name.upper()}: UIA agent cross-check failed: {e}", "DEBUG")  # signed: beta
 
     if not model_ok:
         issues = []
@@ -607,15 +607,15 @@ def _collect_intelligence_metrics() -> dict:
         with urllib.request.urlopen(req, timeout=5) as r:
             msgs = json.loads(r.read())
             knowledge_count = len(msgs) if isinstance(msgs, list) else 0
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"Knowledge bus query failed: {e}", "DEBUG")  # signed: beta
     try:
         req = urllib.request.Request(f"{SKYNET_URL}/bus/messages?topic=convene&limit=100")
         with urllib.request.urlopen(req, timeout=5) as r:
             msgs = json.loads(r.read())
             active_convenes = sum(1 for m in msgs if isinstance(m, dict) and m.get("type") == "request") if isinstance(msgs, list) else 0
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"Convene bus query failed: {e}", "DEBUG")  # signed: beta
     return {
         "knowledge_messages": knowledge_count,
         "active_convenes": active_convenes,
@@ -633,8 +633,8 @@ def _get_worker_state(hwnd: int) -> str:
     try:
         from tools.uia_engine import get_engine
         return get_engine().get_state(hwnd)
-    except Exception:
-        return "UNKNOWN"
+    except Exception as e:
+        log(f"UIA state query failed for HWND {hwnd}: {e}", "DEBUG")  # signed: beta
 
 
 def _cancel_generation(hwnd: int) -> bool:
@@ -745,7 +745,8 @@ def _cleanup_stale_workers():
             return
         data = json.loads(WORKERS_FILE.read_text(encoding="utf-8"))
         current_names = {w.get("name") for w in data.get("workers", []) if w.get("name")}
-    except Exception:
+    except Exception as e:
+        log(f"Workers.json read for cleanup failed: {e}", "DEBUG")  # signed: beta
         return
 
     for tracking_dict in (_worker_productivity, _idle_since, _idle_unproductive_last, _dead_consecutive, _last_alert):
@@ -778,15 +779,15 @@ def _get_pending_work_count() -> int:
             data = json.loads(TODOS_FILE.read_text(encoding="utf-8"))
             items = data.get("todos", [])
             count += sum(1 for t in items if t.get("status") in ("pending", "active"))
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"TODO file read failed: {e}", "DEBUG")  # signed: beta
     try:
         if TASK_QUEUE_FILE.exists():
             data = json.loads(TASK_QUEUE_FILE.read_text(encoding="utf-8"))
             tasks = data.get("tasks", [])
             count += sum(1 for t in tasks if t.get("status") not in ("done", "failed", "cancelled"))
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"Task queue file read failed: {e}", "DEBUG")  # signed: beta
     return count
 
 
@@ -801,8 +802,8 @@ def _get_pending_work_signature() -> str:
                 if todo.get("status") in ("pending", "active"):
                     ident = todo.get("id") or todo.get("task") or todo.get("title") or "todo"
                     items.append(f"todo:{str(ident)[:160]}")
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"TODO signature read failed: {e}", "DEBUG")  # signed: beta
     try:
         if TASK_QUEUE_FILE.exists():
             data = json.loads(TASK_QUEUE_FILE.read_text(encoding="utf-8"))
@@ -811,8 +812,8 @@ def _get_pending_work_signature() -> str:
                 if task.get("status") not in ("done", "failed", "cancelled"):
                     ident = task.get("id") or task.get("task") or task.get("title") or task.get("summary") or "task"
                     items.append(f"queue:{str(ident)[:160]}")
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"Task queue signature read failed: {e}", "DEBUG")  # signed: beta
     encoded = json.dumps(sorted(items), ensure_ascii=True).encode("utf-8")
     return hashlib.md5(encoded).hexdigest()[:12]
 
@@ -840,8 +841,8 @@ def _check_idle_unproductive(
     if alive and hwnd:
         try:
             state = _get_worker_state(hwnd)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"Worker state check failed for {name}: {e}", "DEBUG")  # signed: beta
 
     if state == "IDLE":
         if name not in _idle_since:
@@ -914,10 +915,10 @@ def _update_result_counts(now: float):
                         _worker_productivity[sender]["tasks_completed"] += 1
                         _worker_productivity[sender]["results_this_hour"] += 1
                         _worker_productivity[sender]["last_result_time"] = now
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                except Exception as e:
+                    log(f"Productivity timestamp parse failed for {sender}: {e}", "DEBUG")  # signed: beta
+    except Exception as e:
+        log(f"Productivity bus scan failed: {e}", "DEBUG")  # signed: beta
 
 
 def _track_productivity(workers: list, health: dict):
@@ -1004,8 +1005,8 @@ def _try_restart_daemon(daemon_name: str, pid_file: Path, script_path: Path, now
                     import os
                     os.kill(pid, 0)
                     return True
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as e:
+            log(f"PID alive check failed for {daemon_name}: {e}", "DEBUG")  # signed: beta
         return False  # signed: beta
 
     # Double-check: sleep 2s then re-check PID (daemon may be starting)
@@ -1078,8 +1079,8 @@ def _auto_restart_stale_daemons():
                     import os
                     os.kill(pid, 0)
                     return True
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as e:
+            log(f"SSE PID alive check failed: {e}", "DEBUG")  # signed: beta
         # Secondary check: SSE daemon heartbeat file  # signed: beta
         hb_file = DATA_DIR / "sse_daemon_heartbeat.json"
         try:
@@ -1088,8 +1089,8 @@ def _auto_restart_stale_daemons():
                 age = time.time() - hb.get("epoch", 0)
                 if age < 30:  # heartbeat within last 30s = alive
                     return True
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"SSE heartbeat check failed: {e}", "DEBUG")  # signed: beta
         return False  # signed: alpha (removed duplicate return)
 
     sse_alive = _sse_pid_alive()
@@ -1153,7 +1154,8 @@ def _read_state_timestamp_age(path: Path, *keys: str) -> tuple[object | None, fl
     """Read a JSON timestamp field and return (raw_value, age_seconds)."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        log(f"State file read failed for {path}: {e}", "DEBUG")  # signed: beta
         return None, None
 
     raw_value = None
@@ -1177,7 +1179,8 @@ def _read_state_timestamp_age(path: Path, *keys: str) -> tuple[object | None, fl
         else:
             age = time.time() - float(raw_value)
         return raw_value, max(age, 0.0)
-    except Exception:
+    except Exception as e:
+        log(f"Timestamp parse failed for {path}: {e}", "DEBUG")  # signed: beta
         return raw_value, None
 
 
@@ -1244,8 +1247,8 @@ def main():
     signal.signal(signal.SIGTERM, _sigterm_handler)
     try:
         signal.signal(signal.SIGBREAK, _sigterm_handler)  # Windows Ctrl+Break
-    except (AttributeError, OSError):
-        pass  # SIGBREAK only on Windows  # signed: alpha
+    except (AttributeError, OSError) as e:
+        log(f"SIGBREAK handler not available (expected on non-Windows): {e}", "DEBUG")  # signed: beta
 
     try:
         _run_monitor(args)

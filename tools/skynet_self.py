@@ -218,7 +218,7 @@ class SkynetIdentity:
                     hwnd = w.get("hwnd", 0)
                     if not hwnd:
                         gaps.append({"entity": name, "type": "worker", "gap": "hwnd_is_zero"})
-                    elif hwnd:
+                    else:  # signed: gamma — elif hwnd was always true here (redundant)
                         try:
                             import ctypes
                             if not ctypes.windll.user32.IsWindow(int(hwnd)):
@@ -276,7 +276,7 @@ class SkynetIdentity:
                 if not hwnd:
                     gaps.append({"entity": "orchestrator", "type": "orchestrator",
                                  "gap": "hwnd_is_zero"})
-                elif hwnd:
+                else:  # signed: gamma — elif hwnd was always true here (redundant)
                     try:
                         import ctypes
                         if not ctypes.windll.user32.IsWindow(hwnd):
@@ -1215,7 +1215,7 @@ class SkynetSelf:
         atomic_write_json(history_file, history)
 
         # Determine trend from last 5 readings
-        recent = [h["iq"] for h in history[-6:-1]] if len(history) > 1 else []
+        recent = [h["iq"] for h in history[-5:]] if len(history) > 1 else []  # signed: gamma — fix off-by-one: [-6:-1] excluded latest reading
         if len(recent) < 2:
             return "stable"
 

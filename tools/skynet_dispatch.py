@@ -144,6 +144,13 @@ NO_STEERING_PREAMBLE = (
 
 DISPATCH_LOG = DATA_DIR / "dispatch_log.json"
 
+# ── Tuning Constants ────────────────────────────────────────────────────────
+# signed: gamma
+DISPATCH_LOG_MAX_ENTRIES = 200        # max entries kept in dispatch_log.json
+DELIVERY_VERIFY_CONSECUTIVE_UNKNOWN_LIMIT = 3  # UIA UNKNOWN readings before FAILED
+DELIVERY_RETRY_MAX = 2                # max auto-retries on unverified delivery
+DELIVERY_RETRY_BACKOFF_BASE = 2.0     # seconds; exponential: 2s, 4s, ...
+
 # Self-dispatch identity: set via env var SKYNET_WORKER_NAME or marker file
 _SELF_WORKER_NAME = os.environ.get("SKYNET_WORKER_NAME", "")
 
@@ -179,8 +186,8 @@ def _log_dispatch(worker_name, task, state, success, target_hwnd=0):
                 "strategy": os.environ.get("SKYNET_STRATEGY", "direct"),
                 "strategy_id": os.environ.get("SKYNET_STRATEGY_ID", ""),
             })
-            if len(log_data) > 200:
-                log_data = log_data[-200:]
+            if len(log_data) > DISPATCH_LOG_MAX_ENTRIES:  # signed: gamma
+                log_data = log_data[-DISPATCH_LOG_MAX_ENTRIES:]
             return log_data
         atomic_update_json(DISPATCH_LOG, _append_entry, default=[])
     except Exception as e:
@@ -686,12 +693,24 @@ def clear_steering_and_send(hwnd, task, orch_hwnd):
 
 
 def log(msg, level="INFO"):
+    """Print a timestamped, color-coded log message to stdout.
+
+    Args:
+        msg: Message text to log.
+        level: One of INFO, OK, WARN, ERR, SYS (controls prefix emoji).
+    """  # signed: gamma
     ts = datetime.now().strftime("%H:%M:%S")
     prefix = {"INFO": "🔵", "OK": "🟢", "WARN": "🟡", "ERR": "🔴", "SYS": "⚡"}.get(level, "  ")
     print(f"[{ts}] {prefix} {msg}", flush=True)
 
 
 def load_workers():
+    """Load the worker registry from data/workers.json.
+
+    Returns:
+        list[dict]: List of worker dicts with keys: name, hwnd, model, etc.
+                    Empty list if file is missing or unparseable.
+    """  # signed: gamma
     if not WORKERS_FILE.exists():
         log("No workers.json", "ERR")
         return []
@@ -704,6 +723,11 @@ def load_workers():
 
 
 def load_orch_hwnd():
+    """Load the orchestrator window HWND from data/orchestrator.json.
+
+    Returns:
+        int or None: The orchestrator HWND, or None if unavailable.
+    """  # signed: gamma
     if ORCH_FILE.exists():
         try:
             data = json.loads(ORCH_FILE.read_text(encoding="utf-8"))
@@ -1490,10 +1514,8 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
         verified = _verify_delivery(hwnd, worker_name, pre_state)
         if not verified and pre_state == "IDLE":
             # Auto-retry with exponential backoff  # signed: beta
-            MAX_RETRIES = 2
-            BACKOFF_BASE = 2.0  # seconds: 2s, 4s, 8s
-            for attempt in range(2, MAX_RETRIES + 2):  # attempts 2 and 3
-                delay = BACKOFF_BASE * (2 ** (attempt - 2))  # 2s, 4s
+            for attempt in range(2, DELIVERY_RETRY_MAX + 2):  # signed: gamma — use named constant
+                delay = DELIVERY_RETRY_BACKOFF_BASE * (2 ** (attempt - 2))
                 log(f"[RETRY] {worker_name.upper()} attempt {attempt}/3 -- delivery unverified, retrying in {delay:.0f}s (exp backoff)", "WARN")
                 time.sleep(delay)
                 # Re-check state before retry -- abort if worker moved on its own
@@ -1573,7 +1595,7 @@ def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
                 post_state = engine.get_state(hwnd)
                 if post_state == "UNKNOWN":
                     consecutive_unknown += 1
-                    if consecutive_unknown >= 3:  # signed: alpha
+                    if consecutive_unknown >= DELIVERY_VERIFY_CONSECUTIVE_UNKNOWN_LIMIT:  # signed: gamma
                         log(f"✗ {worker_name.upper()} delivery FAILED: {consecutive_unknown} consecutive UNKNOWN states (UIA broken)", "WARN")
                         return False
                 else:
@@ -1583,7 +1605,7 @@ def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
                     return True
             except Exception:
                 consecutive_unknown += 1  # exceptions also count as UNKNOWN  # signed: alpha
-                if consecutive_unknown >= 3:
+                if consecutive_unknown >= DELIVERY_VERIFY_CONSECUTIVE_UNKNOWN_LIMIT:  # signed: gamma
                     log(f"✗ {worker_name.upper()} delivery FAILED: {consecutive_unknown} consecutive UIA exceptions", "WARN")
                     return False
         # State didn't change — with HardwareEnter the text was likely submitted and
@@ -1654,7 +1676,7 @@ def notify_backend_dispatch(worker_name, task, success=True):
                 "priority": 1,
             }).encode('utf-8')
             req = urllib.request.Request(
-                f"http://localhost:{SKYNET_PORT}/directive",
+                f"http://localhost:8420/directive",  # signed: gamma
                 data=payload,
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -2232,12 +2254,12 @@ def _handle_open_project(project):
     settings_path = os.path.join(vscode_dir, "settings.json")
     settings = {}
     if os.path.exists(settings_path):
-        with open(settings_path) as f:
+        with open(settings_path, encoding="utf-8") as f:  # signed: gamma
             try: settings = json.load(f)
             except (json.JSONDecodeError, ValueError): settings = {}
     if venv_py:
         settings["python.defaultInterpreterPath"] = venv_py.replace("\\", "/")
-        with open(settings_path, "w") as f:
+        with open(settings_path, "w", encoding="utf-8") as f:  # signed: gamma
             json.dump(settings, f, indent=2)
         log(f"Set python.defaultInterpreterPath -> {venv_py}", "OK")
     else:
@@ -2257,13 +2279,13 @@ def _execute_dispatch_mode(args, workers, orch_hwnd):
         log(f"Smart-dispatched to: {routed}", "OK" if routed else "ERR")
         return routed
     if args.fan_out_parallel:
-        with open(args.fan_out_parallel) as f:
+        with open(args.fan_out_parallel, encoding="utf-8") as f:  # signed: gamma
             return dispatch_parallel(json.load(f), workers, orch_hwnd)
     if args.batch:
-        with open(args.batch) as f:
+        with open(args.batch, encoding="utf-8") as f:  # signed: gamma
             return batch_dispatch(json.load(f), workers, orch_hwnd)
     if args.fan_out:
-        with open(args.fan_out) as f:
+        with open(args.fan_out, encoding="utf-8") as f:  # signed: gamma
             return fan_out(json.load(f), workers, orch_hwnd, args.delay)
     if args.idle and args.task:
         exclude = [x.strip() for x in args.exclude.split(",")] if args.exclude else []

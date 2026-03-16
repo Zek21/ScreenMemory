@@ -21,7 +21,9 @@
 10. [Startup Sequence](#10-startup-sequence)
 11. [Failure Cascades](#11-failure-cascades)
 12. [Configuration](#12-configuration)
-13. [Related Files](#13-related-files)
+13. [Additional Daemons (Level 3.5)](#13-additional-daemons-added-in-level-35)
+14. [Updated Criticality Matrix (Level 3.5)](#14-updated-criticality-matrix-level-35)
+15. [Related Files](#15-related-files)
 
 ---
 
@@ -835,11 +837,213 @@ All daemon-tunable parameters in `data/brain_config.json`:
 | `processing_long_s` | 900 | Seconds before critical stuck alert |
 | `alert_dedup_window_s` | 300 | Minimum gap between duplicate stuck alerts |
 
+## 13. Additional Daemons (Added in Level 3.5)
+<!-- signed: delta -->
+
+The following 11 daemons were added post-Sprint 2 and documented during the
+Level 3.5 cross-validation refresh.
+
+### 13.1 skynet_bus_watcher.py — Bus Auto-Router
+
+| Property | Value |
+|----------|-------|
+| **Script** | `tools/skynet_bus_watcher.py` |
+| **PID File** | `data/bus_watcher.pid` |
+| **Port** | — (polls 8420) |
+| **Criticality** | 🟡 MEDIUM |
+| **Signal Handlers** | ❌ (KeyboardInterrupt only) |
+
+Background daemon for orchestrator total bus awareness. Polls the message bus,
+tracks worker activity, auto-routes pending requests to idle workers, and
+maintains a rolling activity log.
+
+### 13.2 skynet_idle_monitor.py — Extended Idle Detection
+
+| Property | Value |
+|----------|-------|
+| **Script** | `tools/skynet_idle_monitor.py` |
+| **PID File** | `data/idle_monitor.pid` |
+| **Port** | — (UIA engine) |
+| **Criticality** | 🟡 MEDIUM |
+| **Signal Handlers** | ❌ |
+
+Monitors worker states every 30s via UIA engine. Detects workers idle for
+extended periods (12+ hours) and auto-redispatches them with self-invoke
+tasks including full capability preamble.
+
+### 13.3 skynet_ws_monitor.py — WebSocket Event Listener
+
+| Property | Value |
+|----------|-------|
+| **Script** | `tools/skynet_ws_monitor.py` |
+| **PID File** | `data/ws_monitor.pid` |
+| **Port** | — (connects to ws://localhost:8420/ws) |
+| **Criticality** | 🟡 MEDIUM |
+| **Signal Handlers** | ❌ |
+
+Real-time WebSocket event listener. Connects to the Go backend's `/ws`
+endpoint and receives security alerts, bus events, and system notifications.
+Logs events to `data/ws_events.log`.
+
+### 13.4 skynet_worker_autonomy.py — Improvement Generator
+
+| Property | Value |
+|----------|-------|
+| **Script** | `tools/skynet_worker_autonomy.py` |
+| **PID File** | `data/worker_autonomy.pid` |
+| **Port** | — (bus interaction) |
+| **Criticality** | 🟢 LOW |
+| **Signal Handlers** | ❌ |
+
+Auto-generates improvement tasks for idle workers. When workers have no
+pending work and the bus has no tasks, generates improvement proposals
+and dispatches them as directives. Tracks activity in `data/autonomy_log.json`.
+Supports `--daemon` flag for continuous 60s loop.
+
+### 13.5 skynet_orch_poller.py — Orchestrator Queue
+
+| Property | Value |
+|----------|-------|
+| **Script** | `tools/skynet_orch_poller.py` |
+| **PID File** | `data/orch_poller.pid` |
+| **Port** | — (bus interaction) |
+| **Criticality** | 🟡 MEDIUM |
+| **Signal Handlers** | ❌ (KeyboardInterrupt cleanup) |
+
+Polls the bus for messages addressed to the orchestrator (`topic=orchestrator`,
+`type=directive` or `type=task`) and queues them in `data/orch_queue.json`.
+The self-prompt daemon reads this queue and types pending directives into the
+orchestrator window.
+
+### 13.6 skynet_bus_worker.py — Per-Worker Bus Delivery
+
+| Property | Value |
+|----------|-------|
+| **Script** | `tools/skynet_bus_worker.py` |
+| **PID File** | `data/bus_worker_{name}.pid` (runtime) |
+| **Port** | — (polls 8420) |
+| **Criticality** | 🟢 LOW |
+| **Signal Handlers** | ❌ |
+
+Bus-based task delivery alternative to cross-window keyboard injection.
+Each worker instance polls the bus every 3s for `topic=worker_{name} type=task`
+messages and types received tasks into the worker's VS Code chat window.
+
+### 13.7 skynet_activity_feed.py — Worker Activity Extraction
+
+| Property | Value |
+|----------|-------|
+| **Script** | `tools/skynet_activity_feed.py` |
+| **PID File** | `data/activity_feed.pid` |
+| **Port** | — (posts to 8420) |
+| **Criticality** | 🟡 MEDIUM |
+| **Signal Handlers** | ✅ SIGTERM + atexit cleanup |
+
+Real-time worker activity extraction daemon. Scans all 4 worker windows every
+3s via UIA, extracts conversation content, diffs against previous snapshot,
+and posts NEW lines to the Skynet bus. Uses proper singleton enforcement with
+`_acquire_singleton()` and `atexit.register(_release_singleton)`.
+
+### 13.8 skynet_agent_telemetry.py — Telemetry HTTP Server
+
+| Property | Value |
+|----------|-------|
+| **Script** | `tools/skynet_agent_telemetry.py` |
+| **PID File** | `data/agent_telemetry.pid` |
+| **Port** | **8426** |
+| **Criticality** | 🟢 LOW |
+| **Signal Handlers** | ❌ (atexit cleanup) |
+
+Truthful live visibility for agent state: `doing` (inferred from task/transport
+state), `typing_visible` (only visible text in UIA fields), `thinking_summary`
+(explicit self-report only). Runs HTTP API server on port 8426.
+
+### 13.9 skynet_stuck_detector.py — Stuck Worker Detection
+
+| Property | Value |
+|----------|-------|
+| **Script** | `tools/skynet_stuck_detector.py` |
+| **PID File** | — |
+| **Port** | — (bus interaction) |
+| **Criticality** | 🟡 MEDIUM |
+| **Signal Handlers** | ❌ |
+
+Detects and intervenes when workers get stuck. In `--monitor` mode, polls
+worker states every 15s via UIA, tracks state history, and alerts the
+orchestrator. Philosophy: workers in PROCESSING are thinking (don't interrupt);
+only the orchestrator decides intervention. Tracks in `data/worker_stuck_history.json`.
+
+### 13.10 skynet_consultant_bridge.py — Consultant HTTP Bridge
+
+| Property | Value |
+|----------|-------|
+| **Script** | `tools/skynet_consultant_bridge.py` |
+| **PID File** | `data/consultant_bridge.pid` |
+| **Port** | **8422** (Codex) / **8425** (Gemini) |
+| **Criticality** | 🟡 MEDIUM |
+| **Signal Handlers** | ❌ (atexit cleanup) |
+
+Live presence bridge HTTP server for consultants. Supports multiple consultant
+identities via CLI args (`--id`, `--display-name`, `--model`, `--source`,
+`--state-file`). Accepts prompts into queue, heartbeats live status every 2s.
+Queue prompts can be consumed by `skynet_consultant_consumer.py`.
+
+### 13.11 skynet_worker_loop.py — Worker Autonomy Loop
+
+| Property | Value |
+|----------|-------|
+| **Script** | `tools/skynet_worker_loop.py` |
+| **PID File** | — |
+| **Port** | — (bus polling) |
+| **Criticality** | 🟢 LOW |
+| **Signal Handlers** | ❌ |
+
+Worker autonomy daemon. Each worker runs this loop to stay productive without
+orchestrator babysitting. Polls bus for tasks, checks TODOs, picks up planning
+proposals when idle. Tracks state in `data/task_queue.json`.
+
 ---
 
-## 13. Related Files
+## 14. Updated Criticality Matrix (Level 3.5)
+<!-- signed: delta -->
 
-### Daemon Source Files
+Updated to align with AGENTS.md (which has been updated more frequently):
+
+| Daemon | Criticality | Purpose |
+|--------|-------------|---------|
+| **skynet.exe** | 🔴 CATASTROPHIC | Total system data source |
+| **skynet_monitor.py** | 🔴 CRITICAL | Worker HWND + model guard |
+| **skynet_watchdog.py** | 🔴 CRITICAL | Service auto-restart |
+| **skynet_realtime.py** | 🔴 CRITICAL | SSE→realtime.json bridge |
+| **god_console.py** | 🟠 HIGH | Dashboard + engine proxy |
+| **skynet_self_prompt.py** | 🟠 HIGH | Orchestrator heartbeat |
+| **skynet_bus_relay.py** | 🟠 HIGH | Topic-based routing |
+| **skynet_overseer.py** | 🟠 HIGH | IDLE+TODO detection |
+| **skynet_learner.py** | 🟠 HIGH | Learning engine |
+| **skynet_sse_daemon.py** | 🟡 MEDIUM | Dashboard live updates |
+| **skynet_bus_persist.py** | 🟡 MEDIUM | JSONL archival |
+| **skynet_bus_watcher.py** | 🟡 MEDIUM | Bus auto-routing |
+| **skynet_ws_monitor.py** | 🟡 MEDIUM | WebSocket events |
+| **skynet_idle_monitor.py** | 🟡 MEDIUM | Extended idle detection |
+| **skynet_orch_poller.py** | 🟡 MEDIUM | Orchestrator queue |
+| **skynet_activity_feed.py** | 🟡 MEDIUM | Worker activity extraction |
+| **skynet_stuck_detector.py** | 🟡 MEDIUM | Stuck worker detection |
+| **skynet_consultant_bridge.py** | 🟡 MEDIUM | Consultant HTTP bridge |
+| **skynet_consultant_consumer.py** | 🟡 MEDIUM | Bridge queue relay |
+| **skynet_self_improve.py** | 🟠 HIGH | Self-improvement engine |
+| **convene_gate.py** | 🟢 LOW | Consensus governance |
+| **skynet_worker_autonomy.py** | 🟢 LOW | Improvement generator |
+| **skynet_agent_telemetry.py** | 🟢 LOW | Telemetry API (port 8426) |
+| **skynet_bus_worker.py** | 🟢 LOW | Per-worker bus delivery |
+| **skynet_worker_loop.py** | 🟢 LOW | Worker autonomy loop |
+| **skynet_health_report.py** | 🟢 LOW | Periodic health reports |
+
+---
+
+## 15. Related Files
+<!-- signed: delta -->
+
+### All Daemon Source Files
 
 | File | Path | Port | PID File | Purpose |
 |------|------|------|----------|---------|
@@ -856,6 +1060,17 @@ All daemon-tunable parameters in `data/brain_config.json`:
 | skynet_self_improve.py | `tools/skynet_self_improve.py` | — | `data/self_improve.pid` | Self-improvement loop |
 | skynet_consultant_consumer.py | `tools/skynet_consultant_consumer.py` | — | `data/consultant_consumer_{port}.pid` | Bridge queue→bus relay |
 | convene_gate.py | `convene_gate.py` | — | `data/convene_gate.pid` | Consensus governance middleware |
+| skynet_bus_watcher.py | `tools/skynet_bus_watcher.py` | — | `data/bus_watcher.pid` | Bus auto-routing |
+| skynet_idle_monitor.py | `tools/skynet_idle_monitor.py` | — | `data/idle_monitor.pid` | Extended idle detection (12h) |
+| skynet_ws_monitor.py | `tools/skynet_ws_monitor.py` | — | `data/ws_monitor.pid` | WebSocket event listener |
+| skynet_worker_autonomy.py | `tools/skynet_worker_autonomy.py` | — | `data/worker_autonomy.pid` | Improvement task generation |
+| skynet_orch_poller.py | `tools/skynet_orch_poller.py` | — | `data/orch_poller.pid` | Orchestrator bus poller |
+| skynet_bus_worker.py | `tools/skynet_bus_worker.py` | — | `data/bus_worker_{name}.pid` | Per-worker bus delivery |
+| skynet_activity_feed.py | `tools/skynet_activity_feed.py` | — | `data/activity_feed.pid` | Worker activity extraction |
+| skynet_agent_telemetry.py | `tools/skynet_agent_telemetry.py` | 8426 | `data/agent_telemetry.pid` | Telemetry HTTP server |
+| skynet_stuck_detector.py | `tools/skynet_stuck_detector.py` | — | — | Stuck worker detection |
+| skynet_consultant_bridge.py | `tools/skynet_consultant_bridge.py` | 8422/8425 | `data/consultant_bridge.pid` | Consultant HTTP bridge |
+| skynet_worker_loop.py | `tools/skynet_worker_loop.py` | — | — | Worker autonomy loop |
 
 ### Supporting Files
 
@@ -885,6 +1100,8 @@ All daemon-tunable parameters in `data/brain_config.json`:
 ---
 
 *Document generated by worker beta as part of Agile Sprint 1.*
+*Level 3.5 update: 11 additional daemons documented, criticality matrix refreshed — delta.*
 *All values sourced directly from daemon source files — no fabrication.*
 
 <!-- signed: beta -->
+<!-- signed: delta -->

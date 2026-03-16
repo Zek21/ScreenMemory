@@ -69,8 +69,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 SCORES_FILE = DATA_DIR / "worker_scores.json"
-_lock = threading.Lock()  # signed: beta
-BRAIN_CONFIG_FILE = DATA_DIR / "brain_config.json"
+BRAIN_CONFIG_FILE = DATA_DIR / "brain_config.json"  # signed: alpha (removed duplicate _lock)
 BUS_URL = "http://localhost:8420/bus/publish"
 SCHEMA_VERSION = 5
 
@@ -113,6 +112,7 @@ ORCHESTRATOR_ROLES = frozenset({"orchestrator"})
 CONSULTANT_ROLES = frozenset({"consultant", "gemini_consultant"})
 
 _lock = threading.Lock()  # Guards all read-modify-write cycles on SCORES_FILE  # signed: gamma
+# Note: single lock instance for thread safety (duplicate at line 72 removed) # signed: alpha
 
 
 def _empty_store() -> dict:

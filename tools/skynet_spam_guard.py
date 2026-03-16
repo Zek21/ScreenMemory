@@ -1,13 +1,3 @@
-# gamma monitor fix result posting
-def gamma_monitor_fix_result():
-    msg = {
-        'sender': 'gamma',
-        'topic': 'orchestrator',
-        'type': 'result',
-        'content': 'Monitor false DEAD alert fix complete. Monitor now always uses freshest HWND for each worker every cycle, resets dead counters and alerts immediately on HWND change, and maintains correct debounce and IsWindow logic. All changes signed: gamma. Zero-ticket compliance verified. # signed: gamma'
-    }
-    return guarded_publish(msg)
-# signed: gamma
 #!/usr/bin/env python3
 """
 skynet_spam_guard.py -- Anti-spam rate limiter for the Skynet bus.
@@ -69,7 +59,7 @@ API:
     from tools.skynet_spam_guard import SpamGuard
     guard = SpamGuard()
     result = guard.publish_guarded({
-        'sender': 'alpha', 'topic': 'orchestrator',
+        'sender': 'worker_name', 'topic': 'orchestrator',
         'type': 'result', 'content': 'task done'
     })
     # result = {'allowed': True, 'fingerprint': '...'} or
@@ -231,7 +221,7 @@ class SpamGuard:
         # 1. CONVENE gate-proposal with same issue_key within 900s
         if topic == "convene" and msg_type == "gate-proposal":
             if self.is_duplicate(fp, PATTERN_WINDOWS["convene_gate_proposal"]):
-                return "spam_convene_gate_proposal: duplicate gate-proposal within 900s"
+                return f"spam_convene_gate_proposal: duplicate gate-proposal within {PATTERN_WINDOWS['convene_gate_proposal']}s"  # signed: gamma
 
         # 2. CONVENE gate-vote duplicates (same voter+gate_id)
         if topic == "convene" and msg_type == "gate-vote":
@@ -393,7 +383,17 @@ class SpamGuard:
         # signed: alpha
 
     def _auto_penalize(self, sender: str, reason: str):
-        """Deduct SPAM_PENALTY from sender's score. Daemons are exempt."""
+        """Deduct SPAM_PENALTY from sender's score. Daemons and convene-protocol dupes exempt."""
+        # Convene-protocol duplicates are systemic, not intentional spam.
+        # Workers post gate-proposals/votes with their own sender name,
+        # so sender-based exemption doesn't catch them. Exempt by reason instead.
+        # signed: gamma
+        _EXEMPT_REASON_PREFIXES = (
+            "spam_convene_gate_proposal",
+            "spam_convene_vote_dupe",
+        )
+        if reason.startswith(_EXEMPT_REASON_PREFIXES):
+            return
         # Local fallback set — used if scoring module import fails
         _LOCAL_SYSTEM_SENDERS = {
             "monitor", "convene", "convene-gate", "convene_gate", "self_prompt",
@@ -462,7 +462,8 @@ class SpamGuard:
                 data=json.dumps(message).encode(),
                 headers={"Content-Type": "application/json"}
             )
-            urlopen(req, timeout=5)
+            resp = urlopen(req, timeout=5)
+            resp.close()  # signed: gamma — prevent FD leak
             return True
         except Exception:
             return False
@@ -575,7 +576,7 @@ def run_self_test():
     print("=== SpamGuard Self-Test ===\n")
 
     # Test 1: Fingerprinting determinism
-    msg1 = {"sender": "alpha", "topic": "test", "type": "result",
+    msg1 = {"sender": "_test_spam_sender", "topic": "test", "type": "result",
             "content": "hello world"}
     fp1 = guard.fingerprint(msg1)
     fp2 = guard.fingerprint(msg1)
@@ -583,24 +584,24 @@ def run_self_test():
     check("fingerprint length", len(fp1) == 16)
 
     # Test 2: Different messages get different fingerprints
-    msg2 = {"sender": "alpha", "topic": "test", "type": "result",
+    msg2 = {"sender": "_test_spam_sender", "topic": "test", "type": "result",
             "content": "goodbye world"}
     fp3 = guard.fingerprint(msg2)
     check("different messages != fingerprints", fp1 != fp3)
 
     # Test 3: Timestamp stripping
-    msg3a = {"sender": "alpha", "topic": "test", "type": "info",
+    msg3a = {"sender": "_test_spam_sender", "topic": "test", "type": "info",
              "content": "event at 2026-03-11T18:00:00Z"}
-    msg3b = {"sender": "alpha", "topic": "test", "type": "info",
+    msg3b = {"sender": "_test_spam_sender", "topic": "test", "type": "info",
              "content": "event at 2026-03-12T09:30:00Z"}
     check("timestamp normalization",
           guard.fingerprint(msg3a) == guard.fingerprint(msg3b))
 
     # Test 4: Gate ID normalization
-    msg4a = {"sender": "delta", "topic": "convene", "type": "gate-proposal",
-             "content": "proposal gate_123_delta test"}
-    msg4b = {"sender": "delta", "topic": "convene", "type": "gate-proposal",
-             "content": "proposal gate_456_delta test"}
+    msg4a = {"sender": "_test_delta", "topic": "convene", "type": "gate-proposal",
+             "content": "proposal gate_123__test_delta test"}
+    msg4b = {"sender": "_test_delta", "topic": "convene", "type": "gate-proposal",
+             "content": "proposal gate_456__test_delta test"}
     check("gate_id normalization",
           guard.fingerprint(msg4a) == guard.fingerprint(msg4b))
 
@@ -622,9 +623,9 @@ def run_self_test():
 
     # Test 7: Pattern -- convene gate-proposal dupe
     guard.reset()
-    gate_msg = {"sender": "delta", "topic": "convene",
+    gate_msg = {"sender": "_test_delta", "topic": "convene",
                 "type": "gate-proposal",
-                "content": "proposal gate_789_delta some issue"}
+                "content": "proposal gate_789__test_delta some issue"}
     r1 = guard.publish_guarded(gate_msg)
     check("first gate-proposal allowed", r1["allowed"])
     r2 = guard.publish_guarded(gate_msg)
@@ -634,7 +635,7 @@ def run_self_test():
 
     # Test 8: Pattern -- result dupe within 300s
     guard.reset()
-    result_msg = {"sender": "alpha", "topic": "orchestrator",
+    result_msg = {"sender": "_test_spam_sender", "topic": "orchestrator",
                   "type": "result", "content": "task done successfully"}
     r3 = guard.publish_guarded(result_msg)
     check("first result allowed", r3["allowed"])
@@ -734,16 +735,7 @@ def main():
 # ── Module-level convenience function ───────────────────────────
 # Usage: from tools.skynet_spam_guard import guarded_publish
 #        guarded_publish({"sender": "x", "topic": "y", "type": "z", "content": "..."})
-
-def delta_identity_ack():
-    """Post identity_ack to bus for delta."""
-    msg = {
-        "sender": "delta",
-        "topic": "orchestrator",
-        "type": "identity_ack",
-        "content": "SKYNET DELTA LIVE signed:delta"
-    }
-    return guarded_publish(msg)
+# signed: alpha — removed stray delta_identity_ack() (dead code, wrong module)
 
 _singleton_guard: Optional[SpamGuard] = None
 
@@ -806,7 +798,7 @@ def check_would_be_blocked(msg: dict) -> dict:
 
     Example:
         result = check_would_be_blocked({
-            'sender': 'alpha', 'topic': 'orchestrator',
+            'sender': 'worker_name', 'topic': 'orchestrator',
             'type': 'result', 'content': 'task done'
         })
         if result['would_block']:

@@ -1,10 +1,11 @@
 # Skynet Self-Awareness & Identity Architecture
 <!-- signed: delta -->
 
-> **Definitive Reference — Level 3.4**
-> Last updated by worker delta after INCIDENT 012 remediation.
+> **Definitive Reference — Level 3.5 (Sprint 2)**
+> Last updated by worker delta — cross-validation refresh 2026-03-15.
 > This document describes every identity, awareness, and scoring subsystem
 > in the Skynet multi-agent network.
+<!-- signed: delta -->
 
 ---
 
@@ -135,7 +136,7 @@ architecture knowledge of ALL entity types.
 
 ## 3. Consciousness Kernel — `tools/skynet_self.py`
 
-The consciousness kernel is a 850+ line Python module organized into 5 classes
+The consciousness kernel is a 1389-line Python module organized into 6 classes
 behind a unified `SkynetSelf` facade.
 
 ### 3.1 Constants (Lines 38–50)
@@ -158,16 +159,17 @@ CONSULTANT_BRIDGE_PORTS = {
 `CONSULTANT_NAMES` and `ALL_AGENT_NAMES` were added in Level 3.4 (INCIDENT 012
 fix) to ensure the kernel knows about every entity in the network.
 
-### 3.2 SkynetIdentity (Line 69+)
+### 3.2 SkynetIdentity (Line 122)
 
 Answers **"Who am I?"** and **"Who else exists?"**
 
 | Method | Purpose |
 |--------|---------|
-| `who_am_i()` | Returns agent name, role, model from `agent_profiles.json` |
-| `get_all_agents()` | Returns `ALL_AGENT_NAMES` list |
-| `get_worker_states()` | Reads `workers.json` for HWND + position + status |
+| `agents()` | Returns dict of all agents from `ALL_AGENT_NAMES` with status |
+| `validate_agent_completeness()` | Checks all 7 entities have valid HWNDs/state, returns issues list |
 | `get_consultant_status()` | **New in 3.4** — Reads state files, checks HWND via `ctypes.windll.user32.IsWindow()`, probes bridge `/health` HTTP endpoint |
+| `report()` | Returns full identity report dict |
+| `save()` | Persists identity state to disk |
 
 #### `get_consultant_status()` Status Taxonomy
 
@@ -179,7 +181,7 @@ Answers **"Who am I?"** and **"Who else exists?"**
 | `REGISTERED` | State file exists but both HWND and bridge are dead |
 | `ABSENT` | No state file found |
 
-### 3.3 SkynetCapabilities (Line 149+)
+### 3.3 SkynetCapabilities (Line 392)
 
 Answers **"What can I do?"** by probing 18 engines and 10 tools.
 
@@ -200,16 +202,16 @@ Answers **"What can I do?"** by probing 18 engines and 10 tools.
 | Analyzer | `core.analyzer` | `Analyzer` |
 | OCREngine | `core.ocr` | `OCREngine` |
 | Embedder | `core.embedder` | `Embedder` |
-| Database | `core.database` | `Database` |
 | HybridRetriever | `core.hybrid_retrieval` | `HybridRetriever` |
 | LanceDBStore | `core.lancedb_store` | `LanceDBStore` |
 | LearningStore | `core.learning_store` | `LearningStore` |
-| DifficultyRouter | `core.difficulty_router` | `DAAORouter` |
+| DAAORouter | `core.difficulty_router` | `DAAORouter` |
 | DAGEngine | `core.dag_engine` | `DAGEngine` |
 | ToolSynthesizer | `core.tool_synthesizer` | `ToolSynthesizer` |
 | SelfEvolution | `core.self_evolution` | `SelfEvolutionSystem` |
-| Security | `core.security` | `SecurityManager` |
+| Orchestrator | `core.orchestrator` | `Orchestrator` |
 | InputGuard | `core.input_guard` | `InputGuard` |
+| SetOfMark | `core.grounding.set_of_mark` | `SetOfMarkGrounding` |
 | ReflexionEngine | `core.cognitive.reflexion` | `ReflexionEngine` |
 | GraphOfThoughts | `core.cognitive.graph_of_thoughts` | `GraphOfThoughts` |
 | HierarchicalPlanner | `core.cognitive.planner` | `HierarchicalPlanner` |
@@ -222,33 +224,33 @@ Answers **"What can I do?"** by probing 18 engines and 10 tools.
 | CDP | `tools.chrome_bridge.cdp` |
 | Desktop | `tools.chrome_bridge.winctl` |
 | PerceptionEngine | `tools.chrome_bridge.perception` |
-| SetOfMarkGrounding | `core.grounding.set_of_mark` |
 | SkynetDispatch | `tools.skynet_dispatch` |
 | SkynetBrain | `tools.skynet_brain` |
 | SkynetConvene | `tools.skynet_convene` |
 | SkynetKnowledge | `tools.skynet_knowledge` |
+| SkynetCollective | `tools.skynet_collective` |
 | EngineMetrics | `tools.engine_metrics` |
 
-### 3.4 SkynetHealth (Line 275+)
+### 3.4 SkynetHealth (Line 518)
 
-Answers **"Is everything working?"** with 8+ health checks:
+Answers **"Is everything working?"** with 9 health checks:
 
 | Check | What it probes |
 |-------|----------------|
 | `_check_backend()` | HTTP GET `http://localhost:8420/status` |
 | `_check_workers()` | Worker count + HWND alive via `ctypes.IsWindow()` |
-| `_check_bus()` | HTTP GET `http://localhost:8420/bus/messages?limit=1` |
-| `_check_sse()` | Verifies `data/realtime.json` freshness |
-| `_check_engines()` | Delegates to `SkynetCapabilities.census()` |
-| `_check_iq()` | Reads `data/iq_history.json` for trend |
-| `_check_disk()` | `shutil.disk_usage()` on workspace root |
-| `_check_memory()` | `psutil.virtual_memory()` if available |
 | `_check_consultants()` | **New in 3.4** — probes bridge HTTP + HWND per consultant |
+| `_check_bus()` | HTTP GET `http://localhost:8420/bus/messages?limit=1` |
+| `_check_sse_daemon()` | Verifies `data/realtime.json` freshness |
+| `_check_intelligence_engines()` | Delegates to `SkynetCapabilities.census()` |
+| `_check_collective_iq()` | Reads `data/iq_history.json` for trend |
+| `_check_knowledge_base()` | Checks learning store fact count |
+| `_check_windows()` | Verifies worker window visibility and position |
 
 Health results are **cached for 15 seconds** with a threading lock using the
 double-check locking pattern to avoid redundant probes.
 
-### 3.5 SkynetIntrospection (Line 384+)
+### 3.5 SkynetIntrospection (Line 674)
 
 Answers **"How am I doing?"** through self-reflection.
 
@@ -256,8 +258,14 @@ Answers **"How am I doing?"** through self-reflection.
 |--------|---------|
 | `reflect()` | Aggregates health + capabilities + worker states into strengths/weaknesses/recommendations |
 | `_reflect_on_consultants()` | **New in 3.4** — generates consultant-specific insights |
-| `find_gaps()` | Identifies capability gaps and missing features |
-| `pattern_analysis()` | Detects recurring patterns in task outcomes |
+| `_reflect_on_backend()` | Backend connectivity analysis |
+| `_reflect_on_workers()` | Worker state analysis |
+| `_reflect_on_capabilities()` | Engine/tool availability analysis |
+| `_reflect_on_iq()` | IQ trend analysis |
+| `_reflect_on_sse()` | SSE daemon health analysis |
+| `_reflect_on_knowledge()` | Knowledge base analysis |
+| `_reflect_on_evolution()` | Self-evolution system analysis |
+| `_detect_incident_patterns()` | Detects 5 recurring failure categories from `data/incidents.json` |
 
 `reflect()` returns a dict with:
 - `strengths` — what is working well (e.g., "4/4 workers alive")
@@ -265,57 +273,74 @@ Answers **"How am I doing?"** through self-reflection.
 - `recommendations` — actionable improvement suggestions
 - `metrics` — raw numeric data (consultants_online, engines_online, etc.)
 
-### 3.6 SkynetGoals (Line 501+)
+### 3.6 SkynetGoals (Line 980)
 
 Answers **"What should I do next?"** through autonomous goal generation.
 
 | Method | Purpose |
 |--------|---------|
-| `generate_goals()` | Analyzes introspection gaps → proposes improvement goals |
-| `prioritize()` | Ranks goals by impact, feasibility, and urgency |
-| `track_progress()` | Correlates past goals with outcomes |
+| `suggest()` | Analyzes introspection gaps → proposes improvement goals with priority |
 
 Goals feed back into the orchestrator's TODO generation loop: when the TODO
-list is empty, the orchestrator calls `SkynetGoals.generate_goals()` to
+list is empty, the orchestrator calls `SkynetGoals.suggest()` to
 produce new improvement tasks.
 
-### 3.7 SkynetSelf — Unified Facade (Line 714+)
+### 3.7 SkynetSelf — Unified Facade (Line 1034)
 
-The `SkynetSelf` class composes all 5 subsystems:
+The `SkynetSelf` class composes all 6 subsystems:
 
 ```python
 class SkynetSelf:
-    def __init__(self, worker_name="orchestrator"):
-        self.identity      = SkynetIdentity(worker_name)
+    def __init__(self):
+        self.identity      = SkynetIdentity()
         self.capabilities  = SkynetCapabilities()
         self.health        = SkynetHealth()
-        self.introspection = SkynetIntrospection(worker_name)
-        self.goals         = SkynetGoals(worker_name)
+        self.introspection = SkynetIntrospection()
+        self.goals         = SkynetGoals()
 ```
 
 **Key public methods on SkynetSelf:**
 
 | Method | Returns |
 |--------|---------|
-| `quick_pulse()` | Dict with workers, consultants, engines, IQ, health status |
-| `assess()` | Full self-assessment report (calls all subsystems) |
-| `reflect()` | Introspection analysis with recommendations |
-| `save()` | Persists current state to `data/self_state.json` |
+| `full_status()` | Complete status report combining all subsystems |
+| `quick_pulse()` | Dict with workers, consultants, engines, IQ, health status, 3 awareness flags |
+| `compute_iq()` | Composite IQ score with trend tracking |
+| `broadcast_awareness()` | Broadcasts self-awareness state to bus |
 
-**IQ Computation** (Line 800+):
+**CLI Commands:**
+
+| Command | Handler |
+|---------|---------|
+| `status` | `full_status()` |
+| `identity` | `identity.report()` |
+| `capabilities` | `capabilities.census()` |
+| `health` | `health.pulse()` |
+| `introspect` | `introspection.reflect()` |
+| `goals` | `goals.suggest()` |
+| `pulse` | `quick_pulse()` |
+| `assess` | Self-assessment via `introspection.reflect()` + `_self_assessment()` |
+| `broadcast` | `broadcast_awareness()` |
+| `validate` | `identity.validate_agent_completeness()` |
+| `patterns` | `SkynetIntrospection._detect_incident_patterns()` |
+| `acknowledge-pattern` | Mark pattern as resolved (args: `pattern_name` `[reason]`) |
+| `acknowledge-all-patterns` | Bulk acknowledge all patterns |
+
+**IQ Computation** (Line 1170):
 
 The composite IQ score weights 6 metrics:
 
 | Metric | Weight | Source |
 |--------|--------|--------|
-| Workers alive ratio | 25% | `len(alive_workers) / min(5, total)` |
+| Workers alive ratio | 25% | `alive / max(total, 1)` |
 | Engines online ratio | 25% | `online_count / total_engines` |
 | Bus health (static) | 10% | Binary — bus responding or not |
 | Knowledge facts | 15% | `min(fact_count / 500, 1.0)` |
 | Uptime | 10% | `min(uptime_seconds / 86400, 1.0)` |
 | Capability ratio | 15% | `engines_online / engines_total` |
 
-Final IQ = weighted sum × 200 (scaled to 0–200 range).
+Final IQ = weighted sum of all components (range 0.0–1.0, rounded to 4 decimal places).
+Trend tracked in `data/iq_history.json` (rising/falling/stable).
 
 ---
 
@@ -328,18 +353,25 @@ Identity lives in 6 data files.  Each tracks a different facet of the network.
 **Purpose:** HWND registry for the 4 worker windows.
 
 ```json
-[
-  {
-    "name": "alpha",
-    "hwnd": 12345678,
-    "display": "Alpha",
-    "model": "Claude Opus 4.6 (fast mode)",
-    "x": 960, "y": 20, "w": 930, "h": 500,
-    "last_seen": "2026-03-12T...",
-    "updated_at": "2026-03-12T..."
-  }
-]
+{
+  "workers": [
+    {
+      "name": "alpha",
+      "hwnd": 12345678,
+      "display": "Alpha",
+      "model": "Claude Opus 4.6 (fast mode)",
+      "x": 960, "y": 20, "w": 930, "h": 500,
+      "last_seen": "2026-03-12T...",
+      "updated_at": "2026-03-12T..."
+    }
+  ],
+  "created": "2026-03-12T..."
+}
 ```
+
+**Note:** Production format wraps workers in a `{"workers": [...]}` dict.
+Code must handle both dict format (`data.get("workers", [])`) and legacy
+flat list format. See Sprint 1 CV1 bug fix (INCIDENT 010 appendix).
 
 Workers are always exactly 4: alpha, beta, gamma, delta.  Grid positions
 define the 2×2 layout on the right monitor (top row y=20, bottom row y=540).

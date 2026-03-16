@@ -1,5 +1,6 @@
 # SKYNET Intelligence Manual
-## Version 3.0 — Level 3 Production
+## Version 3.5 — Level 3.5 Sprint 2
+<!-- signed: delta -->
 
 > *"A thinking system is not its code. It is the pattern of decisions that emerges when code, context, and collaboration converge."*
 
@@ -21,6 +22,16 @@ This is the definitive manual for SKYNET — a distributed AI intelligence netwo
 10. [Health & Diagnostics](#10-health--diagnostics)
 11. [API Endpoint Reference](#11-api-endpoint-reference)
 12. [Tool Reference](#12-tool-reference)
+13. [Consultant System](#13-consultant-system)
+14. [Anti-Spam & SpamGuard](#14-anti-spam--spamguard)
+15. [Scoring System](#15-scoring-system)
+16. [Daemon Ecosystem](#16-daemon-ecosystem)
+17. [ConveneGate Governance](#17-convenegate-governance)
+18. [Real-Time Operations](#18-real-time-operations)
+19. [Dispatch-and-Wait Protocol](#19-dispatch-and-wait-protocol)
+20. [Signature Accountability](#20-signature-accountability)
+21. [Architecture Documentation Index](#21-architecture-documentation-index)
+22. [Version History](#22-version-history)
 
 ---
 
@@ -124,10 +135,10 @@ User types command in Orchestrator
            ▼
 ┌──────────────────────┐
 │   Ghost Dispatch     │    Per worker (parallel via ThreadPoolExecutor):
-│ (ghost_type_to_      │    1. UIA locate bottommost Edit control
-│  worker)             │    2. PostMessage click (no cursor movement)
-│                      │    3. Clipboard paste (thread-locked)
-│                      │    4. PostMessage Enter to submit
+│ (ghost_type_to_      │    1. UIA locate Chrome_RenderWidgetHostHWND
+│  worker)             │    2. AttachThreadInput for focus (no visible steal)
+│                      │    3. Clipboard paste via SendKeys ^V (thread-locked)
+│                      │    4. HardwareEnter via keybd_event(VK_RETURN)
 └──────────┬───────────┘
            │
      ┌─────┼─────┬─────┐
@@ -167,12 +178,14 @@ User types command in Orchestrator
 
 The dispatch system types into worker windows without moving the mouse or stealing focus:
 
-1. **UIA COM Engine** scans the worker window for Edit controls
-2. Selects the **bottommost Edit** (the chat input box, not steering cards)
-3. **PostMessage** sends `WM_LBUTTONDOWN`/`WM_LBUTTONUP` at computed client coordinates
-4. Text is placed on **clipboard** (thread-locked to prevent races)
-5. **PostMessage** sends `Ctrl+V` to paste, then `Enter` to submit
-6. Orchestrator focus is immediately restored via `SetForegroundWindow`
+1. **UIA COM Engine** scans the worker window for Edit controls (primary) or `Chrome_RenderWidgetHostHWND` (fallback)
+2. If multiple Chrome render widgets exist (multi-pane), **right-half area scoring** selects the chat pane
+3. **Clipboard verification**: SetText + GetText readback with 5 retries and exponential backoff (100-800ms)
+4. **AttachThreadInput** attaches the PowerShell thread to the target thread for cross-process focus
+5. **SendKeys ^V** pastes from clipboard, followed by 300ms delay
+6. **HardwareEnter** via `keybd_event(VK_RETURN)` submits (replaces legacy `SendKeys {ENTER}`)
+7. **Focus race prevention**: `GetForegroundWindow()` checked before/after paste; aborts with `FOCUS_STOLEN` if changed
+8. Orchestrator focus is immediately restored via `SetForegroundWindow`
 
 This is a zero-cursor, zero-focus-steal mechanism — the user never sees anything move.
 
@@ -909,5 +922,173 @@ The engine metrics system (`tools/engine_metrics.py`) uses a **3-tier honest sta
 
 ---
 
-*SKYNET v3.0 Level 3 — Production Grade Intelligence Network*
-*Manual written by Workers GAMMA & DELTA | 2026-03-10*
+## 13. Consultant System
+<!-- signed: delta -->
+
+Consultants are **co-equal advisory peers** running different AI models in separate VS Code sessions.
+
+| Consultant | Model | Bridge Port | Sender ID | Boot Script |
+|------------|-------|-------------|-----------|-------------|
+| Codex | GPT-5 Codex | 8422 | `consultant` | `CC-Start.ps1` |
+| Gemini | Gemini 3.1 Pro | 8425 | `gemini_consultant` | `GC-Start.ps1` |
+
+- Consultants communicate exclusively via the Skynet bus
+- They are NOT dispatched via `skynet_dispatch.py` — they receive prompts via bridge queue or bus
+- Consultant proposals appear on bus with `topic=planning type=proposal`
+- The orchestrator reviews and may act on proposals or file them as TODOs
+- Consultants are optional — the system runs without them
+
+**Health checks:** `GET http://localhost:8422/health` (Codex), `GET http://localhost:8425/health` (Gemini)
+
+---
+
+## 14. Anti-Spam & SpamGuard
+<!-- signed: delta -->
+
+**Dual-layer spam prevention** protects the bus from noise.
+
+### Client-Side (Python SpamGuard)
+- `guarded_publish()` from `tools.skynet_spam_guard` is the **ONLY** allowed bus publish method
+- Raw `requests.post` to `/bus/publish` is FORBIDDEN (costs −1.0 score)
+- Content fingerprinting via SHA-256 with 900s dedup window
+- Per-sender rate limiting: 5 msgs/min, 30 msgs/hour
+- Category-specific windows: DEAD alerts (120s), daemon_health (60s), knowledge (1800s)
+
+### Server-Side (Go Backend)
+- Independent fingerprint dedup: 60s window
+- Per-sender rate limiting: 10 msgs/min
+- Blocked messages return HTTP 429 with `SPAM_BLOCKED` body
+- Cleanup goroutine prunes stale entries every 5 minutes
+
+---
+
+## 15. Scoring System
+<!-- signed: delta -->
+
+Every agent has a tracked score in `data/worker_scores.json`.
+
+| Action | Points |
+|--------|--------|
+| Cross-validated task completion | +0.01 |
+| Proactive ticket clearance | +0.20 |
+| Autonomous next-ticket pull | +0.20 |
+| Bug report filed | +0.01 |
+| Bug confirmed by validator | +0.01 (filer) + 0.01 (validator) |
+| Queue reaches zero | +1.0 (orchestrator) + 1.0 (closer) |
+| Low-value refactoring (<150 lines) | −0.01 |
+| Failed validation (broken code) | −0.005 |
+| Biased self-report | −0.10 |
+| SpamGuard bypass | −1.0 |
+
+**Positive-sum principle:** The system wins when ALL agents have positive scores.
+Negative scores indicate systemic failure. The orchestrator must give achievable
+tasks to negative-score agents to help them recover.
+
+**Check scores:** `python tools/skynet_scoring.py --leaderboard`
+
+---
+
+## 16. Daemon Ecosystem
+<!-- signed: delta -->
+
+SKYNET runs **24+ background daemons** organized by criticality tier.
+
+| Tier | Daemons | Recovery Time |
+|------|---------|---------------|
+| 🔴 CRITICAL | skynet.exe, skynet_monitor, skynet_watchdog, skynet_realtime | <30s |
+| 🟠 HIGH | god_console, self_prompt, bus_relay, overseer, learner, self_improve | <5min |
+| 🟡 MEDIUM | sse_daemon, bus_persist, bus_watcher, ws_monitor, idle_monitor, orch_poller, activity_feed, stuck_detector, consultant_bridge, consultant_consumer | Next boot |
+| 🟢 LOW | worker_autonomy, agent_telemetry (port 8426), bus_worker, worker_loop, convene_gate, health_report | Manual |
+
+**Manage:** `python tools/skynet_daemon_status.py [status|start|stop|restart] [daemon_name]`
+
+See `docs/DAEMON_ARCHITECTURE.md` for the full reference (1100+ lines).
+
+---
+
+## 17. ConveneGate Governance
+<!-- signed: delta -->
+
+Workers MUST convene before sending messages to the orchestrator.
+
+1. Worker calls `ConveneGate.propose(worker, report)` instead of posting directly
+2. Proposal broadcast to `topic=convene type=gate-proposal`
+3. Other workers vote YES/NO via `ConveneGate.vote_gate(gate_id, worker, approve)`
+4. 2+ YES votes → elevated to orchestrator digest (delivered every 30 min)
+5. 2+ NO votes → rejected, never reaches orchestrator
+6. Reports tagged `urgent=True` bypass the gate
+
+**CLI:** `python convene_gate.py --propose "report" --worker alpha`
+
+---
+
+## 18. Real-Time Operations
+<!-- signed: delta -->
+
+Zero-sleep orchestrator operations via `data/realtime.json`.
+
+- `skynet_realtime.py` daemon SSE-subscribes to `/stream` (1Hz ticks)
+- Writes atomic state snapshot every second
+- Orchestrator reads local file instead of HTTP — instant, zero-network
+- Result waiting polls at 0.5s resolution (4x faster than legacy 2.0s HTTP polling)
+
+**CLI:** `python tools/orch_realtime.py [status|pending|wait|wait-all|bus|health]`
+
+---
+
+## 19. Dispatch-and-Wait Protocol
+<!-- signed: delta -->
+
+Never use `Start-Sleep` or manual polling loops. Use purpose-built tools:
+
+| Scenario | Command |
+|----------|---------|
+| Complex goal (auto) | `python tools/skynet_brain_dispatch.py "goal"` |
+| Single worker + wait | `python tools/orch_realtime.py dispatch-wait --worker NAME --task "task"` |
+| All workers + wait | `python tools/orch_realtime.py dispatch-parallel-wait --task "task"` |
+| Wait only | `python tools/orch_realtime.py wait NAME --timeout 90` |
+
+---
+
+## 20. Signature Accountability
+<!-- signed: delta -->
+
+Every code change MUST be signed: `# signed: worker_name` (Python), `<!-- signed: worker_name -->` (HTML/MD).
+
+- Unsigned changes cannot earn cross-validation credit
+- Wrong signed work costs −0.1 per verified instance
+- Bus results must include `signed:worker_name` in content
+- Verifiers must prove wrongness with specific evidence
+
+---
+
+## 21. Architecture Documentation Index
+<!-- signed: delta -->
+
+Authoritative deep-dive documents created during Sprint 2:
+
+| Document | Author | Lines | Content |
+|----------|--------|-------|---------|
+| `docs/DELIVERY_PIPELINE.md` | Alpha | 950+ | Ghost-type delivery, clipboard safety, multi-pane, focus race |
+| `docs/DAEMON_ARCHITECTURE.md` | Beta + Delta | 1100+ | All 24+ daemons, PID management, criticality, startup |
+| `docs/BUS_COMMUNICATION.md` | Gamma + Delta | 900+ | 36 endpoints, ring buffer, spam filtering, topics |
+| `docs/SELF_AWARENESS_ARCHITECTURE.md` | Delta | 900+ | Consciousness kernel, identity, health, introspection |
+
+---
+
+## 22. Version History
+<!-- signed: delta -->
+
+| Level | Codename | Key Additions |
+|-------|----------|---------------|
+| 1.0 | Genesis | Manual dispatch, single worker, basic bus |
+| 2.0 | Awakening | Self-awareness, GOD Console, collective intelligence |
+| 3.0 | Production | Watchdog, composite IQ, request logging, version tracking |
+| 3.1 | Hardening | Dispatch result tracking, fair deduction, false-DEAD debounce, anti-spam |
+| 3.5 | Sprint 2 | Delivery defense-in-depth, multi-pane Chrome, focus race prevention, arch verification, 24+ daemons documented |
+
+---
+
+*SKYNET v3.5 Level 3.5 — Sprint 2 Intelligence Network*
+*Manual written by Workers GAMMA & DELTA | Updated 2026-03-15*
+<!-- signed: delta -->

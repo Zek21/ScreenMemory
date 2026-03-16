@@ -2,26 +2,34 @@
 Reflexion Engine — Verbal Self-Critique for Learning from Failures.
 
 When an action fails, the agent generates a verbal self-critique explaining
-WHY it failed, stores it in episodic memory, and uses it to avoid repeating
-the same mistake. This replaces traditional parameter updates with
-natural language learning.
+WHY it failed, stores it in episodic memory AND the persistent LearningStore,
+and uses it to avoid repeating the same mistake. This replaces traditional
+parameter updates with natural language learning.
 
 Reference: "Reflexion: Language Agents with Verbal Reinforcement Learning"
 (Shinn et al., 2023)
+
+P1.11 Enhancement (Level 4 Upgrade Plan):
+    - LearningStore integration: reflections persist across sessions via SQLite
+    - Pre-task context injection: query past failures before starting similar tasks
+    - Side-effect analysis: when task fails goal X but achieves Y, store Y as success
 
 Workflow:
     1. Action fails (error, unexpected state, timeout)
     2. Capture: error trace + pre/post screenshots + action details
     3. Reflect: Generate verbal critique ("I failed because...")
-    4. Store: Save reflection in episodic memory with high importance
-    5. Apply: On next similar action, retrieve relevant reflections
-    6. Adapt: Modify action based on past reflections
+    4. Store: Save to episodic memory (high importance) AND LearningStore (persistent)
+    5. Analyze: Check if failure produced useful side-effects (partial success)
+    6. Apply: On next similar action, retrieve relevant reflections from BOTH stores
+    7. Adapt: Modify action based on past reflections
 
 LOG FORMAT:
     [REFLEXION] trigger    -- action "click mark 7" failed: element not found
     [REFLEXION] analyze    -- comparing pre/post states, error trace captured
     [REFLEXION] reflect    -- "Clicked wrong element. Mark 7 was a label, not a button."
     [REFLEXION] store      -- saved to episodic memory (importance=0.9)
+    [REFLEXION] persist    -- saved to LearningStore (category=reflexion)
+    [REFLEXION] side_effect -- task failed goal X but achieved Y; storing Y as success
     [REFLEXION] retrieve   -- found 2 relevant past reflections for current action
     [REFLEXION] adapt      -- adjusting action: target mark 12 instead of mark 7
 """
@@ -29,7 +37,7 @@ import time
 import json
 import logging
 from typing import List, Optional, Dict, Any, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +57,10 @@ class FailureContext:
     timestamp: float = field(default_factory=time.time)
     subtask: str = ""
     attempt_number: int = 1
+    # P1.11: additional context for side-effect analysis  # signed: delta
+    achieved_outcomes: List[str] = field(default_factory=list)
+    domain: str = ""  # e.g. "python", "go", "security", "testing"
+    files_involved: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -76,19 +88,229 @@ class ReflexionEngine:
     The agent learns from failures by generating natural language reflections
     instead of updating model parameters. These reflections are stored in
     memory and retrieved when similar situations arise.
+
+    P1.11 Enhancement: Integrates with PersistentLearningSystem for cross-session
+    persistence. Reflections survive process restarts. Pre-task context injection
+    queries LearningStore for relevant past failures. Side-effect analysis captures
+    partial successes from failed tasks.
     """
 
-    def __init__(self, memory=None, vlm_analyzer=None, max_reflections: int = 100):
+    def __init__(self, memory=None, vlm_analyzer=None, max_reflections: int = 100,
+                 learning_store=None):
         self.memory = memory
         self.vlm = vlm_analyzer
         self.max_reflections = max_reflections
         self._reflections: List[Reflection] = []
         self._counter = 0
         self._failure_patterns: Dict[str, int] = {}
+        # P1.11: persistent learning store integration  # signed: delta
+        self._learning_store = learning_store
+        self._learning_system = None
+        self._init_learning_store()
 
     def _next_id(self) -> str:
         self._counter += 1
         return f"ref_{self._counter:04d}"
+
+    # ── P1.11: LearningStore integration ──────────────────────  # signed: delta
+
+    def _init_learning_store(self):
+        """Lazy-initialize persistent learning system if not provided."""
+        if self._learning_store is not None:
+            return
+        try:
+            from core.learning_store import PersistentLearningSystem
+            self._learning_system = PersistentLearningSystem()
+            self._learning_store = self._learning_system.store
+            logger.info("[REFLEXION] LearningStore connected for persistent reflections")
+        except Exception as e:
+            logger.warning(f"[REFLEXION] LearningStore unavailable, using in-memory only: {e}")
+            self._learning_store = None
+            self._learning_system = None
+
+    def _persist_reflection(self, reflection: Reflection):
+        """Store a reflection in the persistent LearningStore (survives restarts).
+
+        Stores structured data: critique, lesson, adjustment, error type, domain,
+        and files involved — all BM25-searchable for future recall.
+        """
+        if self._learning_store is None:
+            return
+
+        try:
+            f = reflection.failure
+            # Build rich searchable content combining all reflection fields
+            content = (
+                f"FAILURE [{f.error_type}] in {f.action_type}({f.action_target}): "
+                f"{reflection.critique} "
+                f"LESSON: {reflection.lesson} "
+                f"ADJUSTMENT: {reflection.action_adjustment}"
+            )
+            if f.files_involved:
+                content += f" FILES: {', '.join(f.files_involved)}"
+
+            tags = [
+                "reflexion", f.action_type, f.error_type,
+                f"attempt_{f.attempt_number}",
+            ]
+            if f.domain:
+                tags.append(f.domain)
+            for fpath in f.files_involved:
+                tags.append(fpath.replace("\\", "/").split("/")[-1])
+
+            fact_id = self._learning_store.learn(
+                content=content,
+                category="reflexion",
+                source=f"reflexion:{reflection.id}",
+                tags=tags,
+            )
+
+            # Update expertise profile on failure domain
+            if self._learning_system and f.domain:
+                self._learning_system.expertise.update(f.domain, success=False)
+
+            logger.info(f"[REFLEXION] persist: stored as fact {fact_id} in LearningStore")
+        except Exception as e:
+            logger.warning(f"[REFLEXION] persist failed: {e}")
+
+    def get_persistent_reflections(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """Query LearningStore for past reflections matching a task description.
+
+        Returns structured dicts with content, confidence, and reinforcement count.
+        Use this BEFORE starting a task to inject failure-avoidance context.
+        """
+        if self._learning_store is None:
+            return []
+
+        try:
+            # Prefix query with reflexion category keywords for better BM25 matching
+            search_query = f"FAILURE LESSON {query}"
+            facts = self._learning_store.recall(search_query, top_k=top_k)
+
+            # Filter to reflexion category only
+            results = []
+            for fact in facts:
+                if fact.category == "reflexion":
+                    results.append({
+                        "fact_id": fact.fact_id,
+                        "content": fact.content,
+                        "confidence": fact.confidence,
+                        "reinforcement_count": fact.reinforcement_count,
+                        "tags": fact.tags,
+                        "first_learned": fact.first_learned,
+                    })
+            return results
+        except Exception as e:
+            logger.warning(f"[REFLEXION] persistent recall failed: {e}")
+            return []
+
+    def get_pre_task_context(self, task_description: str, action_type: str = "",
+                             target: str = "", top_k: int = 3) -> str:
+        """Build context string from past failures for injection into task preamble.
+
+        Combines in-memory reflections with persistent LearningStore reflections
+        to produce a compact warning block that prevents repeating past mistakes.
+        Returns empty string if no relevant reflections found.
+        """
+        warnings = []
+
+        # 1. In-memory reflections (current session)
+        in_mem = self.get_relevant_reflections(action_type, target, task_description, limit=top_k)
+        for ref in in_mem:
+            warnings.append(f"⚠ {ref.lesson} (confidence: {ref.confidence:.2f})")
+
+        # 2. Persistent reflections (cross-session)
+        persistent = self.get_persistent_reflections(task_description, top_k=top_k)
+        # Deduplicate against in-memory results by content overlap
+        in_mem_lessons = {r.lesson.lower()[:60] for r in in_mem}
+        for pfact in persistent:
+            # Extract lesson from stored content
+            content = pfact["content"]
+            lesson_start = content.find("LESSON: ")
+            if lesson_start >= 0:
+                lesson_text = content[lesson_start + 8:]
+                adj_start = lesson_text.find(" ADJUSTMENT: ")
+                if adj_start >= 0:
+                    lesson_text = lesson_text[:adj_start]
+            else:
+                lesson_text = content[:120]
+
+            # Skip if already covered by in-memory reflection
+            if lesson_text.lower()[:60] in in_mem_lessons:
+                continue
+
+            conf = pfact["confidence"]
+            warnings.append(f"⚠ [past session] {lesson_text} (confidence: {conf:.2f})")
+
+        if not warnings:
+            return ""
+
+        header = "=== PAST FAILURE WARNINGS (avoid repeating these mistakes) ==="
+        return header + "\n" + "\n".join(warnings[:top_k * 2]) + "\n"
+
+    def analyze_side_effects(self, failure: FailureContext) -> List[str]:
+        """Analyze a failed task for useful side-effects (Hindsight Experience Replay).
+
+        When a task fails its primary goal X but achieves Y as a side-effect,
+        store Y as a successful learning. This extracts value from failures.
+
+        Args:
+            failure: The failure context including achieved_outcomes list.
+
+        Returns:
+            List of fact_ids for side-effect learnings stored in LearningStore.
+        """
+        if not failure.achieved_outcomes:
+            return []
+
+        fact_ids = []
+        for outcome in failure.achieved_outcomes:
+            # Store each side-effect as a successful learning
+            logger.info(f"[REFLEXION] side_effect: task failed '{failure.expected_outcome}' "
+                        f"but achieved '{outcome}'")
+
+            # In-memory: create a positive reflection
+            side_ref = Reflection(
+                id=self._next_id(),
+                failure=failure,
+                critique=f"Task failed primary goal but achieved: {outcome}",
+                lesson=f"When attempting '{failure.action_type}' on '{failure.action_target}', "
+                       f"even if the primary goal fails, '{outcome}' can be achieved as a side-effect.",
+                action_adjustment=f"Consider targeting '{outcome}' directly if primary goal fails again",
+                confidence=0.6,
+            )
+            self._reflections.append(side_ref)
+
+            # Persistent: store as a success in LearningStore
+            if self._learning_store is not None:
+                try:
+                    tags = ["side_effect", "hindsight", failure.action_type]
+                    if failure.domain:
+                        tags.append(failure.domain)
+
+                    fid = self._learning_store.learn(
+                        content=(
+                            f"SIDE EFFECT SUCCESS: While attempting '{failure.expected_outcome}' "
+                            f"via {failure.action_type}({failure.action_target}), "
+                            f"achieved '{outcome}' as a side-effect. "
+                            f"This outcome has value and can be targeted directly."
+                        ),
+                        category="pattern",
+                        source=f"side_effect:{side_ref.id}",
+                        tags=tags,
+                    )
+                    fact_ids.append(fid)
+
+                    # Update expertise for the domain as partial success
+                    if self._learning_system and failure.domain:
+                        self._learning_system.expertise.update(failure.domain, success=True)
+
+                except Exception as e:
+                    logger.warning(f"[REFLEXION] side_effect persist failed: {e}")
+
+        return fact_ids
+
+    # ── End P1.11 additions ───────────────────────────────────  # signed: delta
 
     def on_failure(self, failure: FailureContext) -> Reflection:
         """
@@ -133,6 +355,15 @@ class ReflexionEngine:
                 source_action="reflexion",
                 importance=0.9,  # High importance for failures
             )
+
+        # P1.11: Persist to LearningStore for cross-session recall  # signed: delta
+        self._persist_reflection(reflection)
+
+        # P1.11: Analyze side-effects — extract value from failures  # signed: delta
+        if failure.achieved_outcomes:
+            side_ids = self.analyze_side_effects(failure)
+            if side_ids:
+                logger.info(f"[REFLEXION] side_effects: {len(side_ids)} stored from failure")
 
         logger.info(f"[REFLEXION] reflect: {critique[:100]}")
         logger.info(f"[REFLEXION] lesson: {lesson[:100]}")
@@ -374,9 +605,12 @@ if __name__ == "__main__":
 
     print("=== Reflexion + DynaAct Test ===\n")
 
-    # Test Reflexion
-    from core.cognitive.memory import EpisodicMemory
-    memory = EpisodicMemory()
+    # Test Reflexion (with optional LearningStore integration)
+    try:
+        from core.cognitive.memory import EpisodicMemory
+        memory = EpisodicMemory()
+    except Exception:
+        memory = None
     reflexion = ReflexionEngine(memory=memory)
 
     # Simulate failures
@@ -400,11 +634,42 @@ if __name__ == "__main__":
     ref2 = reflexion.on_failure(f2)
     print(f"Reflection 2: {ref2.critique[:100]}")
 
+    # P1.11: Test side-effect analysis  # signed: delta
+    f3 = FailureContext(
+        action_type="deploy", action_target="production",
+        expected_outcome="Service deployed successfully",
+        actual_outcome="Deploy failed due to missing config",
+        error_type="wrong_state",
+        subtask="Deploy service",
+        domain="devops",
+        achieved_outcomes=[
+            "Config validation script created",
+            "Staging environment verified healthy",
+        ],
+    )
+    ref3 = reflexion.on_failure(f3)
+    print(f"\nReflection 3 (with side-effects): {ref3.critique[:100]}")
+
+    # P1.11: Test pre-task context injection  # signed: delta
+    context = reflexion.get_pre_task_context(
+        task_description="Deploy the Python service to production",
+        action_type="deploy",
+        target="production",
+    )
+    print(f"\n--- Pre-task context injection ---")
+    print(context if context else "(no relevant warnings)")
+
     # Retrieve relevant reflections
     relevant = reflexion.get_relevant_reflections("click", "mark_", "button")
     print(f"\nRelevant reflections for 'click': {len(relevant)}")
     for r in relevant:
         print(f"  - {r.lesson}")
+
+    # P1.11: Test persistent reflections query  # signed: delta
+    persistent = reflexion.get_persistent_reflections("click element not found")
+    print(f"\nPersistent reflections from LearningStore: {len(persistent)}")
+    for p in persistent:
+        print(f"  - [{p['confidence']:.2f}] {p['content'][:100]}")
 
     # Test DynaAct
     print("\n--- DynaAct Filter ---")

@@ -85,6 +85,38 @@ type ThoughtEntry struct {
 	Time string `json:"time"`
 }
 
+// ─── Circuit Breaker ─────────────────────────────────────────────
+
+// CircuitBreaker tracks per-worker failure state.  When a worker accumulates
+// FailThreshold consecutive failures its circuit opens, blocking new tasks for
+// CooldownSec seconds before transitioning to HALF_OPEN.  A single success in
+// HALF_OPEN closes the circuit.
+// signed: beta
+type CircuitBreaker struct {
+	State            string    `json:"state"`             // "CLOSED", "CIRCUIT_OPEN", "HALF_OPEN"
+	ConsecutiveFails int       `json:"consecutive_fails"`
+	FailThreshold    int       `json:"fail_threshold"`
+	CooldownSec      int       `json:"cooldown_sec"`
+	LastFailure      time.Time `json:"last_failure,omitempty"`
+	OpenedAt         time.Time `json:"opened_at,omitempty"`
+	LastSuccess      time.Time `json:"last_success,omitempty"`
+	TotalTrips       int       `json:"total_trips"` // lifetime open count
+}
+
+// WorkerHealthResponse is returned by GET /worker/{name}/health.
+// signed: beta
+type WorkerHealthResponse struct {
+	Worker         string          `json:"worker"`
+	Healthy        bool            `json:"healthy"`
+	CircuitBreaker *CircuitBreaker `json:"circuit_breaker"`
+	Alive          bool            `json:"alive"`
+	LastHeartbeat  string          `json:"last_heartbeat"`
+	TasksCompleted int             `json:"tasks_completed"`
+	TotalErrors    int             `json:"total_errors"`
+	QueueDepth     int             `json:"queue_depth"`
+	Uptime         float64         `json:"uptime_s"`
+}
+
 // ─── Worker Views ────────────────────────────────────────────────
 
 type AgentView struct {

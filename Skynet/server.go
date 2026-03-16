@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
@@ -14,6 +15,145 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// P1.07: sync.Pool for reusable bytes.Buffer — reduces GC pressure on hot JSON paths.
+// Used in SSE stream (1Hz), bus publish (WS broadcast), security alerts, and response encoding.
+// signed: alpha
+var bufPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
+// getBuffer returns a reset buffer from the pool.
+func getBuffer() *bytes.Buffer {
+	b := bufPool.Get().(*bytes.Buffer)
+	b.Reset()
+	return b
+}
+
+// putBuffer returns a buffer to the pool. Drops oversized buffers (>64KB) to prevent pool bloat.
+func putBuffer(b *bytes.Buffer) {
+	if b.Cap() > 65536 {
+		return // let GC collect oversized buffers
+	}
+	bufPool.Put(b)
+}
+
+// writeJSON encodes v as JSON into a pooled buffer, writes to w, and returns the buffer to pool.
+// Replaces json.NewEncoder(w).Encode(v) on hot paths to reuse allocations.
+func writeJSON(w http.ResponseWriter, v any) error {
+	buf := getBuffer()
+	defer putBuffer(buf)
+	if err := json.NewEncoder(buf).Encode(v); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, err := w.Write(buf.Bytes())
+	return err
+}
+
+// marshalPooled encodes v as JSON into a pooled buffer and returns the bytes (caller must putBuffer).
+func marshalPooled(v any) (*bytes.Buffer, error) {
+	buf := getBuffer()
+	if err := json.NewEncoder(buf).Encode(v); err != nil {
+		putBuffer(buf)
+		return nil, err
+	}
+	return buf, nil
+}
+
+// ─── P1.05: Role-Based Access Control (RBAC) ────────────────────
+// Three agent roles with descending privilege: ORCHESTRATOR > WORKER > CONSULTANT.
+// Enforced by rbacMiddleware which reads X-Agent-Role header.
+// Requests without the header from localhost default to ORCHESTRATOR (backward-compat).
+// signed: alpha
+
+type AgentRole string
+
+const (
+	RoleOrchestrator AgentRole = "orchestrator"
+	RoleWorker       AgentRole = "worker"
+	RoleConsultant   AgentRole = "consultant"
+)
+
+// endpointACL maps URL path prefixes to the set of roles allowed to access them.
+// Endpoints not listed here are open to all authenticated roles (default-allow for reads).
+var endpointACL = map[string][]AgentRole{
+	// Orchestrator-only: command & control
+	"/directive":           {RoleOrchestrator},
+	"/dispatch":            {RoleOrchestrator},
+	"/cancel":              {RoleOrchestrator},
+	"/bus/clear":           {RoleOrchestrator},
+	"/orchestrate":         {RoleOrchestrator},
+	"/orchestrate/status":  {RoleOrchestrator},
+	"/orchestrate/pipeline":{RoleOrchestrator},
+	"/brain/ack":           {RoleOrchestrator},
+
+	// Orchestrator + Worker: task lifecycle
+	"/bus/tasks/claim":     {RoleOrchestrator, RoleWorker},
+	"/bus/tasks/complete":  {RoleOrchestrator, RoleWorker},
+	"/task/complete":       {RoleOrchestrator, RoleWorker},
+
+	// All roles: publish, read bus, stream, status — no entry needed (default-allow)
+}
+
+// roleFromHeader parses the X-Agent-Role header. When no header is present,
+// defaults to orchestrator for backward compatibility (existing Python tooling
+// doesn't send the header yet). When a header IS present but unrecognized,
+// returns empty string which rbacMiddleware will reject.
+func roleFromHeader(r *http.Request) AgentRole {
+	h := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Agent-Role")))
+	if h == "" {
+		return RoleOrchestrator // backward-compat: no header = full access during rollout
+	}
+	switch AgentRole(h) {
+	case RoleOrchestrator, RoleWorker, RoleConsultant:
+		return AgentRole(h)
+	}
+	return "" // explicit but unrecognized role — deny
+}
+
+// rbacMiddleware enforces endpoint-level access control based on agent role.
+func rbacMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		role := roleFromHeader(r)
+
+		// Reject unknown roles (non-localhost callers without valid header)
+		if role == "" {
+			http.Error(w, `{"error":"RBAC: unknown role, set X-Agent-Role header"}`, http.StatusForbidden)
+			return
+		}
+
+		// Check ACL for the request path — try exact match first, then prefix
+		path := r.URL.Path
+		var matchedAllowed []AgentRole
+		matchedLen := 0
+		for prefix, allowed := range endpointACL {
+			if strings.HasPrefix(path, prefix) && len(prefix) > matchedLen {
+				matchedAllowed = allowed
+				matchedLen = len(prefix)
+			}
+		}
+		if matchedLen > 0 {
+			permitted := false
+			for _, ar := range matchedAllowed {
+				if ar == role {
+					permitted = true
+					break
+				}
+			}
+			if !permitted {
+				http.Error(w,
+					fmt.Sprintf(`{"error":"RBAC: role '%s' cannot access %s"}`, role, path),
+					http.StatusForbidden)
+				return
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
 
 // SkynetServer — HTTP API and dashboard server for Skynet v2.
 type SkynetServer struct {
@@ -79,6 +219,12 @@ type SkynetServer struct {
 	// signed: gamma
 	taskTrackers []TaskTracker
 	ttMu         sync.RWMutex
+
+	// Per-worker circuit breakers — centralised view into each worker's
+	// circuit breaker state.  Populated on server init, read by
+	// GET /worker/{name}/health.
+	// signed: beta
+	workerCircuitBreakers map[string]*Worker
 }
 
 // ConveneSession represents a multi-worker coordination session.
@@ -121,6 +267,12 @@ type QueuedTask struct {
 }
 
 func NewSkynetServer(bus *MessageBus, workers []*Worker, results chan *TaskResult) *SkynetServer {
+	// Build per-worker circuit breaker lookup map -- signed: beta
+	cbMap := make(map[string]*Worker, len(workers))
+	for _, w := range workers {
+		cbMap[strings.ToLower(w.Name)] = w
+	}
+
 	return &SkynetServer{
 		bus:         bus,
 		workers:     workers,
@@ -137,6 +289,7 @@ func NewSkynetServer(bus *MessageBus, workers []*Worker, results chan *TaskResul
 		wsClients:       make(map[chan []byte]bool),
 		spamFilter:      NewSpamFilter(), // signed: delta
 		taskTrackers:    make([]TaskTracker, 0), // signed: gamma
+		workerCircuitBreakers: cbMap, // signed: beta
 	}
 }
 
@@ -181,7 +334,7 @@ func (s *SkynetServer) Handler() http.Handler {
 		}
 		http.Error(w, "Method not allowed", 405)
 	})
-	return s.rateLimitMiddleware(s.middleware(mux))
+	return s.rateLimitMiddleware(rbacMiddleware(s.middleware(mux))) // P1.05: RBAC in chain — signed: alpha
 }
 
 // ─── Middleware ───────────────────────────────────────────────────
@@ -199,7 +352,7 @@ func (s *SkynetServer) middleware(next http.Handler) http.Handler {
 		// CORS on every response
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Agent-Role") // P1.05 RBAC header
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
@@ -241,8 +394,7 @@ func (s *SkynetServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Timestamp: time.Now().Format(time.RFC3339), // signed: beta
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(payload)
+	writeJSON(w, payload) // P1.07: pooled buffer — signed: alpha
 }
 
 // ─── GET /health ─────────────────────────────────────────────────
@@ -720,6 +872,8 @@ func (s *SkynetServer) handleWorkerRoute(w http.ResponseWriter, r *http.Request)
 		s.handleWorkerHeartbeat(w, r, workerName)
 	case "status":
 		s.handleWorkerStatus(w, r, workerName)
+	case "health":
+		s.handleWorkerHealth(w, r, workerName) // signed: beta
 	case "activity":
 		if r.Method == http.MethodPost {
 			s.handleWorkerActivityPost(w, r, workerName)
@@ -727,7 +881,7 @@ func (s *SkynetServer) handleWorkerRoute(w http.ResponseWriter, r *http.Request)
 			s.handleWorkerActivityGet(w, r, workerName)
 		}
 	default:
-		http.Error(w, "unknown action, use tasks, result, heartbeat, status, or activity", http.StatusBadRequest)
+		http.Error(w, "unknown action, use tasks, result, heartbeat, status, health, or activity", http.StatusBadRequest)
 	}
 }
 
@@ -958,6 +1112,67 @@ func (s *SkynetServer) handleWorkerStatus(w http.ResponseWriter, r *http.Request
 		"running_tasks":  len(running),
 		"tasks":          append(running, pending...),
 	})
+}
+
+// ─── GET /worker/{name}/health ───────────────────────────────────
+// Returns per-worker circuit breaker state and liveness summary.
+// signed: beta
+
+func (s *SkynetServer) handleWorkerHealth(w http.ResponseWriter, r *http.Request, workerName string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "GET only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	wk, ok := s.workerCircuitBreakers[workerName]
+	if !ok {
+		http.Error(w, "worker not found: "+workerName, http.StatusNotFound)
+		return
+	}
+
+	wk.mu.RLock()
+	hbTime := wk.lastHeartbeat
+	if wk.extHBReceived {
+		hbTime = wk.lastExtHB
+	}
+	// If no heartbeat received yet, use startTime (worker just booted)
+	if hbTime.IsZero() {
+		hbTime = wk.startTime
+	}
+	cbState := wk.circuitState
+	if cbState == "" {
+		cbState = "CLOSED"
+	}
+	cb := &CircuitBreaker{
+		State:            cbState,
+		ConsecutiveFails: wk.consecutiveFails,
+		FailThreshold:    3,
+		CooldownSec:      30,
+		OpenedAt:         wk.circuitOpenedAt,
+	}
+	completed := int(wk.tasksCompleted)
+	errors := int(wk.totalErrors)
+	uptime := time.Since(wk.startTime).Seconds()
+	qd := wk.QueueDepth()
+	wk.mu.RUnlock()
+
+	alive := time.Since(hbTime) < 120*time.Second
+	healthy := alive && cbState != "CIRCUIT_OPEN"
+
+	resp := WorkerHealthResponse{
+		Worker:         workerName,
+		Healthy:        healthy,
+		CircuitBreaker: cb,
+		Alive:          alive,
+		LastHeartbeat:  hbTime.Format(time.RFC3339),
+		TasksCompleted: completed,
+		TotalErrors:    errors,
+		QueueDepth:     qd,
+		Uptime:         uptime,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // ─── POST /worker/{name}/activity ────────────────────────────────
@@ -2229,19 +2444,21 @@ func (s *SkynetServer) handleBusPublish(w http.ResponseWriter, r *http.Request) 
 		s.ttMu.Unlock()
 	}
 
-	// Broadcast to WebSocket clients
-	wsMsg, _ := json.Marshal(map[string]interface{}{
+	// Broadcast to WebSocket clients — P1.07: pooled buffer — signed: alpha
+	wsBuf, err := marshalPooled(map[string]interface{}{
 		"type": "bus_message", "sender": msg.Sender, "topic": msg.Topic,
 		"msg_type": msg.Type, "content": msg.Content,
 		"timestamp": time.Now().Format(time.RFC3339), // signed: beta
 	})
-	s.broadcastWS(wsMsg)
+	if err == nil {
+		s.broadcastWS(wsBuf.Bytes())
+		putBuffer(wsBuf)
+	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "published",
-		"sender":  msg.Sender,
-		"topic":   msg.Topic,
+	writeJSON(w, map[string]interface{}{ // P1.07: pooled buffer — signed: alpha
+		"status":    "published",
+		"sender":    msg.Sender,
+		"topic":     msg.Topic,
 		"bus_depth": s.bus.Depth(),
 	})
 }
@@ -2284,8 +2501,7 @@ func (s *SkynetServer) handleBusMessages(w http.ResponseWriter, r *http.Request)
 		msgs = filtered
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(msgs)
+	writeJSON(w, msgs) // P1.07: pooled buffer — signed: alpha
 }
 
 // ─── Embedded Dashboard ──────────────────────────────────────────
@@ -2424,8 +2640,12 @@ func (s *SkynetServer) handleSSEStream(w http.ResponseWriter, r *http.Request) {
 				"goroutines":       runtime.NumGoroutine(),
 				"timestamp":        time.Now().UnixNano(),
 			}
-			data, _ := json.Marshal(payload)
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			// P1.07: pooled buffer for 1Hz SSE — highest-frequency alloc path — signed: alpha
+			buf := getBuffer()
+			if err := json.NewEncoder(buf).Encode(payload); err == nil {
+				fmt.Fprintf(w, "data: %s\n", buf.Bytes())
+			}
+			putBuffer(buf)
 			flusher.Flush()
 		}
 	}
@@ -2448,13 +2668,16 @@ func (s *SkynetServer) logSecurityEvent(source, eventType, details string, block
 	}
 	s.secMu.Unlock()
 
-	// Broadcast to WebSocket clients
+	// Broadcast to WebSocket clients — P1.07: pooled buffer — signed: alpha
 	if blocked {
-		msg, _ := json.Marshal(map[string]interface{}{
+		secBuf, err := marshalPooled(map[string]interface{}{
 			"type": "security_alert", "event": event,
 			"timestamp": time.Now().Format(time.RFC3339), // signed: beta
 		})
-		s.broadcastWS(msg)
+		if err == nil {
+			s.broadcastWS(secBuf.Bytes())
+			putBuffer(secBuf)
+		}
 	}
 }
 

@@ -1071,3 +1071,128 @@ func TestLoadConfigDefaults(t *testing.T) {
 		t.Errorf("expected 5 default workers, got %d", len(cfg.Workers))
 	}
 }
+
+// ─── /worker/{name}/health — Per-worker circuit breaker ──────────
+// signed: beta
+
+func TestHandleWorkerHealth(t *testing.T) {
+	srv := newTestServer("alpha", "beta")
+	handler := srv.Handler()
+
+	rr := doRequest(handler, "GET", "/worker/alpha/health", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+
+	var resp WorkerHealthResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode: %v", err)
+	}
+
+	if resp.Worker != "alpha" {
+		t.Errorf("expected worker 'alpha', got '%s'", resp.Worker)
+	}
+	if resp.CircuitBreaker == nil {
+		t.Fatal("expected circuit_breaker field, got nil")
+	}
+	if resp.CircuitBreaker.State != "CLOSED" {
+		t.Errorf("expected initial state CLOSED, got '%s'", resp.CircuitBreaker.State)
+	}
+	if resp.CircuitBreaker.ConsecutiveFails != 0 {
+		t.Errorf("expected 0 consecutive fails, got %d", resp.CircuitBreaker.ConsecutiveFails)
+	}
+	if resp.CircuitBreaker.FailThreshold != 3 {
+		t.Errorf("expected fail threshold 3, got %d", resp.CircuitBreaker.FailThreshold)
+	}
+	if resp.CircuitBreaker.CooldownSec != 30 {
+		t.Errorf("expected cooldown 30, got %d", resp.CircuitBreaker.CooldownSec)
+	}
+	if !resp.Healthy {
+		t.Errorf("expected healthy=true for fresh worker")
+	}
+}
+
+func TestHandleWorkerHealthNotFound(t *testing.T) {
+	srv := newTestServer("alpha")
+	handler := srv.Handler()
+
+	rr := doRequest(handler, "GET", "/worker/nonexistent/health", nil)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rr.Code)
+	}
+}
+
+func TestHandleWorkerHealthMethodNotAllowed(t *testing.T) {
+	srv := newTestServer("alpha")
+	handler := srv.Handler()
+
+	rr := doRequest(handler, "POST", "/worker/alpha/health", nil)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", rr.Code)
+	}
+}
+
+func TestHandleWorkerHealthCircuitOpen(t *testing.T) {
+	srv := newTestServer("alpha")
+	handler := srv.Handler()
+
+	// Manually trip the circuit breaker on alpha
+	wk := srv.workerCircuitBreakers["alpha"]
+	wk.mu.Lock()
+	wk.consecutiveFails = 3
+	wk.circuitState = "CIRCUIT_OPEN"
+	wk.circuitOpenedAt = time.Now()
+	wk.mu.Unlock()
+
+	rr := doRequest(handler, "GET", "/worker/alpha/health", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+
+	var resp WorkerHealthResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode: %v", err)
+	}
+
+	if resp.CircuitBreaker.State != "CIRCUIT_OPEN" {
+		t.Errorf("expected CIRCUIT_OPEN, got '%s'", resp.CircuitBreaker.State)
+	}
+	if resp.CircuitBreaker.ConsecutiveFails != 3 {
+		t.Errorf("expected 3 consecutive fails, got %d", resp.CircuitBreaker.ConsecutiveFails)
+	}
+	if resp.Healthy {
+		t.Errorf("expected healthy=false when circuit is open")
+	}
+}
+
+func TestHandleWorkerHealthIndependence(t *testing.T) {
+	srv := newTestServer("alpha", "beta")
+	handler := srv.Handler()
+
+	// Trip alpha's circuit breaker, leave beta healthy
+	wk := srv.workerCircuitBreakers["alpha"]
+	wk.mu.Lock()
+	wk.consecutiveFails = 3
+	wk.circuitState = "CIRCUIT_OPEN"
+	wk.circuitOpenedAt = time.Now()
+	wk.mu.Unlock()
+
+	// Alpha should be unhealthy
+	rr := doRequest(handler, "GET", "/worker/alpha/health", nil)
+	var alphaResp WorkerHealthResponse
+	json.NewDecoder(rr.Body).Decode(&alphaResp)
+	if alphaResp.Healthy {
+		t.Errorf("alpha should be unhealthy with open circuit")
+	}
+
+	// Beta should still be healthy (independent breakers)
+	rr = doRequest(handler, "GET", "/worker/beta/health", nil)
+	var betaResp WorkerHealthResponse
+	json.NewDecoder(rr.Body).Decode(&betaResp)
+	if !betaResp.Healthy {
+		t.Errorf("beta should still be healthy when only alpha's circuit is open")
+	}
+	if betaResp.CircuitBreaker.State != "CLOSED" {
+		t.Errorf("beta circuit should be CLOSED, got '%s'", betaResp.CircuitBreaker.State)
+	}
+}

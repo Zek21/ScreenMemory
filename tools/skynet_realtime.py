@@ -144,7 +144,7 @@ def get_conversation_hash(hwnd):
     if not items:
         return ""
     items.sort(key=lambda x: x[0])
-    last_text = items[-1][1] if items else ""
+    last_text = items[-1][1]  # signed: gamma — items guaranteed non-empty (guarded at L144)
     import hashlib
     return hashlib.md5(last_text.encode(errors="replace")).hexdigest()[:12]
 

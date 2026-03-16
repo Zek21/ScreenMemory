@@ -683,10 +683,12 @@ class TestScoringEdgeCases(unittest.TestCase):
     def test_forced_deduction_bypasses_evidence(self):
         """force=True deductions skip evidence checks (spam_guard use case)."""
         from tools.skynet_scoring import deduct_points, verify_dispatch_evidence
-        # Even with no evidence, force=True should succeed
-        with patch("tools.skynet_scoring.verify_dispatch_evidence") as mock_verify:
+        # Use test-safe sender name to avoid polluting production scores  # signed: alpha
+        with patch("tools.skynet_scoring.verify_dispatch_evidence") as mock_verify, \
+             patch("tools.skynet_scoring._save") as mock_save, \
+             patch("tools.skynet_scoring._bus_post"):
             try:
-                result = deduct_points("alpha", "spam_violation",
+                result = deduct_points("_test_alpha", "spam_violation",
                                        "spam_guard", force=True)
                 # verify_dispatch_evidence should NOT have been called
                 mock_verify.assert_not_called()

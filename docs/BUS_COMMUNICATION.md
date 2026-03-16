@@ -23,7 +23,8 @@
 10. [Message Loss Risk Matrix](#10-message-loss-risk-matrix)
 11. [Worker State Communication](#11-worker-state-communication)
 12. [Configuration Reference](#12-configuration-reference)
-13. [Related Files](#13-related-files)
+13. [Complete HTTP Endpoint Reference](#13-complete-http-endpoint-reference)
+14. [Related Files](#14-related-files)
 
 ---
 
@@ -189,7 +190,7 @@ default:
 | `bus_dropped` | int64 | Total dropped messages (slow subscribers) |
 | `agents` | []AgentView | Worker states with heartbeat timestamps |
 | `bus` | []BusMessage | Last 10 bus messages |
-| `orch_thinking` | []string | Orchestrator thought log |
+| `orch_thinking` | []ThoughtEntry | Orchestrator thought log (each entry has `text` + `timestamp`) |
 | `tasks_dispatched` | int64 | Atomic counter — dispatched tasks |
 | `tasks_completed` | int64 | Atomic counter — completed tasks |
 | `tasks_failed` | int64 | Atomic counter — failed tasks |
@@ -283,6 +284,8 @@ While `content` is free-form, these conventions are observed:
 | `workers` | Inter-worker requests, sub-delegation | Workers | Workers |
 | `system` | Infrastructure events, boot announcements | System, orchestrator | All |
 | `consultant` | Consultant prompts and responses | Orchestrator, consultants | Consultants |
+| `directives` | Backend-routed worker directives | Go backend | Workers |
+| `dispatch` | Dispatch events and tracking | Dispatch pipeline | Orchestrator |
 | `tasks` | Task queue events (queued, claimed, completed) | Backend, workers | Orchestrator |
 | `general` | Default topic for unclassified messages | Any | Any |
 
@@ -783,7 +786,89 @@ UIA Engine COM scan        skynet_monitor.py         /status endpoint         da
 
 ---
 
-## 13. Related Files
+## 13. Complete HTTP Endpoint Reference
+<!-- signed: delta -->
+
+The Go backend (`Skynet/server.go`) registers **36 HTTP endpoints**. The sections above
+describe the core bus endpoints in detail. This section provides a comprehensive reference
+for all registered endpoints organized by category.
+
+### Core Bus Endpoints (documented above)
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/bus/publish` | POST | Publish message to bus (SpamGuard required) |
+| `/bus/messages` | GET | Read messages (`?limit=N`, `?topic=X`) |
+| `/bus/clear` | POST | Clear all messages from ring buffer |
+| `/stream` | GET | SSE stream (1Hz ticks with full state) |
+| `/ws` | GET | WebSocket upgrade for real-time bus messages |
+| `/status` | GET | Backend status + worker agent states |
+| `/health` | GET | Health check endpoint (returns endpoint list) |
+| `/metrics` | GET | Backend metrics (goroutines, memory, counters) |
+
+### Worker Management Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/worker/{name}/heartbeat` | POST | Worker heartbeat update |
+| `/worker/{name}/tasks` | GET | Task history for worker (`?limit=N`) |
+| `/worker/{name}/result` | POST | Submit task result for worker |
+| `/worker/{name}/status` | POST | Update worker status |
+| `/worker/{name}/activity` | GET | Get worker activity log |
+| `/worker/{name}/activity` | POST | Post worker activity entry |
+
+### Orchestration Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/directive` | POST | Direct worker directive (`?route=worker_name`) |
+| `/dispatch` | POST | Dispatch task to worker |
+| `/results` | GET | Get pending results |
+| `/cancel` | POST | Cancel running task |
+| `/orchestrate` | POST | Start orchestration pipeline |
+| `/orchestrate/status` | GET | Get orchestration pipeline status |
+| `/orchestrate/pipeline` | GET | Get pipeline execution details |
+
+### Task Lifecycle Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/tasks` | GET | Task lifecycle history (`?worker=X`, `?limit=N`) |
+| `/task/complete` | POST | Mark task as completed |
+
+### Brain / Intelligence Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/brain/pending` | GET | Get pending brain tasks |
+| `/brain/ack` | POST | Acknowledge brain task completion |
+
+### Dashboard / UI Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/dashboard` | GET | Serve dashboard HTML |
+| `/god_feed` | GET | GOD feed events for dashboard |
+| `/activity/stream` | GET | SSE stream for activity feed (2s interval) |
+
+### Security Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/security/audit` | GET | Security audit log |
+| `/security/blocked` | GET | Blocked security events |
+| `/ws/stats` | GET | WebSocket connection statistics |
+
+### Consultant Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/consultants` | GET | List active consultants |
+| `/consultants/prompt` | POST | Queue prompt for consultant |
+
+---
+
+## 14. Related Files
 
 ### Go Backend
 
@@ -843,5 +928,7 @@ UIA Engine COM scan        skynet_monitor.py         /status endpoint         da
 
 ---
 
-> **Document version:** 1.0 | **Generated by:** gamma (worker) | **Date:** 2026-03-12
+> **Document version:** 1.1 | **Generated by:** gamma (worker) | **Date:** 2026-03-12
+> **Level 3.5 refresh:** delta (worker) — added 22 missing endpoints, fixed orch_thinking type, added topics
 > <!-- signed: gamma -->
+> <!-- signed: delta -->

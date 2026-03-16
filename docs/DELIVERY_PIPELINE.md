@@ -1,11 +1,16 @@
 # Skynet Prompt Delivery Pipeline — Definitive Technical Reference
 
 <!-- signed: alpha -->
+<!-- Level 3.5 cross-validation refresh — signed: delta -->
 
 > **This document is the authoritative reference for understanding how Skynet delivers prompts
 > from the orchestrator to workers and consultants.** Every agent MUST read this before proposing
 > communication architecture changes. Created per Rule 0.8 (Mandatory Architecture Knowledge)
 > following INCIDENT 012.
+>
+> **Line Number Notice (Level 3.5):** `skynet_dispatch.py` grew from ~1500 to 2053 lines.
+> Key function locations updated below. Minor inline references (e.g., `L710`) may be
+> approximate — always verify with `grep -n` before citing.
 
 ---
 
@@ -197,7 +202,7 @@ an entire delivery architecture on false assumptions. The fix required:
 
 ### `dispatch_to_worker()` — Primary Entry Point
 
-**File:** `tools/skynet_dispatch.py`, **Line:** 1131
+**File:** `tools/skynet_dispatch.py`, **Line:** 1399
 
 ```python
 def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=None):
@@ -214,12 +219,12 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
 
 **Return Value:** `bool` — `True` if ghost_type reported delivery success, `False` on any failure.
 
-**Routing Logic (L1148-1152):**
-- `"orchestrator"` → `_dispatch_to_orchestrator()` (L975)
-- `"consultant"` or `"gemini_consultant"` → `_dispatch_to_consultant()` (L1008)
+**Routing Logic (L1416-1420):**
+- `"orchestrator"` → `_dispatch_to_orchestrator()` (L1243)
+- `"consultant"` or `"gemini_consultant"` → `_dispatch_to_consultant()` (L1276)
 - Any worker name → full ghost_type pipeline with verification
 
-**Self-Dispatch Guard (L1137-1141):**
+**Self-Dispatch Guard (L1405-1409):**
 ```python
 self_id = _get_self_identity()
 if self_id and self_id.lower() == worker_name.lower():
@@ -229,10 +234,10 @@ if self_id and self_id.lower() == worker_name.lower():
 
 ### `ghost_type_to_worker()` — Low-Level Delivery
 
-**File:** `tools/skynet_dispatch.py`, **Line:** 948
+**File:** `tools/skynet_dispatch.py`, **Line:** 1176
 
 ```python
-def ghost_type_to_worker(hwnd, text, orch_hwnd):
+def ghost_type_to_worker(hwnd, text, orch_hwnd, render_hwnd=None):
 ```
 
 **Parameters:**
@@ -241,14 +246,16 @@ def ghost_type_to_worker(hwnd, text, orch_hwnd):
 | `hwnd` | `int` | Target window HWND (worker or consultant) |
 | `text` | `str` | Full text to deliver (already includes preamble if applicable) |
 | `orch_hwnd` | `int` | Orchestrator HWND for focus restore after paste |
+| `render_hwnd` | `int\|None` | Optional pre-resolved Chrome render widget HWND (fast-path: skips UIA Edit search entirely) |
 
 **Return Value:** `bool` — `True` if the PowerShell script exited with code 0 and stdout contains `OK_*`.
 
 **Internal Flow:**
-1. Validate `hwnd` via `user32.IsWindow(hwnd)` (L958)
-2. Write text to `data/.dispatch_tmp_{hwnd}.txt` with newlines replaced by spaces (L964-966)
-3. Build PowerShell script via `_build_ghost_type_ps()` (L971)
-4. Execute via `_execute_ghost_dispatch()` (L972)
+1. Validate `hwnd` via `user32.IsWindow(hwnd)` (L1186)
+2. Truncate text if > `MAX_DISPATCH_LENGTH` (12000 chars) (L1190)
+3. Write text to `data/.dispatch_tmp_{hwnd}.txt` with newlines replaced by spaces (L1196-1200)
+4. Build PowerShell script via `_build_ghost_type_ps()` (L1204)
+5. Execute via `_execute_ghost_dispatch()` (L1205)
 
 ---
 
@@ -256,7 +263,7 @@ def ghost_type_to_worker(hwnd, text, orch_hwnd):
 
 ### `_build_ghost_type_ps()` — PowerShell Script Generator
 
-**File:** `tools/skynet_dispatch.py`, **Line:** 704
+**File:** `tools/skynet_dispatch.py`, **Line:** 717
 
 This function generates an inline PowerShell script containing a C# class (`GhostType`) with
 Win32 P/Invoke methods. The script is executed as a single `powershell -NoProfile -Command`
@@ -276,7 +283,19 @@ The embedded C# class provides these Win32 functions:
 | `AttachThreadInput(id1,id2,f)` | `user32.dll` | Attach thread input queues for cross-thread focus |
 | `SetFocus(h)` | `user32.dll` | Set keyboard focus |
 
-### `FindRender()` — Recursive Chrome Widget Discovery (L719-728)
+| `GetForegroundWindow()` | `user32.dll` | Capture foreground window before paste (focus race prevention) |
+| `GetWindowRect(h,rect)` | `user32.dll` | Get window bounding rectangle for multi-pane disambiguation |
+
+### Sprint 2+ Additions to GhostType Class
+
+| Method | Purpose |
+|--------|---------|
+| `FindAllRender(hwnd)` | Collects ALL `Chrome_RenderWidgetHostHWND` via DFS (multi-pane support) |
+| `FindAllRenderInner(hwnd, list)` | Recursive inner helper for `FindAllRender()` |
+| `GetWindowRect(h, rect)` | RECT struct for bounding box scoring |
+| `HardwareEnter()` | `keybd_event(VK_RETURN)` — hardware-level Enter key (replaces `SendKeys {ENTER}`) |
+
+### `FindRender()` — Recursive Chrome Widget Discovery
 
 ```csharp
 public static IntPtr FindRender(IntPtr hwnd) {
@@ -318,18 +337,19 @@ Two paths exist:
 1. `FocusViaAttach(hwnd)` — attaches PS thread's input queue to target thread
 2. `edit.SetFocus()` or `SetFocus(renderHwnd)` — sets keyboard focus
 3. `SendKeys ^V` — paste from clipboard
-4. `SendKeys {ENTER}` — submit
-5. `DetachThread(hwnd)` — clean detach
+4. `Start-Sleep -Milliseconds 300` — post-paste delay
+5. `HardwareEnter()` — `keybd_event(VK_RETURN)` hardware key press to submit
+6. `DetachThread(hwnd)` — clean detach
 
 **SetForegroundWindow Fallback (OK_FALLBACK / OK_RENDER_FALLBACK):**
 1. `SetForegroundWindow(hwnd)` — brings target to front (visible focus steal)
 2. `edit.SetFocus()` or `SetFocus(renderHwnd)`
-3. `SendKeys ^V` + `{ENTER}`
+3. `SendKeys ^V` + 300ms delay + `HardwareEnter()`
 4. `SetForegroundWindow(orchHwnd)` — restore orchestrator focus
 
-### `_execute_ghost_dispatch()` — Subprocess Runner (L897)
+### `_execute_ghost_dispatch()` — Subprocess Runner (L1070)
 
-**File:** `tools/skynet_dispatch.py`, **Line:** 897
+**File:** `tools/skynet_dispatch.py`, **Line:** 1070
 
 Runs the generated PowerShell under a threading lock (`_dispatch_lock`) to prevent
 concurrent clipboard operations. Key behaviors:
@@ -348,7 +368,7 @@ concurrent clipboard operations. Key behaviors:
 
 ### `pre_dispatch_visual_check()` — UIA + Screenshot Verification
 
-**File:** `tools/skynet_dispatch.py`, **Line:** 495
+**File:** `tools/skynet_dispatch.py`, **Line:** 474
 
 ```python
 def pre_dispatch_visual_check(hwnd, worker_name):
@@ -386,7 +406,7 @@ def pre_dispatch_visual_check(hwnd, worker_name):
 
 ### `_verify_delivery()` — State Transition Detection
 
-**File:** `tools/skynet_dispatch.py`, **Line:** 1238
+**File:** `tools/skynet_dispatch.py`, **Line:** 1532
 
 ```python
 def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
@@ -459,19 +479,20 @@ prevent data loss and race conditions:
 **Problem:** Between `SetText()` and the actual paste (`SendKeys ^V`), another process
 (or Windows itself) can overwrite the clipboard, causing the wrong text to be pasted.
 
-**Solution:** Triple-retry verification loop:
+**Solution:** 5-retry verification loop with exponential backoff:
 
 ```
-for attempt in 1..3:
+for attempt in 1..5:
     Clipboard.SetText($dispatchText)
-    sleep 50ms
+    sleep (100ms * 2^(attempt-1))    # 100ms, 200ms, 400ms, 800ms
     $readBack = Clipboard.GetText()
     if $readBack == $dispatchText → verified, proceed
-    else → retry with 100ms backoff
+    else → retry with exponential backoff
 ```
 
-If all 3 attempts fail, the script outputs `CLIPBOARD_VERIFY_FAILED` and exits with code 1.
-`_execute_ghost_dispatch()` detects this marker (L924-927) and returns False.
+If all 5 attempts fail, the script outputs `CLIPBOARD_VERIFY_FAILED` and exits with code 1.
+`_execute_ghost_dispatch()` detects this marker and retries once with 500ms cooldown before
+returning False.
 
 ### Post-Paste Clipboard Clear (L879-881)
 
@@ -495,7 +516,7 @@ A lock file (`data/.dispatch_lock.json`) provides visibility into who holds the 
 
 ### `_dispatch_to_consultant()` — Dual-Path Delivery
 
-**File:** `tools/skynet_dispatch.py`, **Line:** 1008
+**File:** `tools/skynet_dispatch.py`, **Line:** 1276
 
 Consultants are VS Code windows identical to workers. They receive prompts via the same
 ghost_type mechanism. Bridge-queue is a fallback, not the primary path.
@@ -854,8 +875,83 @@ Code is truth. Assumptions are lies waiting to be discovered.
 
 - **Created:** 2026-03-12T05:14Z
 - **Author:** Worker Alpha (cross-validated from source code analysis)
-- **Source files verified:** `tools/skynet_dispatch.py` (~1950 lines), `tools/skynet_delivery.py` (~1320 lines), `data/brain_config.json`
-- **Line numbers verified against:** Current HEAD as of creation date
+- **Level 3.5 refresh:** Worker Delta (cross-validation + line number update)
+- **Source files verified:** `tools/skynet_dispatch.py` (2053 lines), `tools/skynet_delivery.py` (~1320 lines), `data/brain_config.json`
+- **Line numbers verified against:** Current HEAD as of Level 3.5 cross-validation
 - **Rule reference:** Rule 0.8 (Mandatory Architecture Knowledge), AGENTS.md
 
+---
+
+## Appendix: Level 3.5 Additions (Previously Undocumented)
+<!-- signed: delta -->
+
+Features added to `skynet_dispatch.py` since the original document was written:
+
+### A.1 render_hwnd Fast-Path
+
+`ghost_type_to_worker()` accepts an optional `render_hwnd` parameter. When provided,
+the PowerShell script skips UIA Edit discovery entirely and jumps directly to the
+Chrome render widget paste path. This eliminates the ~200ms UIA scanning overhead for
+repeat dispatches to the same worker.
+
+### A.2 HardwareEnter()
+
+`SendKeys {ENTER}` was replaced with `HardwareEnter()` — a C# method that uses
+`keybd_event(VK_RETURN, 0, 0, 0)` followed by `keybd_event(VK_RETURN, 0, 2, 0)`
+(KEYEVENTF_KEYUP). Hardware-level key events are more reliable in Chromium contexts
+than WM_KEYDOWN/SendKeys. A 300ms delay precedes the Enter in all 4 paste paths.
+
+### A.3 _verify_delivery Recovery Paths
+
+Two recovery behaviors when verification detects no state change:
+
+1. **IDLE→IDLE assumed-OK:** If pre-state was IDLE and post-state is still IDLE after
+   timeout, the delivery may have been consumed so fast that the state never visibly
+   changed. Logged as warning but NOT treated as failure.
+2. **pyautogui Enter fallback:** If paste completed but the worker didn't start
+   processing, a secondary `pyautogui.press('enter')` is attempted as a hardware-level
+   fallback to submit the pasted text.
+
+### A.4 In-Lock CLIPBOARD_VERIFY Retry
+
+When `_execute_ghost_dispatch()` detects `CLIPBOARD_VERIFY_FAILED` in stdout, it does
+NOT immediately return False. Instead, it sleeps 500ms (allowing the clipboard to settle)
+and retries the entire PowerShell subprocess once within the same dispatch lock. Only if
+the retry also fails does it return False.
+
+### A.5 MAX_DISPATCH_LENGTH
+
+Hard limit: 12000 characters. Text exceeding this limit is truncated with a warning
+appended: `[TRUNCATED: original was N chars]`. This prevents clipboard overflows and
+VS Code input buffer issues.
+
+### A.6 UNRESPONSIVE_THRESHOLD
+
+After 5 consecutive dispatch failures to the same worker (tracked in
+`data/dispatch_failures.json`), the worker is flagged as UNRESPONSIVE and future
+dispatches are blocked until the orchestrator manually clears the failure counter
+or the worker posts a bus message (proving it's alive).
+
+### A.7 Accessibility Placeholder Skip
+
+UIA Edit scoring now skips elements whose `Name` matches `'not accessible'` or
+`'screen reader'`. These 1px-tall accessibility placeholders are not real input targets.
+
+### A.8 Multi-Pane Chrome Disambiguation
+
+`FindAllRender(hwnd)` collects ALL `Chrome_RenderWidgetHostHWND` instances via DFS
+(vs `FindRender()` which returns the first one). When multiple render widgets exist
+(multi-pane VS Code), each is scored by:
+- Right-half area weighting: widgets in the right 50% of the window score higher
+- Bounding box area: larger widgets preferred (chat pane > toolbar)
+Uses `GetWindowRect()` + `RECT` struct added to the `GhostType` class.
+
+### A.9 Focus Race Prevention
+
+`GetForegroundWindow()` is captured before AND after focus operations. If the foreground
+window changes unexpectedly (not matching pre-paste HWND or target HWND), the script
+exits with `FOCUS_STOLEN` status. All 4 paste paths are protected. Prevents clipboard
+corruption from user interaction during paste.
+
 <!-- signed: alpha -->
+<!-- signed: delta -->
