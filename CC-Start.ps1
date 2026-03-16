@@ -16,6 +16,21 @@ $dataDir  = Join-Path $repoRoot "data"
 $venvPython = Join-Path (Split-Path $repoRoot -Parent) "env\Scripts\python.exe"
 $python = if (Test-Path $venvPython) { $venvPython } else { "python" }
 
+# -- INCIDENT 016 Guard: Prevent cli.isolationOption.enabled drift --
+try {
+    $userSettingsPath = Join-Path $env:APPDATA "Code - Insiders\User\settings.json"
+    if (Test-Path $userSettingsPath) {
+        $uSettings = Get-Content $userSettingsPath -Raw | ConvertFrom-Json
+        $isoVal = $uSettings.'github.copilot.chat.cli.isolationOption.enabled'
+        if ($isoVal -eq $true) {
+            Write-Host "[ISOLATION GUARD] DANGER: cli.isolationOption.enabled=True -- fixing!"
+            & $python tools/skynet_isolation_guard.py
+        }
+    }
+} catch {
+    Write-Host "[ISOLATION GUARD] Check failed: $_"
+}
+
 # ── Helpers ──────────────────────────────────────────────
 
 function Write-Status($msg, $level = "INFO") {

@@ -84,5 +84,34 @@
     "related_incidents": [
       "INCIDENT_013"
     ]
+  },
+  {
+    "id": "INCIDENT_016",
+    "title": "CLI Isolation Setting Drift Blocks All Delegation",
+    "date": "2026-03-16",
+    "severity": "CRITICAL",
+    "status": "RESOLVED",
+    "root_causes": [
+      {
+        "issue": "github.copilot.chat.cli.isolationOption.enabled silently changed from false to true in user settings between sessions",
+        "fix": "Set isolationOption.enabled back to false in user settings",
+        "commit": "Added tools/skynet_isolation_guard.py + boot guards in all 3 Start scripts",
+        "files": [
+          "tools/skynet_isolation_guard.py",
+          "Orch-Start.ps1",
+          "GC-Start.ps1",
+          "CC-Start.ps1"
+        ]
+      }
+    ],
+    "impact": "ALL CLI delegation/dispatch to workers silently cancelled. Workers never receive tasks. No error message shown -- delegation just does not happen.",
+    "prevention": [
+      "Isolation guard runs at boot time in all 3 start scripts",
+      "tools/skynet_isolation_guard.py checks both user and workspace settings",
+      "Auto-fixes user setting if it drifts to true",
+      "Workspace setting has explicit override to false",
+      "Can run --watch mode for continuous monitoring"
+    ],
+    "lesson": "VS Code user settings can change between sessions (auto-updates, sync, experiments). All critical settings must be verified at boot time, not assumed stable."
   }
 ]

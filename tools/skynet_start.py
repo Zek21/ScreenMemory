@@ -2021,6 +2021,13 @@ def main():
     print("+" + "=" * 42 + "+")
     print()
 
+    # INCIDENT 016 Guard: Check isolation setting before any worker operations
+    try:
+        from tools.skynet_isolation_guard import guard_isolation
+        guard_isolation(fix=True)
+    except ImportError:
+        pass
+
     if args.dispatch:
         engines = connect_engines()
         result = dispatch_task(args.dispatch, worker=args.worker, engines=engines)
