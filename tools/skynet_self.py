@@ -25,6 +25,7 @@ import os
 import sys
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -55,6 +56,22 @@ _last_incident_pattern_hash: Optional[str] = None
 
 # --- Resolved Incident Pattern Tracking ---  # signed: beta
 _RESOLVED_PATTERNS_FILE = DATA / "resolved_patterns.json"
+
+# Thread pool for timeout-guarded checks (reused across pulse calls)  # signed: alpha
+_PULSE_EXECUTOR = ThreadPoolExecutor(max_workers=12, thread_name_prefix="pulse")
+
+
+def _run_with_timeout(fn, timeout_s: float, default=None):
+    """Run fn() with a thread-based timeout. Returns default on timeout/error.
+
+    Uses a shared thread pool to avoid spawning threads on every call.
+    # signed: alpha
+    """
+    try:
+        fut = _PULSE_EXECUTOR.submit(fn)
+        return fut.result(timeout=timeout_s)
+    except (FuturesTimeout, Exception):
+        return default
 
 
 def get_resolved_patterns() -> Dict[str, Any]:
@@ -519,17 +536,48 @@ class SkynetHealth:
     """Real-time health assessment across all subsystems."""
 
     def pulse(self) -> dict:
-        """Quick health check -- all critical systems."""
+        """Quick health check -- all critical systems.
+
+        ALL checks run in parallel with 2s timeout each, so total pulse
+        completes in ~2-3s regardless of how many endpoints are slow/dead.
+        # signed: alpha
+        """
+        check_fns = {
+            "backend": lambda: self._run_subcheck(self._check_backend),
+            "workers": lambda: self._run_subcheck(self._check_workers),
+            "bus": lambda: self._run_subcheck(self._check_bus),
+            "sse_daemon": lambda: self._run_subcheck(self._check_sse_daemon),
+            "consultants": lambda: self._run_subcheck(self._check_consultants),
+            "intelligence": lambda: self._run_subcheck(self._check_intelligence_engines),
+            "collective_iq": lambda: self._run_subcheck(self._check_collective_iq),
+            "knowledge": lambda: self._run_subcheck(self._check_knowledge_base),
+            "windows": lambda: self._run_subcheck(self._check_windows),
+        }
+        defaults = {
+            "backend": {"status": "TIMEOUT"},
+            "workers": {"all_healthy": False, "error": "timeout"},
+            "bus": {"status": "TIMEOUT"},
+            "sse_daemon": {"running": False, "error": "timeout"},
+            "consultants": {"total": len(CONSULTANT_NAMES), "online": 0, "details": {}},
+            "intelligence": {"engines_online": 0, "engines_total": 0},
+            "collective_iq": 0.0,
+            "knowledge": {"facts": 0, "status": "TIMEOUT"},
+            "windows": {"total_windows": 0, "error": "timeout"},
+        }
+
         checks = {}
-        self._check_backend(checks)
-        self._check_workers(checks)
-        self._check_consultants(checks)  # signed: delta
-        self._check_bus(checks)
-        self._check_sse_daemon(checks)
-        self._check_intelligence_engines(checks)
-        self._check_collective_iq(checks)
-        self._check_knowledge_base(checks)
-        self._check_windows(checks)
+        futures = {key: _PULSE_EXECUTOR.submit(fn) for key, fn in check_fns.items()}
+        # Single 2s deadline for ALL futures combined  # signed: alpha
+        deadline = time.time() + 2.0
+        for key, fut in futures.items():
+            remaining = max(0.001, deadline - time.time())
+            try:
+                result = fut.result(timeout=remaining)
+                checks.update(result)
+            except Exception:
+                pass
+            if key not in checks:
+                checks[key] = defaults[key]
 
         critical_up = all(
             checks.get(k, {}).get("status", checks.get(k, {}).get("all_healthy", False))
@@ -537,6 +585,13 @@ class SkynetHealth:
         )
         return {"timestamp": datetime.now().isoformat(),
                 "overall": "HEALTHY" if critical_up else "DEGRADED", "checks": checks}
+
+    @staticmethod
+    def _run_subcheck(method):
+        """Call a _check_* method and return its output dict."""
+        c = {}
+        method(c)
+        return c
 
     @staticmethod
     def _check_backend(checks):
@@ -1073,41 +1128,83 @@ class SkynetSelf:
         """Fast heartbeat for monitoring — minimal overhead.
 
         Includes architecture/consultant/bus awareness flags (Level 3.4).
+        Runs pulse + agents + consultants in parallel for <3s total.
+        # signed: alpha
         """
-        pulse = self._cached_health_pulse()
-        agents = self.identity.agents()
-        consultants = self.identity.get_consultant_status()  # signed: delta
-        alive = sum(1 for a in agents.values() if a["status"] != "DEAD")
-        consultants_online = sum(
-            1 for c in consultants.values()
-            if c["status"] in ("ONLINE", "BRIDGE_ONLY", "WINDOW_ONLY")
-        )  # signed: delta
-        iq_data = self.compute_iq(pulse, agents)
+        try:
+            # Run the three slow operations in parallel  # signed: alpha
+            pulse_fut = _PULSE_EXECUTOR.submit(self._cached_health_pulse)
+            agents_fut = _PULSE_EXECUTOR.submit(self.identity.agents)
+            consult_fut = _PULSE_EXECUTOR.submit(self.identity.get_consultant_status)
 
-        # Awareness flags — does the agent truly understand the system?
-        architecture_knowledge_ok = self._check_architecture_knowledge()
-        consultant_awareness = self._check_consultant_awareness(consultants)
-        bus_awareness = self._check_bus_awareness(pulse)
+            deadline = time.time() + 3.0
 
-        return {
-            "name": "SKYNET",
-            "version": self.identity.version,
-            "level": self.identity.level,
-            "ts": datetime.now().isoformat(),
-            "health": pulse["overall"],
-            "iq": iq_data["score"],
-            "iq_trend": iq_data["trend"],
-            "agents": {n: a["status"] for n, a in agents.items()},
-            "consultants": {n: c["status"] for n, c in consultants.items()},
-            "alive": alive,
-            "total": len(agents),
-            "consultants_online": consultants_online,
-            "consultants_total": len(consultants),
-            "architecture_knowledge_ok": architecture_knowledge_ok,
-            "consultant_awareness": consultant_awareness,
-            "bus_awareness": bus_awareness,
-        }
-        # signed: delta
+            remaining = max(0.001, deadline - time.time())
+            try:
+                pulse = pulse_fut.result(timeout=remaining)
+            except Exception:
+                pulse = {"overall": "TIMEOUT", "checks": {}}
+
+            remaining = max(0.001, deadline - time.time())
+            try:
+                agents = agents_fut.result(timeout=remaining)
+            except Exception:
+                agents = {}
+
+            remaining = max(0.001, deadline - time.time())
+            try:
+                consultants = consult_fut.result(timeout=remaining)
+            except Exception:
+                consultants = {}
+
+            alive = sum(1 for a in agents.values() if a.get("status") != "DEAD")
+            consultants_online = sum(
+                1 for c in consultants.values()
+                if c.get("status") in ("ONLINE", "BRIDGE_ONLY", "WINDOW_ONLY")
+            )
+            iq_data = self.compute_iq(pulse, agents)
+
+            architecture_knowledge_ok = self._check_architecture_knowledge()
+            consultant_awareness = self._check_consultant_awareness(consultants)
+            bus_awareness = self._check_bus_awareness(pulse)
+
+            return {
+                "name": "SKYNET",
+                "version": self.identity.version,
+                "level": self.identity.level,
+                "ts": datetime.now().isoformat(),
+                "health": pulse["overall"],
+                "iq": iq_data["score"],
+                "iq_trend": iq_data["trend"],
+                "agents": {n: a["status"] for n, a in agents.items()},
+                "consultants": {n: c["status"] for n, c in consultants.items()},
+                "alive": alive,
+                "total": len(agents),
+                "consultants_online": consultants_online,
+                "consultants_total": len(consultants),
+                "architecture_knowledge_ok": architecture_knowledge_ok,
+                "consultant_awareness": consultant_awareness,
+                "bus_awareness": bus_awareness,
+            }
+        except Exception:
+            return {
+                "name": "SKYNET",
+                "version": getattr(self.identity, "version", "?"),
+                "level": getattr(self.identity, "level", "?"),
+                "ts": datetime.now().isoformat(),
+                "health": "ERROR",
+                "iq": 0.0,
+                "iq_trend": "unknown",
+                "agents": {},
+                "consultants": {},
+                "alive": 0,
+                "total": 0,
+                "consultants_online": 0,
+                "consultants_total": 0,
+                "architecture_knowledge_ok": False,
+                "consultant_awareness": False,
+                "bus_awareness": False,
+            }
 
     @staticmethod
     def _check_architecture_knowledge() -> bool:
