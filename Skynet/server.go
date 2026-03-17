@@ -655,6 +655,8 @@ func (s *SkynetServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		TaskThroughput:  tpm,
 		BusMessages:     s.bus.Count(),
 		BusDropped:      s.bus.Dropped(),
+		BusOverwrites:   s.bus.Overwrites(),  // signed: alpha
+		BusCapacity:     s.bus.Capacity(),     // signed: alpha
 		WorkerStats:     wStats,
 		Directives:      DirectiveStats{Total: dTotal, Active: dActive, Completed: dCompleted, Pending: dPending, Timestamp: now}, // signed: beta
 		GoroutineCount:  runtime.NumGoroutine(),
@@ -2631,6 +2633,8 @@ func (s *SkynetServer) handleSSEStream(w http.ResponseWriter, r *http.Request) {
 				"uptime_s":         time.Since(s.startTime).Seconds(),
 				"bus_depth":        s.bus.Depth(),
 				"bus_dropped":      s.bus.Dropped(),
+				"bus_overwrites":   s.bus.Overwrites(), // signed: alpha
+				"bus_capacity":     s.bus.Capacity(),   // signed: alpha
 				"agents":           agents,
 				"bus":              s.bus.Recent(10),
 				"orch_thinking":    thoughts,

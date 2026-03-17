@@ -167,6 +167,8 @@ type MetricsResponse struct {
 	TaskThroughput  float64            `json:"tasks_per_min"`
 	BusMessages     int64              `json:"bus_messages_total"`
 	BusDropped      int64              `json:"bus_dropped"`
+	BusOverwrites   int64              `json:"bus_overwrites"`   // signed: alpha
+	BusCapacity     int                `json:"bus_capacity"`     // signed: alpha
 	WorkerStats     map[string]WStats  `json:"worker_stats"`
 	Directives      DirectiveStats     `json:"directives"`
 	GoroutineCount  int                `json:"goroutine_count"`

@@ -3,23 +3,49 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// MessageBus — lock-free topic-based pub/sub with ring buffer.
-// Zero-copy message passing via Go channels. Features:
+// ringSize is the bus ring buffer capacity. Configurable via SKYNET_RING_SIZE
+// env var (min 100, max 10000, default 100). — signed: alpha
+var ringSize = 100
+
+func init() {
+	if s := os.Getenv("SKYNET_RING_SIZE"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n >= 100 && n <= 10000 {
+			ringSize = n
+		}
+	}
+}
+
+// MessageBus — topic-based pub/sub with ring buffer.
+// Mutex-serialised writes guarantee monotonic ID + timestamp ordering.
+// Features:
 // - Topic-based routing (not just sender filtering)
-// - Ring buffer (fixed memory, no slice growth)
-// - Atomic counters (no lock on hot path for stats)
+// - Configurable ring buffer (fixed memory, no slice growth after init)
+// - Atomic counters for lock-free stats reads
+// - Overwrite tracking for silent ring-wrap detection
+//
+// Struct layout: atomic counters are separated from mutex-protected fields
+// by a cache-line pad to eliminate false sharing under concurrent access.
+// — signed: alpha
 type MessageBus struct {
-	mu       sync.RWMutex
-	ring     [ringSize]BusMessage // fixed ring buffer — zero allocation after init
-	head     int                  // next write position
-	count    int                  // messages in buffer (max ringSize)
-	totalMsg int64                // atomic: total messages ever posted
-	dropped  int64                // atomic: messages dropped due to slow subscribers
+	// --- Hot atomic counters (own cache line) ---
+	totalMsg   int64 // atomic: total messages ever posted
+	dropped    int64 // atomic: messages dropped due to slow subscribers
+	overwrites int64 // atomic: messages overwritten by ring wrap — signed: alpha
+
+	_ [128]byte // cache-line pad — prevents false sharing with mutex fields below — signed: alpha
+
+	// --- Mutex-protected ring state ---
+	mu    sync.RWMutex
+	ring  []BusMessage // ring buffer — sized once in NewMessageBus
+	head  int          // next write position
+	count int          // messages in buffer (max ringSize)
 
 	// Topic-based subscriptions: topic → map[subscriberID]channel
 	subs   map[string]map[string]chan BusMessage
@@ -30,10 +56,9 @@ type MessageBus struct {
 	wildcardsMu sync.RWMutex
 }
 
-const ringSize = 100
-
 func NewMessageBus() *MessageBus {
 	return &MessageBus{
+		ring:      make([]BusMessage, ringSize),
 		subs:      make(map[string]map[string]chan BusMessage),
 		wildcards: make(map[string]chan BusMessage),
 	}
@@ -63,9 +88,12 @@ func (b *MessageBus) SubscribeAll(subscriber string) <-chan BusMessage {
 }
 
 // Post publishes a message to the bus. Fans out to topic subscribers + wildcards.
+// Seq assignment and timestamp are inside the mutex so ring order matches ID
+// order and timestamps are monotonically non-decreasing. — signed: alpha
 func (b *MessageBus) Post(sender, topic, msgType, content string, metadata map[string]string) {
+	// Write to ring buffer — seq + timestamp inside lock guarantees ordering
+	b.mu.Lock()
 	seq := atomic.AddInt64(&b.totalMsg, 1)
-
 	msg := BusMessage{
 		ID:        fmt.Sprintf("msg_%d_%s", seq, sender),
 		Sender:    sender,
@@ -75,12 +103,12 @@ func (b *MessageBus) Post(sender, topic, msgType, content string, metadata map[s
 		Metadata:  metadata,
 		Timestamp: time.Now(),
 	}
-
-	// Write to ring buffer
-	b.mu.Lock()
+	if b.count >= len(b.ring) {
+		atomic.AddInt64(&b.overwrites, 1) // track silent ring overwrites — signed: alpha
+	}
 	b.ring[b.head] = msg
-	b.head = (b.head + 1) % ringSize
-	if b.count < ringSize {
+	b.head = (b.head + 1) % len(b.ring)
+	if b.count < len(b.ring) {
 		b.count++
 	}
 	b.mu.Unlock()
@@ -129,9 +157,9 @@ func (b *MessageBus) Recent(n int) []BusMessage {
 	}
 
 	result := make([]BusMessage, n)
-	start := (b.head - n + ringSize) % ringSize
+	start := (b.head - n + len(b.ring)) % len(b.ring)
 	for i := 0; i < n; i++ {
-		result[i] = b.ring[(start+i)%ringSize]
+		result[i] = b.ring[(start+i)%len(b.ring)]
 	}
 	return result
 }
@@ -166,8 +194,9 @@ func (b *MessageBus) Monitor(ctx context.Context) {
 			b.wildcardsMu.RUnlock()
 
 			depth := b.Depth()
-			fmt.Printf("[bus-monitor] msgs/sec: %.1f | subscribers: %d | topics: %d | queue depth: %d | total: %d\n",
-				mps, subCount, topicCount, depth, currentCount)
+			overwritten := atomic.LoadInt64(&b.overwrites) // signed: alpha
+			fmt.Printf("[bus-monitor] msgs/sec: %.1f | subscribers: %d | topics: %d | queue depth: %d | overwrites: %d | total: %d\n",
+				mps, subCount, topicCount, depth, overwritten, currentCount)
 
 			lastCount = currentCount
 			lastTime = now
@@ -185,6 +214,17 @@ func (b *MessageBus) Dropped() int64 {
 	return atomic.LoadInt64(&b.dropped)
 }
 
+// Overwrites returns total messages overwritten by ring buffer wrapping.
+// — signed: alpha
+func (b *MessageBus) Overwrites() int64 {
+	return atomic.LoadInt64(&b.overwrites)
+}
+
+// Capacity returns the ring buffer size. — signed: alpha
+func (b *MessageBus) Capacity() int {
+	return len(b.ring)
+}
+
 // Depth returns current messages in the ring buffer.
 func (b *MessageBus) Depth() int {
 	b.mu.RLock()
@@ -193,11 +233,44 @@ func (b *MessageBus) Depth() int {
 }
 
 // Clear drains the ring buffer and returns the number of messages cleared.
+// Zeroes ring slots to release heap references and drains subscriber channels
+// to prevent stale message delivery after a clear. — signed: alpha
 func (b *MessageBus) Clear() int {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	cleared := b.count
 	b.head = 0
 	b.count = 0
+	for i := range b.ring {
+		b.ring[i] = BusMessage{} // release string/map references for GC
+	}
+	b.mu.Unlock()
+
+	// Drain buffered messages from all subscriber channels
+	b.subsMu.RLock()
+	for _, topicSubs := range b.subs {
+		for _, ch := range topicSubs {
+			drainChan(ch)
+		}
+	}
+	b.subsMu.RUnlock()
+
+	b.wildcardsMu.RLock()
+	for _, ch := range b.wildcards {
+		drainChan(ch)
+	}
+	b.wildcardsMu.RUnlock()
+
 	return cleared
+}
+
+// drainChan removes all pending messages from a buffered channel.
+// — signed: alpha
+func drainChan(ch chan BusMessage) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
 }
