@@ -17,7 +17,7 @@ This document covers the Wave 2 implementation of work-stealing weighted dispatc
 
 **Changes:**
 - Added `EstimatedWeight int` field to `Task` struct
-- Added `TaskWeight(t *Task) int` function with type→weight mapping:
+- Added `TaskWeight(taskType string) int` function with type→weight mapping:
 
 | Task Type | Weight | Rationale |
 |-----------|--------|-----------|
@@ -26,10 +26,9 @@ This document covers the Wave 2 implementation of work-stealing weighted dispatc
 | `python` | 10 | Variable, typically 1-10s |
 | `powershell` | 10 | Variable, typically 1-10s |
 | `copilot` | 50 | 60-120s LLM calls |
-| `http` | 5 | Network-bound, 0.5-5s |
-| default | 5 | Safe middle ground |
+| default | 10 | Conservative middle ground for unknown task types |
 
-Weight is also derived from timeout: tasks with timeout > 30s get weight 50, > 10s get weight 10.
+<!-- doc errors fixed: signature corrected to (taskType string), removed nonexistent http type, default 5→10, removed unimplemented timeout-derived weight — signed: beta -->
 
 ### P2 — Weighted Load Balancer (`worker.go`, `server.go`)
 
