@@ -788,6 +788,31 @@ func (s *SkynetServer) handleBrainAck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// selectWorker picks the worker with the lowest weighted load using the
+// round-robin counter as a tiebreaker. Replaces the naive round-robin +
+// queue-depth-count approach that caused convoy effects when heavy tasks
+// (copilot 120s, weight 50) were treated identically to light tasks
+// (shell 50ms, weight 1). -- signed: beta
+func (s *SkynetServer) selectWorker() *Worker {
+	if len(s.workers) == 0 {
+		return nil
+	}
+	// Start from RR position to spread ties fairly
+	start := int(atomic.AddInt64(&s.rrCounter, 1)-1) % len(s.workers)
+	best := s.workers[start]
+	bestLoad := best.WeightedLoad()
+	for i, wk := range s.workers {
+		if i == start {
+			continue
+		}
+		if load := wk.WeightedLoad(); load < bestLoad {
+			bestLoad = load
+			best = wk
+		}
+	}
+	return best
+}
+
 // ─── POST /dispatch ──────────────────────────────────────────────
 
 func (s *SkynetServer) handleDispatch(w http.ResponseWriter, r *http.Request) {
@@ -810,21 +835,14 @@ func (s *SkynetServer) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Auto load balancing: round-robin with lowest queue depth tiebreaker
+	// Auto load balancing: weighted load with round-robin tiebreaker -- signed: beta
 	if req.Worker == "" {
-		if len(s.workers) == 0 {
+		wk := s.selectWorker()
+		if wk == nil {
 			http.Error(w, "no workers available", http.StatusServiceUnavailable)
 			return
 		}
-		best := s.workers[int(atomic.AddInt64(&s.rrCounter, 1)-1)%len(s.workers)]
-		bestDepth := best.QueueDepth()
-		for _, wk := range s.workers {
-			if d := wk.QueueDepth(); d < bestDepth {
-				bestDepth = d
-				best = wk
-			}
-		}
-		req.Worker = best.Name
+		req.Worker = wk.Name
 	}
 
 	task := WorkerTask{
@@ -2007,13 +2025,12 @@ func (s *SkynetServer) handleOrchestrate(w http.ResponseWriter, r *http.Request)
 		}
 		s.addThought("orchestrate", fmt.Sprintf("Auto-dispatched to %d workers: %v", len(assigned), assigned))
 	} else {
-		// No auto-dispatch: pick one worker via round-robin
-		if len(s.workers) == 0 {
+		// No auto-dispatch: pick one worker via weighted load -- signed: beta
+		wk := s.selectWorker()
+		if wk == nil {
 			http.Error(w, "no workers available", http.StatusServiceUnavailable)
 			return
 		}
-		idx := int(atomic.AddInt64(&s.rrCounter, 1)-1) % len(s.workers)
-		wk := s.workers[idx]
 		taskID := fmt.Sprintf("task_%d_%s", now.UnixNano(), wk.Name)
 		task := &Task{
 			ID:           taskID,
@@ -2048,7 +2065,7 @@ func (s *SkynetServer) handleOrchestrate(w http.ResponseWriter, r *http.Request)
 		s.wtMu.Unlock()
 
 		assigned = append(assigned, wk.Name)
-		s.addThought("orchestrate", fmt.Sprintf("Dispatched to %s (round-robin)", wk.Name))
+		s.addThought("orchestrate", fmt.Sprintf("Dispatched to %s (weighted-load)", wk.Name))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -2219,13 +2236,12 @@ func (s *SkynetServer) handleOrchestratePipeline(w http.ResponseWriter, r *http.
 		s.directives = append(s.directives, d)
 		s.dirMu.Unlock()
 
-		// Pick worker via round-robin
-		if len(s.workers) == 0 {
+		// Pick worker via weighted load -- signed: beta
+		wk := s.selectWorker()
+		if wk == nil {
 			http.Error(w, "no workers available", http.StatusServiceUnavailable)
 			return
 		}
-		idx := int(atomic.AddInt64(&s.rrCounter, 1)-1) % len(s.workers)
-		wk := s.workers[idx]
 		taskID := fmt.Sprintf("%s_task_%d_%s", pipelineID, i, wk.Name)
 
 		si := stepInfo{

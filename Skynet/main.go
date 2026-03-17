@@ -32,8 +32,14 @@ func main() {
 	workers := make([]*Worker, len(cfg.Workers))
 	for i, name := range cfg.Workers {
 		workers[i] = NewWorker(name, bus, results)
-		go workers[i].Run()
-		log.Printf("[pool] Worker %s spawned", name)
+	}
+	// Wire peer references for work-stealing -- signed: beta
+	for _, w := range workers {
+		w.SetPeers(workers)
+	}
+	for _, w := range workers {
+		go w.Run()
+		log.Printf("[pool] Worker %s spawned", w.Name)
 	}
 
 	// Bus monitor
