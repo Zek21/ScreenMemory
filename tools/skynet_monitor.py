@@ -706,6 +706,280 @@ def _check_stuck_workers(workers: list):
         _try_recover_stuck_worker(name, hwnd, int(duration), now)
 
 
+# ─── CLI Error Detection and Auto-Recovery ──────────────────────────────────
+# Detects rate limiting, CAPIError, model unavailable errors via Win32
+# PrintWindow screen capture + OCR. Posts alerts and tracks error state.
+# signed: gamma
+
+CLI_ERROR_PATTERNS = [
+    ("rate_limit", ["rate limit", "rate limiting", "too many requests", "429", "throttl"]),
+    ("capi_error", ["capierror", "capi error", "capi_error"]),
+    ("http_400", ["error 400", "bad request", "status 400", "400 bad"]),
+    ("execution_failed", ["execution failed", "failed to execute"]),
+    ("model_unavailable", ["model unavailable", "model is unavailable", "model not available",
+                           "premium request limit", "capacity"]),
+    ("no_model", ["no model selected", "model not found", "model not set"]),
+]
+
+CLI_ERROR_CHECK_INTERVAL = 60   # check every 60 seconds
+CLI_ERROR_COOLDOWN = 60         # 60s cooldown after error detection before posting READY
+CLI_ERROR_DEGRADED_THRESHOLD = 5  # consecutive errors → WORKER_DEGRADED
+WORKER_HEALTH_DIR = DATA_DIR / "worker_health"
+
+# Per-worker CLI error tracking: {name: {error_count, last_error_time, last_error_type, consecutive_errors, cooldown_until}}
+_cli_error_state: dict = {}
+_last_cli_error_check: float = 0.0
+
+# Lazy-init GDI32 — share with existing user32 at module level
+gdi32 = ctypes.windll.gdi32
+
+
+def _capture_window_printwindow(hwnd: int):
+    """Capture a window image using Win32 PrintWindow (no focus stealing).
+    Returns PIL Image or None on failure.
+    Uses ctypes Win32 API — NOT pyautogui.
+    """  # signed: gamma
+    try:
+        from PIL import Image
+        import ctypes.wintypes
+
+        rect = ctypes.wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+        if w <= 0 or h <= 0:
+            return None
+
+        hdc_screen = user32.GetDC(0)
+        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+        hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+        old_bmp = gdi32.SelectObject(hdc_mem, hbmp)
+
+        # PW_RENDERFULLCONTENT=2 captures Chromium-rendered content
+        PW_RENDERFULLCONTENT = 2
+        result = user32.PrintWindow(hwnd, hdc_mem, PW_RENDERFULLCONTENT)
+        if not result:
+            user32.PrintWindow(hwnd, hdc_mem, 0)  # fallback without flag
+
+        # Build BITMAPINFO for GetDIBits
+        import struct
+        bmi = ctypes.create_string_buffer(40)
+        struct.pack_into('<lllHHllllll', bmi, 0,
+                         40, w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+
+        buf = ctypes.create_string_buffer(w * h * 4)
+        gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, bmi, 0)
+
+        img = Image.frombuffer('RGBA', (w, h), buf.raw, 'raw', 'BGRA', 0, 1)
+
+        # Cleanup GDI objects
+        gdi32.SelectObject(hdc_mem, old_bmp)
+        gdi32.DeleteObject(hbmp)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(0, hdc_screen)
+
+        return img
+    except Exception as e:
+        log(f"PrintWindow capture failed for HWND {hwnd}: {e}", "ERR")
+        return None
+
+
+_ocr_engine = None
+
+
+def _get_ocr_engine():
+    """Lazy-init OCR engine singleton."""  # signed: gamma
+    global _ocr_engine
+    if _ocr_engine is None:
+        try:
+            from core.ocr import OCREngine
+            engine = OCREngine()
+            if engine.is_available:
+                _ocr_engine = engine
+                log(f"OCR engine initialized: {engine._engine_name}", "OK")
+            else:
+                log("OCR engine not available — CLI error detection disabled", "WARN")
+        except Exception as e:
+            log(f"OCR engine init failed: {e}", "WARN")
+    return _ocr_engine
+
+
+def _extract_error_text(img) -> str:
+    """Extract text from bottom portion of window image using OCR.
+    Crops to bottom 35% where error messages typically appear.
+    """  # signed: gamma
+    try:
+        # Crop to bottom 35% of the image — errors appear in recent chat output
+        w, h = img.size
+        crop_top = int(h * 0.65)
+        cropped = img.crop((0, crop_top, w, h))
+
+        engine = _get_ocr_engine()
+        if engine is None:
+            return ""
+
+        result = engine.extract(cropped.convert("RGB"), min_confidence=0.3)
+        return result.full_text.lower() if result.full_text else ""
+    except Exception as e:
+        log(f"OCR text extraction failed: {e}", "WARN")
+        return ""
+
+
+def _match_error_pattern(text: str) -> str | None:
+    """Check extracted text against known CLI error patterns.
+    Returns error type string or None.
+    """  # signed: gamma
+    if not text:
+        return None
+    for error_type, keywords in CLI_ERROR_PATTERNS:
+        for kw in keywords:
+            if kw in text:
+                return error_type
+    return None
+
+
+def _init_cli_error_entry(name: str):
+    """Initialize CLI error tracking for a worker if not already tracked."""
+    if name not in _cli_error_state:
+        _cli_error_state[name] = {
+            "error_count": 0,
+            "last_error_time": 0.0,
+            "last_error_type": None,
+            "consecutive_errors": 0,
+            "cooldown_until": 0.0,
+        }
+
+
+def _save_error_screenshot(name: str, img):
+    """Save screenshot to data/worker_health/NAME_screenshot.png."""  # signed: gamma
+    try:
+        WORKER_HEALTH_DIR.mkdir(parents=True, exist_ok=True)
+        path = WORKER_HEALTH_DIR / f"{name}_screenshot.png"
+        img.convert("RGB").save(str(path), "PNG")
+        log(f"{name.upper()}: error screenshot saved to {path}", "INFO")
+    except Exception as e:
+        log(f"Failed to save error screenshot for {name}: {e}", "WARN")
+
+
+def detect_cli_error(hwnd: int, name: str) -> str | None:
+    """Detect CLI errors in a worker window via PrintWindow capture + OCR.
+    Returns error type string if error detected, None otherwise.
+    Does not steal focus — uses Win32 PrintWindow.
+    """  # signed: gamma
+    _init_cli_error_entry(name)
+    now = time.time()
+    state = _cli_error_state[name]
+
+    # Respect cooldown — don't re-check during recovery window
+    if now < state["cooldown_until"]:
+        return None
+
+    img = _capture_window_printwindow(hwnd)
+    if img is None:
+        return None
+
+    text = _extract_error_text(img)
+    error_type = _match_error_pattern(text)
+
+    if error_type:
+        _save_error_screenshot(name, img)
+        state["error_count"] += 1
+        state["last_error_time"] = now
+        state["last_error_type"] = error_type
+        state["consecutive_errors"] += 1
+        log(f"{name.upper()}: CLI ERROR detected: {error_type} (consecutive={state['consecutive_errors']})", "CRIT")
+    else:
+        # No error — reset consecutive counter
+        if state["consecutive_errors"] > 0:
+            log(f"{name.upper()}: CLI error cleared (was {state['consecutive_errors']} consecutive)", "OK")
+        state["consecutive_errors"] = 0
+
+    return error_type
+
+
+def _handle_cli_error_recovery(name: str, hwnd: int, error_type: str):
+    """Handle recovery after CLI error detection.
+    Posts alert, sets cooldown, schedules READY notification.
+    """  # signed: gamma
+    state = _cli_error_state[name]
+    now = time.time()
+
+    # Post error alert to bus
+    _guarded_bus_publish({
+        "sender": "monitor", "topic": "orchestrator", "type": "alert",
+        "content": f"CLI_ERROR: {name.upper()} hit {error_type} error "
+                   f"(total={state['error_count']}, consecutive={state['consecutive_errors']}). "
+                   f"Cooldown {CLI_ERROR_COOLDOWN}s before re-check."
+    })
+
+    # Set cooldown — don't re-check this worker for CLI_ERROR_COOLDOWN seconds
+    state["cooldown_until"] = now + CLI_ERROR_COOLDOWN
+
+    # Check for degradation (consecutive > threshold)
+    if state["consecutive_errors"] >= CLI_ERROR_DEGRADED_THRESHOLD:
+        log(f"{name.upper()}: DEGRADED — {state['consecutive_errors']} consecutive CLI errors", "CRIT")
+        _guarded_bus_publish({
+            "sender": "monitor", "topic": "orchestrator", "type": "alert",
+            "content": f"WORKER_DEGRADED: {name.upper()} has hit {state['consecutive_errors']} consecutive "
+                       f"CLI errors (type={error_type}). Worker may need manual intervention or model change."
+        })
+
+
+def _post_worker_ready_after_error(name: str):
+    """Post WORKER_READY_AFTER_ERROR when cooldown expires and no new error found."""
+    state = _cli_error_state.get(name, {})
+    if state.get("consecutive_errors", 0) == 0 and state.get("error_count", 0) > 0:
+        _guarded_bus_publish({
+            "sender": "monitor", "topic": "orchestrator", "type": "report",
+            "content": f"WORKER_READY_AFTER_ERROR: {name.upper()} recovered from CLI error. "
+                       f"Total errors this session: {state['error_count']}."
+        })
+        # Reset the flag so we don't re-post
+        state["error_count"] = 0
+
+
+def _check_cli_errors(workers: list):
+    """Check all workers for CLI errors. Runs at CLI_ERROR_CHECK_INTERVAL."""  # signed: gamma
+    global _last_cli_error_check
+    now = time.time()
+    if (now - _last_cli_error_check) < CLI_ERROR_CHECK_INTERVAL:
+        return
+    _last_cli_error_check = now
+
+    for w in workers:
+        name = w["name"]
+        hwnd = w["hwnd"]
+        if hwnd == 0 or not user32.IsWindow(hwnd):
+            continue
+
+        _init_cli_error_entry(name)
+        state = _cli_error_state[name]
+
+        # If cooldown just expired and consecutive errors were cleared, post READY
+        if now >= state["cooldown_until"] and state["cooldown_until"] > 0:
+            if state["consecutive_errors"] == 0 and state["error_count"] > 0:
+                _post_worker_ready_after_error(name)
+                state["cooldown_until"] = 0.0
+
+        error_type = detect_cli_error(hwnd, name)
+        if error_type:
+            _handle_cli_error_recovery(name, hwnd, error_type)
+
+
+def _update_health_with_cli_errors(health: dict):
+    """Merge CLI error state into the health dict for worker_health.json."""  # signed: gamma
+    for name, state in _cli_error_state.items():
+        if name in health and isinstance(health[name], dict):
+            health[name]["cli_error"] = {
+                "error_count": state["error_count"],
+                "last_error_time": state["last_error_time"],
+                "last_error_type": state["last_error_type"],
+                "consecutive_errors": state["consecutive_errors"],
+                "cooldown_until": state["cooldown_until"],
+                "degraded": state["consecutive_errors"] >= CLI_ERROR_DEGRADED_THRESHOLD,
+            }
+
+
 REALTIME_FILE = DATA_DIR / "realtime.json"
 REALTIME_PID_FILE = DATA_DIR / "realtime.pid"
 REALTIME_STALE_THRESHOLD = 5  # seconds
@@ -1282,9 +1556,13 @@ def _run_monitor_cycle(workers, orch_hwnd, args, cycle, now, last_model_check, l
     do_orch = (now - last_orch_check) >= ORCH_MODEL_CHECK_INTERVAL
 
     health = run_check(workers, orch_hwnd, check_model=do_model, check_orch=do_orch)
-    write_health(health)
 
     _check_stuck_workers(workers)
+
+    _check_cli_errors(workers)  # CLI error detection via PrintWindow + OCR — signed: gamma
+    _update_health_with_cli_errors(health)  # merge error state into health.json — signed: gamma
+
+    write_health(health)  # write after CLI error merge so error state is persisted
 
     _track_productivity(workers, health)
     productivity = _get_productivity_summary()
