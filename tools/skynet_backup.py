@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -75,6 +76,13 @@ PROTOCOL_FILES = [
 ]
 
 ALL_PROTECTED = CRITICAL_DATA_FILES + PROTOCOL_FILES
+
+# Files that should be auto-staged for git after modification
+WHITELISTED_GIT_FILES = {
+    'brain_config.json', 'agent_profiles.json', 'boot_protocol.json',
+    'critical_processes.json', 'incidents.json', 'version_history.json',
+    'level4_architecture.md', 'skynet_bootstrap.md',
+}
 
 
 def _ensure_backup_dir():
@@ -497,6 +505,14 @@ def safe_write_json(filepath: str, data: Any, label: Optional[str] = None) -> st
             os.remove(tmp)
         raise
 
+    # Auto-stage whitelisted files for git
+    basename = os.path.basename(path)
+    if basename in WHITELISTED_GIT_FILES:
+        try:
+            subprocess.run(['git', 'add', str(path)], capture_output=True, timeout=5, cwd=str(REPO_ROOT))
+        except Exception:
+            pass  # git staging is best-effort
+
     return str(path)
 
 
@@ -524,7 +540,31 @@ def safe_write_text(filepath: str, content: str, label: Optional[str] = None) ->
             os.remove(tmp)
         raise
 
+    # Auto-stage whitelisted files for git
+    basename = os.path.basename(path)
+    if basename in WHITELISTED_GIT_FILES:
+        try:
+            subprocess.run(['git', 'add', str(path)], capture_output=True, timeout=5, cwd=str(REPO_ROOT))
+        except Exception:
+            pass  # git staging is best-effort
+
     return str(path)
+
+
+def auto_stage_critical_files():
+    """Stage all modified whitelisted data files for git commit."""
+    staged = []
+    for fname in WHITELISTED_GIT_FILES:
+        fpath = DATA_DIR / fname if not fname.endswith('.md') else REPO_ROOT / 'data' / fname
+        if fpath.exists():
+            result = subprocess.run(
+                ['git', 'diff', '--name-only', str(fpath)],
+                capture_output=True, text=True, timeout=5, cwd=str(REPO_ROOT)
+            )
+            if result.stdout.strip():
+                subprocess.run(['git', 'add', str(fpath)], capture_output=True, timeout=5, cwd=str(REPO_ROOT))
+                staged.append(fname)
+    return staged
 
 
 # --- CLI ---
