@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "lessons": [
+    {
+      "id": "BOOT-001",
+      "title": "Never manually bootstrap workers",
+      "description": "Always use skynet_start.py or --reconnect to bootstrap workers. Manual window opening and prompting is fragile, error-prone, and breaks the grid layout. skynet_start.py handles window creation, positioning, model guard, agent injection, and registration atomically.",
+      "severity": "critical"
+    },
+    {
+      "id": "BOOT-002",
+      "title": "One window at a time rule",
+      "description": "new_chat.ps1 blocks if the chat window has no first prompt. Windows must be opened sequentially, not in parallel. Each window must receive its initial prompt before the next one is opened, otherwise the UI Automation flow stalls waiting for the input box to appear.",
+      "severity": "critical"
+    },
+    {
+      "id": "BOOT-003",
+      "title": "Never call fix_model directly from orchestrator",
+      "description": "fix_model uses SetForegroundWindow which steals focus from the orchestrator. This violates the orchestrator focus protection rule and can cause the orchestrator to lose its input context. Model correction must be done by skynet_monitor.py daemon or via PostMessage-based automation only.",
+      "severity": "critical"
+    },
+    {
+      "id": "BOOT-004",
+      "title": "Grid positions are right monitor only",
+      "description": "Worker windows use a fixed 2x2 grid on the right monitor. Alpha: top-left (1930,20), Beta: top-right (2870,20), Gamma: bottom-left (1930,540), Delta: bottom-right (2870,540). All windows are 930x500. Bottom row y=540 with h=500 gives bottom=1040, leaving 40px taskbar clearance. Never use h=520 for bottom row.",
+      "severity": "high"
+    },
+    {
+      "id": "BOOT-005",
+      "title": "Verify agent_ok before dispatching",
+      "description": "Before dispatching tasks to any worker, scan the window with UIA engine to confirm agent_ok is true (Copilot CLI mode active). Dispatching to a worker in wrong agent mode (Edits, Agent) will cause the task to be misinterpreted or silently dropped. Use uia_engine.scan(hwnd).agent_ok to verify.",
+      "severity": "high"
+    },
+    {
+      "id": "BOOT-006",
+      "title": "Inter-dispatch cooldown 2s mandatory",
+      "description": "A minimum 2-second cooldown between consecutive dispatches is required to prevent clipboard corruption. Ghost-typing uses the clipboard to paste task text into worker input boxes. Rapid sequential dispatches cause clipboard race conditions where one worker receives another worker's task.",
+      "severity": "high"
+    },
+    {
+      "id": "BOOT-007",
+      "title": "Orchestrator focus must never be stolen",
+      "description": "The orchestrator VS Code window must never lose focus during automated operations. All window management must use Win32 API calls (MoveWindow, ShowWindow, PostMessage) that operate without requiring focus. Any operation that steals focus (SetForegroundWindow, SendKeys, pyautogui) is forbidden. If focus is accidentally stolen, it must be restored immediately.",
+      "severity": "critical"
+    }
+  ],
+  "boot_sequence": [
+    "1. Start Skynet backend (port 8420) and GOD Console (port 8421)",
+    "2. Launch skynet_monitor.py daemon for health monitoring",
+    "3. Restore existing sessions via right-click -> Open in New Window. Fall back to opening new windows sequentially via new_chat.ps1 (one at a time, wait for prompt ready)",
+    "4. Position each window in 2x2 grid on right monitor using Win32 MoveWindow",
+    "5. Verify model_ok and agent_ok on each window via UIA engine scan",
+    "6. Inject worker identity preamble into each window with 2s inter-dispatch cooldown",
+    "7. Register all workers with Skynet backend via /register endpoint",
+    "8. Connect ScreenMemory engines (DAAORouter, DAGEngine, InputGuard, HybridRetriever, Orchestrator, Desktop)",
+    "9. Start skynet_self_prompt.py daemon for orchestrator heartbeat",
+    "10. Dispatch initial tasks to workers and enter autonomous pull loop"
+  ],
+  "anti_patterns": [
+    "Opening multiple chat windows simultaneously — causes UI Automation race conditions",
+    "Using SetForegroundWindow from orchestrator context — steals focus",
+    "Using pyautogui or SendKeys for window interaction — fragile screen-based input",
+    "Dispatching without UIA agent_ok verification — tasks silently dropped",
+    "Rapid-fire dispatches without 2s cooldown — clipboard corruption",
+    "Manually positioning windows instead of using grid constants — inconsistent layout",
+    "Killing worker processes to restart them — use skynet_start.py --reconnect instead",
+    "Using h=520 for bottom row workers — overlaps taskbar at y+h=1060+"
+  ]
+}
+

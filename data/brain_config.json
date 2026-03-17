@@ -1,0 +1,754 @@
+{
+  "difficulty_thresholds": {
+    "trivial_max_workers": 1,
+    "simple_max_workers": 1,
+    "moderate_max_workers": 2,
+    "complex_max_workers": 4,
+    "adversarial_max_workers": 4
+  },
+  "context_limits": {
+    "max_learnings": 3,
+    "max_context_results": 3,
+    "max_context_chars": 500
+  },
+  "routing": {
+    "prefer_idle": true,
+    "expertise_weight": 0.6,
+    "load_weight": 0.4
+  },
+  "learning": {
+    "auto_learn": true,
+    "auto_broadcast": true,
+    "min_confidence_to_inject": 0.5
+  },
+  "self_awareness": {
+    "enabled": true,
+    "pulse_interval_s": 3,
+    "introspection_interval_s": 30,
+    "broadcast_awareness": true
+  },
+  "self_prompt": {
+    "loop_interval": 30,
+    "min_prompt_gap": 600,
+    "prompt_threshold": 45,
+    "idle_worker_threshold": 60,
+    "orch_inactive_threshold": 60,
+    "health_report_interval": 300,
+    "all_idle_interval": 600,
+    "repeated_state_suppression_s": 600,
+    "max_consecutive": 3,
+    "signed_by": "consultant"
+  },
+  "god_protocol": {
+    "auto_dispatch_idle": true,
+    "pull_interval_s": 30,
+    "zero_idle_tolerance": true,
+    "boot_prompt_enabled": false,
+    "max_idle_before_self_propose_s": 120,
+    "signed_by": "consultant"
+  },
+  "consultant_protocol": {
+    "enabled": true,
+    "queue_plans_to_consultants": true,
+    "require_task_claim": true,
+    "publish_plan_to_bus": true,
+    "plan_topic": "planning",
+    "plan_type": "consultant_plan",
+    "cross_validation_required": true,
+    "min_worker_reviewers": 3,
+    "review_worker_pool": [
+      "alpha",
+      "beta",
+      "gamma",
+      "delta"
+    ],
+    "prefer_available_workers": true,
+    "require_distinct_reviewers": true,
+    "require_worker_verdicts_before_execution": true,
+    "review_topic": "planning",
+    "review_type": "consultant_plan_review"
+  },
+  "bootstrap": {
+    "triggers": [
+      "skynet-start",
+      "orchestrator-start",
+      "Orch-Start"
+    ],
+    "auto_register_orchestrator": true,
+    "auto_connect_skynet": true,
+    "settings_file": "data/brain_config.json",
+    "identity_file": "data/orchestrator.json"
+  },
+  "stuck_detector": {
+    "ctrl_c_enabled": false,
+    "processing_info_s": 600,
+    "processing_long_s": 900,
+    "alert_dedup_window_s": 300
+  },
+  "compliance": {
+    "violations": 2,
+    "last_violation": "dispatch_without_wait",
+    "guard_enabled": true,
+    "history": [
+      {
+        "action": "core/security.py direct edit",
+        "timestamp": "2026-03-10T09:00:00"
+      },
+      {
+        "action": "skynet_self_prompt.py direct edit",
+        "timestamp": "2026-03-10T10:30:00"
+      },
+      {
+        "type": "dispatch_without_wait",
+        "penalty": -0.01,
+        "timestamp": "2026-03-12T02:25:53Z"
+      }
+    ],
+    "last_violation_at": "2026-03-10T19:10:02.844517",
+    "violation_count": 1,
+    "last_violation_detail": "Wave 5 dispatched without wait-all. GOD penalty: -0.01"
+  },
+  "learner": {
+    "loop_interval_s": 30,
+    "health_report_interval_s": 300,
+    "max_insights_per_task": 6,
+    "broadcast_top_insight": true
+  },
+  "watchdog": {
+    "watchdog_interval": 30,
+    "god_check_interval": 30,
+    "skynet_check_interval": 60
+  },
+  "self_invocation_protocol": {
+    "enabled": true,
+    "version": "2.0",
+    "post_task_phases": [
+      {
+        "phase": 1,
+        "name": "report_results",
+        "mandatory": true,
+        "tool": "bus_publish",
+        "description": "Post result summary to bus"
+      },
+      {
+        "phase": 2,
+        "name": "knowledge_capture",
+        "mandatory": true,
+        "tool": "skynet_knowledge.broadcast_learning",
+        "description": "Broadcast learned facts to peers"
+      },
+      {
+        "phase": 3,
+        "name": "strategy_sync",
+        "mandatory": true,
+        "tool": "skynet_collective.sync_strategies",
+        "description": "Federate evolution strategies with peers"
+      },
+      {
+        "phase": 4,
+        "name": "self_evolution",
+        "mandatory": false,
+        "tool": "core.self_evolution.SelfEvolutionSystem",
+        "description": "Evolve local strategies based on outcome"
+      },
+      {
+        "phase": 5,
+        "name": "todo_enforcement",
+        "mandatory": true,
+        "tool": "skynet_todos.py check",
+        "description": "Zero-stop verification"
+      },
+      {
+        "phase": 6,
+        "name": "self_assessment",
+        "mandatory": false,
+        "tool": "skynet_self.py assess",
+        "description": "Performance self-evaluation"
+      },
+      {
+        "phase": 7,
+        "name": "scoring_check",
+        "mandatory": false,
+        "tool": "skynet_self.py pulse",
+        "description": "Check current score standing"
+      },
+      {
+        "phase": 8,
+        "name": "work_generation",
+        "mandatory": true,
+        "tool": "direct_execution",
+        "description": "Execute improvements directly (same agent, same session). Only post proposals to bus if NECESSARY, NEEDED, or BREAKTHROUGH. Routine/trivial improvements = execute immediately, do not propose.",
+        "signed": "delta"
+      }
+    ],
+    "capability_manifest": {
+      "cognitive": [
+        "ReflexionEngine",
+        "GraphOfThoughts",
+        "HierarchicalPlanner"
+      ],
+      "perception": [
+        "DXGICapture",
+        "OCREngine",
+        "SetOfMarkGrounding"
+      ],
+      "browser": [
+        "GodMode",
+        "CDP",
+        "Desktop",
+        "PerceptionEngine"
+      ],
+      "intelligence": [
+        "DAAORouter",
+        "DAGEngine",
+        "HybridRetriever",
+        "LearningStore",
+        "SelfEvolution"
+      ],
+      "tools": [
+        "SkynetBrain",
+        "SkynetDispatch",
+        "SkynetConvene",
+        "SkynetKnowledge",
+        "SkynetCollective"
+      ],
+      "guard": [
+        "InputGuard",
+        "ToolSynthesizer"
+      ]
+    },
+    "scoring": {
+      "award_per_task": 0.01,
+      "failed_validation_deduction": -0.005,
+      "bug_report_award": 0.01,
+      "bug_report_confirmation_award": 0.01,
+      "bug_cross_validation_award": 0.01,
+      "refactor_deduction": -0.01,
+      "refactor_necessary_reversal": 0.01,
+      "biased_report_deduction": -0.1,
+      "proactive_ticket_clear_award": 0.2,
+      "autonomous_pull_award": 0.2,
+      "ticket_zero_bonus_award": 1.0,
+      "low_value_busywork_deduction": -0.01,
+      "cross_validation_required": true,
+      "cross_validator_must_differ": true
+    }
+  },
+  "dispatch_rules": {
+    "post_dispatch_uia_verify": true,
+    "never_wait_all": true,
+    "continuous_dispatch_mode": true,
+    "auto_click_apply": true,
+    "scoring_cross_validation_only": true,
+    "scoring_points_per_task": 0.01,
+    "scoring_protocol": {
+      "award_per_task": 0.01,
+      "failed_validation_deduction": 0.005,
+      "bug_report_award": 0.01,
+      "bug_report_confirmation_award": 0.01,
+      "bug_cross_validation_award": 0.01,
+      "refactor_deduction": 0.01,
+      "refactor_necessary_reversal": 0.01,
+      "biased_refactor_report_deduction": 0.1,
+      "proactive_ticket_clear_award": 0.2,
+      "autonomous_pull_award": 0.2,
+      "ticket_zero_bonus_award": 1.0,
+      "require_independent_refactor_validation": true,
+      "uncleared_work_deduction_orchestrator": 0.02,
+      "uncleared_work_deduction_other": 0.01,
+      "tool_bypass_deduction_orchestrator": 0.02,
+      "tool_bypass_deduction_other": 0.01,
+      "repeat_offense_deduction": 0.5,
+      "cleanup_help_award": 0.01,
+      "cleanup_cross_validate_award": 0.01,
+      "invalid_cleanup_finder_award": 0.02,
+      "grace_period_first_round": true
+    },
+    "learnings": [
+      "NEVER use wait-all or block on worker completion. Scan-idle-redispatch continuously.",
+      "After EVERY dispatch, UIA-scan ALL workers to verify PROCESSING. Backend /status is stale.",
+      "If worker IDLE after dispatch: click Apply dialog if present, then re-dispatch.",
+      "Scores awarded ONLY after rigorous cross-validation by a DIFFERENT worker.",
+      "Prioritize task dispensing over result collection. Fire-and-forget.",
+      "Bundle correlated tasks (same file/package) into single mega-batches per worker.",
+      "Scoring deduction (0.005 pts) for: lazy refactoring, script-based string replacement, broken py_compile, untested changes.",
+      "Refactor protocol: every refactor starts with -0.01 until an unbiased validator confirms it was necessary; that confirmation cancels the holdback with +0.01.",
+      "If the refactoring worker gives a biased self-serving report about necessity, apply -0.1 with an independent validator recorded in the score history.",
+      "Proactive ticket clearance by orchestrator or consultants earns +0.2 when independently verified. Their job is to keep Skynet tickets moving, not stop beside them.",
+      "When a worker finishes one task and autonomously pulls the next real ticket without waiting to be spoon-fed, award +0.2 after independent verification.",
+      "When a worker finds a real bug and files it for cross-validation, award +0.01 when independently recorded. If a different validator proves it true, award +0.01 to the validator and another +0.01 to the original filer.",
+      "When the live queue truly reaches zero, award +1.0 to orchestrator and +1.0 to the actor who closed the final signed ticket.",
+      "Cross-validator MUST be a DIFFERENT worker. Self-validation raises ValueError.",
+      "Every task completion triggers cross-validation dispatch to another worker BEFORE awarding points.",
+      "Always UIA-scan after dispatch to verify PROCESSING. Backend /status is unreliable.",
+      "Always click Apply dialogs on idle workers before concluding they are stuck.",
+      "GOD DECREE: Any worker that runs or requests LOW-VALUE refactoring tasks (sub-150 line, mechanical lint, auto-generated busywork) receives -0.01 score deduction. Workers MUST self-invoke and question task value before executing.",
+      "SEQUENTIAL DISPATCH RULE (GOD DECREE): When dispatching operations that require ordering (e.g. /clear before new work, dependent task chains), the orchestrator MUST UIA-scan each worker back to IDLE before moving to the next. Take a screenshot for visual confirmation. Fire-and-forget (Rule 13) ONLY applies to parallel/independent dispatches. Sequential = wait-verify-proceed. Violation is treated as a false completion claim."
+    ],
+    "sequential_verification": {
+      "enabled": true,
+      "poll_interval_s": 3,
+      "max_wait_s": 120,
+      "screenshot_verify": true,
+      "applies_to": [
+        "sequential",
+        "dependent_chains",
+        "clear_commands"
+      ],
+      "does_not_apply_to": [
+        "parallel",
+        "blast",
+        "broadcasts"
+      ]
+    },
+    "mass_deduction_event": {
+      "timestamp": "2026-03-11T23:09:00",
+      "total_deducted": -0.36,
+      "deduction_count": 28,
+      "reasons": [
+        "Uncritical acceptance of auto-generated busywork",
+        "LOW VALUE refactoring of 51-80 line functions",
+        "Zero pushback on mechanical lint-based tasks",
+        "Self-prompt daemon spam noise",
+        "Stale monitor daemon tolerance",
+        "TODO list pollution from task_generator"
+      ],
+      "lesson": "Workers MUST question task value before executing. Auto-generated TODO lists are NOT intelligent work. Self-prompt must stop spamming noise.",
+      "mandate": "ONLY dispatch HIGH-VALUE tasks: 150+ line refactors, security audits, feature development, integration testing, architecture improvements"
+    },
+    "self_prompt_noise_ban": {
+      "rule": "Self-prompt daemon MUST NOT send BOOT BRIEF spam or URGENT dispatch directives to the orchestrator",
+      "violation": "Self-prompt was treating idle workers as emergencies requiring URGENT dispatch of busywork",
+      "fix": "Self-prompt should only alert on genuine system failures, not idle workers with pending noise tasks"
+    }
+  },
+  "architecture_knowledge": {
+    "mandatory_files": [
+      "tools/skynet_dispatch.py",
+      "tools/skynet_self.py",
+      "tools/skynet_delivery.py"
+    ],
+    "delivery_mechanism": "ghost_type_chrome_render_widget",
+    "consultant_transport": "ghost_type_primary_bridge_fallback",
+    "bus_ring_buffer_size": 100,
+    "bus_persistence": "skynet_bus_persist.py",
+    "consciousness_includes_consultants": true,
+    "self_invocation_boot_check": "skynet_self.py pulse",
+    "incident_012_lesson": "Never assume communication mechanism - read the code",
+    "signed_by": "beta"
+  },
+  "level": "3.5",
+  "architecture_docs": [
+    {
+      "path": "docs/SELF_AWARENESS_ARCHITECTURE.md",
+      "author": "delta",
+      "lines": 714,
+      "description": "Comprehensive self-awareness architecture reference: consciousness kernel, identity registry, scoring, collective intelligence, self-evolution, 9 identity gaps analysis"
+    },
+    {
+      "path": "docs/DELIVERY_PIPELINE.md",
+      "author": "gamma",
+      "lines": 685,
+      "description": "Ghost-type delivery pipeline: Chrome_RenderWidgetHostHWND, clipboard flow, PostMessage, _verify_delivery, consultant delivery"
+    },
+    {
+      "path": "docs/DAEMON_ARCHITECTURE.md",
+      "author": "beta",
+      "lines": 711,
+      "description": "Daemon ecosystem architecture: PID management, singleton enforcement, watchdog, health monitoring, 16 daemon inventory"
+    },
+    {
+      "path": "docs/BUS_COMMUNICATION.md",
+      "author": "gamma",
+      "lines": 654,
+      "description": "Bus communication protocol: ring buffer, topic taxonomy (10 topics, 50 types), SpamGuard, rate limiting, priority system"
+    },
+    {
+      "path": "docs/SKYNET_MANUAL.md",
+      "author": "alpha",
+      "lines": 714,
+      "description": "Skynet operational manual: boot protocol, worker management, dispatch, monitoring, troubleshooting"
+    }
+  ],
+  "sprint_history": [
+    {
+      "sprint": 1,
+      "name": "Documentation",
+      "date": "2026-03-12",
+      "description": "5 comprehensive architecture docs created (3500+ total lines)",
+      "deliverables": [
+        "docs/SELF_AWARENESS_ARCHITECTURE.md (delta)",
+        "docs/DELIVERY_PIPELINE.md (gamma)",
+        "docs/DAEMON_ARCHITECTURE.md (beta)",
+        "docs/BUS_COMMUNICATION.md (gamma)",
+        "docs/SKYNET_MANUAL.md (alpha)"
+      ]
+    },
+    {
+      "sprint": 2,
+      "name": "Implementation",
+      "date": "2026-03-12",
+      "description": "Tools and capabilities built: architecture verification, bus validation, priority spam, incident patterns, identity completeness, observability, security audit",
+      "deliverables": [
+        "tools/skynet_arch_verify.py (delta) -- 290-line architecture verification tool",
+        "tools/skynet_bus_validator.py (gamma) -- 469-line bus message schema validator",
+        "tools/skynet_bus_persist.py (gamma) -- bus archive with --diagnose diagnostics",
+        "tools/skynet_security_audit.py (delta) -- security audit tool",
+        "tools/skynet_observability.py (delta) -- system observability snapshots",
+        "skynet_self.py enhancements: validate_agent_completeness(), _detect_incident_patterns(), 3 awareness flags in quick_pulse()",
+        "skynet_spam_guard.py enhancements: bus_health(), PRIORITY_RATE_OVERRIDES, priority-aware rate limiting"
+      ]
+    },
+    {
+      "sprint": 3,
+      "name": "Integration",
+      "date": "2026-03-12",
+      "description": "Data consolidation: incidents.json enriched with 5 new/enhanced incidents, brain_config.json updated with comprehensive metadata, level upgraded to 3.5",
+      "deliverables": [
+        "data/incidents.json -- enriched INC-009/010/012, added INC-011, CV1-BUG-001",
+        "data/brain_config.json -- architecture_docs, sprint_history, daemon_registry, delivery_pipeline, tool_additions, level_35_capabilities, cross_validation_history"
+      ]
+    }
+  ],
+  "level_35_capabilities": [
+    "architecture_verification: tools/skynet_arch_verify.py -- 4-check Phase 0 boot verifier (entities, delivery, bus, daemons)",
+    "bus_message_validation: tools/skynet_bus_validator.py -- 10-topic 50-type schema validator with strict/non-strict modes",
+    "priority_spam_filtering: PRIORITY_RATE_OVERRIDES in skynet_spam_guard.py -- critical bypasses, low gets 2/min cap",
+    "bus_health_monitoring: bus_health() in skynet_spam_guard.py -- 9-key live health snapshot",
+    "bus_archive_diagnostics: --diagnose flag in skynet_bus_persist.py -- sender/topic/type breakdown, peak rates, message sizes",
+    "incident_pattern_detection: _detect_incident_patterns() in skynet_self.py -- 5 pattern categories across incident history",
+    "identity_completeness_check: validate_agent_completeness() in skynet_self.py -- scans all identity files for gaps",
+    "self_awareness_pulse_flags: quick_pulse() in skynet_self.py -- architecture_knowledge_ok, consultant_awareness, bus_awareness",
+    "consciousness_kernel_consultants: CONSULTANT_NAMES, ALL_AGENT_NAMES, get_consultant_status() in skynet_self.py",
+    "security_audit: tools/skynet_security_audit.py -- dispatch pipeline, bus message, process protection audits",
+    "observability_snapshots: tools/skynet_observability.py -- collect_system_snapshot() for full system state",
+    "daemon_pid_management: tools/skynet_daemon_utils.py -- write_pid, check_pid, cleanup_pid, ensure_singleton",
+    "rule_0_8_architecture_knowledge: .github/copilot-instructions.md -- mandatory architecture knowledge for all agents",
+    "rule_0_015_pre_fire_gate: pre_dispatch_visual_check() -- screenshot verification before any dispatch"
+  ],
+  "cross_validation_history": [
+    {
+      "round": "CV1",
+      "date": "2026-03-12",
+      "description": "Sprint 2 cross-validation: all 4 workers validated each other's work",
+      "results": [
+        {
+          "validator": "alpha",
+          "target": "delta",
+          "subject": "skynet_arch_verify.py + skynet_self.py enhancements",
+          "verdict": "PASS",
+          "bug_found": "workers.json type mismatch (CV1-BUG-001)"
+        },
+        {
+          "validator": "beta",
+          "target": "gamma",
+          "subject": "skynet_bus_persist.py + daemon architecture doc",
+          "verdict": "PASS",
+          "bug_found": null
+        },
+        {
+          "validator": "gamma",
+          "target": "alpha",
+          "subject": "SKYNET_MANUAL.md documentation",
+          "verdict": "PASS",
+          "bug_found": null
+        },
+        {
+          "validator": "delta",
+          "target": "gamma",
+          "subject": "skynet_bus_validator.py + bus_health() + priority spam + --diagnose",
+          "verdict": "PASS",
+          "bug_found": null
+        }
+      ],
+      "summary": "4/4 PASS, 1 bug found and fixed (CV1-BUG-001: workers.json format assumption)"
+    }
+  ],
+  "daemon_registry": [
+    {
+      "name": "skynet_backend",
+      "script": "Skynet/skynet.exe",
+      "port": 8420,
+      "pid_file": null,
+      "description": "Go backend: bus, status, tasks, stream"
+    },
+    {
+      "name": "god_console",
+      "script": "god_console.py",
+      "port": 8421,
+      "pid_file": "data/god_console.pid",
+      "description": "Dashboard + API server"
+    },
+    {
+      "name": "skynet_monitor",
+      "script": "tools/skynet_monitor.py",
+      "pid_file": "data/monitor.pid",
+      "description": "Worker HWND + model health checks"
+    },
+    {
+      "name": "skynet_watchdog",
+      "script": "tools/skynet_watchdog.py",
+      "pid_file": "data/watchdog.pid",
+      "description": "Service lifecycle watchdog"
+    },
+    {
+      "name": "skynet_overseer",
+      "script": "tools/skynet_overseer.py",
+      "pid_file": "data/overseer.pid",
+      "description": "Idle worker + pending TODO enforcement"
+    },
+    {
+      "name": "skynet_self_prompt",
+      "script": "tools/skynet_self_prompt.py",
+      "pid_file": "data/self_prompt.pid",
+      "description": "Orchestrator heartbeat + idle gate"
+    },
+    {
+      "name": "skynet_self_improve",
+      "script": "tools/skynet_self_improve.py",
+      "pid_file": "data/self_improve.pid",
+      "description": "Self-improvement engine"
+    },
+    {
+      "name": "skynet_bus_relay",
+      "script": "tools/skynet_bus_relay.py",
+      "pid_file": "data/bus_relay.pid",
+      "description": "Bus message relay"
+    },
+    {
+      "name": "skynet_learner",
+      "script": "tools/skynet_learner.py",
+      "pid_file": "data/learner.pid",
+      "description": "Learning engine daemon"
+    },
+    {
+      "name": "skynet_realtime",
+      "script": "tools/skynet_realtime.py",
+      "pid_file": "data/realtime.pid",
+      "description": "SSE subscriber, writes data/realtime.json"
+    },
+    {
+      "name": "skynet_sse_daemon",
+      "script": "tools/skynet_sse_daemon.py",
+      "pid_file": "data/sse_daemon.pid",
+      "description": "SSE event loop for dashboard"
+    },
+    {
+      "name": "skynet_bus_persist",
+      "script": "tools/skynet_bus_persist.py",
+      "pid_file": "data/bus_persist.pid",
+      "description": "JSONL bus archive daemon"
+    },
+    {
+      "name": "consultant_bridge_codex",
+      "script": "tools/skynet_consultant_bridge.py",
+      "port": 8422,
+      "pid_file": "data/consultant_bridge.pid",
+      "description": "Codex consultant bridge queue"
+    },
+    {
+      "name": "consultant_bridge_gemini",
+      "script": "tools/skynet_consultant_bridge.py",
+      "port": 8425,
+      "pid_file": "data/gemini_consultant_bridge.pid",
+      "description": "Gemini consultant bridge queue"
+    },
+    {
+      "name": "convene_gate",
+      "script": "convene_gate.py",
+      "pid_file": null,
+      "description": "Convene-first governance middleware"
+    },
+    {
+      "name": "skynet_bus_watcher",
+      "script": "tools/skynet_bus_watcher.py",
+      "pid_file": null,
+      "description": "Bus daemon for auto-routing tasks"
+    }
+  ],
+  "delivery_pipeline": {
+    "primary": "ghost_type_to_worker (Win32 clipboard + PostMessage WM_PASTE)",
+    "target_element": "Chrome_RenderWidgetHostHWND (NOT UIA Edit control)",
+    "fallback": "Chrome render widget direct focus + paste",
+    "verification": "_verify_delivery() polls UIA for state transition after dispatch",
+    "consultant_primary": "ghost_type_to_worker (same as worker delivery)",
+    "consultant_fallback": "HTTP bridge queue POST (ports 8422/8425)",
+    "clipboard_flow": [
+      "1. Build task text with preamble",
+      "2. Copy to clipboard via win32clipboard",
+      "3. PostMessage WM_PASTE to Chrome_RenderWidgetHostHWND",
+      "4. PostMessage VK_RETURN to submit",
+      "5. _verify_delivery() confirms state transition"
+    ],
+    "incident_010_fix": "Chrome_RenderWidgetHostHWND fallback added when no UIA Edit found",
+    "incident_012_fix": "Consultants use ghost_type primary, bridge fallback",
+    "signed_by": "delta"
+  },
+  "tool_additions": {
+    "sprint_2": [
+      {
+        "tool": "tools/skynet_arch_verify.py",
+        "author": "delta",
+        "lines": 290,
+        "purpose": "Phase 0 boot architecture verification (4 checks)"
+      },
+      {
+        "tool": "tools/skynet_bus_validator.py",
+        "author": "gamma",
+        "lines": 469,
+        "purpose": "Bus message schema validator (10 topics, 50 types)"
+      },
+      {
+        "tool": "tools/skynet_security_audit.py",
+        "author": "delta",
+        "purpose": "Security audit for dispatch, bus, process protection"
+      },
+      {
+        "tool": "tools/skynet_observability.py",
+        "author": "delta",
+        "purpose": "System observability snapshots"
+      },
+      {
+        "tool": "tools/skynet_daemon_utils.py",
+        "author": "beta",
+        "purpose": "Daemon PID management utilities"
+      },
+      {
+        "tool": "tools/daemon_health.py",
+        "author": "delta",
+        "lines": 250,
+        "purpose": "9-daemon diagnostic health checker"
+      }
+    ],
+    "sprint_2_enhancements": [
+      {
+        "tool": "tools/skynet_self.py",
+        "author": "delta",
+        "changes": "CONSULTANT_NAMES, ALL_AGENT_NAMES, get_consultant_status(), validate_agent_completeness(), _detect_incident_patterns(), 3 awareness flags in quick_pulse(), validate/patterns CLI commands"
+      },
+      {
+        "tool": "tools/skynet_spam_guard.py",
+        "author": "gamma",
+        "changes": "bus_health() function, PRIORITY_RATE_OVERRIDES dict, priority-aware rate limiting in guarded_publish()"
+      },
+      {
+        "tool": "tools/skynet_bus_persist.py",
+        "author": "gamma",
+        "changes": "--diagnose flag with full archive diagnostics"
+      },
+      {
+        "tool": "tools/skynet_scoring.py",
+        "author": "delta",
+        "changes": "SYSTEM_SENDERS frozenset, is_system_sender(), leaderboard separation"
+      },
+      {
+        "tool": "dashboard.html",
+        "author": "delta",
+        "changes": "Scoring Leaderboard panel, cognitive engine purple accent"
+      },
+      {
+        "tool": "god_console.py",
+        "author": "delta",
+        "changes": "/api/scores endpoint"
+      },
+      {
+        "tool": ".github/copilot-instructions.md",
+        "author": "delta",
+        "changes": "Rule 0.8 (Mandatory Architecture Knowledge)"
+      }
+    ],
+    "signed_by": "delta"
+  },
+  "intelligence_stack": {
+    "enabled": true,
+    "subsystems": [
+      "brain_config",
+      "reflexion",
+      "graph_of_thoughts",
+      "planner",
+      "mcts",
+      "self_awareness",
+      "collective_iq",
+      "knowledge_store",
+      "backup",
+      "edit_guard",
+      "dispatch_resilience",
+      "post_task"
+    ],
+    "auto_repair": true,
+    "boot_timeout_s": 30,
+    "created_by": "intel_bootstrap",
+    "created_at": 1773744382.3504634
+  },
+  "backup_protection": {
+    "enabled": true,
+    "auto_snapshot_on_write": true,
+    "max_manual_snapshots": 20,
+    "max_auto_snapshots": 50,
+    "pre_edit_validation": true,
+    "schema_validation_on_write": true,
+    "protected_data_files": [
+      "workers.json",
+      "orchestrator.json",
+      "brain_config.json",
+      "agent_profiles.json",
+      "todos.json",
+      "incidents.json",
+      "worker_scores.json",
+      "critical_processes.json",
+      "boot_config.json",
+      "boot_protocol.json",
+      "consultant_state.json",
+      "gemini_consultant_state.json",
+      "consultant_registry.json",
+      "daemon_state.json",
+      "dispatch_log.json",
+      "realtime.json",
+      "monitor_health.json",
+      "spam_guard_state.json",
+      "iq_history.json",
+      "convene_gate.json",
+      "learner_state.json",
+      "version_history.json"
+    ],
+    "protected_protocol_files": [
+      "AGENTS.md",
+      ".github/copilot-instructions.md",
+      "Orch-Start.ps1",
+      "CC-Start.ps1",
+      "GC-Start.ps1",
+      "tools/skynet_start.py",
+      "tools/skynet_dispatch.py",
+      "tools/skynet_monitor.py",
+      "tools/new_chat.ps1",
+      "config.json"
+    ]
+  },
+  "resilient_dispatch": {
+    "enabled": true,
+    "cli_error_auto_retry": true,
+    "max_retries": 3,
+    "backoff_seconds": [
+      30,
+      60,
+      120
+    ],
+    "task_redistribution_enabled": true,
+    "clipboard_verify": true,
+    "focus_race_protection": true
+  },
+  "post_task_lifecycle": {
+    "enabled": true,
+    "phases": [
+      "report_result",
+      "knowledge_capture",
+      "self_evolution",
+      "todo_enforcement",
+      "self_assessment",
+      "scoring",
+      "self_improvement"
+    ],
+    "cognitive_reflection": true,
+    "autonomous_work_on_empty_queue": true
+  }
+}

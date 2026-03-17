@@ -19,7 +19,10 @@ build/
 *.sqlite
 
 # Data directory -- exclude all runtime state, whitelist config
-data/
+# NOTE: Use data/* (not data/) so negation patterns work. Git ignores
+# negations when the parent DIRECTORY is excluded (data/) but honors
+# them when only the directory CONTENTS are excluded (data/*).
+data/*
 !data/.gitkeep
 !data/agent_profiles.json
 !data/boot_protocol.json
