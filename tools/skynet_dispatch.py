@@ -1659,6 +1659,126 @@ def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
         return False  # UIA engine import failed = cannot verify = FAILED, not assumed success  # signed: alpha
 
 
+# ── Dispatch Resilience Integration ──────────────────────────────
+# Wraps dispatch_to_worker() with CLI error detection, retry, and
+# redistribution via tools.skynet_dispatch_resilience.DispatchResilience.
+# signed: alpha
+
+_resilience_instance = None
+
+
+def _get_resilience():
+    """Lazy-load singleton DispatchResilience. Returns None if unavailable."""
+    global _resilience_instance
+    if _resilience_instance is None:
+        try:
+            from tools.skynet_dispatch_resilience import DispatchResilience
+            _resilience_instance = DispatchResilience()
+        except Exception as e:
+            log(f"DispatchResilience unavailable: {e}", "WARN")
+            return None
+    return _resilience_instance
+
+
+def _resilience_notify(content):
+    """Post resilience event to bus via SpamGuard. # signed: alpha"""
+    try:
+        from tools.skynet_spam_guard import guarded_publish
+        guarded_publish({
+            "sender": "dispatch_resilience",
+            "topic": "orchestrator",
+            "type": "resilience_event",
+            "content": content,
+        })
+    except Exception as e:
+        log(f"Resilience bus notification failed: {e}", "WARN")
+
+
+def resilient_dispatch_to_worker(name, task, max_retries=3, monitor_delay_s=5):
+    """Dispatch with automatic CLI error detection, retry, and redistribution.
+
+    Wraps dispatch_to_worker() with the DispatchResilience layer:
+    1. Calls dispatch_to_worker(name, task)
+    2. If delivery succeeds, waits monitor_delay_s then checks for CLI errors
+       via DispatchResilience.detect_cli_error(hwnd)
+    3. If CLI error detected, retries with exponential backoff (30s, 60s, 120s)
+    4. If max_retries exceeded, calls redistribute_task() to send to idle worker
+    5. Posts bus alerts for all recovery events
+
+    Falls back to standard dispatch_to_worker() if DispatchResilience is unavailable.
+
+    Args:
+        name: Target worker name (e.g. 'alpha')
+        task: Task text to dispatch
+        max_retries: Maximum retry attempts before redistribution (default 3)
+        monitor_delay_s: Seconds to wait before checking for CLI errors (default 5)
+
+    Returns:
+        bool: True if dispatch succeeded (possibly after retries/redistribution)
+
+    # signed: alpha
+    """
+    dr = _get_resilience()
+    if dr is None:
+        return dispatch_to_worker(name, task)
+
+    workers = load_workers()
+    worker_map = {w["name"]: w for w in workers}
+    hwnd = worker_map.get(name, {}).get("hwnd", 0)
+
+    for attempt in range(1, max_retries + 1):
+        ok = dispatch_to_worker(name, task)
+        if not ok:
+            log(f"[resilience] dispatch_to_worker returned False for {name} "
+                f"(attempt {attempt}/{max_retries})", "WARN")
+            if attempt < max_retries:
+                backoff = 30 * (2 ** (attempt - 1))
+                log(f"[resilience] Backing off {backoff}s before retry", "WARN")
+                _resilience_notify(
+                    f"RETRY {name} attempt {attempt}/{max_retries}: "
+                    f"DISPATCH_FAILED. Backoff {backoff}s. signed:alpha"
+                )
+                time.sleep(backoff)
+            continue
+
+        # Post-dispatch monitoring: wait then check for CLI error
+        if hwnd:
+            time.sleep(monitor_delay_s)
+            error = dr.detect_cli_error(hwnd)
+            if error and error.has_error:
+                log(f"[resilience] CLI error on {name}: {error.category} "
+                    f"({error.matched_text[:60]})", "WARN")
+                _resilience_notify(
+                    f"RETRY {name} attempt {attempt}/{max_retries}: "
+                    f"{error.category}. signed:alpha"
+                )
+                if attempt < max_retries:
+                    backoff = 30 * (2 ** (attempt - 1))
+                    log(f"[resilience] Backing off {backoff}s before retry {attempt + 1}", "WARN")
+                    time.sleep(backoff)
+                continue
+
+        # Success — no CLI error detected
+        return True
+
+    # All retries exhausted — redistribute
+    log(f"[resilience] Max retries ({max_retries}) exhausted for {name}, redistributing", "WARN")
+    new_target = dr.redistribute_task(task, name)
+    if new_target:
+        log(f"[resilience] Redistributed from {name} to {new_target}", "OK")
+        _resilience_notify(
+            f"REDISTRIBUTED from {name} to {new_target} "
+            f"after {max_retries} failures. signed:alpha"
+        )
+        return True
+
+    _resilience_notify(
+        f"DISPATCH_FAILED {name} after {max_retries} retries, "
+        f"no redistribution target. signed:alpha"
+    )
+    return False
+
+
 def notify_backend_dispatch(worker_name, task, success=True):
     """Fire-and-forget notification to Go backend so atomic counters increment.
 
@@ -1742,11 +1862,13 @@ def dispatch_to_all(task, workers=None, orch_hwnd=None, delay=2.0):
     return results
 
 
-def dispatch_parallel(tasks_by_worker, workers=None, orch_hwnd=None, max_workers=8):
+def dispatch_parallel(tasks_by_worker, workers=None, orch_hwnd=None, max_workers=8, use_resilience=False):
     """Dispatch different tasks to different workers IN PARALLEL — no sequential delay.
 
     Uses ThreadPoolExecutor so all workers start simultaneously.
     tasks_by_worker: dict like {"alpha": "task1", "beta": "task2", ...}
+    use_resilience: If True, each thread monitors for CLI errors post-dispatch
+                    and marks failed dispatches (orchestrator can retry). # signed: alpha
     Returns dict of worker_name → True/False
     """
     if not workers:
@@ -1789,6 +1911,19 @@ def dispatch_parallel(tasks_by_worker, workers=None, orch_hwnd=None, max_workers
         ok = ghost_type_to_worker(hwnd, full_task, orch_hwnd)
         if not ok:
             ok = clear_steering_and_send(hwnd, full_task, orch_hwnd)
+        # Post-dispatch resilience: detect CLI errors in-thread (Win32 GDI, no COM needed)  # signed: alpha
+        if ok and use_resilience:
+            dr = _get_resilience()
+            if dr and hwnd:
+                time.sleep(5)
+                error = dr.detect_cli_error(hwnd)
+                if error and error.has_error:
+                    log(f"[resilience] CLI error in parallel dispatch to {name}: {error.category}", "WARN")
+                    _resilience_notify(
+                        f"CLI_ERROR {name} (parallel): {error.category}. "
+                        f"Manual retry may be needed. signed:alpha"
+                    )
+                    return False
         return ok
 
     with ThreadPoolExecutor(max_workers=n) as pool:
@@ -1916,10 +2051,12 @@ def _load_score(worker_name, states, bus_statuses):
     return (state_val + pending_val) / 2.0
 
 
-def smart_dispatch(task, workers=None, orch_hwnd=None, n_workers=1):
+def smart_dispatch(task, workers=None, orch_hwnd=None, n_workers=1, use_resilience=False):
     """Auto-route task to the best available worker(s).
 
     Uses expertise-aware routing: score = expertise_match * expertise_weight + inverse_load * load_weight.
+    use_resilience: If True, uses resilient_dispatch_to_worker for single-worker
+                    dispatch and passes resilience flag to dispatch_parallel. # signed: alpha
     """
     if not workers:
         workers = load_workers()
@@ -1955,11 +2092,14 @@ def smart_dispatch(task, workers=None, orch_hwnd=None, n_workers=1):
         return []
 
     if len(selected) == 1:
-        ok = dispatch_to_worker(selected[0]["name"], task, workers, orch_hwnd)
+        if use_resilience:  # signed: alpha
+            ok = resilient_dispatch_to_worker(selected[0]["name"], task)
+        else:
+            ok = dispatch_to_worker(selected[0]["name"], task, workers, orch_hwnd)
         return [selected[0]["name"]] if ok else []
     else:
         tasks_map = {w["name"]: task for w in selected}
-        results = dispatch_parallel(tasks_map, workers, orch_hwnd)
+        results = dispatch_parallel(tasks_map, workers, orch_hwnd, use_resilience=use_resilience)
         return [name for name, ok in results.items() if ok]
 
 
@@ -2270,12 +2410,19 @@ def _handle_open_project(project):
 
 def _execute_dispatch_mode(args, workers, orch_hwnd):
     """Execute the selected dispatch mode. Returns dispatch result or None."""
+    use_resilience = not getattr(args, "no_resilience", False)  # signed: alpha
     if args.blast and args.task:
         return blast_all(args.task, workers, orch_hwnd)
     if args.parallel and args.task:
-        return dispatch_parallel({w["name"]: args.task for w in workers}, workers, orch_hwnd)
+        return dispatch_parallel(
+            {w["name"]: args.task for w in workers}, workers, orch_hwnd,
+            use_resilience=use_resilience,
+        )
     if args.smart and args.task:
-        routed = smart_dispatch(args.task, workers, orch_hwnd, n_workers=args.n)
+        routed = smart_dispatch(
+            args.task, workers, orch_hwnd, n_workers=args.n,
+            use_resilience=use_resilience,
+        )
         log(f"Smart-dispatched to: {routed}", "OK" if routed else "ERR")
         return routed
     if args.fan_out_parallel:
@@ -2366,6 +2513,8 @@ Examples:
     parser.add_argument("--debate-rounds", type=int, default=3, help="Number of debate rounds (default 3)")
     parser.add_argument("--wait-result", type=str, help="After dispatch, wait for bus result matching this key")
     parser.add_argument("--timeout", type=float, default=90, help="Timeout for --wait-result (default 90s)")  # signed: beta
+    parser.add_argument("--no-resilience", action="store_true",
+                        help="Skip CLI error detection/retry for --smart and --parallel (faster)")  # signed: alpha
     args = parser.parse_args()
 
     workers = load_workers()

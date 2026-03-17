@@ -15,10 +15,11 @@ Learned from new_chat.ps1 activation sequence:
 - Model guard uses keyboard filter ("fast" + Down+Enter), not UIA list clicks
 
 Usage:
-    python tools/skynet_start.py                  # Full bootstrap
+    python tools/skynet_start.py                  # Full bootstrap (uses skynet_boot_workers)
     python tools/skynet_start.py --fresh          # Skip session restore, fresh windows only
     python tools/skynet_start.py --workers 2      # Only 2 workers
     python tools/skynet_start.py --reconnect      # Reconnect to existing workers
+    python tools/skynet_start.py --use-legacy     # Use legacy boot path (phase_3_workers)
     python tools/skynet_start.py --status         # Show system status
 """
 
@@ -97,6 +98,7 @@ NEW_CHAT_PS1   = str(ROOT / "tools" / "new_chat.ps1")
 WORKTREE_BASE  = ROOT.parent / "ScreenMemory.worktrees"
 
 BOOT_IN_PROGRESS_FILE = DATA_DIR / "boot_in_progress.json"
+BOOT_LOCK_FILE = BOOT_IN_PROGRESS_FILE  # alias for clarity — same path skynet_monitor checks  # signed: beta
 WORKER_NAMES = ["alpha", "beta", "gamma", "delta"]
 GRID_SLOTS = [
     {"name": "alpha", "x": 1930, "y": 20,  "w": 930, "h": 500, "grid": "top-left"},
@@ -1355,6 +1357,104 @@ def _map_chats_to_workers(chats, orch_hwnd):
     return mapped
 
 
+def _phase_3_boot_workers(num_workers=4, orch_hwnd=None):
+    """Open worker windows via skynet_boot_workers (canonical boot path).
+
+    Delegates to boot_all_workers() which handles: worktree creation,
+    VS Code window opening, model/session/permissions configuration via
+    pyautogui, identity prompt injection, and state verification.
+
+    Returns worker list in the same format as phase_3_workers() for
+    compatibility with phase_4_register/phase_5_save.
+
+    # signed: beta
+    """
+    if not orch_hwnd:
+        orch_hwnd = get_orchestrator_hwnd()
+    if not orch_hwnd:
+        log("No orchestrator HWND found in data/orchestrator.json", "ERR")
+        return []
+
+    # Write boot-lock file so skynet_monitor backs off during boot
+    try:
+        DATA_DIR.mkdir(exist_ok=True)
+        BOOT_LOCK_FILE.write_text(json.dumps({
+            "phase": "phase_3_boot_workers",
+            "pid": os.getpid(),
+            "started": datetime.now().isoformat(),
+            "t": time.time(),
+            "boot_script": "skynet_boot_workers",
+        }))
+        log("Boot lock acquired (boot_in_progress.json)", "SYS")
+    except Exception as e:
+        log(f"Boot lock write failed: {e}", "WARN")
+
+    try:
+        from tools.skynet_boot_workers import boot_all_workers, save_workers_json
+
+        # Determine which workers to boot
+        worker_names_to_boot = WORKER_NAMES[:min(num_workers, 4)]
+        log(f"Booting {len(worker_names_to_boot)} workers via skynet_boot_workers...", "SYS")
+
+        results = boot_all_workers(orch_hwnd, worker_names_to_boot)
+
+        # Save workers.json via boot_workers' own save logic (preserves format)
+        save_workers_json(results)
+
+        # Convert boot_workers result format → phase_3 format for downstream phases
+        workers = []
+        for r in results:
+            if not r.get("success"):
+                log(f"Worker {r['name']} boot failed: {r.get('error', 'unknown')}", "ERR")
+                continue
+            grid = r.get("grid", [0, 0, 930, 500])
+            if isinstance(grid, (list, tuple)) and len(grid) >= 4:
+                x, y, w, h = grid[0], grid[1], grid[2], grid[3]
+            else:
+                x, y, w, h = 0, 0, 930, 500
+            # Find matching grid slot name by worker name (coordinates differ
+            # slightly between skynet_start GRID_SLOTS and boot_workers GRID)  # signed: beta
+            grid_label = "unknown"
+            for slot in GRID_SLOTS:
+                if slot["name"] == r["name"]:
+                    grid_label = slot["grid"]
+                    break
+            workers.append({
+                "name": r["name"],
+                "hwnd": r["hwnd"],
+                "grid": grid_label,
+                "x": x, "y": y, "w": w, "h": h,
+                "model": r.get("model", "unknown"),
+                "session_target": r.get("session_target", "unknown"),
+                "worktree": r.get("worktree", ""),
+            })
+            log(f"Worker {r['name'].upper()}: HWND={r['hwnd']} grid={grid_label}", "OK")
+
+        # Restore orchestrator focus
+        if orch_hwnd:
+            focus_window(orch_hwnd)
+
+        succeeded = len(workers)
+        failed = len(results) - succeeded
+        log(f"Boot complete: {succeeded} succeeded, {failed} failed", "OK" if failed == 0 else "WARN")
+
+        return workers
+
+    except ImportError as e:
+        log(f"skynet_boot_workers import failed: {e} — falling back to legacy boot", "ERR")
+        return phase_3_workers(num_workers=num_workers, orch_hwnd=orch_hwnd, fresh=True)
+    except Exception as e:
+        log(f"skynet_boot_workers failed: {e} — falling back to legacy boot", "ERR")
+        return phase_3_workers(num_workers=num_workers, orch_hwnd=orch_hwnd, fresh=True)
+    finally:
+        # Release boot lock
+        try:
+            BOOT_LOCK_FILE.unlink(missing_ok=True)
+            log("Boot lock released (boot_in_progress.json)", "SYS")
+        except Exception:
+            pass
+
+
 def phase_4_register(workers):
     """Register all workers with Skynet backend."""
     for w in workers:
@@ -2009,6 +2109,7 @@ def _start_post_boot_daemons():
 def _run_full_bootstrap(args):
     """Execute the full multi-phase bootstrap sequence."""
     t0 = time.time()
+    use_legacy = getattr(args, "use_legacy", False)
 
     # Phase 0: Persistent Memory Preload
     log("Phase 0: Persistent Memory Preload", "SYS")
@@ -2028,18 +2129,33 @@ def _run_full_bootstrap(args):
 
     try:
         _set_boot_phase("phase_3_workers")
-        log("Phase 3: Worker Chat Windows", "SYS")
-        workers = phase_3_workers(num_workers=args.workers, fresh=args.fresh, boot_memories=boot_memories)
+
+        if use_legacy:
+            # Legacy boot path: original phase_3_workers + phase_4b_identity
+            log("Phase 3: Worker Chat Windows (LEGACY PATH)", "SYS")
+            workers = phase_3_workers(num_workers=args.workers, fresh=args.fresh, boot_memories=boot_memories)
+            used_new_boot = False
+        else:
+            # New canonical boot path via skynet_boot_workers  # signed: beta
+            log("Phase 3: Worker Boot (skynet_boot_workers)", "SYS")
+            workers = _phase_3_boot_workers(num_workers=args.workers, orch_hwnd=get_orchestrator_hwnd())
+            used_new_boot = True
 
         _set_boot_phase("phase_4_register")
         log("Phase 4: Skynet Registration", "SYS")
         if workers:
             phase_4_register(workers)
 
-        _set_boot_phase("phase_4b_identity")
-        log("Phase 4b: Identity Injection", "SYS")
-        if workers:
-            phase_4b_identity(workers)
+        # Identity injection: skip when using new boot path (boot_single_worker
+        # already injects identity prompt in step 8 and verifies PROCESSING).
+        # Only needed for legacy boot path.  # signed: beta
+        if not used_new_boot:
+            _set_boot_phase("phase_4b_identity")
+            log("Phase 4b: Identity Injection", "SYS")
+            if workers:
+                phase_4b_identity(workers)
+        else:
+            log("Phase 4b: Identity Injection (skipped -- handled by boot_workers)", "OK")
 
         _set_boot_phase("phase_5_engines")
         log("Phase 5: ScreenMemory Engines", "SYS")
@@ -2071,6 +2187,7 @@ def main():
     parser.add_argument("--workers", type=int, default=4, help="Number of workers (1-4)")
     parser.add_argument("--reconnect", action="store_true", help="Reconnect to existing workers")
     parser.add_argument("--fresh", action="store_true", help="Skip session restore, open fresh windows")
+    parser.add_argument("--use-legacy", action="store_true", help="Use legacy boot path (phase_3_workers) instead of skynet_boot_workers")  # signed: beta
     parser.add_argument("--status", action="store_true", help="Show system status")
     parser.add_argument("--dispatch", type=str, help="Dispatch a task to Skynet")
     parser.add_argument("--worker", type=str, help="Target worker for dispatch")
