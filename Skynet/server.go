@@ -1833,8 +1833,14 @@ func (s *SkynetServer) appendBrainInbox(directiveID, goal string) {
 		"source":     "god_console",
 		"timestamp":  float64(time.Now().UnixMilli()) / 1000.0,
 	})
-	out, _ := json.Marshal(inbox) // P4: compact JSON — signed: gamma
-	os.WriteFile(inboxPath, out, 0644)
+	out, err := json.Marshal(inbox) // P4: compact JSON — signed: gamma
+	if err != nil {
+		fmt.Printf("[SKYNET] appendBrainInbox marshal error: %v\n", err) // P5: log errors — signed: gamma
+		return
+	}
+	if err := os.WriteFile(inboxPath, out, 0644); err != nil {
+		fmt.Printf("[SKYNET] appendBrainInbox write error: %v\n", err) // P5: log errors — signed: gamma
+	}
 }
 
 // ─── Task Result History ─────────────────────────────────────────
@@ -2862,7 +2868,13 @@ func wsAllowedOrigin(origin string) bool {
 		"http://[::1]", "https://[::1]",
 	} {
 		if strings.HasPrefix(lower, prefix) {
-			return true
+			// After the allowed host, only end-of-string, ':', or '/' is
+			// valid.  This prevents subdomain spoofs like localhost.evil.com.
+			// signed: alpha
+			rest := lower[len(prefix):]
+			if rest == "" || rest[0] == ':' || rest[0] == '/' {
+				return true
+			}
 		}
 	}
 	return false
@@ -2880,24 +2892,34 @@ func (s *SkynetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ── P2.2: RBAC authentication ───────────────────────────────────
-	// Note: roleFromHeader defaults to RoleOrchestrator when no header is present
-	// (backward-compat for existing Python tooling). The ACL entry for /ws
-	// restricts access to orchestrator + worker roles.
-	role := roleFromHeader(r)
-	if role == "" {
+	// WebSocket requires explicit role header — no backward-compat default.
+	// This is stricter than HTTP endpoints (which default to orchestrator)
+	// because WS connections are long-lived and harder to revoke. signed: delta
+	wsRole := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Agent-Role")))
+	if wsRole == "" {
 		atomic.AddInt64(&s.wsRejected, 1)
 		s.logSecurityEvent(r.RemoteAddr, "ws_auth_rejected",
-			"WebSocket upgrade rejected: unknown role", true)
-		http.Error(w, `{"error":"RBAC: set X-Agent-Role header"}`, http.StatusForbidden)
+			"WebSocket upgrade rejected: missing X-Agent-Role header (required for WS)", true)
+		http.Error(w, `{"error":"RBAC: X-Agent-Role header required for WebSocket"}`, http.StatusForbidden)
+		return
+	}
+	role := AgentRole(wsRole)
+	if role != RoleOrchestrator && role != RoleWorker {
+		atomic.AddInt64(&s.wsRejected, 1)
+		s.logSecurityEvent(r.RemoteAddr, "ws_auth_rejected",
+			fmt.Sprintf("WebSocket upgrade rejected: role %q not permitted", wsRole), true)
+		http.Error(w, `{"error":"RBAC: role not authorized for WebSocket"}`, http.StatusForbidden)
 		return
 	}
 
-	// ── P2.3: Connection count limit ────────────────────────────────
-	current := atomic.LoadInt64(&s.wsConns)
-	if current >= wsMaxConnections {
+	// ── P2.3: Connection count limit (atomic add-then-check-then-rollback) ─
+	// signed: delta
+	newCount := atomic.AddInt64(&s.wsConns, 1)
+	if newCount > wsMaxConnections {
+		atomic.AddInt64(&s.wsConns, -1) // rollback
 		atomic.AddInt64(&s.wsRejected, 1)
 		s.logSecurityEvent(r.RemoteAddr, "ws_limit_reached",
-			fmt.Sprintf("WebSocket upgrade rejected: %d/%d connections", current, wsMaxConnections), true)
+			fmt.Sprintf("WebSocket upgrade rejected: %d/%d connections", newCount, wsMaxConnections), true)
 		http.Error(w, `{"error":"too many websocket connections"}`, http.StatusServiceUnavailable)
 		return
 	}
@@ -2905,12 +2927,14 @@ func (s *SkynetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// ── Upgrade HTTP to WebSocket using raw hijack ──────────────────
 	hj, ok := w.(http.Hijacker)
 	if !ok {
+		atomic.AddInt64(&s.wsConns, -1) // rollback: upgrade failed
 		http.Error(w, "websocket not supported", http.StatusInternalServerError)
 		return
 	}
 
 	conn, bufrw, err := hj.Hijack()
 	if err != nil {
+		atomic.AddInt64(&s.wsConns, -1) // rollback: hijack failed
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -2918,6 +2942,7 @@ func (s *SkynetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// WebSocket handshake
 	key := r.Header.Get("Sec-WebSocket-Key")
 	if key == "" {
+		atomic.AddInt64(&s.wsConns, -1) // rollback: bad handshake
 		conn.Close()
 		return
 	}
@@ -2930,8 +2955,7 @@ func (s *SkynetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	bufrw.WriteString("\r\n")
 	bufrw.Flush()
 
-	// Track connection
-	atomic.AddInt64(&s.wsConns, 1)
+	// Connection count already incremented above (add-then-check pattern)
 
 	// Register client channel
 	ch := make(chan []byte, 64)
@@ -3006,9 +3030,11 @@ func (s *SkynetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		masked := (buf[1] & 0x80) != 0
 		payloadLen := int(buf[1] & 0x7F)
 
-		// Clients MUST mask frames per RFC 6455 §5.1
+		// Clients MUST mask frames per RFC 6455 §5.1 — signed: delta
 		if !masked {
-			close(ch)
+			close(ch) // close channel first to prevent broadcast race
+			s.logSecurityEvent(r.RemoteAddr, "ws_unmasked_frame",
+				"WebSocket frame rejected: client frame not masked (RFC 6455 §5.1 violation)", false)
 			return
 		}
 
