@@ -13,7 +13,8 @@ import (
 )
 
 // Worker — goroutine-based agent. Picks tasks from priority queue, executes, reports.
-// Features: per-worker task queue, health monitoring, circuit breaker, retry with backoff.
+// Features: per-worker task queue, health monitoring, circuit breaker, retry with backoff,
+// weighted load tracking, and work-stealing from busiest peer. -- signed: beta
 type Worker struct {
 	Name           string
 	Status         string
@@ -38,6 +39,13 @@ type Worker struct {
 	taskQueue workerHeap
 	taskMu    sync.Mutex
 	taskNotify chan struct{}
+
+	// Weighted load tracking -- signed: beta
+	activeWeight int64    // weight of currently executing task (atomic)
+	peers        []*Worker // sibling workers for work-stealing
+
+	// Work-stealing stats -- signed: beta
+	tasksStolen int32
 
 	bus     *MessageBus
 	results chan *TaskResult
@@ -86,7 +94,11 @@ func (w *Worker) setStatus(status, task string) {
 }
 
 // Enqueue adds a task to this worker's personal queue.
+// Stamps EstimatedWeight from TaskWeight() if not already set. -- signed: beta
 func (w *Worker) Enqueue(task *Task) {
+	if task.EstimatedWeight == 0 {
+		task.EstimatedWeight = TaskWeight(task.Type)
+	}
 	w.taskMu.Lock()
 	heap.Push(&w.taskQueue, task)
 	w.taskMu.Unlock()
@@ -102,6 +114,23 @@ func (w *Worker) QueueDepth() int {
 	w.taskMu.Lock()
 	defer w.taskMu.Unlock()
 	return w.taskQueue.Len()
+}
+
+// WeightedLoad returns the total scheduling weight of queued tasks plus the
+// currently executing task. Used by the load balancer to route new tasks to
+// the least-loaded worker by estimated cost, not just item count.
+// This prevents convoy effects where a worker with one 120s copilot task
+// (weight 50) appears lighter than a worker with two 50ms shell tasks
+// (weight 2). -- signed: beta
+func (w *Worker) WeightedLoad() int64 {
+	active := atomic.LoadInt64(&w.activeWeight)
+	w.taskMu.Lock()
+	var queued int64
+	for _, t := range w.taskQueue {
+		queued += int64(t.EstimatedWeight)
+	}
+	w.taskMu.Unlock()
+	return active + queued
 }
 
 // GetState returns a thread-safe snapshot for the dashboard.
@@ -149,12 +178,15 @@ func (w *Worker) GetState() *AgentView {
 		AvgTaskMs:        avgMs,
 		LastHeartbeat:    hbTime.Format("15:04:05"),
 		QueueDepth:       w.QueueDepth(),
+		WeightedLoad:     w.WeightedLoad(), // signed: beta
 		CircuitState:     circuitState,
 		ConsecutiveFails: consecutiveFails,
 	}
 }
 
 // Run starts the worker loop — blocks until context cancelled.
+// After draining its local queue, attempts to steal work from the busiest
+// peer before going idle. -- signed: beta
 func (w *Worker) Run() {
 	w.log(fmt.Sprintf("Worker %s online — ready for tasks", strings.ToUpper(w.Name)))
 	w.bus.Post(w.Name, "system", "report",
@@ -170,6 +202,8 @@ func (w *Worker) Run() {
 			return
 		case <-w.taskNotify:
 			w.drainQueue()
+			// After local queue is empty, try stealing from busiest peer -- signed: beta
+			w.trySteal()
 		}
 	}
 }
@@ -188,8 +222,61 @@ func (w *Worker) drainQueue() {
 	}
 }
 
+// trySteal attempts to steal a task from the peer with the highest weighted
+// load. Uses mutex-based locking on the victim's queue (safe, low-contention
+// with 4 workers). Stolen tasks are taken from the bottom of the victim's
+// heap (lowest priority first) to minimize impact on the victim's critical
+// work. -- signed: beta
+func (w *Worker) trySteal() {
+	if len(w.peers) == 0 {
+		return
+	}
+
+	// Find peer with highest weighted load and at least 2 queued tasks
+	var victim *Worker
+	var bestLoad int64
+	for _, peer := range w.peers {
+		if peer == w {
+			continue
+		}
+		load := peer.WeightedLoad()
+		depth := peer.QueueDepth()
+		if depth >= 2 && load > bestLoad {
+			bestLoad = load
+			victim = peer
+		}
+	}
+	if victim == nil {
+		return
+	}
+
+	// Steal the lowest-priority task from victim's queue
+	victim.taskMu.Lock()
+	if victim.taskQueue.Len() < 2 {
+		victim.taskMu.Unlock()
+		return
+	}
+	// Remove last element (lowest priority in min-heap = highest index)
+	lastIdx := victim.taskQueue.Len() - 1
+	stolen := heap.Remove(&victim.taskQueue, lastIdx).(*Task)
+	victim.taskMu.Unlock()
+
+	atomic.AddInt32(&w.tasksStolen, 1)
+	w.log(fmt.Sprintf("⇠ Stole task [%s] from %s (their load: %d)",
+		truncate(stolen.ID, 20), strings.ToUpper(victim.Name), bestLoad))
+	w.bus.Post(w.Name, "workers", "steal",
+		fmt.Sprintf("%s stole task from %s", strings.ToUpper(w.Name), strings.ToUpper(victim.Name)),
+		map[string]string{"task_id": stolen.ID, "victim": victim.Name})
+
+	w.execute(stolen)
+	// After executing stolen task, try stealing again
+	w.trySteal()
+}
+
 func (w *Worker) execute(task *Task) {
-	// Circuit breaker check
+	// Circuit breaker check -- signed: beta
+	// FIX: When circuit is OPEN, re-queue the task instead of silently dropping it.
+	// The original code returned without re-queuing, causing permanent task loss.
 	w.mu.RLock()
 	cState := w.circuitState
 	cOpened := w.circuitOpenedAt
@@ -197,7 +284,9 @@ func (w *Worker) execute(task *Task) {
 
 	if cState == "CIRCUIT_OPEN" {
 		if time.Since(cOpened) < 30*time.Second {
-			w.log(fmt.Sprintf("⚡ Circuit OPEN — skipping task [%s]", task.ID))
+			w.log(fmt.Sprintf("⚡ Circuit OPEN — re-queuing task [%s] (retry after cooldown)", task.ID))
+			// Re-queue the task so it will be retried after the cooldown expires -- signed: beta
+			w.Enqueue(task)
 			return
 		}
 		// Transition to HALF_OPEN
@@ -206,7 +295,17 @@ func (w *Worker) execute(task *Task) {
 		w.mu.Unlock()
 		w.setStatus("HALF_OPEN", task.Description)
 		w.log("Circuit → HALF_OPEN, retrying...")
+		w.bus.Post(w.Name, "workers", "circuit",
+			fmt.Sprintf("%s circuit HALF_OPEN — probing", strings.ToUpper(w.Name)), nil)
 	}
+
+	// Track active task weight for weighted load balancer -- signed: beta
+	weight := int64(task.EstimatedWeight)
+	if weight == 0 {
+		weight = int64(TaskWeight(task.Type))
+	}
+	atomic.StoreInt64(&w.activeWeight, weight)
+	defer atomic.StoreInt64(&w.activeWeight, 0)
 
 	w.setStatus("WORKING", task.Description)
 	w.log(fmt.Sprintf("▶ Task [%s]: %s", task.ID, truncate(task.Description, 60)))
@@ -245,13 +344,16 @@ func (w *Worker) execute(task *Task) {
 		result.ReturnCode = 1
 		w.log(fmt.Sprintf("  ✗ Failed after %d retries: %s", maxRetries, truncate(lastErr.Error(), 80)))
 
-		// Circuit breaker: track consecutive failures
+		// Circuit breaker: track consecutive failures -- signed: beta
 		w.mu.Lock()
 		w.consecutiveFails++
 		if w.consecutiveFails >= 3 {
 			w.circuitState = "CIRCUIT_OPEN"
 			w.circuitOpenedAt = time.Now()
 			w.log("⚡ Circuit breaker OPEN — 3 consecutive failures")
+			w.bus.Post(w.Name, "workers", "circuit",
+				fmt.Sprintf("%s circuit OPEN — 3 consecutive failures, cooldown 30s",
+					strings.ToUpper(w.Name)), nil)
 		}
 		w.mu.Unlock()
 	} else {
@@ -266,6 +368,8 @@ func (w *Worker) execute(task *Task) {
 		if w.circuitState == "HALF_OPEN" {
 			w.circuitState = ""
 			w.log("Circuit breaker CLOSED — recovered")
+			w.bus.Post(w.Name, "workers", "circuit",
+				fmt.Sprintf("%s circuit CLOSED — recovered", strings.ToUpper(w.Name)), nil)
 		}
 		w.mu.Unlock()
 	}
@@ -361,6 +465,12 @@ func (w *Worker) heartbeatLoop() {
 			w.mu.Unlock()
 		}
 	}
+}
+
+// SetPeers sets the sibling workers for work-stealing. Called after all workers
+// are created so each worker has references to steal from. -- signed: beta
+func (w *Worker) SetPeers(all []*Worker) {
+	w.peers = all
 }
 
 // Stop gracefully shuts down the worker.

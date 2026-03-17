@@ -20,20 +20,43 @@ func (r RiskLevel) String() string {
 // ─── Task System ─────────────────────────────────────────────────
 
 type Task struct {
-	ID           string            `json:"task_id"`
-	Type         string            `json:"type"`
-	Command      string            `json:"command"`
-	Description  string            `json:"description"`
-	Priority     int               `json:"priority"`
-	Phase        string            `json:"phase"`
-	DependsOn    []string          `json:"depends_on,omitempty"`
-	DirectiveID  string            `json:"directive_id,omitempty"`
-	OriginAgent  string            `json:"origin_agent,omitempty"`
-	DispatchedAt time.Time         `json:"dispatched_at"`
-	RetryCount   int               `json:"retry_count"`
-	MaxRetries   int               `json:"max_retries"`
-	RetryAt      *time.Time        `json:"retry_at,omitempty"`      // timestamp of last retry event -- signed: beta
-	Metadata     map[string]string `json:"metadata,omitempty"`
+	ID              string            `json:"task_id"`
+	Type            string            `json:"type"`
+	Command         string            `json:"command"`
+	Description     string            `json:"description"`
+	Priority        int               `json:"priority"`
+	Phase           string            `json:"phase"`
+	DependsOn       []string          `json:"depends_on,omitempty"`
+	DirectiveID     string            `json:"directive_id,omitempty"`
+	OriginAgent     string            `json:"origin_agent,omitempty"`
+	DispatchedAt    time.Time         `json:"dispatched_at"`
+	RetryCount      int               `json:"retry_count"`
+	MaxRetries      int               `json:"max_retries"`
+	RetryAt         *time.Time        `json:"retry_at,omitempty"`      // timestamp of last retry event -- signed: beta
+	EstimatedWeight int               `json:"estimated_weight"`        // scheduling weight (higher = heavier task) -- signed: beta
+	Metadata        map[string]string `json:"metadata,omitempty"`
+}
+
+// TaskWeight returns the scheduling weight for a task based on its type.
+// Weight approximates relative execution cost: shell=1, message=1, python=10,
+// powershell=10, copilot=50. Used by weighted load balancer to prevent convoy
+// effects where heavy tasks (copilot 120s) are treated identically to fast
+// tasks (shell 50ms). -- signed: beta
+func TaskWeight(taskType string) int {
+	switch taskType {
+	case "shell":
+		return 1
+	case "message":
+		return 1
+	case "python":
+		return 10
+	case "powershell":
+		return 10
+	case "copilot":
+		return 50
+	default:
+		return 10
+	}
 }
 
 type TaskResult struct {
@@ -131,6 +154,7 @@ type AgentView struct {
 	AvgTaskMs      float64  `json:"avg_task_ms"`
 	LastHeartbeat  string   `json:"last_heartbeat"`
 	QueueDepth       int      `json:"queue_depth"`
+	WeightedLoad     int64    `json:"weighted_load"`      // sum of task weights (queued + active) -- signed: beta
 	CircuitState     string   `json:"circuit_state"`
 	ConsecutiveFails int      `json:"consecutive_fails"`
 }
