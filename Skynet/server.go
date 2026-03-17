@@ -155,6 +155,58 @@ func rbacMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// tokenBucket implements a lock-free per-IP rate limiter using atomic operations.
+// Each bucket tracks token count and last refill time separately.
+// signed: gamma
+type tokenBucket struct {
+	tokens     atomic.Int64
+	lastRefill atomic.Int64 // UnixNano
+}
+
+const (
+	tokenBucketCapacity = 20              // max tokens per IP
+	tokenRefillRate     = 2               // tokens per second
+	tokenRefillInterval = time.Second / 2 // refill check granularity
+)
+
+// allow checks if a request is permitted, consuming one token.
+// Uses atomic operations — no mutex needed.
+func (tb *tokenBucket) allow() bool {
+	now := time.Now().UnixNano()
+	last := tb.lastRefill.Load()
+	elapsed := now - last
+
+	// Refill tokens based on elapsed time
+	if elapsed > int64(tokenRefillInterval) {
+		if tb.lastRefill.CompareAndSwap(last, now) {
+			refill := int64(elapsed) * tokenRefillRate / int64(time.Second)
+			if refill > 0 {
+				for {
+					cur := tb.tokens.Load()
+					newVal := cur + refill
+					if newVal > tokenBucketCapacity {
+						newVal = tokenBucketCapacity
+					}
+					if tb.tokens.CompareAndSwap(cur, newVal) {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Try to consume one token via CAS loop
+	for {
+		cur := tb.tokens.Load()
+		if cur <= 0 {
+			return false
+		}
+		if tb.tokens.CompareAndSwap(cur, cur-1) {
+			return true
+		}
+	}
+}
+
 // SkynetServer — HTTP API and dashboard server for Skynet v2.
 type SkynetServer struct {
 	bus       *MessageBus
@@ -182,9 +234,8 @@ type SkynetServer struct {
 	thoughts []ThoughtEntry
 	thMu     sync.RWMutex
 
-	// Rate limiting: IP → last request time
-	rateMu    sync.Mutex
-	rateLimit map[string]time.Time
+	// Rate limiting: lock-free token bucket per IP — signed: gamma
+	rateBuckets sync.Map // IP (string) → *tokenBucket
 
 	// Task result history
 	taskResults []TaskResult
@@ -199,8 +250,11 @@ type SkynetServer struct {
 	secMu       sync.RWMutex
 
 	// File I/O mutexes for concurrent goroutine safety
-	godFeedMu   sync.Mutex
-	brainInboxMu sync.Mutex
+	// RWMutex so readers (handleGodFeed, handleBrainPending) can share-lock
+	// while writers (appendGodFeed, appendBrainInbox, handleBrainAck) exclusive-lock.
+	// signed: gamma
+	godFeedMu   sync.RWMutex
+	brainInboxMu sync.RWMutex
 
 	// Task queue for pull-based work distribution
 	taskQueue []QueuedTask
@@ -281,8 +335,8 @@ func NewSkynetServer(bus *MessageBus, workers []*Worker, results chan *TaskResul
 		workerTasks: make([]WorkerTask, 0),
 		directives:  make([]Directive, 0),
 		thoughts:    make([]ThoughtEntry, 0),
-		rateLimit:       make(map[string]time.Time),
-		taskResults:     make([]TaskResult, 0),
+		// rateBuckets: zero-value sync.Map is ready to use — signed: gamma
+		taskResults:make([]TaskResult, 0),
 		conveneSessions: make([]ConveneSession, 0),
 		securityLog:     make([]SecurityEvent, 0),
 		taskQueue:       make([]QueuedTask, 0),
@@ -676,8 +730,12 @@ func (s *SkynetServer) handleGodFeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// P1 FIX: RLock prevents torn reads during concurrent appendGodFeed writes — signed: gamma
+	s.godFeedMu.RLock()
 	feedPath := `D:\Prospects\ScreenMemory\data\brain\god_feed.json`
 	data, err := os.ReadFile(feedPath)
+	s.godFeedMu.RUnlock()
+
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode([]interface{}{})
@@ -701,8 +759,12 @@ func (s *SkynetServer) handleBrainPending(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// P2a FIX: RLock prevents torn reads during concurrent appendBrainInbox writes — signed: gamma
+	s.brainInboxMu.RLock()
 	inboxPath := `D:\Prospects\ScreenMemory\data\brain\brain_inbox.json`
 	data, err := os.ReadFile(inboxPath)
+	s.brainInboxMu.RUnlock()
+
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode([]interface{}{})
@@ -750,15 +812,20 @@ func (s *SkynetServer) handleBrainAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// P2b FIX: Write lock for entire read-modify-write cycle — signed: gamma
+	// Prevents data loss from concurrent ACK + appendBrainInbox races.
+	s.brainInboxMu.Lock()
 	inboxPath := `D:\Prospects\ScreenMemory\data\brain\brain_inbox.json`
 	data, err := os.ReadFile(inboxPath)
 	if err != nil {
+		s.brainInboxMu.Unlock()
 		http.Error(w, "inbox not found", http.StatusInternalServerError)
 		return
 	}
 
 	var inbox []map[string]interface{}
 	if err := json.Unmarshal(data, &inbox); err != nil {
+		s.brainInboxMu.Unlock()
 		http.Error(w, "inbox parse error", http.StatusInternalServerError)
 		return
 	}
@@ -773,12 +840,14 @@ func (s *SkynetServer) handleBrainAck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !found {
+		s.brainInboxMu.Unlock()
 		http.Error(w, "request_id not found", http.StatusNotFound)
 		return
 	}
 
-	out, _ := json.MarshalIndent(inbox, "", "  ")
+	out, _ := json.Marshal(inbox) // P4: compact JSON — signed: gamma
 	os.WriteFile(inboxPath, out, 0644)
+	s.brainInboxMu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1722,8 +1791,14 @@ func (s *SkynetServer) appendGodFeed(feedType, text string) {
 	if len(feed) > 200 {
 		feed = feed[len(feed)-200:]
 	}
-	out, _ := json.MarshalIndent(feed, "", "  ")
-	os.WriteFile(feedPath, out, 0644)
+	out, err := json.Marshal(feed) // P4: compact JSON saves ~2x disk I/O — signed: gamma
+	if err != nil {
+		fmt.Printf("[SKYNET] appendGodFeed marshal error: %v\n", err) // P5: log errors — signed: gamma
+		return
+	}
+	if err := os.WriteFile(feedPath, out, 0644); err != nil {
+		fmt.Printf("[SKYNET] appendGodFeed write error: %v\n", err) // P5: log errors — signed: gamma
+	}
 }
 
 // appendBrainInbox writes a pending directive to brain_inbox.json for Orchestrator polling.
@@ -1751,7 +1826,7 @@ func (s *SkynetServer) appendBrainInbox(directiveID, goal string) {
 		"source":     "god_console",
 		"timestamp":  float64(time.Now().UnixMilli()) / 1000.0,
 	})
-	out, _ := json.MarshalIndent(inbox, "", "  ")
+	out, _ := json.Marshal(inbox) // P4: compact JSON — signed: gamma
 	os.WriteFile(inboxPath, out, 0644)
 }
 
@@ -1917,19 +1992,22 @@ func (s *SkynetServer) ProcessResult(r *TaskResult) {
 
 // ─── Rate Limit Cleanup ─────────────────────────────────────────
 
+// StartCleanup periodically evicts stale token buckets from the sync.Map.
+// signed: gamma
 func (s *SkynetServer) StartCleanup() {
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			s.rateMu.Lock()
-			now := time.Now()
-			for ip, last := range s.rateLimit {
-				if now.Sub(last) > 10*time.Second {
-					delete(s.rateLimit, ip)
+			cutoff := time.Now().Add(-30 * time.Second).UnixNano()
+			s.rateBuckets.Range(func(key, value interface{}) bool {
+				if tb, ok := value.(*tokenBucket); ok {
+					if tb.lastRefill.Load() < cutoff {
+						s.rateBuckets.Delete(key)
+					}
 				}
-			}
-			s.rateMu.Unlock()
+				return true
+			})
 		}
 	}()
 }
@@ -2584,6 +2662,7 @@ func (s *SkynetServer) handleTasks(w http.ResponseWriter, r *http.Request) {
 }
 
 // ─── Rate Limiting Middleware ─────────────────────────────────────
+// P3: Lock-free token bucket replaces mutex-locked map — signed: gamma
 
 func (s *SkynetServer) rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2598,16 +2677,20 @@ func (s *SkynetServer) rateLimitMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		s.rateMu.Lock()
-		last, exists := s.rateLimit[ip]
-		now := time.Now()
-		if exists && now.Sub(last) < 500*time.Microsecond {
-			s.rateMu.Unlock()
+		// Load or create per-IP token bucket (lock-free via sync.Map)
+		val, _ := s.rateBuckets.LoadOrStore(ip, &tokenBucket{})
+		tb := val.(*tokenBucket)
+
+		// Initialize new buckets with full capacity
+		if tb.lastRefill.Load() == 0 {
+			tb.tokens.Store(tokenBucketCapacity)
+			tb.lastRefill.Store(time.Now().UnixNano())
+		}
+
+		if !tb.allow() {
 			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
-		s.rateLimit[ip] = now
-		s.rateMu.Unlock()
 
 		next.ServeHTTP(w, r)
 	})
