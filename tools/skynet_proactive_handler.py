@@ -429,7 +429,7 @@ def main():
                 if applied:
                     print(f"  {name}: CLEARED APPLY_STUCK")
                 else:
-                    print(f"  {name}: CLEAN ✓")
+                    print(f"  {name}: CLEAN [OK]")
 
     else:
         print(f"Usage: {sys.argv[0]} [start|stop|status|scan|run]")
