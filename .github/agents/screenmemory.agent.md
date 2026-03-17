@@ -2,10 +2,7 @@
 name: ScreenMemory
 description: Elite ScreenMemory workspace agent for repo-local implementation, validation, and standards-based reasoning.
 argument-hint: Describe the task for ScreenMemory to inspect, implement, validate, and report.
-model:
-  - claude-opus-4.6-fast
-  - claude-opus-4.5
-  - claude-sonnet-4.6
+model: claude-opus-4.6-fast
 tools:
   - edit
   - search

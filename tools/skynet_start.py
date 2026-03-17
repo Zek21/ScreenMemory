@@ -94,6 +94,7 @@ BACKGROUND_SPAWN_FLAGS = (
     | subprocess.CREATE_NO_WINDOW
 )
 NEW_CHAT_PS1   = str(ROOT / "tools" / "new_chat.ps1")
+WORKTREE_BASE  = ROOT.parent / "ScreenMemory.worktrees"
 
 BOOT_IN_PROGRESS_FILE = DATA_DIR / "boot_in_progress.json"
 WORKER_NAMES = ["alpha", "beta", "gamma", "delta"]
@@ -387,21 +388,26 @@ def _poll_for_new_window(before_set, exclude_hwnd=None, timeout_s=8):
     return None
 
 
-def open_chat_window(orch_hwnd):
-    """Open a new detached chat window using tools/new_chat.ps1.
+def open_chat_window(orch_hwnd, worker_name=None):
+    """Open a new worker window using tools/new_chat.ps1.
+
+    When worker_name is provided, opens a full VS Code window on a worktree path.
+    Without worker_name, falls back to legacy chat-only window (deprecated).
     Returns the new HWND on success, None on failure.
     """
     before = {w["hwnd"] for w in find_vscode_windows()}
     script_path = str(ROOT / "tools" / "new_chat.ps1")
 
+    args = ["powershell", "-STA", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", script_path, "-Monitor", "2", "-SkipEmptyCheck"]
+    if worker_name:
+        args.extend(["-WorkerName", worker_name])
+    timeout = 60 if worker_name else 45  # worktree windows need longer
+
     try:
-        r = subprocess.run(
-            ["powershell", "-STA", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-File", script_path, "-Monitor", "2", "-SkipEmptyCheck"],
-            capture_output=True, text=True, timeout=45, cwd=str(ROOT)
-        )
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=str(ROOT))
     except subprocess.TimeoutExpired:
-        log("new_chat.ps1 timed out after 45s", "ERR")
+        log(f"new_chat.ps1 timed out after {timeout}s", "ERR")
         return None
     except Exception as e:
         log(f"open_chat_window failed: {e}", "ERR")
@@ -432,6 +438,66 @@ def open_chat_window(orch_hwnd):
         return new_hwnd
 
     log("New chat window not detected after 8s", "ERR")
+    return None
+
+
+def _ensure_worktree(worker_name):
+    """Ensure a git worktree exists for the given worker. Returns the path."""
+    wt_path = WORKTREE_BASE / f"worker-{worker_name}"
+    if wt_path.exists():
+        return wt_path
+    branch = f"worker-{worker_name}"
+    # Create branch if needed
+    r = subprocess.run(["git", "branch", "--list", branch],
+                       capture_output=True, text=True, cwd=str(ROOT))
+    if not (r.stdout or "").strip():
+        subprocess.run(["git", "branch", branch, "master"],
+                       capture_output=True, text=True, cwd=str(ROOT))
+        log(f"Created branch {branch}", "SYS")
+    # Create worktree
+    r = subprocess.run(["git", "worktree", "add", str(wt_path), branch],
+                       capture_output=True, text=True, cwd=str(ROOT))
+    if r.returncode == 0:
+        log(f"Created worktree at {wt_path}", "OK")
+    else:
+        log(f"Worktree creation failed: {(r.stderr or '')[:200]}", "ERR")
+    return wt_path
+
+
+def open_worktree_window(worker_name, orch_hwnd):
+    """Open a full VS Code window on a worker worktree.
+
+    Chat-only windows (from 'New Chat Window') cannot spawn their own CLI
+    process because they share the parent extension host. Full VS Code windows
+    opened on separate worktree paths get their own extension host and can run
+    Copilot CLI independently.
+
+    Returns the new HWND on success, None on failure.
+    """
+    wt_path = _ensure_worktree(worker_name)
+    if not wt_path.exists():
+        log(f"Worktree path missing for {worker_name}: {wt_path}", "ERR")
+        return None
+
+    before = {w["hwnd"] for w in find_vscode_windows()}
+    log(f"Opening full VS Code window for {worker_name} at {wt_path}", "SYS")
+
+    try:
+        subprocess.Popen(
+            ["code-insiders", "--new-window", str(wt_path)],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception as e:
+        log(f"Failed to launch code-insiders for {worker_name}: {e}", "ERR")
+        return None
+
+    # Poll for new window (up to 15s — full windows take longer to load)
+    new_hwnd = _poll_for_new_window(before, exclude_hwnd=orch_hwnd, timeout_s=15)
+    if new_hwnd:
+        log(f"Worktree window for {worker_name}: HWND={new_hwnd}", "OK")
+        return new_hwnd
+
+    log(f"Worktree window for {worker_name} not detected after 15s", "ERR")
     return None
 
 
@@ -1186,13 +1252,13 @@ def _open_single_worker(worker_idx, orch_hwnd, fresh, boot_memories, existing_ch
     if not new_hwnd:
         if not fresh:
             log(f"Session restore failed for {worker_name}, opening fresh window...", "WARN")
-        new_hwnd = open_chat_window(orch_hwnd)
+        # Use worktree-based full VS Code window via new_chat.ps1 -- chat-only
+        # windows cannot spawn their own CLI process (no independent extension host).
+        new_hwnd = open_chat_window(orch_hwnd, worker_name=worker_name)
         opened_fresh = True
         if not new_hwnd:
             log(f"Could not open window for {worker_name}", "ERR")
             return None, False
-        move_window(new_hwnd, slot["x"], slot["y"], slot["w"], slot["h"])
-        time.sleep(0.5)
 
     if not opened_fresh:
         _guard_restored_session(new_hwnd, orch_hwnd)
