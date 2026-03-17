@@ -158,6 +158,16 @@ DAEMON_REGISTRY = [
         "criticality": "MEDIUM",
         "restart_cmd": [PYTHON, "tools/skynet_knowledge_distill_daemon.py"],
     },
+    {  # signed: orchestrator — proactive dialog/Apply/steering auto-handler
+        "name": "proactive_handler",
+        "label": "Proactive Handler Daemon",
+        "script": "tools/skynet_proactive_handler.py",
+        "pid_file": "data/proactive_handler.pid",
+        "port": None,
+        "health_url": None,
+        "criticality": "HIGH",
+        "restart_cmd": [PYTHON, "tools/skynet_proactive_handler.py", "start"],
+    },
     {
         "name": "consultant_bridge_codex",
         "label": "Codex Consultant Bridge",

@@ -1,0 +1,760 @@
+{
+  "synthesis_date": "2026-03-17",
+  "total_findings": 41,
+  "domains": [
+    "cognitive_architecture",
+    "distributed_systems",
+    "perception_realtime",
+    "security_evolution"
+  ],
+  "ranked_findings": [
+    {
+      "id": "P-009",
+      "title": "Autonomous Desktop Agent Loop: Perception-Action Cycle",
+      "researcher": "gamma",
+      "domain": "perception_realtime",
+      "power": 10.0,
+      "complexity": "HIGH",
+      "score": 3.33
+    },
+    {
+      "id": "CA-002",
+      "title": "DAAORouter for Intelligent Worker Selection",
+      "researcher": "alpha",
+      "domain": "cognitive_architectu",
+      "power": 3.0,
+      "complexity": "LOW",
+      "score": 3.0
+    },
+    {
+      "id": "CA-003",
+      "title": "HybridRetrieval RRF Fusion for Context-Enriched Dispatch",
+      "researcher": "alpha",
+      "domain": "cognitive_architectu",
+      "power": 2.0,
+      "complexity": "LOW",
+      "score": 2.0
+    },
+    {
+      "id": "P-003",
+      "title": "Proactive Dialog Detection via Semantic Change Monitoring",
+      "researcher": "gamma",
+      "domain": "perception_realtime",
+      "power": 2.0,
+      "complexity": "LOW",
+      "score": 2.0
+    },
+    {
+      "id": "P-005",
+      "title": "Visual Grounding for Autonomous UI Interaction",
+      "researcher": "gamma",
+      "domain": "perception_realtime",
+      "power": 4.0,
+      "complexity": "MEDIUM",
+      "score": 2.0
+    },
+    {
+      "id": "P-008",
+      "title": "Hierarchical Semantic Change Detection with Animation Suppression",
+      "researcher": "gamma",
+      "domain": "perception_realtime",
+      "power": 2.0,
+      "complexity": "LOW",
+      "score": 2.0
+    },
+    {
+      "id": "F6",
+      "title": "No persistent memory across VS Code session restarts",
+      "researcher": "delta",
+      "domain": "security_self_evolut",
+      "power": 4.0,
+      "complexity": "MEDIUM",
+      "score": 2.0
+    },
+    {
+      "id": "CA-001",
+      "title": "Core Orchestrator is Dead Code \u2014 Entire Cognitive Stack Disconnec",
+      "researcher": "alpha",
+      "domain": "cognitive_architectu",
+      "power": 5.0,
+      "complexity": "HIGH",
+      "score": 1.67
+    },
+    {
+      "id": "P-004",
+      "title": "GodMode Desktop Extension: Beyond Browser to Full OS Automation",
+      "researcher": "gamma",
+      "domain": "perception_realtime",
+      "power": 5.0,
+      "complexity": "HIGH",
+      "score": 1.67
+    },
+    {
+      "id": "CA-004",
+      "title": "Graph-of-Thoughts for Complex Task Decomposition",
+      "researcher": "alpha",
+      "domain": "cognitive_architectu",
+      "power": 3.0,
+      "complexity": "MEDIUM",
+      "score": 1.5
+    },
+    {
+      "id": "CA-010",
+      "title": "Cognitive __init__.py Registry \u2014 Zero-Config Engine Activation",
+      "researcher": "alpha",
+      "domain": "cognitive_architectu",
+      "power": 1.5,
+      "complexity": "LOW",
+      "score": 1.5
+    },
+    {
+      "id": "P-001",
+      "title": "Event-Driven Capture: Replace Polling with OS Window Change Hooks",
+      "researcher": "gamma",
+      "domain": "perception_realtime",
+      "power": 3.0,
+      "complexity": "MEDIUM",
+      "score": 1.5
+    },
+    {
+      "id": "P-006",
+      "title": "Spatial Region Embeddings for UI Element Retrieval",
+      "researcher": "gamma",
+      "domain": "perception_realtime",
+      "power": 3.0,
+      "complexity": "MEDIUM",
+      "score": 1.5
+    },
+    {
+      "id": "P-002",
+      "title": "Multi-Modal Scene Fusion: VLM + OCR + Accessibility Unified Graph",
+      "researcher": "gamma",
+      "domain": "perception_realtime",
+      "power": 4.0,
+      "complexity": "HIGH",
+      "score": 1.33
+    },
+    {
+      "id": "CA-005",
+      "title": "Multi-Agent Debate Protocol for ADVERSARIAL Tasks",
+      "researcher": "alpha",
+      "domain": "cognitive_architectu",
+      "power": 2.0,
+      "complexity": "MEDIUM",
+      "score": 1.0
+    },
+    {
+      "id": "CA-007",
+      "title": "Self-Evolution Genetic Algorithm for Strategy Optimization",
+      "researcher": "alpha",
+      "domain": "cognitive_architectu",
+      "power": 2.0,
+      "complexity": "MEDIUM",
+      "score": 1.0
+    },
+    {
+      "id": "CA-008",
+      "title": "R-MCTS Reflective Search for Multi-Step Task Planning",
+      "researcher": "alpha",
+      "domain": "cognitive_architectu",
+      "power": 3.0,
+      "complexity": "HIGH",
+      "score": 1.0
+    },
+    {
+      "id": "P-007",
+      "title": "Table and Form-Aware OCR Layout Parsing",
+      "researcher": "gamma",
+      "domain": "perception_realtime",
+      "power": 2.0,
+      "complexity": "MEDIUM",
+      "score": 1.0
+    },
+    {
+      "id": "CA-006",
+      "title": "EpisodicMemory Temporal Decay for Adaptive Context",
+      "researcher": "alpha",
+      "domain": "cognitive_architectu",
+      "power": 1.5,
+      "complexity": "MEDIUM",
+      "score": 0.75
+    },
+    {
+      "id": "CA-009",
+      "title": "CodeGenerator for Dynamic Tool Synthesis",
+      "researcher": "alpha",
+      "domain": "cognitive_architectu",
+      "power": 2.0,
+      "complexity": "HIGH",
+      "score": 0.67
+    },
+    {
+      "id": "DS-01",
+      "title": "Stigmergy Layer: Indirect Worker Coordination via Shared Artifact",
+      "researcher": "beta",
+      "domain": "distributed_systems",
+      "power": 1.0,
+      "complexity": "MODERATE (300 lines new module + integration)",
+      "score": 0.5
+    },
+    {
+      "id": "DS-02",
+      "title": "Emergent Worker Specialization via Fitness-Weighted Task Routing",
+      "researcher": "beta",
+      "domain": "distributed_systems",
+      "power": 1.0,
+      "complexity": "MODERATE (modify smart_dispatch ~100 lines, add skill vector computation ~80 lines)",
+      "score": 0.5
+    },
+    {
+      "id": "DS-03",
+      "title": "Sub-Second Dispatch: Pre-Cached PowerShell + Async Verification P",
+      "researcher": "beta",
+      "domain": "distributed_systems",
+      "power": 1.0,
+      "complexity": "MODERATE-HIGH (DLL caching ~150 lines, async verify ~100 lines, screenshot skip logic ~50 lines)",
+      "score": 0.5
+    },
+    {
+      "id": "DS-04",
+      "title": "Work Stealing: Idle Workers Proactively Pull From Busy Workers' Q",
+      "researcher": "beta",
+      "domain": "distributed_systems",
+      "power": 1.0,
+      "complexity": "MODERATE (200 lines new module + bus integration)",
+      "score": 0.5
+    },
+    {
+      "id": "DS-05",
+      "title": "Checkpoint/Resume: Fault-Tolerant Task Execution With Progress Pe",
+      "researcher": "beta",
+      "domain": "distributed_systems",
+      "power": 1.0,
+      "complexity": "MODERATE (250 lines checkpoint module + dispatch/preamble integration)",
+      "score": 0.5
+    },
+    {
+      "id": "DS-06",
+      "title": "Priority Message Channels: Urgent vs Normal Bus Traffic Separatio",
+      "researcher": "beta",
+      "domain": "distributed_systems",
+      "power": 1.0,
+      "complexity": "LOW-MODERATE (Go backend: 50 lines for dual buffer, Python: 20 lines SpamGuard priority tag)",
+      "score": 0.5
+    },
+    {
+      "id": "DS-07",
+      "title": "Byzantine Fault Tolerance: Signed Votes + Quorum Enforcement in C",
+      "researcher": "beta",
+      "domain": "distributed_systems",
+      "power": 1.0,
+      "complexity": "MODERATE (150 lines: HMAC signing, quorum calculation, verification)",
+      "score": 0.5
+    },
+    {
+      "id": "DS-08",
+      "title": "Speculative Execution: Run Multiple Approaches in Parallel, Pick ",
+      "researcher": "beta",
+      "domain": "distributed_systems",
+      "power": 1.0,
+      "complexity": "MODERATE (150 lines dispatch mode + cancellation logic)",
+      "score": 0.5
+    },
+    {
+      "id": "DS-09",
+      "title": "Intelligence Score Accuracy: Fix Duplicated Engine Weight + Fake ",
+      "researcher": "beta",
+      "domain": "distributed_systems",
+      "power": 1.0,
+      "complexity": "LOW (40 lines in intelligence_score())",
+      "score": 0.5
+    },
+    {
+      "id": "DS-10",
+      "title": "Adaptive Mutation Rates: Self-Tuning Evolution Based on Fitness C",
+      "researcher": "beta",
+      "domain": "distributed_systems",
+      "power": 1.0,
+      "complexity": "LOW (60 lines in evolve_generation())",
+      "score": 0.5
+    },
+    {
+      "id": "DS-11",
+      "title": "Persistent Bus Archive with Replay: Never Lose Critical Messages",
+      "researcher": "beta",
+      "domain": "distributed_systems",
+      "power": 1.0,
+      "complexity": "MODERATE (Go backend: 100 lines WAL + replay endpoint, Python: 30 lines replay client)",
+      "score": 0.5
+    },
+    {
+      "id": "DS-12",
+      "title": "Fitness Sharing / Niching: Prevent Strategy Population Collapse",
+      "researcher": "beta",
+      "domain": "distributed_systems",
+      "power": 1.0,
+      "complexity": "LOW (30 lines in evolve_generation())",
+      "score": 0.5
+    },
+    {
+      "id": "F1",
+      "title": "Security model covers only key management \u2014 no runtime sandboxing",
+      "researcher": "delta",
+      "domain": "security_self_evolut",
+      "power": 1.0,
+      "complexity": "MEDIUM",
+      "score": 0.5
+    },
+    {
+      "id": "F2",
+      "title": "Input guard lacks semantic analysis and multi-turn attack detecti",
+      "researcher": "delta",
+      "domain": "security_self_evolut",
+      "power": 1.0,
+      "complexity": "MEDIUM",
+      "score": 0.5
+    },
+    {
+      "id": "F3",
+      "title": "Evolution engine runs synchronously \u2014 10x speedup possible with p",
+      "researcher": "delta",
+      "domain": "security_self_evolut",
+      "power": 1.0,
+      "complexity": "MEDIUM",
+      "score": 0.5
+    },
+    {
+      "id": "F4",
+      "title": "Tool synthesizer has no network sandbox \u2014 subprocess execution tr",
+      "researcher": "delta",
+      "domain": "security_self_evolut",
+      "power": 1.0,
+      "complexity": "MEDIUM",
+      "score": 0.5
+    },
+    {
+      "id": "F5",
+      "title": "Consciousness kernel introspection is read-only \u2014 no actionable g",
+      "researcher": "delta",
+      "domain": "security_self_evolut",
+      "power": 1.0,
+      "complexity": "MEDIUM",
+      "score": 0.5
+    },
+    {
+      "id": "F7",
+      "title": "Self-modifying code has no reversibility or approval gates",
+      "researcher": "delta",
+      "domain": "security_self_evolut",
+      "power": 1.0,
+      "complexity": "MEDIUM",
+      "score": 0.5
+    },
+    {
+      "id": "F8",
+      "title": "Tool synthesizer can discover and integrate external tools at run",
+      "researcher": "delta",
+      "domain": "security_self_evolut",
+      "power": 1.0,
+      "complexity": "MEDIUM",
+      "score": 0.5
+    },
+    {
+      "id": "F9",
+      "title": "Agent communication protocol is static \u2014 no protocol evolution me",
+      "researcher": "delta",
+      "domain": "security_self_evolut",
+      "power": 1.0,
+      "complexity": "MEDIUM",
+      "score": 0.5
+    },
+    {
+      "id": "F10",
+      "title": "Evolution fitness function is fixed \u2014 no meta-learning on what 'f",
+      "researcher": "delta",
+      "domain": "security_self_evolut",
+      "power": 1.0,
+      "complexity": "MEDIUM",
+      "score": 0.5
+    }
+  ],
+  "implementation_tiers": {
+    "tier1_immediate": [
+      {
+        "id": "P-009",
+        "title": "Autonomous Desktop Agent Loop: Perception-Action Cycle",
+        "researcher": "gamma",
+        "domain": "perception_realtime",
+        "power": 10.0,
+        "complexity": "HIGH",
+        "score": 3.33
+      },
+      {
+        "id": "CA-002",
+        "title": "DAAORouter for Intelligent Worker Selection",
+        "researcher": "alpha",
+        "domain": "cognitive_architectu",
+        "power": 3.0,
+        "complexity": "LOW",
+        "score": 3.0
+      }
+    ],
+    "tier2_high_value": [
+      {
+        "id": "CA-003",
+        "title": "HybridRetrieval RRF Fusion for Context-Enriched Dispatch",
+        "researcher": "alpha",
+        "domain": "cognitive_architectu",
+        "power": 2.0,
+        "complexity": "LOW",
+        "score": 2.0
+      },
+      {
+        "id": "P-003",
+        "title": "Proactive Dialog Detection via Semantic Change Monitoring",
+        "researcher": "gamma",
+        "domain": "perception_realtime",
+        "power": 2.0,
+        "complexity": "LOW",
+        "score": 2.0
+      },
+      {
+        "id": "P-005",
+        "title": "Visual Grounding for Autonomous UI Interaction",
+        "researcher": "gamma",
+        "domain": "perception_realtime",
+        "power": 4.0,
+        "complexity": "MEDIUM",
+        "score": 2.0
+      },
+      {
+        "id": "P-008",
+        "title": "Hierarchical Semantic Change Detection with Animation Suppression",
+        "researcher": "gamma",
+        "domain": "perception_realtime",
+        "power": 2.0,
+        "complexity": "LOW",
+        "score": 2.0
+      },
+      {
+        "id": "F6",
+        "title": "No persistent memory across VS Code session restarts",
+        "researcher": "delta",
+        "domain": "security_self_evolut",
+        "power": 4.0,
+        "complexity": "MEDIUM",
+        "score": 2.0
+      }
+    ],
+    "tier3_medium_value": [
+      {
+        "id": "CA-001",
+        "title": "Core Orchestrator is Dead Code \u2014 Entire Cognitive Stack Disconnec",
+        "researcher": "alpha",
+        "domain": "cognitive_architectu",
+        "power": 5.0,
+        "complexity": "HIGH",
+        "score": 1.67
+      },
+      {
+        "id": "P-004",
+        "title": "GodMode Desktop Extension: Beyond Browser to Full OS Automation",
+        "researcher": "gamma",
+        "domain": "perception_realtime",
+        "power": 5.0,
+        "complexity": "HIGH",
+        "score": 1.67
+      },
+      {
+        "id": "CA-004",
+        "title": "Graph-of-Thoughts for Complex Task Decomposition",
+        "researcher": "alpha",
+        "domain": "cognitive_architectu",
+        "power": 3.0,
+        "complexity": "MEDIUM",
+        "score": 1.5
+      },
+      {
+        "id": "CA-010",
+        "title": "Cognitive __init__.py Registry \u2014 Zero-Config Engine Activation",
+        "researcher": "alpha",
+        "domain": "cognitive_architectu",
+        "power": 1.5,
+        "complexity": "LOW",
+        "score": 1.5
+      },
+      {
+        "id": "P-001",
+        "title": "Event-Driven Capture: Replace Polling with OS Window Change Hooks",
+        "researcher": "gamma",
+        "domain": "perception_realtime",
+        "power": 3.0,
+        "complexity": "MEDIUM",
+        "score": 1.5
+      },
+      {
+        "id": "P-006",
+        "title": "Spatial Region Embeddings for UI Element Retrieval",
+        "researcher": "gamma",
+        "domain": "perception_realtime",
+        "power": 3.0,
+        "complexity": "MEDIUM",
+        "score": 1.5
+      },
+      {
+        "id": "P-002",
+        "title": "Multi-Modal Scene Fusion: VLM + OCR + Accessibility Unified Graph",
+        "researcher": "gamma",
+        "domain": "perception_realtime",
+        "power": 4.0,
+        "complexity": "HIGH",
+        "score": 1.33
+      },
+      {
+        "id": "CA-005",
+        "title": "Multi-Agent Debate Protocol for ADVERSARIAL Tasks",
+        "researcher": "alpha",
+        "domain": "cognitive_architectu",
+        "power": 2.0,
+        "complexity": "MEDIUM",
+        "score": 1.0
+      },
+      {
+        "id": "CA-007",
+        "title": "Self-Evolution Genetic Algorithm for Strategy Optimization",
+        "researcher": "alpha",
+        "domain": "cognitive_architectu",
+        "power": 2.0,
+        "complexity": "MEDIUM",
+        "score": 1.0
+      },
+      {
+        "id": "CA-008",
+        "title": "R-MCTS Reflective Search for Multi-Step Task Planning",
+        "researcher": "alpha",
+        "domain": "cognitive_architectu",
+        "power": 3.0,
+        "complexity": "HIGH",
+        "score": 1.0
+      },
+      {
+        "id": "P-007",
+        "title": "Table and Form-Aware OCR Layout Parsing",
+        "researcher": "gamma",
+        "domain": "perception_realtime",
+        "power": 2.0,
+        "complexity": "MEDIUM",
+        "score": 1.0
+      }
+    ],
+    "tier4_heavy_investment": [
+      {
+        "id": "CA-006",
+        "title": "EpisodicMemory Temporal Decay for Adaptive Context",
+        "researcher": "alpha",
+        "domain": "cognitive_architectu",
+        "power": 1.5,
+        "complexity": "MEDIUM",
+        "score": 0.75
+      },
+      {
+        "id": "CA-009",
+        "title": "CodeGenerator for Dynamic Tool Synthesis",
+        "researcher": "alpha",
+        "domain": "cognitive_architectu",
+        "power": 2.0,
+        "complexity": "HIGH",
+        "score": 0.67
+      },
+      {
+        "id": "DS-01",
+        "title": "Stigmergy Layer: Indirect Worker Coordination via Shared Artifact",
+        "researcher": "beta",
+        "domain": "distributed_systems",
+        "power": 1.0,
+        "complexity": "MODERATE (300 lines new module + integration)",
+        "score": 0.5
+      },
+      {
+        "id": "DS-02",
+        "title": "Emergent Worker Specialization via Fitness-Weighted Task Routing",
+        "researcher": "beta",
+        "domain": "distributed_systems",
+        "power": 1.0,
+        "complexity": "MODERATE (modify smart_dispatch ~100 lines, add skill vector computation ~80 lines)",
+        "score": 0.5
+      },
+      {
+        "id": "DS-03",
+        "title": "Sub-Second Dispatch: Pre-Cached PowerShell + Async Verification P",
+        "researcher": "beta",
+        "domain": "distributed_systems",
+        "power": 1.0,
+        "complexity": "MODERATE-HIGH (DLL caching ~150 lines, async verify ~100 lines, screenshot skip logic ~50 lines)",
+        "score": 0.5
+      },
+      {
+        "id": "DS-04",
+        "title": "Work Stealing: Idle Workers Proactively Pull From Busy Workers' Q",
+        "researcher": "beta",
+        "domain": "distributed_systems",
+        "power": 1.0,
+        "complexity": "MODERATE (200 lines new module + bus integration)",
+        "score": 0.5
+      },
+      {
+        "id": "DS-05",
+        "title": "Checkpoint/Resume: Fault-Tolerant Task Execution With Progress Pe",
+        "researcher": "beta",
+        "domain": "distributed_systems",
+        "power": 1.0,
+        "complexity": "MODERATE (250 lines checkpoint module + dispatch/preamble integration)",
+        "score": 0.5
+      },
+      {
+        "id": "DS-06",
+        "title": "Priority Message Channels: Urgent vs Normal Bus Traffic Separatio",
+        "researcher": "beta",
+        "domain": "distributed_systems",
+        "power": 1.0,
+        "complexity": "LOW-MODERATE (Go backend: 50 lines for dual buffer, Python: 20 lines SpamGuard priority tag)",
+        "score": 0.5
+      },
+      {
+        "id": "DS-07",
+        "title": "Byzantine Fault Tolerance: Signed Votes + Quorum Enforcement in C",
+        "researcher": "beta",
+        "domain": "distributed_systems",
+        "power": 1.0,
+        "complexity": "MODERATE (150 lines: HMAC signing, quorum calculation, verification)",
+        "score": 0.5
+      },
+      {
+        "id": "DS-08",
+        "title": "Speculative Execution: Run Multiple Approaches in Parallel, Pick ",
+        "researcher": "beta",
+        "domain": "distributed_systems",
+        "power": 1.0,
+        "complexity": "MODERATE (150 lines dispatch mode + cancellation logic)",
+        "score": 0.5
+      },
+      {
+        "id": "DS-09",
+        "title": "Intelligence Score Accuracy: Fix Duplicated Engine Weight + Fake ",
+        "researcher": "beta",
+        "domain": "distributed_systems",
+        "power": 1.0,
+        "complexity": "LOW (40 lines in intelligence_score())",
+        "score": 0.5
+      },
+      {
+        "id": "DS-10",
+        "title": "Adaptive Mutation Rates: Self-Tuning Evolution Based on Fitness C",
+        "researcher": "beta",
+        "domain": "distributed_systems",
+        "power": 1.0,
+        "complexity": "LOW (60 lines in evolve_generation())",
+        "score": 0.5
+      },
+      {
+        "id": "DS-11",
+        "title": "Persistent Bus Archive with Replay: Never Lose Critical Messages",
+        "researcher": "beta",
+        "domain": "distributed_systems",
+        "power": 1.0,
+        "complexity": "MODERATE (Go backend: 100 lines WAL + replay endpoint, Python: 30 lines replay client)",
+        "score": 0.5
+      },
+      {
+        "id": "DS-12",
+        "title": "Fitness Sharing / Niching: Prevent Strategy Population Collapse",
+        "researcher": "beta",
+        "domain": "distributed_systems",
+        "power": 1.0,
+        "complexity": "LOW (30 lines in evolve_generation())",
+        "score": 0.5
+      },
+      {
+        "id": "F1",
+        "title": "Security model covers only key management \u2014 no runtime sandboxing",
+        "researcher": "delta",
+        "domain": "security_self_evolut",
+        "power": 1.0,
+        "complexity": "MEDIUM",
+        "score": 0.5
+      },
+      {
+        "id": "F2",
+        "title": "Input guard lacks semantic analysis and multi-turn attack detecti",
+        "researcher": "delta",
+        "domain": "security_self_evolut",
+        "power": 1.0,
+        "complexity": "MEDIUM",
+        "score": 0.5
+      },
+      {
+        "id": "F3",
+        "title": "Evolution engine runs synchronously \u2014 10x speedup possible with p",
+        "researcher": "delta",
+        "domain": "security_self_evolut",
+        "power": 1.0,
+        "complexity": "MEDIUM",
+        "score": 0.5
+      },
+      {
+        "id": "F4",
+        "title": "Tool synthesizer has no network sandbox \u2014 subprocess execution tr",
+        "researcher": "delta",
+        "domain": "security_self_evolut",
+        "power": 1.0,
+        "complexity": "MEDIUM",
+        "score": 0.5
+      },
+      {
+        "id": "F5",
+        "title": "Consciousness kernel introspection is read-only \u2014 no actionable g",
+        "researcher": "delta",
+        "domain": "security_self_evolut",
+        "power": 1.0,
+        "complexity": "MEDIUM",
+        "score": 0.5
+      },
+      {
+        "id": "F7",
+        "title": "Self-modifying code has no reversibility or approval gates",
+        "researcher": "delta",
+        "domain": "security_self_evolut",
+        "power": 1.0,
+        "complexity": "MEDIUM",
+        "score": 0.5
+      },
+      {
+        "id": "F8",
+        "title": "Tool synthesizer can discover and integrate external tools at run",
+        "researcher": "delta",
+        "domain": "security_self_evolut",
+        "power": 1.0,
+        "complexity": "MEDIUM",
+        "score": 0.5
+      },
+      {
+        "id": "F9",
+        "title": "Agent communication protocol is static \u2014 no protocol evolution me",
+        "researcher": "delta",
+        "domain": "security_self_evolut",
+        "power": 1.0,
+        "complexity": "MEDIUM",
+        "score": 0.5
+      },
+      {
+        "id": "F10",
+        "title": "Evolution fitness function is fixed \u2014 no meta-learning on what 'f",
+        "researcher": "delta",
+        "domain": "security_self_evolut",
+        "power": 1.0,
+        "complexity": "MEDIUM",
+        "score": 0.5
+      }
+    ]
+  }
+}

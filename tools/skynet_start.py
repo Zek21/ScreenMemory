@@ -2105,6 +2105,12 @@ def _start_post_boot_daemons():
         DATA_DIR / "knowledge_distill.pid",
         "Knowledge distill daemon",
     )
+    # Proactive handler — auto-clears dialogs, Apply buttons, STEERING
+    _start_daemon_safe(
+        str(ROOT / "tools" / "skynet_proactive_handler.py"),
+        DATA_DIR / "proactive_handler.pid",
+        "Proactive handler daemon",
+    )
     _ensure_consultant_bridge()
     _ensure_gemini_consultant_bridge()
 
