@@ -181,7 +181,11 @@ def _classify_difficulty(goal: str) -> str:
 
 
 def _decompose_subtasks(goal: str, idle: list, difficulty: str) -> list:
-    """Decompose goal into worker subtasks using rule-based heuristics."""
+    """Decompose goal into worker subtasks using rule-based heuristics.
+
+    For hard (COMPLEX/ADVERSARIAL) tasks, tries got_router first for
+    structured branching decomposition before falling back to rules.
+    """  # signed: beta
     import re
     subtasks = []
 
@@ -204,6 +208,12 @@ def _decompose_subtasks(goal: str, idle: list, difficulty: str) -> list:
             subtasks.append({"worker": worker, "task": f"{base} {path}".strip(), "depends_on": None})
         return subtasks
 
+    # For hard tasks: try GoT router for structured decomposition  # signed: beta
+    if difficulty == "hard" and len(idle) >= 2:
+        got_subtasks = _try_got_decompose_dispatch(goal, idle)
+        if got_subtasks:
+            return got_subtasks
+
     if difficulty == "easy" or len(idle) <= 1:
         worker = idle[0] if idle else "alpha"
         subtasks.append({"worker": worker, "task": goal, "depends_on": None})
@@ -216,6 +226,32 @@ def _decompose_subtasks(goal: str, idle: list, difficulty: str) -> list:
                 "depends_on": None,
             })
     return subtasks
+
+
+def _try_got_decompose_dispatch(goal: str, idle: list) -> list:
+    """Try GoT router decomposition for brain_dispatch fallback path.
+
+    Returns list of subtask dicts compatible with brain_dispatch format,
+    or empty list if got_router unavailable or fails.
+    """  # signed: beta
+    try:
+        from tools.skynet_got_router import got_decompose
+        # Try COMPLEX first (parallel exploration), then ADVERSARIAL (debate)
+        got_results = got_decompose(goal, "COMPLEX", idle, timeout=5.0)
+        if not got_results:
+            return []
+        subtasks = []
+        for gst in got_results:
+            dep = gst.dependencies[0] if gst.dependencies else None
+            subtasks.append({
+                "worker": gst.assigned_worker,
+                "task": gst.task_text,
+                "depends_on": dep,
+                "branch_type": gst.branch_type,
+            })
+        return subtasks
+    except Exception:
+        return []
 
 
 def _brain_think(goal: str) -> dict:

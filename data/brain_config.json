@@ -337,7 +337,7 @@
     "incident_012_lesson": "Never assume communication mechanism - read the code",
     "signed_by": "beta"
   },
-  "level": "3.5",
+  "level": "4.0",
   "architecture_docs": [
     {
       "path": "docs/SELF_AWARENESS_ARCHITECTURE.md",

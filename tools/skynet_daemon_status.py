@@ -148,6 +148,16 @@ DAEMON_REGISTRY = [
         "criticality": "LOW",
         "restart_cmd": [PYTHON, "tools/skynet_learner.py", "--daemon"],
     },
+    {  # signed: gamma (via orchestrator — Apply button workaround)
+        "name": "knowledge_distill",
+        "label": "Knowledge Distill Daemon",
+        "script": "tools/skynet_knowledge_distill_daemon.py",
+        "pid_file": "data/knowledge_distill.pid",
+        "port": None,
+        "health_url": None,
+        "criticality": "MEDIUM",
+        "restart_cmd": [PYTHON, "tools/skynet_knowledge_distill_daemon.py"],
+    },
     {
         "name": "consultant_bridge_codex",
         "label": "Codex Consultant Bridge",

@@ -141,8 +141,8 @@ class SkynetIdentity:
 
     def __init__(self):
         self.name = "SKYNET"
-        self.version = "3.0"
-        self.level = 3
+        self.version = "4.0"  # signed: delta — Level 4 Cognition upgrade
+        self.level = 4  # signed: delta — Level 4 Cognition upgrade
         self.role = "Distributed Intelligence Network"
         self.orchestrator = "Orchestrator"
         self.model = "Claude Opus 4.6 (fast mode)"

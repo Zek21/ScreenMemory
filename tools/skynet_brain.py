@@ -245,22 +245,29 @@ class CognitiveStrategy:
             print(f"[brain] WARN: Planner unavailable: {e}")
 
     def select_strategy(self, difficulty: str) -> str:
-        """Select the cognitive strategy based on task difficulty."""
+        """Select the cognitive strategy based on task difficulty.
+
+        COMPLEX and ADVERSARIAL both route through GoT (got_router provides
+        parallel exploration for COMPLEX and debate format for ADVERSARIAL).
+        """  # signed: beta
         strategy_map = {
             "TRIVIAL": "direct",
             "SIMPLE": "direct",
             "MODERATE": "reflexion",
             "COMPLEX": "got",
-            "ADVERSARIAL": "mcts",
+            "ADVERSARIAL": "got",
         }
         selected = strategy_map.get(difficulty, "direct")
         # Downgrade if engine unavailable
         if selected == "reflexion" and not self.reflexion:
             selected = "direct"
         if selected == "got" and not self.got:
-            selected = "reflexion" if self.reflexion else "direct"
-        if selected == "mcts" and not self.mcts:
-            selected = "got" if self.got else "direct"
+            # Still try -- got_router may work without internal GoT engine
+            try:
+                from tools.skynet_got_router import got_decompose  # noqa: F401
+                pass  # got_router available, keep "got" selected
+            except ImportError:
+                selected = "reflexion" if self.reflexion else "direct"
         return selected
 
     def apply_reflexion(self, goal: str, learnings: list) -> dict:
@@ -295,29 +302,54 @@ class CognitiveStrategy:
             "reflection_count": len(relevant),
         }
 
-    def apply_got(self, goal: str, learnings: list) -> dict:
-        """Apply Graph-of-Thought: decompose into multi-path reasoning graph."""
+    def apply_got(self, goal: str, learnings: list, difficulty: str = "COMPLEX") -> dict:
+        """Apply Graph-of-Thought: decompose into multi-path reasoning graph.
+
+        Tries got_router first for richer structured decomposition (parallel
+        branches for COMPLEX, debate format for ADVERSARIAL). Falls back to
+        internal GoT if got_router is unavailable or fails.
+        """  # signed: beta
+        # Try got_router for structured decomposition first
+        try:
+            from tools.skynet_got_router import got_decompose
+            got_results = got_decompose(goal, difficulty, timeout=5.0)
+            if got_results:
+                # Convert GoTSubtask list to cognitive context dict
+                thought_nodes = [
+                    {"id": gst.thought_id, "content": gst.task_text,
+                     "score": gst.score, "branch_type": gst.branch_type}
+                    for gst in got_results
+                ]
+                best_path = [gst.task_text for gst in got_results]
+                print(f"[brain] GoT router: {len(got_results)} branches via {difficulty} graph")
+                return {
+                    "strategy": "got",
+                    "thoughts": thought_nodes,
+                    "best_path": best_path,
+                    "graph_size": len(got_results),
+                    "source": "got_router",
+                    "difficulty": difficulty,
+                }
+        except Exception as e:
+            print(f"[brain] WARN: got_router failed ({e}), using internal GoT")
+
+        # Fallback: internal GoT  # signed: beta
         if not self.got:
             return {"strategy": "got", "thoughts": [], "best_path": []}
 
-        # Create reasoning graph
         root = self.got.add_thought(goal, score=0.5)
 
-        # Generate exploration branches based on goal analysis
         branches = self._generate_thought_branches(goal)
         thought_nodes = []
         for branch in branches:
             t = self.got.generate(root.id, branch["content"], score=branch.get("score", 0.5))
             thought_nodes.append({"id": t.id, "content": t.content, "score": t.score})
 
-        # Score all thoughts
         self.got.score_all()
 
-        # Get best reasoning path
         best_path = self.got.get_best_path()
         path_contents = [t.content for t in best_path]
 
-        # Aggregate findings
         if len(thought_nodes) > 1:
             agg_content = f"Synthesize approaches for: {goal}"
             merged = self.got.aggregate(
@@ -331,6 +363,7 @@ class CognitiveStrategy:
             "thoughts": thought_nodes,
             "best_path": path_contents,
             "graph_size": len(self.got._thoughts),
+            "source": "internal",
         }
 
     def apply_mcts(self, goal: str) -> dict:
@@ -382,7 +415,7 @@ class CognitiveStrategy:
             return self.apply_reflexion(goal, learnings)
 
         if strategy == "got":
-            return self.apply_got(goal, learnings)
+            return self.apply_got(goal, learnings, difficulty=difficulty)  # signed: beta
 
         if strategy == "mcts":
             return self.apply_mcts(goal)
@@ -448,10 +481,17 @@ class CognitiveStrategy:
                     parts.append(f"  - {adj[:200]}")
 
         elif strategy == "got":
+            source = result.get("source", "internal")
             if result.get("best_path"):
-                parts.append("REASONING PATH (Graph of Thought):")
+                parts.append(f"REASONING PATH (Graph of Thought via {source}):")
                 for i, step in enumerate(result["best_path"][:5], 1):
                     parts.append(f"  {i}. {step[:200]}")
+            # Include branch type info from got_router  # signed: beta
+            if source == "got_router" and result.get("thoughts"):
+                parts.append("BRANCH TYPES:")
+                for t in result["thoughts"]:
+                    btype = t.get("branch_type", "unknown")
+                    parts.append(f"  - [{btype}] {t.get('content', '')[:120]}")
             parts.append(f"  Graph size: {result.get('graph_size', 0)} nodes")
 
         elif strategy == "mcts":
@@ -751,7 +791,11 @@ class SkynetBrain:
 
     def _decompose(self, goal: str, difficulty: str, idle_workers: List[str],
                    learnings: List[str], context_docs: List[str]) -> List[Subtask]:
-        """Decompose goal into subtasks based on difficulty level."""
+        """Decompose goal into subtasks based on difficulty level.
+
+        For COMPLEX/ADVERSARIAL: attempts GoT-based branching decomposition
+        first, falls back to linear templates if GoT fails or times out.
+        """  # signed: beta
         context_str = self._build_context(learnings, context_docs)
 
         if difficulty in ("TRIVIAL", "SIMPLE"):
@@ -766,6 +810,13 @@ class SkynetBrain:
                 (f"Implement and verify: {goal}", w[1] if len(idle_workers) > 1 else w[0], ["subtask_0"]),
             ], context_str)
 
+        # COMPLEX and ADVERSARIAL: try GoT decomposition first  # signed: beta
+        if difficulty in ("COMPLEX", "ADVERSARIAL"):
+            got_subtasks = self._try_got_decompose(goal, difficulty, idle_workers, context_str)
+            if got_subtasks:
+                return got_subtasks
+
+        # Fallback: linear templates for COMPLEX/ADVERSARIAL  # signed: beta
         if difficulty == "COMPLEX":
             return self._make_subtask_chain([
                 (f"Research and analyze requirements for: {goal}", w[0], []),
@@ -781,6 +832,38 @@ class SkynetBrain:
             (f"Critique both approaches for: {goal}. Identify flaws and risks.", w[2], ["subtask_0", "subtask_1"]),
             (f"Synthesize final solution from debate for: {goal}", w[3], ["subtask_0", "subtask_1", "subtask_2"]),
         ], context_str)
+
+    def _try_got_decompose(self, goal: str, difficulty: str,
+                           idle_workers: List[str], context_str: str) -> List[Subtask]:
+        """Attempt GoT-based decomposition. Returns subtasks or empty list on failure.
+
+        Falls back gracefully if GoT engine is unavailable, fails, or times out (5s).
+        """  # signed: beta
+        try:
+            from tools.skynet_got_router import got_decompose
+            got_results = got_decompose(goal, difficulty, idle_workers, timeout=5.0)
+            if not got_results:
+                return []
+            # Convert GoTSubtask objects to Subtask objects
+            subtasks = []
+            for gst in got_results:
+                got_context = gst.context
+                full_context = f"{context_str}\n\n{got_context}" if context_str and got_context else (context_str or got_context)
+                subtasks.append(Subtask(
+                    task_text=gst.task_text,
+                    assigned_worker=gst.assigned_worker,
+                    context=full_context,
+                    dependencies=list(gst.dependencies),
+                    index=gst.index,
+                ))
+            print(f"[brain] GoT decomposition: {len(subtasks)} subtasks via {difficulty} graph")
+            return subtasks
+        except ImportError:
+            print("[brain] WARN: skynet_got_router unavailable, using linear fallback")
+            return []
+        except Exception as e:
+            print(f"[brain] WARN: GoT decomposition failed ({e}), using linear fallback")
+            return []
 
     def _build_context(self, learnings: List[str], docs: List[str]) -> str:
         """Build context string from learnings and retrieved documents."""

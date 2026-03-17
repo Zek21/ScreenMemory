@@ -39,6 +39,14 @@ if hasattr(sys.stdout, 'reconfigure'):
 from pathlib import Path
 from datetime import datetime
 
+# Reflexion hook — learns from dispatch failures, injects past lessons  # signed: alpha
+try:
+    from tools.skynet_reflexion_hook import reflexion_hook as _reflexion_hook
+    from tools.skynet_reflexion_hook import pre_dispatch_context as _pre_dispatch_context
+    _REFLEXION_AVAILABLE = True
+except Exception:
+    _REFLEXION_AVAILABLE = False
+
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 DATA_DIR = ROOT / "data"
@@ -437,6 +445,19 @@ _AUTONOMY_INSTRUCTION = (
 )  # signed: beta
 
 
+def _enrich_reflexion_context(worker_name, task):  # signed: alpha
+    """Query past failure reflections relevant to this task for pre-dispatch injection."""
+    if not _REFLEXION_AVAILABLE:
+        return None
+    try:
+        ctx = _pre_dispatch_context(task, worker_name=worker_name, top_k=2)
+        if ctx and ctx.strip():
+            return f"[REFLEXION] {ctx.strip()}"
+    except Exception:
+        pass
+    return None
+
+
 def _build_result_posting_reminder(worker_name):
     """Build a compact reminder to post results via guarded_publish.
 
@@ -461,6 +482,7 @@ def enrich_task(worker_name, task):
         _enrich_context(task),
         _enrich_worker_states(worker_name),
         _enrich_last_result(worker_name),
+        _enrich_reflexion_context(worker_name, task),  # signed: alpha
         _AUTONOMY_INSTRUCTION,
     ) if s]
 
@@ -2183,7 +2205,21 @@ def wait_for_bus_result(key, timeout=90, poll=2.0, skynet_url="http://localhost:
         sender = (result.get("sender") or "").strip()
         if sender:
             mark_dispatch_received(sender)  # signed: alpha
+        # Reflexion hook — record success learning  # signed: alpha
+        if _REFLEXION_AVAILABLE:
+            try:
+                content = result.get("content", "")
+                _reflexion_hook(sender, _original_task or key, content, success=True)
+            except Exception:
+                pass
         return result
+
+    # Reflexion hook — record failure/timeout  # signed: alpha
+    if _REFLEXION_AVAILABLE and _original_task:
+        try:
+            _reflexion_hook(key, _original_task, "Timeout: no result received", success=False)
+        except Exception:
+            pass
 
     if auto_recover and _original_task:
         log(f"Timeout waiting for '{key}' -- attempting auto-recovery", "WARN")

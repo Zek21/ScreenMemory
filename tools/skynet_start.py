@@ -2100,6 +2100,11 @@ def _start_post_boot_daemons():
         "Learner daemon",
         extra_args=["--daemon"],
     )
+    _start_daemon_safe(  # signed: gamma (via orchestrator — Apply button workaround)
+        str(ROOT / "tools" / "skynet_knowledge_distill_daemon.py"),
+        DATA_DIR / "knowledge_distill.pid",
+        "Knowledge distill daemon",
+    )
     _ensure_consultant_bridge()
     _ensure_gemini_consultant_bridge()
 

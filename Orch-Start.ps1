@@ -445,7 +445,8 @@ $daemonSpecs = @(
     @{ Script = "tools\skynet_self_prompt.py";  Pid = "data\self_prompt.pid";  Name = "Self-prompt";  Args = @("start") },
     @{ Script = "tools\skynet_self_improve.py"; Pid = "data\self_improve.pid"; Name = "Self-improve"; Args = @("start") },
     @{ Script = "tools\skynet_bus_relay.py";    Pid = "data\bus_relay.pid";    Name = "Bus relay";    Args = $null },
-    @{ Script = "tools\skynet_learner.py";      Pid = "data\learner.pid";      Name = "Learner";      Args = @("--daemon") }
+    @{ Script = "tools\skynet_learner.py";      Pid = "data\learner.pid";      Name = "Learner";      Args = @("--daemon") },
+    @{ Script = "tools\skynet_knowledge_distill_daemon.py"; Pid = "data\knowledge_distill.pid"; Name = "Knowledge distill"; Args = $null }  # signed: gamma
 )
 
 foreach ($d in $daemonSpecs) {
