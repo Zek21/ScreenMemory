@@ -1,8 +1,44 @@
 [
   {
+    "version": "1.0",
+    "level": 1,
+    "codename": "Genesis",
+    "timestamp": "2026-03-08T12:00:00",
+    "changes_summary": "Initial system -- manual dispatch, single worker, basic bus messaging, no self-awareness. Go backend on port 8420, single VS Code worker window, manual task dispatch, basic bus publish/subscribe."
+  },
+  {
+    "version": "2.0",
+    "level": 2,
+    "codename": "Awakening",
+    "timestamp": "2026-03-09T12:00:00",
+    "changes_summary": "Self-awareness added: skynet_self.py consciousness kernel with identity/capabilities/health introspection. GOD Console dashboard on port 8421. Engine metrics with 3-tier probe (online/available/offline). Collective intelligence federation via skynet_collective.py. Agent profiles in data/agent_profiles.json."
+  },
+  {
     "version": "3.0",
     "level": 3,
+    "codename": "Production",
     "timestamp": "2026-03-10T16:21:32.621990",
     "changes_summary": "Level 3 upgrade: Truth audit (Go backend fixes -- honest model/heartbeat/taskCount), engine_metrics 3-tier probe, real-time ops (skynet_realtime daemon + orch_realtime), intelligent dispatch (brain pipeline + brain_config), collective intelligence (knowledge sharing + convene + strategy federation), self-awareness kernel (agent_profiles + skynet_self), monitor upgrades (realtime daemon check + intelligence metrics), AGENTS.md comprehensive update, Chrome Bridge PLAYWRIGHT_REPLACEMENT.md, Win32 API compliance audit, version tracking system"
+  },
+  {
+    "version": "3.1",
+    "level": 3,
+    "codename": "Hardening",
+    "timestamp": "2026-03-12T10:00:00",
+    "changes_summary": "Dispatch result tracking (mark_dispatch_received in skynet_dispatch.py), fair deduction rule (Rule 0.5, verify_dispatch_evidence gates all score deductions), false DEAD debounce (3 consecutive HWND failures required), task lifecycle tracking (GET /tasks endpoint in Go backend), cp1252 encoding fix (orch_realtime.py with bus HTTP fallback), anti-spam system (SpamGuard with guarded_publish + server-side rate limiting 10 msgs/min/sender + HTTP 429)."
+  },
+  {
+    "version": "3.5",
+    "level": 3,
+    "codename": "Sprint 2",
+    "timestamp": "2026-03-12T18:00:00",
+    "changes_summary": "Delivery pipeline defense-in-depth: multi-pane Chrome_RenderWidgetHostHWND disambiguation via FindAllRender + right-half area scoring, focus race prevention with GetForegroundWindow pre/post check (FOCUS_STOLEN handler), clipboard verification (3x SetText/GetText readback loop), architecture verification (skynet_arch_verify.py Phase 0 boot check), unified daemon CLI (skynet_daemon_status.py), priority-aware spam filtering (category-specific windows), consultant consumer daemon (skynet_consultant_consumer.py), comprehensive dispatch docstrings, self-awareness expansion (validate_agent_completeness + incident pattern detection + quick_pulse awareness flags)."
+  },
+  {
+    "version": "4.0",
+    "level": 4,
+    "codename": "Cognition",
+    "timestamp": "2026-03-17T13:33:00",
+    "changes_summary": "Level 4 Cognition upgrade: Cognitive engine integration into live task pipeline. ReflexionEngine (core/cognitive/reflexion.py) wired for cross-session failure learning via LearningStore + EpisodicMemory. GraphOfThoughts (core/cognitive/graph_of_thoughts.py) integrated for non-linear COMPLEX+ task decomposition. KnowledgeDistiller daemon (core/cognitive/knowledge_distill.py + tools/skynet_distill_hook.py) runs episodic-to-semantic memory consolidation as 17th daemon. MCTS Navigator (core/cognitive/mcts.py) implemented for future autonomous browser planning. Memory architecture live: 3-tier working(7)/episodic(500)/semantic(unlimited). Version tracking with codenames and full history."
   }
 ]

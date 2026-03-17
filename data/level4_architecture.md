@@ -1,263 +1,574 @@
-# Skynet Level 4 Architecture — Intelligence Maximizer
+# Skynet Level 4 Architecture — Cognition
 
-**Author:** Worker Beta (Protocol Engineer)
-**Date:** 2026-03-10
-**Status:** Design Document — Ready for Implementation
+**Codename:** Cognition
+**Author:** Worker Delta (Architecture & Self-Awareness Specialist)
+**Date:** 2026-03-17
+**Status:** Active — Level 4.0 Released
+**Previous:** Level 3.5 Sprint 2 (Delivery Pipeline Hardening)
+
+<!-- signed: delta -->
 
 ---
 
 ## Executive Summary
 
-Level 3 gave Skynet production-grade resilience (watchdog, crash recovery, real IQ tracking, truth enforcement). Level 4 moves from **reliable infrastructure** to **maximized intelligence** — the system becomes genuinely autonomous, self-healing, and operates with zero human attention overhead.
+Level 4 "Cognition" represents Skynet's transition from a **production-hardened dispatch system** to a
+**cognitive intelligence network**. Four cognitive engines — previously standalone research modules in
+`core/cognitive/` — are now wired directly into the live task pipeline, enabling cross-session
+failure learning, non-linear task decomposition, automatic knowledge consolidation, and (future)
+autonomous browser planning via Monte Carlo Tree Search.
+
+Level 3 gave Skynet reliability: watchdog recovery, truth enforcement, anti-spam, dispatch
+verification, architecture verification. Level 4 gives Skynet **thought** — the ability to reflect
+on failures, explore solution spaces as graphs, distill ephemeral experience into durable knowledge,
+and plan multi-step web navigation autonomously.
 
 ---
 
-## Capability 1: Fully Focusless Dispatch
+## Architecture Overview
 
-### Problem
-Current `ghost_type_to_worker()` uses `SetForegroundWindow` + clipboard paste (`WM_PASTE`). This steals focus from the orchestrator for ~200ms per dispatch, disrupting the user if they're typing.
-
-### What Actually Works vs What Doesn't (Tested)
-
-**WORKS:**
-- `OpenClipboard(NULL)` + `SetClipboardData` — sets clipboard without needing focus ✓
-- `WM_PASTE` via `PostMessage` to Chromium-based VS Code — pastes from clipboard ✓
-- `PostMessage(WM_CHAR)` for simple ASCII — sometimes works on Chromium ✓
-
-**DOES NOT WORK (Chromium limitation):**
-- `PostMessage(WM_KEYDOWN/WM_KEYUP)` for Enter key — Chromium ignores keyboard messages sent via PostMessage. The Electron/Chromium input pipeline uses a separate IPC channel (Mojo) between the browser process and renderer, so Win32 keyboard messages posted to the HWND never reach the web content.
-- `SendInput` without focus — SendInput always targets the foreground window
-- `PostMessage(WM_KEYDOWN, VK_RETURN)` — silently dropped by Chromium
-
-**CURRENT WORKAROUND:**
-The ghost_type pipeline uses: `SetClipboard` → `PostMessage(WM_PASTE)` → brief `SetForegroundWindow` + `SendKeys({ENTER})` → restore focus. The Enter key is the ONLY operation requiring focus steal (~50ms window).
-
-### Implementation Path
-
-**Phase 1 — Minimize focus steal window (Level 4.0)**
-The current approach is already near-optimal. Reduce the focus steal to bare minimum:
-1. Set clipboard without focus (already works)
-2. `PostMessage(WM_PASTE)` without focus (already works)
-3. For Enter: `SetForegroundWindow` → immediate `SendInput(VK_RETURN)` → immediate restore
-4. Total focus steal: ~20ms (down from ~200ms)
-5. Use `AttachThreadInput` to avoid focus flash
-
-**Files:** `tools/skynet_dispatch.py` → `ghost_type_to_worker()`
-
-**Phase 2 — Named pipe injection (Level 4.1)**
-For true zero-UI dispatch:
-1. Write a tiny VS Code extension (`skynet-injector`) that listens on a named pipe (`\\.\pipe\skynet-{worker}`)
-2. Extension receives task text and programmatically inserts it into the Copilot CLI input + submits
-3. No clipboard, no focus, no Win32 messages — pure IPC
-4. Extension runs executeCommand('workbench.action.chat.submitPrompt') after inserting text
-
-**Files:** New `extensions/skynet-injector/` directory
-
-**Phase 3 — Direct language server protocol (Level 4.2)**
-Bypass UI entirely:
-1. Connect to the Copilot CLI's internal API via localhost HTTP or WebSocket
-2. Submit prompts programmatically
-3. Read responses from the API stream
-4. Workers become headless — no VS Code window needed
-
-**Risk:** Copilot CLI internal API is undocumented and may change between versions.
-
----
-
-## Capability 2: Worker-to-Worker Direct Communication
-
-### Problem
-All worker coordination goes through the orchestrator (bus relay). Worker A posts to bus → orchestrator reads → orchestrator dispatches to Worker B. This adds 2-3 seconds latency per hop and burns orchestrator turns.
-
-### Implementation Path
-
-**Phase 1 — Bus-direct addressing (Level 4.0)**
-Workers already have bus access. Enable direct messaging:
-```python
-# Worker Alpha wants Beta to run a subtask:
-requests.post('http://localhost:8420/bus/publish', json={
-    'sender': 'alpha',
-    'topic': 'beta',  # Direct to worker, not 'orchestrator'
-    'type': 'sub-task',
-    'content': 'Run pytest on core/',
-    'reply_to': 'alpha',  # Where to send result
-})
 ```
-Workers poll for `topic={their_name}` messages and auto-execute.
-
-**Files:** `tools/skynet_dispatch.py` → new `worker_to_worker()` function, worker preamble updated to poll own topic.
-
-**Phase 2 — Worker mesh network (Level 4.1)**
-Each worker runs a lightweight HTTP server on a unique port:
-- Alpha: 8430, Beta: 8431, Gamma: 8432, Delta: 8433
-- Workers POST tasks directly to each other's endpoints
-- Zero bus overhead, sub-100ms latency
-- Mesh topology stored in `data/mesh_registry.json`
-
-**Files:** New `tools/skynet_mesh.py` — worker-side HTTP micro-server
-
-**Phase 3 — Shared memory IPC (Level 4.2)**
-For maximum speed (sub-1ms):
-1. Use Windows named shared memory (`CreateFileMapping`)
-2. Each worker has a read slot and write slot
-3. Workers poll their read slot at 100ms intervals
-4. Zero network overhead
-
-**Files:** `tools/skynet_ipc.py` — ctypes-based shared memory ring buffer
-
----
-
-## Capability 3: Autonomous Goal Generation
-
-### Problem
-Workers sit idle until the orchestrator dispatches tasks. They don't proactively identify improvements or act on them.
-
-### Implementation Path
-
-**Phase 1 — Self-improvement scanner (Level 4.0)**
-Each worker runs periodic self-assessment:
-```python
-# In worker preamble, after task completion:
-1. Check TODOs (skynet_todos.py) — pick highest priority pending item
-2. Scan data/incidents.json — find unresolved patterns
-3. Grep for TODO/FIXME/HACK in codebase — propose fixes
-4. Review own past failures (learning_store) — identify recurring issues
-5. Post improvement proposal to bus: topic='planning', type='proposal'
+┌─────────────────────────────────────────────────────────────────────┐
+│                    SKYNET LEVEL 4 — COGNITION                       │
+│                                                                     │
+│  ┌──────────────┐  ┌──────────────┐  ┌───────────────┐  ┌────────┐ │
+│  │  Reflexion    │  │  Graph of    │  │  Knowledge    │  │  MCTS  │ │
+│  │  Engine       │  │  Thoughts    │  │  Distillation │  │  Nav   │ │
+│  │              │  │              │  │  Daemon       │  │(future)│ │
+│  │ cross-session│  │  non-linear  │  │  episodic →   │  │  web   │ │
+│  │ failure      │  │  task        │  │  semantic     │  │  auto  │ │
+│  │ learning     │  │  decomp      │  │  memory       │  │  plan  │ │
+│  └──────┬───────┘  └──────┬───────┘  └───────┬───────┘  └────┬───┘ │
+│         │                 │                  │               │     │
+│  ═══════╪═════════════════╪══════════════════╪═══════════════╪═══  │
+│         │          COGNITIVE BUS LAYER       │               │     │
+│  ═══════╪═════════════════╪══════════════════╪═══════════════╪═══  │
+│         │                 │                  │               │     │
+│  ┌──────▼───────────────────────────────────────────────────────┐  │
+│  │              SKYNET TASK PIPELINE (Level 3.5 base)           │  │
+│  │                                                              │  │
+│  │  brain_dispatch → decompose → enrich → dispatch → collect    │  │
+│  │        ↕              ↕           ↕          ↕         ↕     │  │
+│  │  DAAORouter    HierPlanner   LearningStore  ghost_type  bus  │  │
+│  └──────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │              INFRASTRUCTURE LAYER (Level 3.x)                │   │
+│  │  Go backend · GOD Console · 17 daemons · SpamGuard · UIA    │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-**Files:** `tools/skynet_self_improve.py` — autonomous goal scanner with proposal generation
+The cognitive engines sit **above** the existing task pipeline and inject intelligence at key
+decision points:
 
-**Phase 2 — Goal marketplace (Level 4.1)**
-1. Workers post proposed goals to `data/goal_marketplace.json`
-2. Other workers vote (upvote/downvote) on proposals
-3. Goals reaching consensus threshold auto-dispatch to the proposing worker
-4. Orchestrator has veto power but doesn't need to initiate
-
-**Files:** `tools/skynet_goals.py` — marketplace + voting + auto-dispatch
-
-**Phase 3 — Continuous improvement loop (Level 4.2)**
-1. Workers maintain personal backlog in `data/worker_{name}_backlog.json`
-2. After completing an assigned task, immediately pick next from:
-   a. Orchestrator-dispatched queue (highest priority)
-   b. Bus sub-task requests from other workers
-   c. Own backlog items
-   d. System-wide improvement proposals
-3. Workers never idle — always improving something
-
-**Files:** `tools/skynet_backlog.py` — personal backlog manager
+| Engine | Pipeline Hook | When It Fires |
+|--------|--------------|---------------|
+| **ReflexionEngine** | Post-failure in `skynet_brain_dispatch.py` | When a worker reports task failure |
+| **GraphOfThoughts** | Task decomposition in `skynet_brain.py` | When COMPLEX/ADVERSARIAL tasks need non-linear planning |
+| **KnowledgeDistiller** | Post-task in `skynet_distill_hook.py` | After every task completion (success or failure) |
+| **MCTS Navigator** | Browser automation in `god_mode.py` | (Future) When multi-step web navigation is needed |
 
 ---
 
-## Capability 4: Distributed Memory / Collective Knowledge Graph
+## Cognitive Engine 1: Reflexion Engine
 
-### Problem
-Each worker starts fresh each session. Knowledge learned by Alpha is not available to Beta. The LearningStore is file-based and not queryable across workers in real-time.
+**Module:** `core/cognitive/reflexion.py`
+**Class:** `ReflexionEngine`
+**Integration:** `tools/skynet_brain_dispatch.py` Step 7 (`_brain_learn`)
+**Status:** ✅ Active in Level 4.0
 
-### Implementation Path
+### What It Does
 
-**Phase 1 — Bus-broadcast learnings (Level 4.0)**
-Already partially implemented (`skynet_knowledge.py`). Complete the loop:
-1. After task completion: `broadcast_learning(fact, confidence, source)`
-2. On task start: `absorb_learnings(task_keywords)` — retrieve relevant peer discoveries
-3. Facts validated by 3+ workers promoted to `high_confidence` in LearningStore
+When an action fails, the Reflexion Engine generates a **verbal self-critique** explaining WHY it
+failed, stores the critique in both episodic memory and the persistent `LearningStore` (SQLite), and
+retrieves relevant past reflections before attempting similar tasks in the future.
 
-**Files:** `tools/skynet_knowledge.py` — enhance existing broadcast/absorb
+This replaces traditional parameter-update learning with **natural language learning** — the agent
+remembers "I failed because the Chrome_RenderWidgetHostHWND was in the wrong pane" rather than
+adjusting numeric weights.
 
-**Phase 2 — Queryable knowledge API (Level 4.1)**
-Add Go backend endpoints for knowledge operations:
-- `GET /knowledge/search?q=clipboard+dispatch` → returns relevant learnings
-- `POST /knowledge/store` → stores validated learning
-- `GET /knowledge/graph` → returns relationship graph (fact → related facts)
+### Architecture
 
-**Files:** `Skynet/knowledge.go` — new Go module
-
-**Phase 3 — LanceDB vector knowledge store (Level 4.2)**
-1. Use existing `core/lancedb_store.py` for vector embeddings
-2. Workers embed their learnings as vectors
-3. Semantic search across all worker knowledge: "How did we fix the SSE daemon?" → returns relevant incidents, fixes, and learnings from any worker
-4. Auto-dedup: if Beta learns same thing Alpha already knows, merge rather than duplicate
-
-**Files:** Extend `core/lancedb_store.py` with knowledge-specific collections, `tools/skynet_knowledge.py` updated to use vector search
-
----
-
-## Capability 5: Self-Healing Workers
-
-### Problem
-Workers get stuck in PROCESSING, STEERING, or crash states. Currently detected by `skynet_monitor.py` (180s threshold) and auto-cancelled. But recovery is slow and lossy.
-
-### Implementation Path
-
-**Phase 1 — Proactive stuck detection (Level 4.0)**
-Reduce detection from 180s to 60s with graduated response:
-1. **60s PROCESSING** on simple task → auto-cancel, re-dispatch to different worker
-2. **120s PROCESSING** on complex task → cancel, split task into subtasks, re-dispatch
-3. **STEERING detected** → immediate cancel (already implemented), add rate tracking
-4. **3 STEERINGs in 5 minutes** → mark worker as degraded, prefer other workers for dispatch
-
-**Files:** `tools/skynet_monitor.py` — graduated response, `tools/skynet_dispatch.py` — worker health scoring
-
-**Phase 2 — Worker self-diagnostics (Level 4.1)**
-Workers detect their own health:
-```python
-# At start of each task, worker checks:
-1. Am I responding within expected timeframes?
-2. Is my context window near capacity? (check token count estimate)
-3. Am I producing useful output or repeating myself?
-4. Post health self-report: {type: 'health', content: 'DEGRADED: context exhaustion'}
+```
+Action Fails
+  │
+  ├── 1. Capture: error trace + pre/post state + action details
+  │         → FailureContext dataclass (core/cognitive/reflexion.py:46)
+  │
+  ├── 2. Reflect: Generate verbal critique
+  │         → "I failed because..." natural language explanation
+  │         → Stored as Reflection dataclass with severity + tags
+  │
+  ├── 3. Store: Episodic memory (high importance=0.9)
+  │         → core/cognitive/memory.py EpisodicMemory.store_episodic()
+  │         → Persistent LearningStore (category='reflexion')
+  │         → core/learning_store.py PersistentLearningSystem.learn_from_task()
+  │
+  ├── 4. Side-effect analysis: Did failure achieve something useful?
+  │         → If task failed goal X but achieved Y, store Y as success
+  │
+  └── 5. Pre-task retrieval: Before similar actions, query past reflections
+            → LearningStore.recall_for_task() + EpisodicMemory.retrieve()
+            → Inject relevant failure context into dispatch preamble
 ```
 
-**Files:** `tools/skynet_self_health.py` — worker-side health monitor
+### Cross-Session Persistence
 
-**Phase 3 — Automatic context refresh (Level 4.2)**
-When a worker detects context exhaustion:
-1. Save current task state to `data/worker_{name}_checkpoint.json`
-2. Post `CONTEXT_REFRESH_NEEDED` to bus
-3. Orchestrator opens fresh chat window for worker (via `new_chat.ps1`)
-4. Restore: inject identity + task checkpoint into fresh window
-5. Worker resumes from checkpoint — zero task loss
+Unlike Level 3 where failure knowledge was session-local, Level 4 reflections persist via:
 
-**Files:** `tools/skynet_checkpoint.py` — task state save/restore, `tools/skynet_start.py` — fresh window for exhausted worker
+1. **EpisodicMemory** (`core/cognitive/memory.py`) — In-session, decays over time
+2. **PersistentLearningSystem** (`core/learning_store.py`) — Cross-session via SQLite in `data/learning.db`
+3. **Bus broadcast** (`tools/skynet_knowledge.py`) — Cross-worker via knowledge bus
 
----
+### Key Files
 
-## Implementation Priority (Recommended Order)
-
-| Priority | Capability | Phase | Impact | Effort |
-|----------|-----------|-------|--------|--------|
-| **P0** | Focusless dispatch | Phase 1 (PostMessage) | High — eliminates user disruption | Low |
-| **P0** | Backend counter notification | Phase 1 (notify_backend_dispatch) | High — fixes dashboard | Done ✓ |
-| **P1** | Worker-to-worker comms | Phase 1 (bus-direct) | High — reduces orchestrator load | Low |
-| **P1** | Self-healing | Phase 1 (proactive detection) | High — reduces stuck incidents | Medium |
-| **P1** | Autonomous goals | Phase 1 (self-improvement scanner) | Medium — keeps workers productive | Low |
-| **P2** | Distributed memory | Phase 1 (bus-broadcast) | Medium — already partially done | Low |
-| **P2** | Batch dispatch | Phase 1 (batch_dispatch) | Medium — reduces dispatch overhead | Done ✓ |
-| **P3** | Worker mesh network | Phase 2 | Medium — performance optimization | Medium |
-| **P3** | Knowledge API | Phase 2 | Medium — queryable knowledge | Medium |
-| **P4** | Named pipe injection | Phase 2 | High — true focusless | High |
-| **P4** | Context refresh | Phase 3 | High — eliminates context exhaustion | High |
-| **P5** | Headless workers | Phase 3 | Transformative — no UI needed | Very High |
-| **P5** | Shared memory IPC | Phase 3 | Marginal — bus is fast enough | High |
+| File | Role |
+|------|------|
+| `core/cognitive/reflexion.py` | ReflexionEngine class with reflect/retrieve/adapt cycle |
+| `core/learning_store.py` | SQLite-backed persistent learning (cross-session) |
+| `core/cognitive/memory.py` | EpisodicMemory with decay and utility scoring |
+| `tools/skynet_brain_dispatch.py` | Integration hook (Step 7: _brain_learn calls reflexion) |
+| `tools/skynet_distill_hook.py` | Distillation hook that processes failed reflections |
 
 ---
 
-## Success Metrics for Level 4
+## Cognitive Engine 2: Graph of Thoughts
 
-| Metric | Level 3 Baseline | Level 4 Target |
-|--------|-----------------|----------------|
-| Dispatch latency | 800ms (with focus steal) | <100ms (focusless) |
-| Worker idle time | 30-60% of session | <5% (autonomous goals) |
-| Stuck recovery time | 180s detection + 30s cancel | 60s detection + 10s cancel |
-| Cross-worker knowledge reuse | 0% (siloed) | 80% (broadcast + absorb) |
-| Orchestrator turns per task | 3-5 (dispatch + poll + synthesize) | 1-2 (dispatch-and-wait) |
-| Dashboard accuracy | 0% (counters never increment) | 100% (notify_backend_dispatch) |
-| Worker-to-worker latency | 3-5s (bus relay via orchestrator) | <500ms (direct addressing) |
+**Module:** `core/cognitive/graph_of_thoughts.py`
+**Class:** `GraphOfThoughts`
+**Integration:** `tools/skynet_brain.py` task decomposition
+**Status:** ✅ Active in Level 4.0
+
+### What It Does
+
+Replaces linear chain-of-thought (CoT) reasoning with a **graph structure** where vertices represent
+discrete thought units and edges represent logical dependencies. This enables multi-path exploration,
+thought aggregation, and backtracking — mirroring human lateral thinking.
+
+### Architecture
+
+```
+                    ┌─────┐     ┌─────┐     ┌─────┐
+                    │ T_1 │────▶│ T_2 │────▶│ T_4 │──┐
+                    └─────┘     └──┬──┘     └─────┘  │
+                                   │                  ▼
+                                   │              ┌─────┐
+                                   │              │MERGE │──▶ Final
+                                   │              └─────┘
+                                   ▼                  ▲
+                                ┌─────┐     ┌─────┐  │
+                                │ T_3 │────▶│ T_5 │──┘
+                                └─────┘     └─────┘
+```
+
+### Graph Operations
+
+| Operation | Description | When Used |
+|-----------|-------------|-----------|
+| **GENERATE** | Create new thought vertices from existing ones | Exploring solution branches |
+| **AGGREGATE** | Merge multiple thought vertices into one | Combining parallel exploration results |
+| **REFINE** | Improve a single thought using new context | Iterating on promising approaches |
+| **SCORE** | Evaluate quality/utility of a thought vertex | Pruning decision |
+| **PRUNE** | Remove low-scoring branches | Memory management |
+
+### Integration with Task Pipeline
+
+For COMPLEX and ADVERSARIAL difficulty tasks (as assessed by DAAORouter in
+`core/difficulty_router.py`), the brain dispatch pipeline uses GraphOfThoughts instead of
+linear decomposition:
+
+1. **Root thought** — the user's goal becomes the root vertex
+2. **Branch generation** — multiple approach vertices are generated
+3. **Parallel evaluation** — each branch is scored for feasibility
+4. **Aggregation** — best branches are merged into a unified plan
+5. **Worker dispatch** — merged plan is decomposed into worker subtasks
+
+### Key Files
+
+| File | Role |
+|------|------|
+| `core/cognitive/graph_of_thoughts.py` | GraphOfThoughts class with vertex/edge management |
+| `core/cognitive/planner.py` | HierarchicalPlanner integration for multi-level decomposition |
+| `tools/skynet_brain.py` | Brain pipeline hooks for GoT-based decomposition |
+| `tools/skynet_brain_dispatch.py` | Full auto pipeline using GoT for complex goals |
 
 ---
 
-## Non-Goals for Level 4
+## Cognitive Engine 3: Knowledge Distillation Daemon
 
-- **Multi-machine distribution** — all workers on same machine for now
-- **Custom model per worker** — all workers run Opus 4.6 fast
-- **Dynamic worker scaling** — fixed 4-worker grid for now
+**Module:** `core/cognitive/knowledge_distill.py`
+**Class:** `KnowledgeDistiller`
+**Integration:** `tools/skynet_distill_hook.py` (post-task hook)
+**Daemon:** 17th daemon in the Skynet ecosystem
+**Status:** ✅ Active in Level 4.0
+
+### What It Does
+
+Implements cognitive memory consolidation: when episodic memories decay below a utility threshold,
+they are not deleted but **summarized into concise factual entries** that get promoted to semantic
+memory. This mimics the human process of forgetting specific details while retaining general lessons.
+
+### Consolidation Pipeline
+
+```
+Worker completes task
+  │
+  ├── 1. Result arrives on bus (topic=orchestrator, type=result)
+  │
+  ├── 2. distill_result() called from skynet_distill_hook.py
+  │         → Stores in EpisodicMemory (working_capacity=7, episodic_capacity=500)
+  │
+  ├── 3. Pattern extraction via _extract_pattern_insights()
+  │         → Domain tags, architectural patterns, performance data
+  │         → Tool/module references, cross-worker collaboration signals
+  │
+  ├── 4. KnowledgeDistiller.distill() runs consolidation
+  │         → Scans episodic entries below decay_threshold (0.3)
+  │         → Groups by tags into clusters (min_cluster_size=2)
+  │         → Summarizes clusters (LLM via Ollama when available, rule-based fallback)
+  │         → Promotes summaries to semantic memory
+  │         → Frees episodic slots
+  │
+  ├── 5. PersistentLearningSystem stores insights cross-session
+  │         → core/learning_store.py (SQLite: data/learning.db)
+  │
+  └── 6. Top insight broadcast to knowledge bus
+            → tools/skynet_knowledge.py broadcast_learning()
+            → Available for future task context enrichment
+```
+
+### Integration Points
+
+| Caller | Hook | Purpose |
+|--------|------|---------|
+| `skynet_brain_dispatch.py` Step 7 | `_brain_learn()` calls `distill_result()` | Auto-distill after brain dispatch |
+| `skynet_learner.py` | `process_result()` calls `distill_result()` | Learner daemon integration |
+| CLI standalone | `python tools/skynet_distill_hook.py --scan` | Manual bus scan for unprocessed results |
+
+### Daemon Configuration
+
+The Knowledge Distillation daemon (`skynet_distill_hook.py --scan` in daemon mode) is the 17th
+daemon in Skynet's ecosystem. It runs periodically to scan bus results and distill them.
+
+| Parameter | Value | Source |
+|-----------|-------|--------|
+| `decay_threshold` | 0.3 | `tools/skynet_distill_hook.py` line 81 |
+| `min_cluster_size` | 2 | `tools/skynet_distill_hook.py` line 82 |
+| `episodic_capacity` | 500 | `tools/skynet_distill_hook.py` line 61 |
+| `working_capacity` | 7 | `tools/skynet_distill_hook.py` line 60 (Miller's Law) |
+| `ollama_model` | `qwen3:8b` | `core/cognitive/knowledge_distill.py` line 45 |
+| `ollama_base_url` | `http://localhost:11434` | `core/cognitive/knowledge_distill.py` line 48 |
+
+### Key Files
+
+| File | Role |
+|------|------|
+| `core/cognitive/knowledge_distill.py` | KnowledgeDistiller class — episodic→semantic promotion |
+| `core/cognitive/memory.py` | EpisodicMemory / SemanticMemory / WorkingMemory stores |
+| `tools/skynet_distill_hook.py` | Post-task hook + bus scanner + CLI |
+| `core/learning_store.py` | SQLite persistence for cross-session knowledge |
+| `tools/skynet_knowledge.py` | Bus-based knowledge broadcast/absorb protocol |
+| `tools/skynet_learner.py` | Learner daemon integration |
+
+---
+
+## Cognitive Engine 4: MCTS Navigation (Future)
+
+**Module:** `core/cognitive/mcts.py`
+**Class:** `MCTSNavigator` (R-MCTS variant)
+**Integration:** `tools/chrome_bridge/god_mode.py` (planned)
+**Status:** 🔮 Implemented, not yet wired into live pipeline
+
+### What It Does
+
+Implements Reflective Monte Carlo Tree Search for autonomous web navigation. Uses dual optimization:
+
+1. **Global Planner** — decomposes high-level web task into ordered subtasks
+2. **Local MCTS** — searches action space per subtask with contrastive reflection
+
+### Architecture
+
+```
+┌────────────────────────────────────────────┐
+│              GLOBAL PLANNER                │
+│  Task → [Subtask_1, Subtask_2, ...]       │
+└──────────────┬─────────────────────────────┘
+               │
+┌──────────────▼─────────────────────────────┐
+│         LOCAL MCTS (per subtask)            │
+│                                             │
+│   SELECT ──▶ EXPAND ──▶ SIMULATE ──▶ BACK  │
+│      ▲                                │     │
+│      └────────────────────────────────┘     │
+│                                             │
+│   + Contrastive Reflection on failures      │
+│   + UCB1 exploration/exploitation balance    │
+│   + VLM-based state evaluation              │
+│   + Browser state snapshot backtracking      │
+└─────────────────────────────────────────────┘
+```
+
+UCB1 Formula: `UCB1(node) = Q(node)/N(node) + C * sqrt(ln(N(parent)) / N(node))`
+
+### Key Files
+
+| File | Role |
+|------|------|
+| `core/cognitive/mcts.py` | MCTSNavigator with NavigationState, MCTSNode, contrastive reflection |
+| `tools/chrome_bridge/god_mode.py` | Future integration point for browser automation |
+| `core/capture.py` | DXGICapture for navigation state screenshots |
+| `core/ocr.py` | OCREngine for state description extraction |
+
+### Future Integration Plan
+
+When wired into GodMode, the MCTS navigator will:
+1. Receive a high-level web goal (e.g., "find and book cheapest flight to NYC")
+2. Decompose into subtasks (search, filter, compare, select, checkout)
+3. For each subtask, use MCTS to search the action space
+4. On failure, use contrastive reflection to learn why and adjust
+5. Backtrack via browser snapshots when dead-ends are detected
+
+---
+
+## Version History
+
+| Version | Level | Codename | Date | Key Capabilities |
+|---------|-------|----------|------|------------------|
+| 1.0 | 1 | **Genesis** | 2026-03-08 | Initial system — manual dispatch, single worker, basic bus messaging, no self-awareness |
+| 2.0 | 2 | **Awakening** | 2026-03-09 | Self-awareness (`skynet_self.py`), identity/capabilities/health introspection, GOD Console dashboard, engine metrics, collective intelligence federation |
+| 3.0 | 3 | **Production** | 2026-03-10 | Crash resilience (`skynet_watchdog.py`), real composite IQ with trend tracking, truth audit enforcement, 3-tier engine status (online/available/offline), context-enriched dispatch, WebSocket monitoring, SSE daemon |
+| 3.1 | 3 | **Hardening** | 2026-03-12 | Dispatch result tracking, fair deduction rule (Rule 0.5), false DEAD debounce, task lifecycle tracking (`GET /tasks`), cp1252 encoding fix, anti-spam system (SpamGuard + server-side rate limiting) |
+| 3.5 | 3 | **Sprint 2** | 2026-03-12 | Delivery pipeline defense-in-depth: multi-pane Chrome disambiguation, focus race prevention (`FOCUS_STOLEN`), clipboard verification (3x readback), architecture verification (Phase 0 boot), unified daemon CLI, priority-aware spam filtering, consultant consumer daemon |
+| **4.0** | **4** | **Cognition** | **2026-03-17** | **Cognitive engine integration: ReflexionEngine (cross-session failure learning), GraphOfThoughts (non-linear decomposition), KnowledgeDistiller daemon (episodic→semantic consolidation), MCTS Navigator (future browser planning). 17th daemon. Version history tracking.** |
+
+---
+
+## Capability Matrix: Level 3 vs Level 4
+
+| Capability | Level 3 / 3.5 | Level 4.0 |
+|------------|---------------|-----------|
+| **Failure learning** | Session-local (lost on restart) | Cross-session via LearningStore + Reflexion |
+| **Task decomposition** | Linear decomposition + difficulty routing | Graph-of-Thoughts for COMPLEX+ tasks |
+| **Knowledge retention** | Bus broadcast (ephemeral, 100-msg ring) | Episodic→semantic distillation + SQLite persistence |
+| **Memory architecture** | Flat learning store | 3-tier: working (7 items) → episodic (500) → semantic (unlimited) |
+| **Browser planning** | Reactive (GodMode click-by-click) | MCTS-based multi-step planning (future) |
+| **Self-improvement** | Manual via `skynet_self_improve.py` | Automated via distillation + reflexion feedback loop |
+| **Worker idle intelligence** | Self-generated improvement proposals | Context-enriched proposals with past failure awareness |
+| **Dispatch intelligence** | DAAORouter + natural decomposition | DAAORouter + GoT branching + reflexion context injection |
+| **Daemon count** | 16 | 17 (+ knowledge_distill) |
+| **Cognitive modules used** | 0 (available but unwired) | 4 (reflexion, GoT, distiller, memory) |
+
+---
+
+## Daemon Registry (Level 4.0 — 17 Daemons)
+
+All daemons live in `tools/` and use PID files under `data/` for singleton enforcement.
+
+| # | Daemon | Script | PID File | Criticality | Purpose |
+|---|--------|--------|----------|-------------|---------|
+| 1 | `skynet_monitor` | `tools/skynet_monitor.py` | `data/monitor.pid` | CRITICAL | Worker HWND liveness + model drift detection |
+| 2 | `skynet_watchdog` | `tools/skynet_watchdog.py` | `data/watchdog.pid` | CRITICAL | Backend/GOD Console process liveness |
+| 3 | `skynet_realtime` | `tools/skynet_realtime.py` | `data/realtime.pid` | CRITICAL | SSE→realtime.json atomic writes (1Hz) |
+| 4 | `skynet_self_prompt` | `tools/skynet_self_prompt.py` | `data/self_prompt.pid` | HIGH | Orchestrator heartbeat (idle-gated) |
+| 5 | `skynet_self_improve` | `tools/skynet_self_improve.py` | `data/self_improve.pid` | HIGH | Autonomous improvement scanning |
+| 6 | `skynet_bus_relay` | `tools/skynet_bus_relay.py` | `data/bus_relay.pid` | HIGH | Bus message relay |
+| 7 | `skynet_learner` | `tools/skynet_learner.py` | `data/learner.pid` | HIGH | Learning engine (absorb knowledge) |
+| 8 | `skynet_overseer` | `tools/skynet_overseer.py` | `data/overseer.pid` | HIGH | IDLE+pending detection (30s interval) |
+| 9 | `skynet_sse_daemon` | `tools/skynet_sse_daemon.py` | `data/sse_daemon.pid` | MEDIUM | SSE event loop for dashboard |
+| 10 | `skynet_bus_watcher` | `tools/skynet_bus_watcher.py` | `data/bus_watcher.pid` | MEDIUM | Auto-route pending tasks to idle workers |
+| 11 | `skynet_ws_monitor` | `tools/skynet_ws_monitor.py` | `data/ws_monitor.pid` | MEDIUM | WebSocket security alerts |
+| 12 | `skynet_idle_monitor` | `tools/skynet_idle_monitor.py` | `data/idle_monitor.pid` | MEDIUM | Extended idle detection |
+| 13 | `skynet_bus_persist` | `tools/skynet_bus_persist.py` | `data/bus_persist.pid` | MEDIUM | JSONL bus archival |
+| 14 | `skynet_consultant_consumer` | `tools/skynet_consultant_consumer.py` | `data/consultant_consumer.pid` | MEDIUM | Consultant bridge queue drain |
+| 15 | `skynet_worker_loop` | `tools/skynet_worker_loop.py` | `data/worker_loop.pid` | LOW | Autonomous task pickup loop |
+| 16 | `skynet_health_report` | `tools/skynet_health_report.py` | — | LOW | Periodic health reports |
+| **17** | **`knowledge_distill`** | **`tools/skynet_distill_hook.py --scan`** | **`data/distill.pid`** | **HIGH** | **Episodic→semantic memory consolidation** |
+
+---
+
+## Cognitive Integration Points (Code-Level Reference)
+
+### 1. Brain Dispatch Pipeline (`tools/skynet_brain_dispatch.py`)
+
+The brain dispatch pipeline is the primary integration point for all cognitive engines:
+
+```
+Step 1: ASSESS    → DAAORouter difficulty scoring
+Step 2: DECOMPOSE → Natural language splitting OR GoT for COMPLEX+
+Step 3: RECALL    → LearningStore retrieves past learnings (reflexion-enriched)
+Step 4: SEARCH    → HybridRetriever finds related context
+Step 5: ENRICH    → Each subtask gets context (learnings + solutions + reflexions)
+Step 6: DISPATCH  → Parallel/sequential worker dispatch
+Step 7: LEARN     → distill_result() + reflexion on failures + knowledge broadcast
+```
+
+### 2. Post-Task Distillation (`tools/skynet_distill_hook.py`)
+
+Every worker result triggers the distillation pipeline:
+
+```python
+# Called from skynet_brain_dispatch.py _brain_learn() and skynet_learner.py
+from tools.skynet_distill_hook import distill_result
+
+result = distill_result(
+    worker="alpha",
+    task_text="Fix CORS header in auth.py",
+    result_text="Fixed X-Frame-Options and Access-Control-Allow-Origin headers",
+    success=True,
+)
+# result: {episodic_stored, patterns_extracted, semantic_promoted, broadcast, insights}
+```
+
+### 3. Reflexion Pre-Task Context (`core/cognitive/reflexion.py`)
+
+Before dispatching similar tasks, past reflections are injected:
+
+```python
+from core.cognitive.reflexion import ReflexionEngine
+
+engine = ReflexionEngine(memory=episodic_memory)
+# Retrieve relevant past failures for context enrichment
+relevant = engine.retrieve_reflections(
+    action_type="code_edit",
+    target="tools/skynet_dispatch.py",
+    limit=3,
+)
+# Inject into dispatch preamble as failure warnings
+```
+
+### 4. Graph of Thoughts Decomposition (`core/cognitive/graph_of_thoughts.py`)
+
+For complex tasks, GoT replaces linear decomposition:
+
+```python
+from core.cognitive.graph_of_thoughts import GraphOfThoughts
+
+got = GraphOfThoughts()
+root = got.add_thought("Redesign the dispatch pipeline for zero-focus operation")
+# Generate multiple approach branches
+branch_a = got.generate(root, "Use named pipes for IPC")
+branch_b = got.generate(root, "Use PostMessage with Chrome render widget")
+# Score and aggregate
+got.score_all()
+got.prune(threshold=0.3)
+final = got.aggregate([branch_a, branch_b])
+# Convert to worker subtasks
+```
+
+---
+
+## Performance Targets (Level 4.0)
+
+| Metric | Level 3.5 Baseline | Level 4.0 Target | Measurement |
+|--------|-------------------|------------------|-------------|
+| Failure repeat rate | ~40% (no memory) | <10% (reflexion) | Track repeated failure patterns in incidents.json |
+| Knowledge retention (cross-session) | 0% (session-local) | 80%+ (SQLite+distill) | Measure recalled facts on session restart |
+| Task decomposition quality (COMPLEX) | Linear only | GoT branching | Compare plan quality before/after GoT |
+| Episodic→semantic promotion rate | N/A | >5 facts/hour | Monitor distill_state.json total_distilled |
+| Memory utilization | N/A | <80% episodic capacity | Track episodic count vs 500 capacity |
+| Distillation latency | N/A | <2s per result | Time distill_result() calls |
+| Browser planning efficiency | N/A | (Future) | MCTS success rate vs reactive navigation |
+
+---
+
+## Success Metrics
+
+Level 4 is considered successful when:
+
+1. **Reflexion reduces failure repetition** — Same failure patterns should not recur within 5 tasks
+2. **Knowledge persists across sessions** — On session restart, workers recall >80% of important facts
+3. **GoT improves complex task quality** — COMPLEX tasks produce better plans with GoT vs linear
+4. **Distillation runs automatically** — Every task completion triggers distill_result() without manual intervention
+5. **17 daemons operational** — All daemons including knowledge_distill running and healthy
+6. **Zero knowledge loss** — Episodic memories are consolidated before capacity overflow
+
+---
+
+## Migration Notes (3.5 → 4.0)
+
+### What Changed
+
+1. **Cognitive engines wired into pipeline** — Previously standalone modules in `core/cognitive/` now integrated via `tools/skynet_distill_hook.py` and `tools/skynet_brain_dispatch.py`
+2. **17th daemon** — Knowledge distillation daemon added (`tools/skynet_distill_hook.py --scan`)
+3. **Version bump** — `tools/skynet_self.py` version 3.0→4.0, level 3→4
+4. **Memory architecture live** — `core/cognitive/memory.py` EpisodicMemory actively used in task pipeline
+5. **Cross-session learning** — ReflexionEngine stores to both EpisodicMemory and PersistentLearningSystem
+
+### What Didn't Change
+
+1. **Bus architecture** — Same Go backend, same ring buffer, same SpamGuard
+2. **Dispatch mechanism** — Same ghost_type clipboard paste delivery
+3. **Worker management** — Same 4-worker grid, same HWND tracking
+4. **Dashboard** — Same GOD Console, same SSE streaming
+5. **All Level 3.5 hardening** — Focus race prevention, clipboard verification, architecture verification all preserved
+
+### Backward Compatibility
+
+Level 4 is **fully backward compatible** with Level 3.5. All existing dispatch, monitoring, and
+communication protocols continue to work unchanged. The cognitive engines are additive — they enhance
+the pipeline without modifying existing behavior. Systems that don't call the cognitive hooks
+continue to operate exactly as before.
+
+---
+
+## Non-Goals for Level 4.0
+
+- **Multi-machine distribution** — All workers on same machine
+- **Custom model per worker** — All workers run Claude Opus 4.6 (fast mode)
+- **Dynamic worker scaling** — Fixed 4-worker grid
 - **External API exposure** — Skynet stays localhost-only
+- **Headless workers** — Still requires VS Code windows (future Level 5)
+- **Named pipe injection** — Still uses clipboard paste dispatch (future Level 4.1)
+- **MCTS live integration** — Module exists but not wired into GodMode yet
+
+---
+
+## Future Roadmap
+
+| Version | Planned Capabilities |
+|---------|---------------------|
+| 4.1 | MCTS wired into GodMode, Named pipe dispatch (zero-focus), Worker mesh network |
+| 4.2 | LanceDB vector knowledge store, Queryable knowledge API, Headless worker prototype |
+| 5.0 | **Autonomy** — Dynamic worker scaling, multi-machine distribution, self-healing context refresh |
+
+---
+
+## File Reference
+
+### Core Cognitive Modules (`core/cognitive/`)
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `reflexion.py` | ~300 | ReflexionEngine — verbal self-critique, cross-session failure learning |
+| `graph_of_thoughts.py` | ~400 | GraphOfThoughts — non-linear reasoning graph with operations |
+| `knowledge_distill.py` | ~250 | KnowledgeDistiller — episodic→semantic memory consolidation |
+| `mcts.py` | ~350 | MCTSNavigator — reflective MCTS for web navigation |
+| `memory.py` | ~300 | EpisodicMemory/SemanticMemory/WorkingMemory stores |
+| `planner.py` | ~250 | HierarchicalPlanner — multi-level task decomposition |
+| `code_gen.py` | ~200 | Code generation utilities |
+| `__init__.py` | ~10 | Package init |
+
+### Integration Hooks (`tools/`)
+
+| File | Purpose |
+|------|---------|
+| `skynet_distill_hook.py` | Post-task distillation hook + bus scanner + CLI |
+| `skynet_brain_dispatch.py` | Brain dispatch pipeline (Steps 1-7 including cognitive hooks) |
+| `skynet_brain.py` | Brain task intelligence (GoT integration for COMPLEX+ tasks) |
+| `skynet_knowledge.py` | Knowledge broadcast/absorb protocol |
+| `skynet_learner.py` | Learner daemon (calls distill_result) |
+| `skynet_version.py` | Version tracking and upgrade history |
+| `skynet_self.py` | Self-awareness kernel (version constants) |
+
+### Data Files (`data/`)
+
+| File | Purpose |
+|------|---------|
+| `version_history.json` | Full version progression from Level 1 to Level 4 |
+| `distill_state.json` | Distillation dedup state (seen_ids, total_distilled) |
+| `learning.db` | SQLite persistent learning store (cross-session) |
+| `brain_config.json` | Brain dispatch configuration + scoring protocol |
+| `agent_profiles.json` | Agent identity + capabilities + self-assessment |
+| `incidents.json` | Institutional incident memory |
+| `level4_architecture.md` | This document |
