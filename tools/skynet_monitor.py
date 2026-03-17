@@ -400,6 +400,14 @@ def _check_worker_dead(name: str, hwnd: int, alive: bool, visible: bool, h: dict
         health[name] = h
         return True  # skip further processing
 
+    # Suppress DEAD alerts during redistribution cooldown — signed: gamma
+    if is_in_redistribution_cooldown(name):
+        log(f"{name.upper()}: visibility check failed but in redistribution cooldown -- suppressed", "WARN")
+        _dead_consecutive[name] = 0
+        h.update({"model": "CHECKING", "status": "REDISTRIBUTION_COOLDOWN"})
+        health[name] = h
+        return True
+
     # Suppress false DEAD alerts during boot window or monitor startup grace period  # signed: alpha
     if _is_boot_in_progress():
         log(f"{name.upper()}: visibility check failed but boot in progress -- suppressed", "WARN")
@@ -707,135 +715,42 @@ def _check_stuck_workers(workers: list):
 
 
 # ─── CLI Error Detection and Auto-Recovery ──────────────────────────────────
-# Detects rate limiting, CAPIError, model unavailable errors via Win32
-# PrintWindow screen capture + OCR. Posts alerts and tracks error state.
+# Uses DispatchResilience from tools/skynet_dispatch_resilience.py for error
+# detection (PrintWindow + OCR + pattern matching). Monitor adds: per-worker
+# state tracking, cooldown, degradation detection, bus alerts, recovery flow,
+# redistribution cooldown to suppress false DEAD alerts.
 # signed: gamma
-
-CLI_ERROR_PATTERNS = [
-    ("rate_limit", ["rate limit", "rate limiting", "too many requests", "429", "throttl"]),
-    ("capi_error", ["capierror", "capi error", "capi_error"]),
-    ("http_400", ["error 400", "bad request", "status 400", "400 bad"]),
-    ("execution_failed", ["execution failed", "failed to execute"]),
-    ("model_unavailable", ["model unavailable", "model is unavailable", "model not available",
-                           "premium request limit", "capacity"]),
-    ("no_model", ["no model selected", "model not found", "model not set"]),
-]
 
 CLI_ERROR_CHECK_INTERVAL = 60   # check every 60 seconds
 CLI_ERROR_COOLDOWN = 60         # 60s cooldown after error detection before posting READY
-CLI_ERROR_DEGRADED_THRESHOLD = 5  # consecutive errors → WORKER_DEGRADED
+CLI_ERROR_DEGRADED_THRESHOLD = 5  # consecutive errors -> WORKER_DEGRADED
+REDISTRIBUTION_COOLDOWN = 120   # suppress DEAD alerts for 120s after redistribution
 WORKER_HEALTH_DIR = DATA_DIR / "worker_health"
 
-# Per-worker CLI error tracking: {name: {error_count, last_error_time, last_error_type, consecutive_errors, cooldown_until}}
+# Per-worker CLI error tracking
 _cli_error_state: dict = {}
 _last_cli_error_check: float = 0.0
+# Redistribution cooldown: {worker_name: expiry_timestamp}
+_redistribution_cooldown: dict = {}
+# Session-level tracking for uptime calculation
+_worker_first_seen: dict = {}    # {name: timestamp}
+_worker_error_seconds: dict = {}  # {name: total_seconds_in_error}
 
-# Lazy-init GDI32 — share with existing user32 at module level
-gdi32 = ctypes.windll.gdi32
-
-
-def _capture_window_printwindow(hwnd: int):
-    """Capture a window image using Win32 PrintWindow (no focus stealing).
-    Returns PIL Image or None on failure.
-    Uses ctypes Win32 API — NOT pyautogui.
-    """  # signed: gamma
-    try:
-        from PIL import Image
-        import ctypes.wintypes
-
-        rect = ctypes.wintypes.RECT()
-        user32.GetWindowRect(hwnd, ctypes.byref(rect))
-        w = rect.right - rect.left
-        h = rect.bottom - rect.top
-        if w <= 0 or h <= 0:
-            return None
-
-        hdc_screen = user32.GetDC(0)
-        hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
-        hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
-        old_bmp = gdi32.SelectObject(hdc_mem, hbmp)
-
-        # PW_RENDERFULLCONTENT=2 captures Chromium-rendered content
-        PW_RENDERFULLCONTENT = 2
-        result = user32.PrintWindow(hwnd, hdc_mem, PW_RENDERFULLCONTENT)
-        if not result:
-            user32.PrintWindow(hwnd, hdc_mem, 0)  # fallback without flag
-
-        # Build BITMAPINFO for GetDIBits
-        import struct
-        bmi = ctypes.create_string_buffer(40)
-        struct.pack_into('<lllHHllllll', bmi, 0,
-                         40, w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
-
-        buf = ctypes.create_string_buffer(w * h * 4)
-        gdi32.GetDIBits(hdc_mem, hbmp, 0, h, buf, bmi, 0)
-
-        img = Image.frombuffer('RGBA', (w, h), buf.raw, 'raw', 'BGRA', 0, 1)
-
-        # Cleanup GDI objects
-        gdi32.SelectObject(hdc_mem, old_bmp)
-        gdi32.DeleteObject(hbmp)
-        gdi32.DeleteDC(hdc_mem)
-        user32.ReleaseDC(0, hdc_screen)
-
-        return img
-    except Exception as e:
-        log(f"PrintWindow capture failed for HWND {hwnd}: {e}", "ERR")
-        return None
+# Lazy-init DispatchResilience singleton
+_dispatch_resilience = None
 
 
-_ocr_engine = None
-
-
-def _get_ocr_engine():
-    """Lazy-init OCR engine singleton."""  # signed: gamma
-    global _ocr_engine
-    if _ocr_engine is None:
+def _get_resilience():
+    """Lazy-init DispatchResilience singleton."""  # signed: gamma
+    global _dispatch_resilience
+    if _dispatch_resilience is None:
         try:
-            from core.ocr import OCREngine
-            engine = OCREngine()
-            if engine.is_available:
-                _ocr_engine = engine
-                log(f"OCR engine initialized: {engine._engine_name}", "OK")
-            else:
-                log("OCR engine not available — CLI error detection disabled", "WARN")
+            from tools.skynet_dispatch_resilience import DispatchResilience
+            _dispatch_resilience = DispatchResilience()
+            log("DispatchResilience initialized for CLI error detection", "OK")
         except Exception as e:
-            log(f"OCR engine init failed: {e}", "WARN")
-    return _ocr_engine
-
-
-def _extract_error_text(img) -> str:
-    """Extract text from bottom portion of window image using OCR.
-    Crops to bottom 35% where error messages typically appear.
-    """  # signed: gamma
-    try:
-        # Crop to bottom 35% of the image — errors appear in recent chat output
-        w, h = img.size
-        crop_top = int(h * 0.65)
-        cropped = img.crop((0, crop_top, w, h))
-
-        engine = _get_ocr_engine()
-        if engine is None:
-            return ""
-
-        result = engine.extract(cropped.convert("RGB"), min_confidence=0.3)
-        return result.full_text.lower() if result.full_text else ""
-    except Exception as e:
-        log(f"OCR text extraction failed: {e}", "WARN")
-        return ""
-
-
-def _match_error_pattern(text: str) -> str | None:
-    """Check extracted text against known CLI error patterns.
-    Returns error type string or None.
-    """  # signed: gamma
-    if not text:
-        return None
-    for error_type, keywords in CLI_ERROR_PATTERNS:
-        for kw in keywords:
-            if kw in text:
-                return error_type
-    return None
+            log(f"DispatchResilience init failed: {e}", "WARN")
+    return _dispatch_resilience
 
 
 def _init_cli_error_entry(name: str):
@@ -847,64 +762,63 @@ def _init_cli_error_entry(name: str):
             "last_error_type": None,
             "consecutive_errors": 0,
             "cooldown_until": 0.0,
+            "recovery_count": 0,
         }
-
-
-def _save_error_screenshot(name: str, img):
-    """Save screenshot to data/worker_health/NAME_screenshot.png."""  # signed: gamma
-    try:
-        WORKER_HEALTH_DIR.mkdir(parents=True, exist_ok=True)
-        path = WORKER_HEALTH_DIR / f"{name}_screenshot.png"
-        img.convert("RGB").save(str(path), "PNG")
-        log(f"{name.upper()}: error screenshot saved to {path}", "INFO")
-    except Exception as e:
-        log(f"Failed to save error screenshot for {name}: {e}", "WARN")
+    if name not in _worker_first_seen:
+        _worker_first_seen[name] = time.time()
+    if name not in _worker_error_seconds:
+        _worker_error_seconds[name] = 0.0
 
 
 def detect_cli_error(hwnd: int, name: str) -> str | None:
-    """Detect CLI errors in a worker window via PrintWindow capture + OCR.
-    Returns error type string if error detected, None otherwise.
-    Does not steal focus — uses Win32 PrintWindow.
+    """Detect CLI errors via DispatchResilience.detect_cli_error().
+    Returns error category string if error detected, None otherwise.
+    Delegates capture+OCR+pattern matching to the resilience module.
     """  # signed: gamma
     _init_cli_error_entry(name)
     now = time.time()
     state = _cli_error_state[name]
 
-    # Respect cooldown — don't re-check during recovery window
+    # Respect cooldown
     if now < state["cooldown_until"]:
         return None
 
-    img = _capture_window_printwindow(hwnd)
-    if img is None:
+    resilience = _get_resilience()
+    if resilience is None:
         return None
 
-    text = _extract_error_text(img)
-    error_type = _match_error_pattern(text)
+    try:
+        result = resilience.detect_cli_error(hwnd)
+    except Exception as e:
+        log(f"{name.upper()}: DispatchResilience.detect_cli_error failed: {e}", "WARN")
+        return None
 
-    if error_type:
-        _save_error_screenshot(name, img)
+    if result.has_error:
         state["error_count"] += 1
         state["last_error_time"] = now
-        state["last_error_type"] = error_type
+        state["last_error_type"] = result.category
         state["consecutive_errors"] += 1
-        log(f"{name.upper()}: CLI ERROR detected: {error_type} (consecutive={state['consecutive_errors']})", "CRIT")
+        log(f"{name.upper()}: CLI ERROR detected: {result.category} "
+            f"(consecutive={state['consecutive_errors']}, scan={result.scan_ms:.0f}ms)", "CRIT")
+        return result.category
     else:
-        # No error — reset consecutive counter
+        # No error — if recovering, track it
         if state["consecutive_errors"] > 0:
+            state["recovery_count"] += 1
+            if state["last_error_time"] > 0:
+                _worker_error_seconds[name] += now - state["last_error_time"]
             log(f"{name.upper()}: CLI error cleared (was {state['consecutive_errors']} consecutive)", "OK")
         state["consecutive_errors"] = 0
-
-    return error_type
+        return None
 
 
 def _handle_cli_error_recovery(name: str, hwnd: int, error_type: str):
     """Handle recovery after CLI error detection.
-    Posts alert, sets cooldown, schedules READY notification.
+    Posts alert, sets cooldown, calls DispatchResilience.recover_worker().
     """  # signed: gamma
     state = _cli_error_state[name]
     now = time.time()
 
-    # Post error alert to bus
     _guarded_bus_publish({
         "sender": "monitor", "topic": "orchestrator", "type": "alert",
         "content": f"CLI_ERROR: {name.upper()} hit {error_type} error "
@@ -912,12 +826,20 @@ def _handle_cli_error_recovery(name: str, hwnd: int, error_type: str):
                    f"Cooldown {CLI_ERROR_COOLDOWN}s before re-check."
     })
 
-    # Set cooldown — don't re-check this worker for CLI_ERROR_COOLDOWN seconds
     state["cooldown_until"] = now + CLI_ERROR_COOLDOWN
 
-    # Check for degradation (consecutive > threshold)
+    # Attempt recovery via DispatchResilience (immediate check, no backoff)
+    resilience = _get_resilience()
+    if resilience is not None:
+        try:
+            recovered = resilience.recover_worker(hwnd, name, backoff_s=0)
+            if recovered:
+                log(f"{name.upper()}: recover_worker reports responsive after error", "OK")
+        except Exception as e:
+            log(f"{name.upper()}: recover_worker failed: {e}", "WARN")
+
     if state["consecutive_errors"] >= CLI_ERROR_DEGRADED_THRESHOLD:
-        log(f"{name.upper()}: DEGRADED — {state['consecutive_errors']} consecutive CLI errors", "CRIT")
+        log(f"{name.upper()}: DEGRADED -- {state['consecutive_errors']} consecutive CLI errors", "CRIT")
         _guarded_bus_publish({
             "sender": "monitor", "topic": "orchestrator", "type": "alert",
             "content": f"WORKER_DEGRADED: {name.upper()} has hit {state['consecutive_errors']} consecutive "
@@ -934,8 +856,47 @@ def _post_worker_ready_after_error(name: str):
             "content": f"WORKER_READY_AFTER_ERROR: {name.upper()} recovered from CLI error. "
                        f"Total errors this session: {state['error_count']}."
         })
-        # Reset the flag so we don't re-post
         state["error_count"] = 0
+
+
+def set_redistribution_cooldown(worker_name: str):
+    """Suppress DEAD alerts for a worker that just had its task redistributed."""  # signed: gamma
+    _redistribution_cooldown[worker_name] = time.time() + REDISTRIBUTION_COOLDOWN
+    log(f"{worker_name.upper()}: redistribution cooldown set ({REDISTRIBUTION_COOLDOWN}s)", "INFO")
+
+
+def is_in_redistribution_cooldown(worker_name: str) -> bool:
+    """Check if a worker is in redistribution cooldown (suppress DEAD alerts)."""
+    expiry = _redistribution_cooldown.get(worker_name, 0)
+    if expiry > 0 and time.time() < expiry:
+        return True
+    if expiry > 0 and time.time() >= expiry:
+        del _redistribution_cooldown[worker_name]
+    return False
+
+
+def _scan_bus_for_redistribution_events():
+    """Poll bus for resilience redistribution events and set cooldowns."""  # signed: gamma
+    try:
+        url = f"{SKYNET_URL}/bus/messages?limit=20"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            msgs = json.loads(resp.read())
+        if not isinstance(msgs, list):
+            return
+        for msg in msgs:
+            content = msg.get("content", "")
+            if "REDISTRIBUTED" in content and "from" in content:
+                parts = content.split()
+                try:
+                    from_idx = parts.index("from")
+                    original_worker = parts[from_idx + 1].lower().rstrip(",")
+                    if original_worker and not is_in_redistribution_cooldown(original_worker):
+                        set_redistribution_cooldown(original_worker)
+                except (ValueError, IndexError):
+                    pass
+    except Exception:
+        pass  # bus poll failure is non-critical
 
 
 def _check_cli_errors(workers: list):
@@ -946,6 +907,8 @@ def _check_cli_errors(workers: list):
         return
     _last_cli_error_check = now
 
+    _scan_bus_for_redistribution_events()
+
     for w in workers:
         name = w["name"]
         hwnd = w["hwnd"]
@@ -955,7 +918,6 @@ def _check_cli_errors(workers: list):
         _init_cli_error_entry(name)
         state = _cli_error_state[name]
 
-        # If cooldown just expired and consecutive errors were cleared, post READY
         if now >= state["cooldown_until"] and state["cooldown_until"] > 0:
             if state["consecutive_errors"] == 0 and state["error_count"] > 0:
                 _post_worker_ready_after_error(name)
@@ -964,6 +926,22 @@ def _check_cli_errors(workers: list):
         error_type = detect_cli_error(hwnd, name)
         if error_type:
             _handle_cli_error_recovery(name, hwnd, error_type)
+
+
+def _calc_uptime_pct(name: str) -> float:
+    """Calculate uptime percentage for a worker since first seen."""
+    first_seen = _worker_first_seen.get(name, 0)
+    if first_seen <= 0:
+        return 100.0
+    total_s = time.time() - first_seen
+    if total_s <= 0:
+        return 100.0
+    error_s = _worker_error_seconds.get(name, 0.0)
+    state = _cli_error_state.get(name, {})
+    if state.get("consecutive_errors", 0) > 0 and state.get("last_error_time", 0) > 0:
+        error_s += time.time() - state["last_error_time"]
+    uptime = max(0.0, 1.0 - (error_s / total_s)) * 100.0
+    return round(uptime, 2)
 
 
 def _update_health_with_cli_errors(health: dict):
@@ -976,8 +954,57 @@ def _update_health_with_cli_errors(health: dict):
                 "last_error_type": state["last_error_type"],
                 "consecutive_errors": state["consecutive_errors"],
                 "cooldown_until": state["cooldown_until"],
+                "recovery_count": state.get("recovery_count", 0),
+                "uptime_pct": _calc_uptime_pct(name),
                 "degraded": state["consecutive_errors"] >= CLI_ERROR_DEGRADED_THRESHOLD,
+                "redistribution_cooldown": is_in_redistribution_cooldown(name),
             }
+
+
+def print_health_summary():
+    """Print a formatted health summary of all workers to stdout."""  # signed: gamma
+    try:
+        with open(HEALTH_FILE, "r", encoding="utf-8") as f:
+            health = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        print("No worker_health.json found.")
+        return
+
+    updated = health.pop("updated", "unknown")
+    print("=" * 72)
+    print(f"  SKYNET WORKER HEALTH SUMMARY  (updated: {updated})")
+    print("=" * 72)
+    hdr = f"  {'Worker':<10} {'Status':<12} {'Model':<10} {'CLI Err':<8} {'Consec':<7} {'Recov':<6} {'Uptime':<8} {'Flags'}"
+    print(hdr)
+    sep = f"  {'-'*10} {'-'*12} {'-'*10} {'-'*8} {'-'*7} {'-'*6} {'-'*8} {'-'*15}"
+    print(sep)
+
+    for name, data in sorted(health.items()):
+        if not isinstance(data, dict):
+            continue
+        status = data.get("status", "?")
+        model = data.get("model", "?")
+        if len(model) > 10:
+            model = model[:9] + "~"
+
+        cli = data.get("cli_error", {})
+        err_count = cli.get("error_count", 0)
+        consec = cli.get("consecutive_errors", 0)
+        recovery = cli.get("recovery_count", 0)
+        uptime = cli.get("uptime_pct", 100.0)
+
+        flags = []
+        if cli.get("degraded"):
+            flags.append("DEGRADED")
+        if cli.get("redistribution_cooldown"):
+            flags.append("REDIST_CD")
+        if status == "DEAD":
+            flags.append("DEAD")
+        flag_str = ",".join(flags) if flags else "-"
+
+        print(f"  {name.upper():<10} {status:<12} {model:<10} {err_count:<8} {consec:<7} {recovery:<6} {uptime:<7.1f}% {flag_str}")
+
+    print("=" * 72)
 
 
 REALTIME_FILE = DATA_DIR / "realtime.json"
