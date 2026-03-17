@@ -12,7 +12,8 @@ param(
     [int]$Height = 880,
     [switch]$SkipEmptyCheck,  # Skip the "no first prompt" guard (used by skynet_start.py)
     [ValidateSet("worker", "consultant")]
-    [string]$Layout = "worker"
+    [string]$Layout = "worker",
+    [string]$WorkerName = ""  # Worker name (alpha/beta/gamma/delta) -- opens full VS Code on worktree
 )
 
 # --- Session open failure tracker (max 2 consecutive attempts) ---
@@ -411,143 +412,51 @@ if (-not $placed) {
 # --- Snapshot windows before creation ---
 $before = [Ghost]::GetVSCodeWindows()
 
-# --- Open new chat window via UIA ExpandCollapsePattern + InvokePattern (zero mouse) ---
-# Runs in STA runspace because UIA desktop scans require Single-Threaded Apartment
-[Ghost]::SetForegroundWindow($orchHwnd)
-Start-Sleep -Milliseconds 500
+# --- Open worker window ---
+# Chat-only windows (from "New Chat Window" dropdown) cannot spawn their own CLI
+# process because they share the parent's extension host. Full VS Code windows
+# opened on worktree paths get their own extension host and Copilot CLI works.
+$launched = $false
+$worktreeBase = "D:\Prospects\ScreenMemory.worktrees"
 
-function Open-NewChatWindowUIA {
-    param([long]$OrchHwnd)
-    # Load UIA assemblies (main thread must be STA -- call with powershell -STA -File)
-    Add-Type -AssemblyName UIAutomationClient
-    Add-Type -AssemblyName UIAutomationTypes
-
-    $hwnd = [IntPtr]$OrchHwnd
-    $null = [Ghost]::SetForegroundWindow($hwnd)
+if ($WorkerName -ne "") {
+    # Worktree-based: open full VS Code window on worker-specific worktree path
+    $worktreePath = Join-Path $worktreeBase "worker-$WorkerName"
+    if (-not (Test-Path $worktreePath)) {
+        # Create worktree if missing
+        $branch = "worker-$WorkerName"
+        $branchExists = git -C "D:\Prospects\ScreenMemory" branch --list $branch 2>$null
+        if (-not $branchExists) {
+            git -C "D:\Prospects\ScreenMemory" branch $branch master 2>$null
+            Write-Host "WORKTREE: Created branch $branch"
+        }
+        git -C "D:\Prospects\ScreenMemory" worktree add $worktreePath $branch 2>$null
+        Write-Host "WORKTREE: Created worktree at $worktreePath"
+    }
+    Write-Host "WORKTREE: Opening full VS Code window for $WorkerName at $worktreePath"
+    Start-Process "code-insiders" -ArgumentList "--new-window", $worktreePath -WindowStyle Hidden
+    $launched = $true
+} else {
+    # Legacy fallback: UIA dropdown approach (creates chat-only window -- DEPRECATED)
+    # This path is kept for backward compatibility but produces windows that cannot run CLI.
+    [Ghost]::SetForegroundWindow($orchHwnd)
     Start-Sleep -Milliseconds 500
-
-    $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-    if (-not $root) { return 'NO_ROOT' }
-
-    # Targeted search: exact ClassName + Name + ControlType
-    $chevronCond = New-Object System.Windows.Automation.AndCondition(
-        (New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::Button
-        )),
-        (New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::NameProperty,
-            'New Chat'
-        )),
-        (New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ClassNameProperty,
-            'action-label codicon codicon-chevron-down'
-        ))
-    )
-    $chevronBtn = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $chevronCond)
-    # Fallback: any "New Chat" button with chevron in ClassName
-    if (-not $chevronBtn) {
-        $nameCond = New-Object System.Windows.Automation.AndCondition(
-            (New-Object System.Windows.Automation.PropertyCondition(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                [System.Windows.Automation.ControlType]::Button
-            )),
-            (New-Object System.Windows.Automation.PropertyCondition(
-                [System.Windows.Automation.AutomationElement]::NameProperty,
-                'New Chat'
-            ))
-        )
-        $matches = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $nameCond)
-        foreach ($b in $matches) {
-            if ($b.Current.ClassName -match 'chevron') {
-                $chevronBtn = $b; break
-            }
-        }
+    $dropdownResult = Open-NewChatWindowUIA -OrchHwnd ([long]$orchHwnd)
+    Write-Host "DROPDOWN: $dropdownResult"
+    if ($dropdownResult -ne 'OK') {
+        Record-Failure "Dropdown open failed: $dropdownResult"
+        Write-Host "ERROR: Could not open new chat window via dropdown: $dropdownResult"
+        exit 1
     }
-    if (-not $chevronBtn) { return 'NO_BUTTON' }
-
-    # Expand dropdown via UIA ExpandCollapsePattern (no mouse)
-    $expandOK = $false
-    try {
-        $chevronBtn.SetFocus()
-        Start-Sleep -Milliseconds 300
-        $ec = $chevronBtn.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-        $ec.Expand()
-        $expandOK = $true
-    } catch {
-        try {
-            $inv = $chevronBtn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-            $inv.Invoke()
-            $expandOK = $true
-        } catch {
-            # Fallback 3: PostMessage ghost-click on chevron bounding rect center
-            try {
-                $rect = $chevronBtn.Current.BoundingRectangle
-                $cx = [int]($rect.X + $rect.Width / 2)
-                $cy = [int]($rect.Y + $rect.Height / 2)
-                $render = [Ghost]::FindRenderSurface($hwnd)
-                if ($render -ne [IntPtr]::Zero) {
-                    [Ghost]::Click($render, $cx, $cy)
-                    $expandOK = $true
-                    Write-Host "DROPDOWN: Ghost.Click fallback at ($cx,$cy)"
-                } else {
-                    # Last resort: PostMessage click directly on main hwnd
-                    [Ghost]::Click($hwnd, $cx, $cy)
-                    $expandOK = $true
-                    Write-Host "DROPDOWN: Ghost.Click direct on hwnd at ($cx,$cy)"
-                }
-            } catch {
-                return "EXPAND_FAILED:$($_.Exception.Message)"
-            }
-        }
-    }
-    if (-not $expandOK) { return 'EXPAND_FAILED:All methods exhausted' }
-    Start-Sleep -Milliseconds 800
-
-    # Find "New Chat Window" menu item via FocusedElement + ControlViewWalker (no keyboard needed)
-    $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
-    if (-not $focused) { return 'NO_FOCUSED' }
-    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
-    $child = $walker.GetFirstChild($focused)
-    $target = $null
-    $idx = 0
-    while ($child -ne $null -and $idx -lt 20) {
-        if ($child.Current.Name -eq 'New Chat Window') {
-            $target = $child
-            break
-        }
-        $child = $walker.GetNextSibling($child)
-        $idx++
-    }
-    if (-not $target) {
-        try { $ec.Collapse() } catch {}
-        return 'NO_MENU_ITEM'
-    }
-
-    # Invoke the menu item via InvokePattern (pure UIA, no mouse or keyboard)
-    try {
-        $menuInv = $target.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-        $menuInv.Invoke()
-    } catch {
-        try { $ec.Collapse() } catch {}
-        return "INVOKE_FAILED:$($_.Exception.Message)"
-    }
-    return 'OK'
+    $launched = $true
 }
 
-$dropdownResult = Open-NewChatWindowUIA -OrchHwnd ([long]$orchHwnd)
-Write-Host "DROPDOWN: $dropdownResult"
-if ($dropdownResult -ne 'OK') {
-    Record-Failure "Dropdown open failed: $dropdownResult"
-    Write-Host "ERROR: Could not open new chat window via dropdown: $dropdownResult"
-    exit 1
-}
-$launched = $true
-
-# --- Poll for new window (faster than fixed 4s wait) ---
+# --- Poll for new window ---
+# Worktree windows need longer to load (full extension host startup)
+$pollMax = if ($WorkerName -ne "") { 20 } else { 8 }
 $newHwnd = $null
-for ($poll = 1; $poll -le 8; $poll++) {
-    Start-Sleep -Milliseconds 500
+for ($poll = 1; $poll -le $pollMax; $poll++) {
+    Start-Sleep -Milliseconds 1000
     $after = [Ghost]::GetVSCodeWindows()
     foreach ($hwnd in $after) {
         if ($before -notcontains $hwnd) {
