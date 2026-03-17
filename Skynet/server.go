@@ -95,6 +95,10 @@ var endpointACL = map[string][]AgentRole{
 	"/bus/tasks/complete":  {RoleOrchestrator, RoleWorker},
 	"/task/complete":       {RoleOrchestrator, RoleWorker},
 
+	// WebSocket: orchestrator + worker (consultants use bus HTTP)
+	// signed: delta
+	"/ws":                  {RoleOrchestrator, RoleWorker},
+
 	// All roles: publish, read bus, stream, status — no entry needed (default-allow)
 }
 
@@ -261,10 +265,13 @@ type SkynetServer struct {
 	tqMu      sync.RWMutex
 	tqSeq     int64 // atomic task ID sequence
 
-	// WebSocket clients for real-time push
+	// WebSocket clients for real-time push — P2: hardened with security controls
+	// signed: delta
 	wsClients    map[chan []byte]bool
 	wsMu         sync.RWMutex
 	wsBroadcasts int64 // atomic counter
+	wsConns      int64 // atomic: current active connection count
+	wsRejected   int64 // atomic: total rejected upgrade attempts
 
 	// Spam filter for bus publish deduplication and rate limiting
 	spamFilter *SpamFilter // signed: delta
@@ -2829,10 +2836,73 @@ func (s *SkynetServer) handleSecurityBlocked(w http.ResponseWriter, r *http.Requ
 	json.NewEncoder(w).Encode(map[string]string{"status": "logged"})
 }
 
-// ─── WebSocket (lightweight, no external deps) ───────────────────
+// ─── WebSocket (lightweight, no external deps) ── P2: Security Hardened ──
+// CSWSH protection, RBAC auth, frame limits, connection caps, ping/pong.
+// signed: delta
+
+const (
+	wsMaxConnections = 50              // hard cap on concurrent WS clients
+	wsMaxFrameSize   = 1 << 20        // 1 MB max inbound frame
+	wsPingInterval   = 30 * time.Second
+	wsIdleTimeout    = 5 * time.Minute // close connections idle longer than this
+	wsWriteTimeout   = 10 * time.Second
+	wsReadTimeout    = 60 * time.Second
+)
+
+// wsAllowedOrigin returns true if the Origin header is acceptable.
+// Empty origin (non-browser clients), localhost variants, and null (local file) are allowed.
+func wsAllowedOrigin(origin string) bool {
+	if origin == "" || origin == "null" {
+		return true
+	}
+	lower := strings.ToLower(origin)
+	for _, prefix := range []string{
+		"http://localhost", "https://localhost",
+		"http://127.0.0.1", "https://127.0.0.1",
+		"http://[::1]", "https://[::1]",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 func (s *SkynetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Upgrade HTTP to WebSocket using raw hijack (no gorilla/websocket needed)
+	// ── P2.1: Origin validation (CSWSH protection) ──────────────────
+	origin := r.Header.Get("Origin")
+	if !wsAllowedOrigin(origin) {
+		atomic.AddInt64(&s.wsRejected, 1)
+		s.logSecurityEvent(origin, "ws_cswsh_blocked",
+			fmt.Sprintf("WebSocket upgrade rejected: disallowed Origin %q from %s", origin, r.RemoteAddr), true)
+		http.Error(w, `{"error":"origin not allowed"}`, http.StatusForbidden)
+		return
+	}
+
+	// ── P2.2: RBAC authentication ───────────────────────────────────
+	// Note: roleFromHeader defaults to RoleOrchestrator when no header is present
+	// (backward-compat for existing Python tooling). The ACL entry for /ws
+	// restricts access to orchestrator + worker roles.
+	role := roleFromHeader(r)
+	if role == "" {
+		atomic.AddInt64(&s.wsRejected, 1)
+		s.logSecurityEvent(r.RemoteAddr, "ws_auth_rejected",
+			"WebSocket upgrade rejected: unknown role", true)
+		http.Error(w, `{"error":"RBAC: set X-Agent-Role header"}`, http.StatusForbidden)
+		return
+	}
+
+	// ── P2.3: Connection count limit ────────────────────────────────
+	current := atomic.LoadInt64(&s.wsConns)
+	if current >= wsMaxConnections {
+		atomic.AddInt64(&s.wsRejected, 1)
+		s.logSecurityEvent(r.RemoteAddr, "ws_limit_reached",
+			fmt.Sprintf("WebSocket upgrade rejected: %d/%d connections", current, wsMaxConnections), true)
+		http.Error(w, `{"error":"too many websocket connections"}`, http.StatusServiceUnavailable)
+		return
+	}
+
+	// ── Upgrade HTTP to WebSocket using raw hijack ──────────────────
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "websocket not supported", http.StatusInternalServerError)
@@ -2860,37 +2930,118 @@ func (s *SkynetServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	bufrw.WriteString("\r\n")
 	bufrw.Flush()
 
-	// Register client
+	// Track connection
+	atomic.AddInt64(&s.wsConns, 1)
+
+	// Register client channel
 	ch := make(chan []byte, 64)
 	s.wsMu.Lock()
 	s.wsClients[ch] = true
 	s.wsMu.Unlock()
 
-	// Writer goroutine
+	// cleanup removes the client from the map and decrements the counter
+	cleanup := sync.OnceFunc(func() {
+		s.wsMu.Lock()
+		delete(s.wsClients, ch)
+		s.wsMu.Unlock()
+		atomic.AddInt64(&s.wsConns, -1)
+		conn.Close()
+	})
+
+	// ── Writer goroutine with write deadline + ping keepalive ───────
 	go func() {
-		defer func() {
-			s.wsMu.Lock()
-			delete(s.wsClients, ch)
-			s.wsMu.Unlock()
-			conn.Close()
-		}()
-		for msg := range ch {
-			// Send as text frame (opcode 0x81)
-			frame := makeWSFrame(msg)
-			if _, err := conn.Write(frame); err != nil {
-				return
+		defer cleanup()
+		pingTicker := time.NewTicker(wsPingInterval)
+		defer pingTicker.Stop()
+
+		for {
+			select {
+			case msg, ok := <-ch:
+				if !ok {
+					return // channel closed
+				}
+				conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+				frame := makeWSFrame(msg)
+				if _, err := conn.Write(frame); err != nil {
+					return
+				}
+			case <-pingTicker.C:
+				// Send WebSocket ping frame (opcode 0x89)
+				conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+				ping := []byte{0x89, 0x00} // FIN + ping opcode, zero payload
+				if _, err := conn.Write(ping); err != nil {
+					return
+				}
 			}
 		}
 	}()
 
-	// Reader goroutine — keep connection alive, handle pings
+	// ── Reader goroutine with frame validation + idle timeout ───────
 	buf := make([]byte, 4096)
+	lastActivity := time.Now()
 	for {
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		_, err := conn.Read(buf)
+		deadline := wsReadTimeout
+		idleRemaining := time.Until(lastActivity.Add(wsIdleTimeout))
+		if idleRemaining < deadline {
+			deadline = idleRemaining
+		}
+		if deadline <= 0 {
+			// Idle timeout exceeded
+			close(ch)
+			return
+		}
+		conn.SetReadDeadline(time.Now().Add(deadline))
+		n, err := conn.Read(buf)
 		if err != nil {
 			close(ch)
 			return
+		}
+		if n < 2 {
+			continue
+		}
+		lastActivity = time.Now()
+
+		// ── P2.3: Frame validation ──────────────────────────────────
+		opcode := buf[0] & 0x0F
+		masked := (buf[1] & 0x80) != 0
+		payloadLen := int(buf[1] & 0x7F)
+
+		// Clients MUST mask frames per RFC 6455 §5.1
+		if !masked {
+			close(ch)
+			return
+		}
+
+		// Calculate actual payload length for size check
+		actualLen := payloadLen
+		if payloadLen == 126 && n >= 4 {
+			actualLen = int(buf[2])<<8 | int(buf[3])
+		} else if payloadLen == 127 && n >= 10 {
+			actualLen = 0
+			for i := 0; i < 8; i++ {
+				actualLen = actualLen<<8 | int(buf[2+i])
+			}
+		}
+
+		// Reject oversized frames
+		if actualLen > wsMaxFrameSize {
+			s.logSecurityEvent(r.RemoteAddr, "ws_frame_too_large",
+				fmt.Sprintf("WebSocket frame rejected: %d bytes > %d max", actualLen, wsMaxFrameSize), true)
+			close(ch)
+			return
+		}
+
+		// Handle control frames
+		switch opcode {
+		case 0x08: // Close frame
+			close(ch)
+			return
+		case 0x09: // Ping — respond with pong
+			conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			pong := []byte{0x8A, 0x00} // FIN + pong opcode
+			conn.Write(pong)
+		case 0x0A: // Pong — acknowledged, update activity
+			// lastActivity already updated above
 		}
 	}
 }
@@ -2909,7 +3060,10 @@ func (s *SkynetServer) handleWSStats(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"connected_clients":  clients,
+		"max_connections":    wsMaxConnections,
 		"total_broadcasts":   atomic.LoadInt64(&s.wsBroadcasts),
+		"total_rejected":     atomic.LoadInt64(&s.wsRejected),
+		"active_connections": atomic.LoadInt64(&s.wsConns),
 	})
 }
 
