@@ -266,44 +266,100 @@ def step5_set_permissions(hwnd: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def step6_dispatch_identity(name: str, hwnd: int, gx: int, gy: int, orch_hwnd: int) -> bool:
-    """Clipboard paste FULL POWER boot invocation into the worker window."""
+    """Clipboard paste FULL POWER boot invocation into the worker window.
+    
+    Includes IMMEDIATE delivery verification — polls UIA state for up to 8s
+    to confirm the worker transitioned from IDLE to PROCESSING. If the first
+    attempt fails, retries with adjusted click coordinates.
+    """
     try:
         log(f"Step 6 — Dispatching FULL POWER invocation to {name}...")
         task = _get_identity_prompt(name)
         log(f"  Invocation size: {len(task)} chars")
 
-        # Save and replace clipboard
-        old_clip = ""
+        # Import UIA engine for delivery verification
         try:
-            old_clip = pyperclip.paste()
+            from tools.uia_engine import get_engine
+            engine = get_engine()
         except Exception:
-            pass
-        pyperclip.copy(task)
+            engine = None
 
-        u32.SetForegroundWindow(hwnd)
-        time.sleep(1.0)
+        # Get pre-dispatch state
+        pre_state = "UNKNOWN"
+        if engine:
+            try:
+                pre_scan = engine.scan(hwnd)
+                pre_state = pre_scan.state
+            except Exception:
+                pass
 
-        # Click in the input area (center of text box)
-        pyautogui.click(gx + INPUT_OFFSET[0], gy + INPUT_OFFSET[1])
-        time.sleep(0.5)
+        # Try dispatch with up to 2 attempts (different click targets)
+        click_offsets = [
+            (INPUT_OFFSET[0], INPUT_OFFSET[1]),      # Standard: (465, 415)
+            (400, 435),                                # Fallback: slightly different
+        ]
 
-        # Paste the prompt
-        pyautogui.hotkey('ctrl', 'v')
-        time.sleep(0.5)
+        for attempt, (cx, cy) in enumerate(click_offsets):
+            # Save and replace clipboard
+            old_clip = ""
+            try:
+                old_clip = pyperclip.paste()
+            except Exception:
+                pass
+            pyperclip.copy(task)
 
-        # Submit
-        pyautogui.press('enter')
-        time.sleep(1.0)
+            u32.SetForegroundWindow(hwnd)
+            time.sleep(1.0 if attempt == 0 else 1.5)
 
-        # Restore clipboard and return focus to orchestrator
-        try:
-            pyperclip.copy(old_clip if old_clip else '')
-        except Exception:
-            pass
-        u32.SetForegroundWindow(orch_hwnd)
+            # Click in the input area
+            pyautogui.click(gx + cx, gy + cy)
+            time.sleep(0.5)
 
-        log(f"Step 6 — Identity prompt dispatched to {name}")
-        return True
+            # Paste the prompt
+            pyautogui.hotkey('ctrl', 'v')
+            time.sleep(0.5)
+
+            # Submit
+            pyautogui.press('enter')
+            time.sleep(1.0)
+
+            # Restore clipboard and return focus to orchestrator
+            try:
+                pyperclip.copy(old_clip if old_clip else '')
+            except Exception:
+                pass
+            u32.SetForegroundWindow(orch_hwnd)
+
+            # IMMEDIATE DELIVERY VERIFICATION — poll UIA for state transition
+            if engine:
+                verified = False
+                for i in range(16):  # 16 * 0.5s = 8s
+                    time.sleep(0.5)
+                    try:
+                        post_scan = engine.scan(hwnd)
+                        if post_scan.state != pre_state and post_scan.state != "UNKNOWN":
+                            log(f"Step 6 — VERIFIED: {name} state {pre_state} → {post_scan.state} after {(i+1)*0.5}s")
+                            verified = True
+                            break
+                    except Exception:
+                        pass
+
+                if verified:
+                    log(f"Step 6 — Identity prompt delivered and confirmed for {name}")
+                    return True
+                else:
+                    if attempt < len(click_offsets) - 1:
+                        log(f"Step 6 — Attempt {attempt+1} FAILED: {name} still {pre_state} after 8s, retrying with different coordinates...")
+                        continue
+                    else:
+                        log(f"Step 6 — WARNING: {name} state did not change after {len(click_offsets)} attempts — dispatch may have failed")
+                        return False
+            else:
+                # No UIA engine — can't verify, assume success
+                log(f"Step 6 — Identity prompt dispatched to {name} (unverified — no UIA engine)")
+                return True
+
+        return False
     except Exception as e:
         log(f"Step 6 FAILED: {e}")
         return False

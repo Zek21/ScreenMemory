@@ -1323,6 +1323,8 @@ When this does NOT apply (use Rule 13 fire-and-forget instead):
 | **Level 3** | Production | Production-grade hardening — crash resilience via `skynet_watchdog.py`, real composite IQ with trend tracking (`data/iq_history.json`), request logging via `skynet_metrics.py`, version tracking via `skynet_version.py`, truth audit enforcement, 3-tier engine status (online/available/offline), context-enriched dispatch preambles, WebSocket monitoring, SSE daemon for real-time state |
 | **Level 3.1** | Hardening | Dispatch result tracking, fair deduction rule, false DEAD debounce, task lifecycle tracking, cp1252 encoding fix, anti-spam system (SpamGuard + server-side rate limiting) |
 | **Level 3.5** | Sprint 2 | Delivery pipeline defense-in-depth — multi-pane Chrome disambiguation, focus race prevention, FOCUS_STOLEN handler, steering detection secondary scan, clipboard verification, architecture verification (Phase 0 boot), bus message validation, unified daemon CLI, priority-aware spam filtering, consultant consumer daemon, comprehensive dispatch docstrings, self-awareness expansion |
+| **Level 4** | Boot Codex | Proven pyautogui-based worker boot procedure (Rule #0.06), canonical boot script (`skynet_worker_boot.py`), integrity guard (`skynet_boot_guard.py`), full-power invocation system (`skynet_invocation.py`), self-prompt daemon permanently disabled (INCIDENT 016) |
+| **Level 5** | Prometheus | Internet research & data access — `web_fetch` integration, `skynet_research.py` (search URL generators, tech discovery, research protocol), Chrome CDP/GodMode for deep browsing, research-before-implement workflow, "think outside the box" directive, Level 5 boot invocations with internet capabilities |
 
 ## Architecture Documentation Index
 <!-- signed: alpha -->
@@ -1678,6 +1680,35 @@ Sprint 2 focused on delivery pipeline hardening, architecture verification, and 
 | 12 | **Consultant Consumer Daemon** | `tools/skynet_consultant_consumer.py` | 245-line daemon that polls consultant bridge prompt queue (port 8422/8425), ACKs prompts, relays to bus with `type=consultant_relay`, marks complete. Prevents prompt accumulation in bridge queues (INCIDENT 011 fix). |
 | 13 | **Comprehensive Dispatch Docstrings** | `skynet_dispatch.py` | All 4 key delivery functions now have comprehensive docstrings referencing `docs/DELIVERY_PIPELINE.md`: `_build_ghost_type_ps` (L738-769), `_execute_ghost_dispatch` (L1060-1081), `ghost_type_to_worker` (L1135-1171), `_verify_delivery` (L1452-1482). |
 | 14 | **Self-Awareness Expansion** | `skynet_self.py` | Sprint 2 additions: `validate_agent_completeness()` (L142) checks all 7 entities, `_detect_incident_patterns()` (L787) finds 5 recurring failure categories, `quick_pulse()` (L1025-1027) reports 3 awareness flags (`architecture_knowledge_ok`, `consultant_awareness`, `bus_awareness`). |
+
+---
+
+## Level 4 Capabilities (Boot Codex — Built 2026-03-18)
+
+Level 4 focused on proven worker boot procedure, canonical boot scripts, and full-power invocation system.
+
+| # | Capability | Module | Details |
+|---|-----------|--------|---------|
+| 1 | **Proven Worker Boot Procedure** | `tools/skynet_worker_boot.py` | Rule #0.06 — pyautogui-based 7-step boot: open via dropdown → find HWND → grid position → Copilot CLI → bypass permissions → dispatch identity → verify. ONLY authorized method. |
+| 2 | **Boot Integrity Guard** | `tools/skynet_boot_guard.py` | SHA-256 hash verification of boot script, deprecation audit of old methods, boot event logging |
+| 3 | **Full-Power Invocation System** | `tools/skynet_invocation.py` | Tiered invocations: boot (~5500 chars) with 23 engines + 7 lifecycle phases + rules + scoring; dispatch (~430 chars) lean task-specific preamble |
+| 4 | **Self-Prompt Kill Switch** | `tools/skynet_self_prompt.py`, `data/brain_config.json` | Permanently disabled via config kill switch after INCIDENT 016. Code checks `self_prompt.enabled` before starting. |
+
+---
+
+## Level 5 Capabilities (Prometheus — Built 2026-03-18)
+
+Level 5 adds internet research and data access to all workers. Workers can now research the latest technologies, fetch any URL, and apply cutting-edge knowledge.
+
+| # | Capability | Module | Details |
+|---|-----------|--------|---------|
+| 1 | **web_fetch Integration** | Copilot CLI built-in | Workers are now explicitly instructed to use `web_fetch(url)` — fetches any URL as markdown. Available in every Copilot CLI session. Never referenced before Level 5. |
+| 2 | **Research Engine** | `tools/skynet_research.py` | Google/GitHub/StackOverflow/arXiv/PyPI/npm search URL generators, tech discovery queries, authoritative source registry (9 domains), research capture to `data/research_log.json` |
+| 3 | **Research Protocol** | `tools/skynet_invocation.py` | 5-phase protocol in boot invocation: Survey → Deep Dive → Synthesize → Apply → Share. Workers research before implementing. |
+| 4 | **Think Outside The Box** | Boot invocation directive | Workers explicitly instructed to: check if libraries exist, find cutting-edge 2025-2026 approaches, look at arxiv papers, apply cross-domain technology |
+| 5 | **Level 5 Boot Invocations** | `tools/skynet_invocation.py` | Upgraded boot prompts include internet research section, web_fetch usage, research toolkit imports, creative thinking directives |
+| 6 | **Tech Source Registry** | `tools/skynet_research.py` | Curated sources across 9 domains: python, javascript, ai_ml, devops, security, web, go, windows, general. Over 40 authoritative URLs. |
+| 7 | **Research Knowledge Capture** | `tools/skynet_research.py` | `capture_research()` saves findings to `data/research_log.json` (100 entries) and broadcasts via `skynet_knowledge` |
 
 ---
 
