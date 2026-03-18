@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Skynet Isolation Guard — prevents cli.isolationOption.enabled from drifting to True.
+Skynet Isolation Guard — ensures cli.isolationOption.enabled stays True.
 
-INCIDENT: 2026-03-16
-  User setting `github.copilot.chat.cli.isolationOption.enabled` silently changed
-  from False to True between sessions. When enabled, CLI sessions are isolated and
-  CANNOT delegate to workers — causing all dispatch/delegation to be cancelled.
-  This is a catastrophic failure for Skynet's multi-worker architecture.
+INCIDENT 014 (2026-03-15): VS Code's isWorktreeIsolationSelected() has INVERTED logic:
+  - When enabled=False → worktree isolation is FORCED (creates worktrees, breaks inline execution)
+  - When enabled=True → worktree isolation is OPTIONAL (CLI runs inline, which is what we need)
+
+INCIDENT 016 (2026-03-16) incorrectly set this to False, which CAUSED the worktree problem.
+
+CORRECTED 2026-03-18: The correct value is True. This guard ensures it stays True.
 
 This script:
   1. Checks both user and workspace settings for the isolation option
-  2. Fixes the user setting if it drifted to True
-  3. Ensures workspace setting has the explicit override to False
+  2. Fixes the setting if it drifted to False (which forces worktree creation)
+  3. Ensures workspace setting has the explicit override to True
   4. Can be run standalone or imported as a guard function
 
 Usage:
@@ -38,8 +40,8 @@ SETTING_KEY = "github.copilot.chat.cli.isolationOption.enabled"
 # Other dangerous settings that could break delegation
 DANGEROUS_SETTINGS = {
     "github.copilot.chat.cli.isolationOption.enabled": {
-        "required_value": False,
-        "description": "When True, CLI sessions are isolated and cannot delegate to workers"
+        "required_value": True,
+        "description": "Must be True — False forces worktree isolation which breaks inline CLI execution"
     },
 }
 
@@ -77,31 +79,29 @@ def check_workspace_setting() -> tuple:
 
 
 def fix_user_setting() -> bool:
-    """Fix the user setting back to False."""
+    """Fix the user setting to True (prevents forced worktree isolation)."""
     if not USER_SETTINGS.exists():
         print(f"  [WARN] User settings file not found: {USER_SETTINGS}")
         return False
     try:
         text = USER_SETTINGS.read_text(encoding="utf-8")
-        # Use regex replacement to avoid JSON formatting issues with trailing commas
-        if '"github.copilot.chat.cli.isolationOption.enabled": true' in text:
+        if '"github.copilot.chat.cli.isolationOption.enabled": false' in text:
             text = text.replace(
-                '"github.copilot.chat.cli.isolationOption.enabled": true',
-                '"github.copilot.chat.cli.isolationOption.enabled": false'
+                '"github.copilot.chat.cli.isolationOption.enabled": false',
+                '"github.copilot.chat.cli.isolationOption.enabled": true'
             )
             USER_SETTINGS.write_text(text, encoding="utf-8")
-            print(f"  [FIXED] User {SETTING_KEY}: true -> false (regex replace)")
+            print(f"  [FIXED] User {SETTING_KEY}: false -> true (regex replace)")
             return True
         else:
-            # Parse leniently to check and add
             data = _load_json_lenient(USER_SETTINGS)
             old_val = data.get(SETTING_KEY)
-            data[SETTING_KEY] = False
+            data[SETTING_KEY] = True
             USER_SETTINGS.write_text(
                 json.dumps(data, indent=4, ensure_ascii=False) + "\n",
                 encoding="utf-8"
             )
-            print(f"  [FIXED] User {SETTING_KEY}: {old_val} -> false")
+            print(f"  [FIXED] User {SETTING_KEY}: {old_val} -> true")
             return True
     except (json.JSONDecodeError, OSError) as e:
         print(f"  [ERROR] Failed to fix user setting: {e}")
@@ -109,20 +109,20 @@ def fix_user_setting() -> bool:
 
 
 def fix_workspace_setting() -> bool:
-    """Ensure workspace setting has the False override."""
+    """Ensure workspace setting has the True override."""
     if not WORKSPACE_SETTINGS.exists():
         print(f"  [WARN] Workspace settings file not found: {WORKSPACE_SETTINGS}")
         return False
     try:
         data = json.loads(WORKSPACE_SETTINGS.read_text(encoding="utf-8"))
-        if data.get(SETTING_KEY) is False:
+        if data.get(SETTING_KEY) is True:
             return True  # Already correct
-        data[SETTING_KEY] = False
+        data[SETTING_KEY] = True
         WORKSPACE_SETTINGS.write_text(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8"
         )
-        print(f"  [FIXED] Workspace {SETTING_KEY} set to False")
+        print(f"  [FIXED] Workspace {SETTING_KEY} set to True")
         return True
     except (json.JSONDecodeError, OSError) as e:
         print(f"  [ERROR] Failed to fix workspace setting: {e}")
@@ -133,32 +133,36 @@ def guard_isolation(fix: bool = True) -> bool:
     """
     Main guard function. Returns True if settings are correct (or were fixed).
     
-    Call this at boot time from Orch-Start.ps1, CC-Start.ps1, GC-Start.ps1,
-    or skynet_start.py to prevent delegation failures.
+    The CORRECT value is True — this prevents forced worktree isolation.
+    False is WRONG — it forces worktree creation which breaks inline CLI execution.
     """
     all_ok = True
     
-    # Check user setting
+    # Check user setting — must be True
     exists, val = check_user_setting()
-    if exists and val is True:
-        print(f"  [DANGER] User {SETTING_KEY} = True (blocks delegation!)")
+    if exists and val is False:
+        print(f"  [DANGER] User {SETTING_KEY} = False (forces worktree isolation!)")
         if fix:
             fix_user_setting()
         else:
             all_ok = False
-    elif exists and val is False:
-        print(f"  [OK] User {SETTING_KEY} = False")
+    elif exists and val is True:
+        print(f"  [OK] User {SETTING_KEY} = True")
     elif exists and val is None:
-        print(f"  [OK] User {SETTING_KEY} not set (defaults to False)")
+        print(f"  [WARN] User {SETTING_KEY} not set — adding True override")
+        if fix:
+            fix_user_setting()
+        else:
+            all_ok = False
     else:
         print(f"  [WARN] User settings file not found")
     
-    # Check workspace setting
+    # Check workspace setting — must be True
     exists, val = check_workspace_setting()
-    if exists and val is False:
-        print(f"  [OK] Workspace {SETTING_KEY} = False (override active)")
-    elif exists and val is True:
-        print(f"  [DANGER] Workspace {SETTING_KEY} = True!")
+    if exists and val is True:
+        print(f"  [OK] Workspace {SETTING_KEY} = True (override active)")
+    elif exists and val is False:
+        print(f"  [DANGER] Workspace {SETTING_KEY} = False (forces worktree isolation!)")
         if fix:
             fix_workspace_setting()
         else:
@@ -180,8 +184,8 @@ def watch_isolation(interval: int = 30):
     print(f"Watching {SETTING_KEY} every {interval}s...")
     while True:
         _, val = check_user_setting()
-        if val is True:
-            print(f"\n[{time.strftime('%H:%M:%S')}] DRIFT DETECTED! Fixing...")
+        if val is False:
+            print(f"\n[{time.strftime('%H:%M:%S')}] DRIFT DETECTED! Value is False (forces worktrees). Fixing...")
             fix_user_setting()
             # Alert on bus
             try:

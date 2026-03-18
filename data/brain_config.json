@@ -28,6 +28,8 @@
     "broadcast_awareness": true
   },
   "self_prompt": {
+    "enabled": false,
+    "disabled_reason": "INCIDENT 016 — self-prompt daemon types into orchestrator window, corrupts worker sessions and dispatches. Permanently disabled 2026-03-18. Do NOT re-enable without proven need and tested fix.",
     "loop_interval": 30,
     "min_prompt_gap": 600,
     "prompt_threshold": 45,
@@ -37,7 +39,7 @@
     "all_idle_interval": 600,
     "repeated_state_suppression_s": 600,
     "max_consecutive": 3,
-    "signed_by": "consultant"
+    "signed_by": "orchestrator"
   },
   "god_protocol": {
     "auto_dispatch_idle": true,

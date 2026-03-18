@@ -287,12 +287,49 @@ if ($SkipInfra) {
 }
 
 # -- Execute startup with timeout protection --
+# PROVEN BOOT PROCEDURE -- Rule #0.06 (2026-03-18)
+# Uses tools/skynet_worker_boot.py -- the ONLY authorized method to open worker windows.
+# Do NOT revert to tools/skynet_start.py for window opening without tested proof.
 
 if ($action -ne "none") {
+    $bootScript = Join-Path $repoRoot "tools\skynet_worker_boot.py"
     $startScript = Join-Path $repoRoot "tools\skynet_start.py"
-    if (-not (Test-Path $startScript)) {
-        Write-Status "tools\skynet_start.py not found" "ERR"
-    } else {
+    
+    if (Test-Path $bootScript) {
+        # Use the proven boot procedure (Rule #0.06)
+        $orchHwnd = 0
+        try {
+            $orchJson = Get-Content (Join-Path $repoRoot "data\orchestrator.json") -Raw | ConvertFrom-Json
+            $orchHwnd = $orchJson.hwnd
+        } catch {}
+        
+        if ($orchHwnd -eq 0) {
+            Write-Status "Cannot determine orchestrator HWND -- boot script needs it" "WARN"
+            Write-Status "Set HWND manually: python tools/skynet_worker_boot.py --all --orch-hwnd HWND" "SYS"
+        } else {
+            $pyArgs = @($bootScript, "--all", "--orch-hwnd", "$orchHwnd")
+            Write-Status "Running PROVEN boot: python $($pyArgs -join ' ')" "SYS"
+            Write-Status "Timeout: ${Timeout}s (Ctrl+C to abort earlier)" "SYS"
+            
+            $proc = Start-Process -FilePath $python -ArgumentList $pyArgs `
+                        -WorkingDirectory $repoRoot -PassThru -NoNewWindow
+            $exited = $proc.WaitForExit($Timeout * 1000)
+            
+            if ($exited) {
+                if ($proc.ExitCode -eq 0) {
+                    Write-Status "PROVEN boot completed successfully" "OK"
+                } else {
+                    Write-Status "PROVEN boot exited with code $($proc.ExitCode)" "WARN"
+                }
+            } else {
+                Write-Status "Boot timed out after ${Timeout}s -- killing" "WARN"
+                try { $proc.Kill() } catch {}
+            }
+        }
+    } elseif (Test-Path $startScript) {
+        # DEPRECATED FALLBACK -- tools/skynet_start.py (Rule #0.06 violation warning)
+        Write-Status "WARNING: tools/skynet_worker_boot.py not found -- using DEPRECATED skynet_start.py" "WARN"
+        Write-Status "This method is DEPRECATED per Rule #0.06. Restore skynet_worker_boot.py." "WARN"
         $pyArgs = @($startScript)
         switch ($action) {
             "reconnect" { $pyArgs += "--reconnect" }
@@ -301,8 +338,6 @@ if ($action -ne "none") {
         }
 
         Write-Status "Running: $python $($pyArgs -join ' ')" "SYS"
-        Write-Status "Timeout: ${Timeout}s (Ctrl+C to abort earlier)" "SYS"
-
         $proc = Start-Process -FilePath $python -ArgumentList $pyArgs `
                     -WorkingDirectory $repoRoot -PassThru -NoNewWindow
         $exited = $proc.WaitForExit($Timeout * 1000)
@@ -318,6 +353,8 @@ if ($action -ne "none") {
             try { $proc.Kill() } catch {}
             Write-Status "Services may be partially started -- check dashboard" "WARN"
         }
+    } else {
+        Write-Status "No boot script found (skynet_worker_boot.py or skynet_start.py)" "ERR"
     }
 }
 
@@ -442,7 +479,10 @@ function Start-VerifiedDaemon($spec) {
 }  # signed: beta
 
 $daemonSpecs = @(
-    @{ Script = "tools\skynet_self_prompt.py";  Pid = "data\self_prompt.pid";  Name = "Self-prompt";  Args = @("start") },
+    # DISABLED: Self-prompt daemon permanently disabled per INCIDENT 016 (2026-03-18)
+    # It types into the orchestrator window, corrupting sessions and dispatches.
+    # Kill switch: data/brain_config.json -> self_prompt.enabled = false
+    # @{ Script = "tools\skynet_self_prompt.py";  Pid = "data\self_prompt.pid";  Name = "Self-prompt";  Args = @("start") },
     @{ Script = "tools\skynet_self_improve.py"; Pid = "data\self_improve.pid"; Name = "Self-improve"; Args = @("start") },
     @{ Script = "tools\skynet_bus_relay.py";    Pid = "data\bus_relay.pid";    Name = "Bus relay";    Args = $null },
     @{ Script = "tools\skynet_learner.py";      Pid = "data\learner.pid";      Name = "Learner";      Args = @("--daemon") },

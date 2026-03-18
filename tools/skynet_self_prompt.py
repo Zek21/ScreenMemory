@@ -2631,6 +2631,15 @@ class SelfPromptDaemon:
 
     def run(self):
         """Main daemon loop -- status-based with configurable cadence."""
+        # ── KILL SWITCH: re-check enabled flag on every run() entry ──
+        try:
+            cfg = json.loads(BRAIN_CONFIG_FILE.read_text(encoding="utf-8"))
+            if cfg.get("self_prompt", {}).get("enabled") is False:
+                log("DAEMON BLOCKED — self_prompt.enabled=false in brain_config.json")
+                return
+        except Exception:
+            pass
+
         self._start_time = time.time()
         log(f"Self-prompt daemon v{DAEMON_VERSION} starting (status-based, {LOOP_INTERVAL}s poll)")
         log(f"Config: poll={LOOP_INTERVAL}s gap={MIN_PROMPT_GAP}s threshold={PROMPT_THRESHOLD} idle_thresh={IDLE_WORKER_THRESHOLD}s")
@@ -2785,6 +2794,20 @@ def _action_version():
 
 def _action_start():
     """Start the self-prompt daemon if not already running."""
+    # ── KILL SWITCH: check brain_config.json self_prompt.enabled ──
+    # INCIDENT 016 (2026-03-18): Self-prompt daemon types into orchestrator window,
+    # corrupts worker sessions and dispatches. Permanently disabled unless explicitly re-enabled.
+    try:
+        cfg = json.loads(BRAIN_CONFIG_FILE.read_text(encoding="utf-8"))
+        sp = cfg.get("self_prompt", {})
+        if sp.get("enabled") is False:
+            reason = sp.get("disabled_reason", "disabled in brain_config.json")
+            print(f"SELF-PROMPT DAEMON DISABLED: {reason}")
+            log(f"Daemon start BLOCKED — enabled=false in brain_config.json: {reason}")
+            return
+    except Exception:
+        pass  # If config unreadable, allow start (fail-open for backward compat)
+
     # ── Atomic PID guard via shared utility ──  # signed: alpha
     from tools.skynet_pid_guard import acquire_pid_guard
     if not acquire_pid_guard(PID_FILE, "skynet_self_prompt", logger=log):

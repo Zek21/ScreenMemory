@@ -49,6 +49,12 @@
 
 **Rule:** Workers MUST remain in Copilot CLI mode at all times. Agent mode and Edits mode are FORBIDDEN for Skynet workers because their Apply mechanism is fragile and non-recoverable in concurrent environments.
 
+### INCIDENT 016 -- Boot Method Resolution and Self-Prompt Corruption (2026-03-18)
+- **What:** (1) Multiple boot methods existed (new_chat.ps1, skynet_start.py, manual ctypes) causing repeated worker boot failures. Workers opened with wrong mode (Local instead of Copilot CLI), wrong model, or failed to submit prompts. (2) The self-prompt daemon (`skynet_self_prompt.py`) typed garbage characters ("llllllll...") into the orchestrator window, corrupting active sessions and killing worker dispatches.
+- **Root cause:** (1) No single authoritative boot method. Each session used a different approach. The dropdown chevron method with pyautogui was the only method that consistently worked across all conditions. (2) The self-prompt daemon uses `deliver_to_orchestrator()` which ghost-types into the orchestrator window — this interferes with any ongoing clipboard operations, dispatch sequences, or user interaction.
+- **Fix:** (1) Codified the exact proven 7-step procedure in `docs/WORKER_BOOT_PROCEDURE.txt` and `tools/skynet_worker_boot.py`. Created integrity guard `tools/skynet_boot_guard.py`. Deprecated all other boot methods. Added Rule #0.06 making this the immutable boot standard. (2) Permanently disabled self-prompt daemon via kill switch in `data/brain_config.json` (`self_prompt.enabled = false`). Added enabled check to `_action_start()` and `run()` in `skynet_self_prompt.py`.
+- **Rule:** (1) Only `tools/skynet_worker_boot.py` may open worker windows. All other methods are DEPRECATED and FORBIDDEN. (2) The self-prompt daemon must remain disabled. Any daemon that types into VS Code windows must have a kill switch in brain_config.json.
+
 <!-- signed: alpha -->
 
 # ScreenMemory Agent Notes
@@ -165,6 +171,90 @@ Does NOT replace existing worker screenshot rules for blocked recovery; it adds 
 - **Orchestrator = CEO:** decompose, dispatch, monitor, collect, synthesize — NEVER do implementation work directly
 - **Workers are intelligent:** dispatch high-level goals, not line-by-line code templates
 - **No workers?** If boot failed to open windows, orchestrator may fall back to direct execution with a warning
+
+## PROVEN WORKER BOOT PROCEDURE — Rule #0.06 (Immutable, Security-Critical)
+
+**The ONLY authorized method to open Skynet worker windows is `tools/skynet_worker_boot.py`.** All other methods are DEPRECATED and FORBIDDEN.
+
+This procedure was tested and confirmed working on 2026-03-18 after multiple failed attempts with other methods (new_chat.ps1, skynet_start.py, manual ctypes). It is the result of empirical testing, not theoretical design.
+
+### Canonical Script
+```
+python tools/skynet_worker_boot.py --all --orch-hwnd HWND    # Boot all 4 workers
+python tools/skynet_worker_boot.py --name alpha --orch-hwnd HWND  # Boot single worker
+python tools/skynet_worker_boot.py --verify                   # Verify all workers
+python tools/skynet_worker_boot.py --close-all                # Close all workers
+```
+
+### The 7-Step Procedure (Summary)
+
+For each worker, IN ORDER (alpha → beta → gamma → delta):
+
+| Step | Action | Key Detail |
+|------|--------|------------|
+| 1 | Open window via dropdown | Click chevron at (248, 52) on orchestrator, Down×3 → Enter |
+| 2 | Find new HWND | Enumerate windows, exclude known HWNDs |
+| 3 | Position in grid | MoveWindow to grid slot (930×500) |
+| 4 | Set Copilot CLI | Click (gx+55, gy+484), Down, Enter — auto-sets model |
+| 5 | Set permissions | Run guard_bypass.ps1 TWICE |
+| 6 | Dispatch identity | Clipboard paste + Enter (pyautogui) |
+| 7 | Verify | Bus identity_ack + title + IsWindow — MUST pass before next worker |
+
+### Grid Positions (Right Monitor, Taskbar-Safe)
+
+| Worker | Position | X | Y | W | H |
+|--------|----------|------|-----|-----|-----|
+| Alpha | top-left | 1930 | 20 | 930 | 500 |
+| Beta | top-right | 2870 | 20 | 930 | 500 |
+| Gamma | bottom-left | 1930 | 540 | 930 | 500 |
+| Delta | bottom-right | 2870 | 540 | 930 | 500 |
+
+### Coordinate Constants (ABSOLUTE/RELATIVE)
+
+| Constant | Value | Type | Purpose |
+|----------|-------|------|---------|
+| Dropdown chevron | (248, 52) | ABSOLUTE screen | Opens "New Chat Window" menu |
+| CLI dropdown | (gx+55, gy+484) | RELATIVE to window | Sets session target to Copilot CLI |
+| Input area | (gx+465, gy+415) | RELATIVE to window | Click before pasting prompt |
+| Send button | (gx+880, gy+453) | RELATIVE to window | Fallback for 2nd+ prompts |
+
+### Key Facts
+
+1. **Setting "Copilot CLI" as session target AUTOMATICALLY sets model to Claude Opus 4.6 (fast mode)** — no separate model change needed
+2. **`github.copilot.chat.cli.isolationOption.enabled` MUST be `true`** — `false` FORCES worktree isolation (inverted logic). Workers must be CLOSED and REOPENED after changing this setting
+3. **`guard_bypass.ps1` always needs 2 runs** — first sets permissions, second confirms
+4. **pyautogui (hardware-level input) is required** — Win32 PostMessage/SendKeys do NOT trigger submission in Copilot CLI windows (INCIDENT 013)
+5. **Do ONE worker at a time** — verify each before opening the next (Sequential Worker Boot Rule)
+
+### Integrity Protection
+
+- **Guard script**: `tools/skynet_boot_guard.py` — hash verification, deprecation audit, boot logging
+- **Procedure doc**: `docs/WORKER_BOOT_PROCEDURE.txt` — full reference with every coordinate and timing
+- **Hash file**: `data/boot_integrity.json` — SHA-256 of boot script and procedure doc
+
+### Change Policy
+
+**Any modification to this procedure requires:**
+1. A tested alternative that demonstrably outperforms this method
+2. Successful boot of all 4 workers using the new method (recorded in boot_log.json)
+3. Update to `data/boot_integrity.json` hash via `python tools/skynet_boot_guard.py --update-hash`
+4. Documentation in AGENTS.md explaining why the change was made
+
+**Changes without proof are treated as SECURITY INCIDENTS.**
+
+### DEPRECATED Methods (FORBIDDEN)
+
+| Method | Status | Reason |
+|--------|--------|--------|
+| `tools/new_chat.ps1` | DEPRECATED | Opens window but doesn't configure Copilot CLI mode |
+| `tools/skynet_start.py` (worker opening) | DEPRECATED | Complex UIA operations, unreliable Enter key submission |
+| `tools/set_copilot_cli.py` | DEPRECATED | Replaced by inline step 4 in boot script |
+| Manual `ctypes.MoveWindow` | DEPRECATED | Only handles positioning, missing 6 other steps |
+| `Ctrl+Shift+N` / command palette | DEPRECATED | Opens wrong window type, no configuration |
+
+### Self-Prompt Daemon Status
+
+The self-prompt daemon (`tools/skynet_self_prompt.py`) is **PERMANENTLY DISABLED** as of INCIDENT 016 (2026-03-18). It typed garbage into the orchestrator window, corrupting worker sessions and dispatches. The daemon has a kill switch in `data/brain_config.json` → `self_prompt.enabled = false`. Do NOT re-enable without a proven fix that prevents window input corruption.
 
 ## PROCESS PROTECTION — Rule #0.1 (Inviolable, Emergency-Grade)
 
