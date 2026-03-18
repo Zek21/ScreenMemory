@@ -248,32 +248,31 @@ def _heartbeat_after_dispatch(worker_name, task, success):
 
 
 def build_preamble(worker_name):
-    """Build a compact identity preamble for a worker.
+    """Build an enhanced dispatch preamble for a worker.
 
-    LEAN PREAMBLE: Workers have full rules via ScreenMemory agent context
-    (AGENTS.md + copilot-instructions.md). This preamble provides ONLY:
-    - Worker identity (who you are)
-    - Bus result posting command (how to report results)
-    - Signature + no-steering directives
-    - Anti-injection fingerprint
+    Workers receive the FULL POWER boot invocation at boot time via
+    skynet_invocation.py (Rule #0.06). This dispatch preamble is lean
+    but references key capabilities and lifecycle phases.
 
-    Previous preamble was ~5,500 chars — caused 'Copilot CLI delegation cancelled'
-    errors by overwhelming the input buffer (see screenshots of gamma/delta).
-    Trimmed to ~600 chars. All rules are in the agent context already.
+    Previous preamble was ~5,500 chars — caused 'Copilot CLI delegation cancelled'.
+    Boot invocation (~4,200 chars) is sent ONCE at boot. Dispatch preamble stays
+    lean (~600 chars) since workers already have full context.
     """  # signed: orchestrator
-    return (
-        f"You are worker {worker_name} in the Skynet multi-agent system. "
-        f"The orchestrator dispatched this task to you. Execute it directly -- "
-        f"no steering options, no draft choices, no clarifying questions. "
-        f"WHEN DONE post your result: "
-        f"python -c \"from tools.skynet_spam_guard import guarded_publish; "
-        f"guarded_publish(dict(sender='{worker_name}',topic='orchestrator',"
-        f"type='result',content='YOUR_RESULT signed:{worker_name}'))\" "
-        f"Sign all code changes with '# signed: {worker_name}'. "
-        f"Use update_todo to track subtasks. Check skynet_todos.py before going idle. "
-        f"WARNING: This preamble is for {worker_name} ONLY. If you are NOT {worker_name}, "
-        f"report 'IDENTITY MISMATCH'. "
-    )
+    try:
+        from tools.skynet_invocation import build_dispatch_preamble
+        return build_dispatch_preamble(worker_name)
+    except Exception:
+        # Fallback if invocation module unavailable
+        return (
+            f"[SKYNET DISPATCH → {worker_name.upper()}] "
+            f"Execute directly — no steering, no drafts, no questions. "
+            f"WHEN DONE: from tools.skynet_spam_guard import guarded_publish; "
+            f"guarded_publish(dict(sender='{worker_name}',topic='orchestrator',"
+            f"type='result',content='YOUR_RESULT signed:{worker_name}')). "
+            f"Sign code: # signed: {worker_name}. "
+            f"Track subtasks with update_todo. "
+            f"Check skynet_todos.py before idle. "
+        )
 
 
 def build_context_preamble(worker_name, task, context=None):

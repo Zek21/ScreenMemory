@@ -123,7 +123,7 @@ Does NOT replace existing worker screenshot rules for blocked recovery; it adds 
 
 **On EVERY new session start, determine role from the trigger BEFORE any other work.**
 
-- `skynet-start` = **Full boot.** Run `.\Orch-Start.ps1` which handles everything: backend, GOD Console, daemons, worker windows (via `skynet_start.py` with timeout protection), identity announcement, dashboard. This is the canonical cold-start entry point.
+- `skynet-start` = **Full boot.** Run `.\Orch-Start.ps1` which handles everything: backend, GOD Console, daemons, worker windows (via `tools/skynet_worker_boot.py` per Rule #0.06), identity announcement, dashboard. This is the canonical cold-start entry point.
 - `orchestrator-start` / `Orch-Start` = **Role assumption only.** Assumes Skynet infrastructure and workers are already running. Self-identifies, absorbs context (bus, status, TODOs, profiles), and enters CEO mode. If infrastructure is dead, run `.\Orch-Start.ps1` to bootstrap it first.
 - `CC-Start` = execute Codex Consultant bootstrap, announce `sender=consultant`, and stay in consultant role
 - `GC-Start` = execute Gemini Consultant bootstrap, announce `sender=gemini_consultant`, and stay in consultant role
@@ -136,8 +136,8 @@ Does NOT replace existing worker screenshot rules for blocked recovery; it adds 
    - Checks backend (port 8420), starts if dead
    - Checks GOD Console (port 8421), starts if dead
    - Checks worker window liveness via Win32 `IsWindowVisible`
-   - Opens worker windows via `skynet_start.py` if needed (with timeout protection)
-   - Starts daemons (self-prompt, self-improve, bus-relay, learner)
+   - Opens worker windows via `tools/skynet_worker_boot.py` (Rule #0.06 proven procedure)
+   - Starts daemons (self-improve, bus-relay, learner — self-prompt DISABLED per INCIDENT 016)
    - Announces orchestrator identity on bus
    - Opens dashboard
 3. **Knowledge Acquisition** — After boot completes, absorb ALL context:
@@ -510,23 +510,26 @@ Violations are treated as governance incidents. The orchestrator MUST dispatch a
 The orchestrator MUST follow this exact sequence when booting workers. Violations cause focus stealing, wrong positions, and agent mode failures.
 
 ### Correct Boot Procedure
-1. Run `skynet_start.py` which handles everything: backend, dashboard, sequential window opening via `new_chat.ps1`, grid placement, model guard, initial prompts
-2. Use `--reconnect` flag if worker windows already exist
+1. Run `python tools/skynet_worker_boot.py --all --orch-hwnd HWND` which implements the proven 7-step procedure (Rule #0.06). Falls back to `skynet_start.py` ONLY if boot script is missing (DEPRECATED fallback with warning).
+2. Use `--verify` flag to check existing worker windows without reopening
 3. After boot, scan all workers via UIA engine to verify `model_ok` and `agent_ok`
 4. If `agent_ok` is `False`, wait for `skynet_monitor.py` daemon to auto-correct -- do NOT call `fix_model` manually
 5. Dispatch via `skynet_dispatch.py` with `--parallel` for broadcasts or `--worker` for targeted
 
 ### Anti-Patterns -- FORBIDDEN during boot
-- Manual `ctypes` `MoveWindow` for worker positioning
+- Using `tools/new_chat.ps1` for window opening (DEPRECATED per Rule #0.06)
+- Using `tools/skynet_start.py` for window opening (DEPRECATED — use `tools/skynet_worker_boot.py`)
+- Using manual `ctypes` `MoveWindow` without the full 7-step procedure
+- Opening multiple windows before configuring each one
+- Skipping Copilot CLI session target setting (Step 4)
+- Skipping `guard_bypass.ps1` permissions (Step 5)
 - Calling `fix_model` from orchestrator context -- steals focus
 - Blast dispatch without inter-dispatch cooldown -- corrupts clipboard
-- Opening worker windows without `new_chat.ps1`
 - Assuming workers have correct model/agent without UIA verification
 
 ### VS Code Overload Prevention
 - Never run more than one UIA-heavy operation at a time during startup
 - Inter-dispatch cooldown of 2s minimum between workers
-- Self-prompt daemon must not fire during model guard operations
 - If VS Code sticks during boot, reduce concurrent UIA operations
 
 ## Self-Invocation Protocol (Clear + Invoke)
@@ -635,15 +638,18 @@ The orchestrator is a continuous operations loop, not a request-response system.
 7. Report ready to user
 
 ### Sequential Worker Boot Rule (MANDATORY)
-**Worker windows MUST be opened one at a time. You may NOT open the next worker until the previous one has been visually verified as correct and has started processing.**
+**Worker windows MUST be opened one at a time using the PROVEN WORKER BOOT PROCEDURE (Rule #0.06).** You may NOT open the next worker until the previous one has been verified as correct and has started processing.
 
-For each worker (alpha, beta, gamma, delta) in order:
-1. **Open window** — Use `tools/new_chat.ps1` or session restore to open a single worker window.
-2. **Visual verification** — Take a screenshot and verify: window visible in correct grid slot, model is Claude Opus 4.6 (fast mode), agent is Copilot CLI / ScreenMemory, no errors.
-3. **MANDATORY: Switch to Copilot CLI mode** — Run `python tools/set_copilot_cli.py --worker NAME --hwnd HWND` to switch the session target from "Local" to "Copilot CLI". This is NON-NEGOTIABLE. Workers opened via "New Chat Window" default to "Local" mode. The `set_copilot_cli.py` script uses pyautogui (hardware-level input) to click the session target dropdown and select "Copilot CLI". Verification is built into the script. **If this step is skipped, the worker operates in degraded Local mode which the user has explicitly forbidden.**
-4. **Dispatch identity prompt** — Send worker its identity injection via `skynet_dispatch.py`.
-5. **Confirm processing** — Wait for IDLE → PROCESSING transition (UIA scan or screenshot). Worker must be actively processing before proceeding.
-6. **Only then** — Move to the next worker. If verification fails, retry once. If it fails again, log and continue.
+Use `python tools/skynet_worker_boot.py --name WORKER --orch-hwnd HWND` for single workers or `--all` for full boot.
+
+For each worker (alpha, beta, gamma, delta) in order, the boot script executes:
+1. **Open window** — Click dropdown chevron at (248, 52) on orchestrator, Down×3 → Enter
+2. **Find HWND** — Enumerate windows, exclude known HWNDs, discover new window
+3. **Position in grid** — MoveWindow to assigned grid slot (930×500)
+4. **Set Copilot CLI** — Click (gx+55, gy+484), Down, Enter — auto-sets model to Claude Opus 4.6 (fast mode)
+5. **Set permissions** — Run `guard_bypass.ps1` TWICE (set + confirm)
+6. **Dispatch identity** — Clipboard paste identity prompt + Enter (pyautogui hardware input)
+7. **Verify** — Bus identity_ack + window title + UIA scan — MUST pass before next worker
 
 **NEVER open multiple worker windows simultaneously.** Each window must be individually verified before the next one is started.
 

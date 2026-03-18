@@ -43,6 +43,12 @@ BOOT_VERSION = "1.0.0"
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# Compute file hash for integrity verification
+try:
+    BOOT_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+except Exception:
+    BOOT_HASH = "unknown"
+
 # --- Grid positions (right monitor, taskbar-safe) ---
 GRID = {
     'alpha': (1930, 20),
@@ -54,22 +60,36 @@ WINDOW_SIZE = (930, 500)
 
 WORKER_NAMES = ['alpha', 'beta', 'gamma', 'delta']
 
-# Dropdown chevron absolute screen position on the orchestrator window
-DROPDOWN_CHEVRON = (248, 52)
+# --- Critical coordinate constants ---
+DROPDOWN_POS = (248, 52)       # ABSOLUTE on orchestrator window
+CLI_OFFSET = (55, 484)         # RELATIVE to worker window (session target dropdown)
+INPUT_OFFSET = (465, 415)      # RELATIVE to worker window (chat input area)
+SEND_OFFSET = (880, 453)       # RELATIVE to worker window (Send button, for 2nd+ prompts)
 
-# Identity prompt template — worker fills NAME/name at format time
-IDENTITY_PROMPT = (
-    "You are {NAME}, a Skynet worker. Post your identity to the bus. "
-    "Run this Python script:\n\n"
-    "import requests\n"
-    "requests.post('http://localhost:8420/bus/publish', json={{\n"
-    "    'sender': '{name}',\n"
-    "    'topic': 'orchestrator',\n"
-    "    'type': 'identity_ack',\n"
-    "    'content': '{NAME} ONLINE - Claude Opus 4.6 fast - Ready'\n"
-    "}})\n"
-    "print('Identity posted to bus')\n"
-)
+# Legacy alias
+DROPDOWN_CHEVRON = DROPDOWN_POS
+
+# Identity prompt — FULL POWER invocation from skynet_invocation.py
+# Falls back to basic prompt if invocation module unavailable.
+def _get_identity_prompt(name):
+    """Get the full-power boot invocation for a worker."""
+    try:
+        from tools.skynet_invocation import build_boot_invocation
+        return build_boot_invocation(name)
+    except Exception:
+        # Fallback: basic identity prompt
+        return (
+            "You are {NAME}, a Skynet worker. Post your identity to the bus. "
+            "Run this Python script:\n\n"
+            "import requests\n"
+            "requests.post('http://localhost:8420/bus/publish', json={{\n"
+            "    'sender': '{name}',\n"
+            "    'topic': 'orchestrator',\n"
+            "    'type': 'identity_ack',\n"
+            "    'content': '{NAME} ONLINE - Claude Opus 4.6 fast - Ready'\n"
+            "}})\n"
+            "print('Identity posted to bus')\n"
+        ).format(NAME=name.upper(), name=name)
 
 u32 = ctypes.windll.user32
 
@@ -184,7 +204,7 @@ def step4_set_copilot_cli(hwnd: int, gx: int, gy: int) -> bool:
         time.sleep(1)
 
         # Click the "Local" text at bottom-left of window
-        pyautogui.click(gx + 55, gy + 484)
+        pyautogui.click(gx + CLI_OFFSET[0], gy + CLI_OFFSET[1])
         time.sleep(1.5)
 
         # Select "Copilot CLI" (2nd item, right below "Local")
@@ -246,10 +266,11 @@ def step5_set_permissions(hwnd: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def step6_dispatch_identity(name: str, hwnd: int, gx: int, gy: int, orch_hwnd: int) -> bool:
-    """Clipboard paste identity prompt into the worker window, submit with Enter."""
+    """Clipboard paste FULL POWER boot invocation into the worker window."""
     try:
-        log(f"Step 6 — Dispatching identity prompt to {name}...")
-        task = IDENTITY_PROMPT.format(NAME=name.upper(), name=name)
+        log(f"Step 6 — Dispatching FULL POWER invocation to {name}...")
+        task = _get_identity_prompt(name)
+        log(f"  Invocation size: {len(task)} chars")
 
         # Save and replace clipboard
         old_clip = ""
@@ -263,7 +284,7 @@ def step6_dispatch_identity(name: str, hwnd: int, gx: int, gy: int, orch_hwnd: i
         time.sleep(1.0)
 
         # Click in the input area (center of text box)
-        pyautogui.click(gx + 465, gy + 415)
+        pyautogui.click(gx + INPUT_OFFSET[0], gy + INPUT_OFFSET[1])
         time.sleep(0.5)
 
         # Paste the prompt

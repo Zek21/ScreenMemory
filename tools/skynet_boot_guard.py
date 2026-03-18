@@ -292,22 +292,18 @@ def get_boot_log(limit: int = 20) -> list[dict]:
 # ─── Bus Alert ───────────────────────────────────────────────────────────────
 
 def _post_bus_alert(mismatches: list[dict]):
-    """POST a CRITICAL integrity alert to the Skynet bus."""
+    """POST a CRITICAL integrity alert to the Skynet bus via SpamGuard."""
     try:
-        import requests
+        from tools.skynet_spam_guard import guarded_publish
         summary = "; ".join(
             f"{m['file']}: {m['issue']}" for m in mismatches
         )
-        requests.post(
-            "http://localhost:8420/bus/publish",
-            json={
-                "sender": "boot_guard",
-                "topic": "orchestrator",
-                "type": "alert",
-                "content": f"BOOT_INTEGRITY_VIOLATION: {summary}",
-            },
-            timeout=5,
-        )
+        guarded_publish({
+            "sender": "boot_guard",
+            "topic": "orchestrator",
+            "type": "alert",
+            "content": f"BOOT_INTEGRITY_VIOLATION: {summary}",
+        })
     except Exception:
         pass  # bus may be down — alert is best-effort
 

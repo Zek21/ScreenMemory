@@ -14,13 +14,20 @@ Learned from new_chat.ps1 activation sequence:
 - Failure tracker (chat_open_failures.json) must be cleared between opens
 - Model guard uses keyboard filter ("fast" + Down+Enter), not UIA list clicks
 
+PROVEN BOOT PROCEDURE: tools/skynet_worker_boot.py is the canonical boot method (Rule #0.06).
+Worker window opening in this file is DEPRECATED. Orch-Start.ps1 now calls
+skynet_worker_boot.py directly. This file is retained for --reconnect, --status,
+engine connection, and registration phases only.
+
 Usage:
-    python tools/skynet_start.py                  # Full bootstrap (uses skynet_boot_workers)
+    python tools/skynet_start.py                  # Full bootstrap (DEPRECATED for window opening)
     python tools/skynet_start.py --fresh          # Skip session restore, fresh windows only
     python tools/skynet_start.py --workers 2      # Only 2 workers
     python tools/skynet_start.py --reconnect      # Reconnect to existing workers
     python tools/skynet_start.py --use-legacy     # Use legacy boot path (phase_3_workers)
     python tools/skynet_start.py --status         # Show system status
+
+NOTE: For worker window opening, use tools/skynet_worker_boot.py instead (Rule #0.06).
 """
 
 import json
@@ -1287,7 +1294,15 @@ def _open_single_worker(worker_idx, orch_hwnd, fresh, boot_memories, existing_ch
 
 
 def phase_3_workers(num_workers=4, orch_hwnd=None, fresh=False, boot_memories=None):
-    """Open worker chat windows, one at a time, with ghost mouse automation."""
+    """Open worker chat windows, one at a time, with ghost mouse automation.
+
+    DEPRECATED (Rule #0.06): Use tools/skynet_worker_boot.py instead.
+    This function is retained for --use-legacy fallback only.
+    """
+    # DEPRECATED: Use tools/skynet_worker_boot.py instead (Rule #0.06, INCIDENT 016)
+    log("WARNING: phase_3_workers() is DEPRECATED per Rule #0.06. "
+        "Use tools/skynet_worker_boot.py instead.", "WARN")
+
     if not orch_hwnd:
         orch_hwnd = get_orchestrator_hwnd()
     if not orch_hwnd:
