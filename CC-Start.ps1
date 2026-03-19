@@ -193,6 +193,20 @@ function Wait-GodConsoleTruth([int]$maxSeconds = 15, [int]$timeoutSec = 5) {
     return $null
 }
 
+function Test-SelfPromptEnabled {
+    $configFile = Join-Path $dataDir "brain_config.json"
+    if (-not (Test-Path $configFile)) { return $true }
+    try {
+        $cfg = Get-Content $configFile -Raw | ConvertFrom-Json
+        if ($null -ne $cfg.self_prompt -and $cfg.self_prompt.enabled -eq $false) {
+            return $false
+        }
+    } catch {
+        Write-Status "Could not read brain_config.json self-prompt kill switch: $_" "WARN"
+    }
+    return $true
+}  # signed: consultant -- boot output must not claim self-prompt started when the kill switch is off
+
 Add-Type -Name "CCUser32" -Namespace "Win32CC" -MemberDefinition @"
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
@@ -543,8 +557,13 @@ if ($action -ne "none") {
 
 # ── Ensure daemons (lightweight, no UIA) ─────────────────
 
-$daemonSpecs = @(
-    @{ Script = "tools\skynet_self_prompt.py";  Pid = "data\self_prompt.pid";  Name = "Self-prompt";  Args = @("start") },
+$daemonSpecs = @()
+if (Test-SelfPromptEnabled) {
+    $daemonSpecs += @{ Script = "tools\skynet_self_prompt.py";  Pid = "data\self_prompt.pid";  Name = "Self-prompt";  Args = @("start") }
+} else {
+    Write-Status "Self-prompt daemon SKIPPED (brain_config self_prompt.enabled=false)" "WARN"
+}
+$daemonSpecs += @(
     @{ Script = "tools\skynet_self_improve.py"; Pid = "data\self_improve.pid"; Name = "Self-improve"; Args = @("start") },
     @{ Script = "tools\skynet_bus_relay.py";    Pid = "data\bus_relay.pid";    Name = "Bus relay";    Args = $null },
     @{ Script = "tools\skynet_learner.py";      Pid = "data\learner.pid";      Name = "Learner";      Args = @("--daemon") }

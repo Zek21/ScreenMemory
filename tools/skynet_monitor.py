@@ -1668,13 +1668,19 @@ def _run_monitor(args):
         while True:
             if _shutdown_requested:  # signed: alpha
                 log("SIGTERM/SIGBREAK received -- shutting down gracefully", "INFO")
-                _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",
-                    "content": f"Monitor shutdown: signal received after {cycle} cycles"})
+                try:
+                    _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",
+                        "content": f"Monitor shutdown: signal received after {cycle} cycles"})
+                except Exception:
+                    pass  # signed: alpha — best-effort shutdown notification
                 break
             if max_runtime and (time.time() - start_time) >= max_runtime:
                 log(f"Max runtime {max_runtime}s reached -- shutting down gracefully", "INFO")
-                _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",
-                    "content": f"Monitor shutdown: max_runtime={max_runtime}s reached after {cycle} cycles"})
+                try:
+                    _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",
+                        "content": f"Monitor shutdown: max_runtime={max_runtime}s reached after {cycle} cycles"})
+                except Exception:
+                    pass  # signed: alpha — best-effort shutdown notification
                 break
             try:
                 cycle += 1
@@ -1726,14 +1732,28 @@ def _run_monitor(args):
                 _consecutive_loop_errors += 1
                 log(f"Monitor cycle error ({_consecutive_loop_errors}): {e}", "ERR")
             if _consecutive_loop_errors >= DEGRADED_THRESHOLD and _consecutive_loop_errors % DEGRADED_THRESHOLD == 0:
-                _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
-                    "content": f"DAEMON_DEGRADED: skynet_monitor hit {_consecutive_loop_errors} consecutive errors"})  # signed: gamma
+                try:  # signed: alpha — protect main loop from bus publish failures
+                    _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
+                        "content": f"DAEMON_DEGRADED: skynet_monitor hit {_consecutive_loop_errors} consecutive errors"})  # signed: gamma
+                except Exception:
+                    log(f"Failed to publish DAEMON_DEGRADED alert (bus unreachable?)", "ERR")
 
             time.sleep(current_interval)
     except KeyboardInterrupt:
         log("Monitor shutting down (Ctrl+C)", "INFO")
-        _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",
-            "content": f"Monitor shutdown: KeyboardInterrupt after {cycle} cycles"})
+        try:
+            _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "lifecycle",
+                "content": f"Monitor shutdown: KeyboardInterrupt after {cycle} cycles"})
+        except Exception:
+            pass
+    except Exception as e:
+        # Top-level safety net — prevents silent daemon death  # signed: alpha
+        log(f"Monitor FATAL unhandled exception: {e}", "ERR")
+        try:
+            _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
+                "content": f"MONITOR_CRASH: unhandled exception: {str(e)[:200]}"})
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

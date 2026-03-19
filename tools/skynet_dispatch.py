@@ -32,6 +32,45 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Without this, parallel dispatch corrupts clipboard between threads
 _dispatch_lock = threading.Lock()
 
+# Cross-process named Mutex for clipboard isolation.
+# threading.Lock only protects within a single Python process. If multiple
+# dispatch processes run simultaneously (e.g., orchestrator + daemon + worker),
+# they can corrupt each other's clipboard. A named Windows Mutex provides
+# system-wide serialization of clipboard dispatch operations.
+# signed: beta
+_dispatch_mutex_handle = None
+_DISPATCH_MUTEX_NAME = "Global\\SkynetDispatchClipboard"
+
+
+def _acquire_dispatch_mutex(timeout_ms=15000):
+    """Acquire the cross-process dispatch mutex. Returns True if acquired.
+
+    Uses a named Windows Mutex for system-wide clipboard isolation.
+    Falls back gracefully if Mutex creation fails (thread lock still protects).
+    """  # signed: beta
+    global _dispatch_mutex_handle
+    try:
+        kernel32 = ctypes.windll.kernel32
+        if _dispatch_mutex_handle is None:
+            _dispatch_mutex_handle = kernel32.CreateMutexW(None, False, _DISPATCH_MUTEX_NAME)
+            if not _dispatch_mutex_handle:
+                return False
+        # WAIT_OBJECT_0 = 0, WAIT_TIMEOUT = 0x102, WAIT_ABANDONED = 0x80
+        result = kernel32.WaitForSingleObject(_dispatch_mutex_handle, timeout_ms)
+        return result in (0, 0x80)  # WAIT_OBJECT_0 or WAIT_ABANDONED
+    except Exception:
+        return False
+
+
+def _release_dispatch_mutex():
+    """Release the cross-process dispatch mutex."""  # signed: beta
+    global _dispatch_mutex_handle
+    try:
+        if _dispatch_mutex_handle:
+            ctypes.windll.kernel32.ReleaseMutex(_dispatch_mutex_handle)
+    except Exception:
+        pass
+
 # Ensure UTF-8 output on Windows (emojis in log messages)
 if hasattr(sys.stdout, 'reconfigure'):
     try: sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -51,6 +90,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 DATA_DIR = ROOT / "data"
 WORKERS_FILE = DATA_DIR / "workers.json"
+PROFILES_FILE = DATA_DIR / "agent_profiles.json"
 ORCH_FILE = DATA_DIR / "orchestrator.json"
 CRITICAL_PROCS_FILE = DATA_DIR / "critical_processes.json"
 DISPATCH_LOCK_FILE = DATA_DIR / "dispatch_active.lock"
@@ -273,6 +313,38 @@ def build_preamble(worker_name):
             f"Track subtasks with update_todo. "
             f"Check skynet_todos.py before idle. "
         )
+
+
+def build_external_preamble(worker_name, worker_info=None):
+    """Build a dispatch preamble tailored for external workers.
+
+    External workers operate on specific projects/domains and have quarantine rules.
+    The preamble includes: identity, domain context, allowed paths, bus reporting,
+    and quarantine awareness.
+
+    Args:
+        worker_name: Name of the external worker (e.g. 'website-worker').
+        worker_info: Optional dict with 'project_path', 'domain', etc.
+    """  # signed: alpha
+    project_path = ""
+    domain = ""
+    if worker_info:
+        project_path = worker_info.get("project_path", "")
+        domain = worker_info.get("domain", "")
+
+    domain_ctx = f" Domain: {domain}." if domain else ""
+    path_ctx = f" Project: {project_path}." if project_path else ""
+
+    return (
+        f"[SKYNET DISPATCH -> {worker_name.upper()}] "
+        f"Execute directly -- no steering, no drafts, no questions.{domain_ctx}{path_ctx} "
+        f"WHEN DONE: from tools.skynet_spam_guard import guarded_publish; "
+        f"guarded_publish(dict(sender='{worker_name}',topic='orchestrator',"
+        f"type='result',content='YOUR_RESULT signed:{worker_name}')). "
+        f"Sign code: # signed: {worker_name}. "
+        f"Track subtasks with update_todo. "
+        f"EXTERNAL WORKER: Results go through quarantine review by core workers. "
+    )
 
 
 def build_context_preamble(worker_name, task, context=None):
@@ -743,6 +815,63 @@ def load_workers():
     return data.get("workers", [])
 
 
+CORE_WORKER_NAMES = frozenset({"alpha", "beta", "gamma", "delta"})  # signed: alpha
+
+
+def load_all_workers():
+    """Load core workers from workers.json merged with external workers from agent_profiles.json.
+
+    External workers are entries in agent_profiles.json with type='external' and a valid hwnd.
+    Returns a unified list matching workers.json format, with an added 'type' field
+    ('core' or 'external') to distinguish them.
+
+    Returns:
+        list[dict]: Merged list of core + external worker dicts.
+    """  # signed: alpha
+    core = load_workers()
+    # Tag core workers
+    for w in core:
+        w.setdefault("type", "core")
+
+    # Load external workers from agent_profiles.json
+    if not PROFILES_FILE.exists():
+        return core
+
+    try:
+        profiles = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        log(f"Failed to parse agent_profiles.json for external workers: {e}", "WARN")
+        return core
+
+    core_names = {w["name"] for w in core}
+    external = []
+    for key, profile in profiles.items():
+        if not isinstance(profile, dict):
+            continue
+        if profile.get("type") != "external":
+            continue
+        hwnd = profile.get("hwnd")
+        if not hwnd:
+            continue
+        name = profile.get("name", key)
+        if name in core_names:
+            continue  # already a core worker, skip
+        external.append({
+            "name": name,
+            "hwnd": int(hwnd),
+            "model": profile.get("model", "unknown"),
+            "type": "external",
+            "grid": profile.get("grid", {}),
+            "project_path": profile.get("project_path", ""),
+            "domain": profile.get("domain", ""),
+        })
+
+    if external:
+        log(f"Loaded {len(external)} external worker(s): {[w['name'] for w in external]}", "SYS")
+
+    return core + external
+
+
 def load_orch_hwnd():
     """Load the orchestrator window HWND from data/orchestrator.json.
 
@@ -777,9 +906,12 @@ def _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path, render_hwnd=None):
            (chat panes are typically positioned there in VS Code)
         4. Focus race prevention -- verify foreground window hasn't changed between
            clipboard set and paste; abort with FOCUS_STOLEN if stolen
-        5. Clipboard verification -- 3x SetText/GetText retry loop
-        6. Focus + paste + enter -- AttachThreadInput preferred, SetForegroundWindow fallback
-        7. Clipboard cleanup -- Clear() + restore saved clipboard
+        5. Clipboard verification -- 5x SetText/GetText retry loop with exponential backoff
+        6. Clipboard isolation -- GetClipboardSequenceNumber() recorded after verify,
+           checked immediately before each paste; abort with CLIPBOARD_TAMPERED if
+           an external process modified the clipboard between verify and paste  # signed: alpha
+        7. Focus + paste + enter -- AttachThreadInput preferred, SetForegroundWindow fallback
+        8. Clipboard cleanup -- Clear() + restore saved clipboard
 
     Args:
         hwnd: Target worker/consultant window HWND (int cast to IntPtr in PS)
@@ -841,6 +973,7 @@ public class GhostType {{
     }}
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();  // signed: alpha
     [StructLayout(LayoutKind.Sequential)] public struct RECT {{
         public int Left, Top, Right, Bottom;
     }}
@@ -863,10 +996,49 @@ public class GhostType {{
     // because Chromium loses internal focus after paste. keybd_event sends through the
     // OS input queue like physical keyboard, which Chromium always receives. (INCIDENT 013 class)
     [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll")] public static extern IntPtr GetFocus();
+    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    private const uint WM_KEYDOWN = 0x0100;
+    private const uint WM_KEYUP   = 0x0101;
+    private static readonly IntPtr VK_RETURN_PTR = (IntPtr)0x0D;
+    // Hardware-level Ctrl+V paste -- replaces SendKeys::SendWait("^v") which fails
+    // with "Access is denied" due to UIPI when target window has different integrity.
+    // keybd_event goes through OS input queue like a physical keyboard.
+    public static void HardwarePaste() {{
+        keybd_event(0x11, 0, 0, UIntPtr.Zero);          // VK_CONTROL down
+        System.Threading.Thread.Sleep(30);
+        keybd_event(0x56, 0, 0, UIntPtr.Zero);          // 'V' key down
+        System.Threading.Thread.Sleep(30);
+        keybd_event(0x56, 0, 2, UIntPtr.Zero);          // 'V' key up
+        System.Threading.Thread.Sleep(30);
+        keybd_event(0x11, 0, 2, UIntPtr.Zero);          // VK_CONTROL up
+    }}
     public static void HardwareEnter() {{
         keybd_event(0x0D, 0, 0, UIntPtr.Zero);          // VK_RETURN down
         System.Threading.Thread.Sleep(50);
         keybd_event(0x0D, 0, 2, UIntPtr.Zero);          // VK_RETURN up (KEYEVENTF_KEYUP=2)
+    }}
+    // SafeEnter: verify focus target before firing Enter. If the render widget lost
+    // focus (e.g. Apply dialog banner stole it), re-focus before keybd_event.
+    // Returns true if HardwareEnter was sent with verified focus.  # signed: beta
+    public static bool SafeEnter(IntPtr targetHwnd) {{
+        IntPtr focused = GetFocus();
+        if (focused != targetHwnd && targetHwnd != IntPtr.Zero) {{
+            // Focus was stolen -- re-focus the render widget before Enter
+            SetFocus(targetHwnd);
+            System.Threading.Thread.Sleep(80);
+        }}
+        HardwareEnter();
+        return true;
+    }}
+    // PostMessageEnter: targeted Enter via PostMessage to a specific HWND.
+    // Unlike keybd_event (which goes to OS input queue / focused window),
+    // PostMessage delivers WM_KEYDOWN/WM_KEYUP directly to the target HWND
+    // regardless of which window has focus. Used as retry fallback.  # signed: beta
+    public static void PostMessageEnter(IntPtr targetHwnd) {{
+        PostMessage(targetHwnd, WM_KEYDOWN, VK_RETURN_PTR, IntPtr.Zero);
+        System.Threading.Thread.Sleep(50);
+        PostMessage(targetHwnd, WM_KEYUP, VK_RETURN_PTR, (IntPtr)0xC0000001);
     }}
 }}
 "@
@@ -931,6 +1103,9 @@ foreach ($e in $allEdits) {{
 if ($edit) {{
     $focusTarget = $edit
     $focusMethod = "EDIT"
+    # Extract native HWND from UIA Edit for SafeEnter focus verification  # signed: alpha
+    $editNativeHwnd = [IntPtr]::Zero
+    try {{ $editNativeHwnd = [IntPtr]$edit.Current.NativeWindowHandle }} catch {{}}
 }} else {{
     # No UIA Edit found -- VS Code chat input lives inside Chrome renderer
     # MULTI-PANE FIX: Collect ALL Chrome_RenderWidgetHostHWND children and pick the best one.
@@ -1016,6 +1191,11 @@ if ($focusMethod -ne "NONE") {{
         exit 1
     }}
 
+    # CLIPBOARD ISOLATION: Record clipboard sequence number after successful verify.
+    # If any external process modifies the clipboard between now and the paste, the
+    # sequence number changes and we can detect the corruption.  # signed: alpha
+    $clipSeqAfterVerify = [GhostType]::GetClipboardSequenceNumber()
+
     # FOCUS RACE PREVENTION: Verify foreground window hasn't been stolen between
     # clipboard set and paste. If another window grabbed focus, the paste would go
     # to the wrong target. See docs/DELIVERY_PIPELINE.md Section 9, Risk 2.  # signed: alpha
@@ -1034,9 +1214,18 @@ if ($focusMethod -ne "NONE") {{
                 try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
                 exit 1
             }}
-            [System.Windows.Forms.SendKeys]::SendWait("^v")
+            # Clipboard tamper check: verify no external process modified clipboard  # signed: alpha
+            if ([GhostType]::GetClipboardSequenceNumber() -ne $clipSeqAfterVerify) {{
+                Write-Host "CLIPBOARD_TAMPERED"
+                [GhostType]::DetachThread($hwnd)
+                try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
+                exit 1
+            }}
+            [GhostType]::HardwarePaste()
             Start-Sleep -Milliseconds 300
-            [GhostType]::HardwareEnter()
+            # ENTER KEY RACE FIX: re-verify focus before Enter (Apply dialog can steal it)  # signed: beta
+            # FIX: pass Edit native HWND, not top-level window (GetFocus returns child HWNDs)  # signed: alpha
+            if ($editNativeHwnd -ne [IntPtr]::Zero) {{ [GhostType]::SafeEnter($editNativeHwnd) }} else {{ [GhostType]::HardwareEnter() }}
             [GhostType]::DetachThread($hwnd)
             $deliveryStatus = "OK_ATTACHED"
         }} else {{
@@ -1050,9 +1239,17 @@ if ($focusMethod -ne "NONE") {{
                 try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
                 exit 1
             }}
-            [System.Windows.Forms.SendKeys]::SendWait("^v")
+            # Clipboard tamper check: verify no external process modified clipboard  # signed: alpha
+            if ([GhostType]::GetClipboardSequenceNumber() -ne $clipSeqAfterVerify) {{
+                Write-Host "CLIPBOARD_TAMPERED"
+                try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
+                exit 1
+            }}
+            [GhostType]::HardwarePaste()
             Start-Sleep -Milliseconds 300
-            [GhostType]::HardwareEnter()
+            # ENTER KEY RACE FIX: re-verify focus before Enter (Apply dialog can steal it)  # signed: beta
+            # FIX: pass Edit native HWND, not top-level window (GetFocus returns child HWNDs)  # signed: alpha
+            if ($editNativeHwnd -ne [IntPtr]::Zero) {{ [GhostType]::SafeEnter($editNativeHwnd) }} else {{ [GhostType]::HardwareEnter() }}
             [GhostType]::SetForegroundWindow($orchHwnd)
             $deliveryStatus = "OK_FALLBACK"
         }}
@@ -1070,9 +1267,41 @@ if ($focusMethod -ne "NONE") {{
                 try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
                 exit 1
             }}
-            [System.Windows.Forms.SendKeys]::SendWait("^v")
+            # Clipboard tamper check: verify no external process modified clipboard  # signed: alpha
+            if ([GhostType]::GetClipboardSequenceNumber() -ne $clipSeqAfterVerify) {{
+                Write-Host "CLIPBOARD_TAMPERED"
+                [GhostType]::DetachThread($hwnd)
+                try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
+                exit 1
+            }}
+            [GhostType]::HardwarePaste()
             Start-Sleep -Milliseconds 300
-            [GhostType]::HardwareEnter()
+            # ENTER KEY RACE FIX: re-verify focus on render widget before Enter  # signed: beta
+            [GhostType]::SafeEnter($renderHwnd)
+            # Post-Enter retry: if Enter didn't fire (focus stolen), use PostMessage as targeted fallback  # signed: beta
+            Start-Sleep -Milliseconds 500
+            try {{
+                $uiaRoot = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+                $postEnterState = "UNKNOWN"
+                if ($uiaRoot) {{
+                    $allElems = $uiaRoot.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                        [System.Windows.Automation.Condition]::TrueCondition)
+                    foreach ($el in $allElems) {{
+                        try {{
+                            $name = $el.Current.Name
+                            if ($name -match "Cancel \(Alt\+Backspace\)") {{ $postEnterState = "STEERING"; break }}
+                            if ($name -match "Generating|Searching|Thinking") {{ $postEnterState = "PROCESSING"; break }}
+                        }} catch {{}}
+                    }}
+                    if ($postEnterState -eq "UNKNOWN") {{ $postEnterState = "IDLE" }}
+                }}
+                if ($postEnterState -eq "IDLE") {{
+                    Write-Host "ENTER_RETRY: state still IDLE after HardwareEnter, retrying via PostMessage"
+                    [GhostType]::PostMessageEnter($renderHwnd)
+                }}
+            }} catch {{
+                Write-Host "ENTER_VERIFY_FAILED: $($_.Exception.Message)"
+            }}
             [GhostType]::DetachThread($hwnd)
             $deliveryStatus = "OK_RENDER_ATTACHED"
         }} else {{
@@ -1087,9 +1316,40 @@ if ($focusMethod -ne "NONE") {{
                 try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
                 exit 1
             }}
-            [System.Windows.Forms.SendKeys]::SendWait("^v")
+            # Clipboard tamper check: verify no external process modified clipboard  # signed: alpha
+            if ([GhostType]::GetClipboardSequenceNumber() -ne $clipSeqAfterVerify) {{
+                Write-Host "CLIPBOARD_TAMPERED"
+                try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
+                exit 1
+            }}
+            [GhostType]::HardwarePaste()
             Start-Sleep -Milliseconds 300
-            [GhostType]::HardwareEnter()
+            # ENTER KEY RACE FIX: re-verify focus on render widget before Enter  # signed: beta
+            [GhostType]::SafeEnter($renderHwnd)
+            # Post-Enter retry: if Enter didn't fire (focus stolen), use PostMessage as targeted fallback  # signed: beta
+            Start-Sleep -Milliseconds 500
+            try {{
+                $uiaRoot = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+                $postEnterState = "UNKNOWN"
+                if ($uiaRoot) {{
+                    $allElems = $uiaRoot.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                        [System.Windows.Automation.Condition]::TrueCondition)
+                    foreach ($el in $allElems) {{
+                        try {{
+                            $name = $el.Current.Name
+                            if ($name -match "Cancel \(Alt\+Backspace\)") {{ $postEnterState = "STEERING"; break }}
+                            if ($name -match "Generating|Searching|Thinking") {{ $postEnterState = "PROCESSING"; break }}
+                        }} catch {{}}
+                    }}
+                    if ($postEnterState -eq "UNKNOWN") {{ $postEnterState = "IDLE" }}
+                }}
+                if ($postEnterState -eq "IDLE") {{
+                    Write-Host "ENTER_RETRY: state still IDLE after HardwareEnter, retrying via PostMessage"
+                    [GhostType]::PostMessageEnter($renderHwnd)
+                }}
+            }} catch {{
+                Write-Host "ENTER_VERIFY_FAILED: $($_.Exception.Message)"
+            }}
             [GhostType]::SetForegroundWindow($orchHwnd)
             $deliveryStatus = "OK_RENDER_FALLBACK"
         }}
@@ -1117,11 +1377,12 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
 
     Runs the PowerShell script generated by _build_ghost_type_ps() as a subprocess
     with CREATE_NO_WINDOW flag. Validates success by checking stdout for OK_* prefix
-    status codes. Handles failure codes: CLIPBOARD_VERIFY_FAILED, FOCUS_STOLEN,
-    NO_EDIT_NO_RENDER.
+    status codes. Handles failure codes: CLIPBOARD_VERIFY_FAILED, CLIPBOARD_TAMPERED,
+    FOCUS_STOLEN, NO_EDIT_NO_RENDER.  # signed: alpha
 
     Architecture (see docs/DELIVERY_PIPELINE.md Section 4.3):
-        - Acquires _dispatch_lock (threading.Lock) to prevent concurrent ghost-type ops
+        - Acquires cross-process named Mutex (SkynetDispatchClipboard) + thread lock
+          for system-wide clipboard isolation across all Skynet processes
         - Writes dispatch lock file for external monitoring
         - Runs PS with 20s timeout, CREATE_NO_WINDOW (0x08000000) creation flag
         - CLIPBOARD_VERIFY_FAILED retry runs INSIDE the lock to prevent clipboard
@@ -1136,7 +1397,12 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
     Returns:
         bool: True if PS reported successful delivery (OK_*), False otherwise
     """  # signed: beta
+    mutex_acquired = False
     try:
+        # Cross-process mutex for system-wide clipboard isolation  # signed: beta
+        mutex_acquired = _acquire_dispatch_mutex(timeout_ms=15000)
+        if not mutex_acquired:
+            log(f"Ghost dispatch: failed to acquire cross-process mutex for HWND={hwnd}, proceeding with thread lock only", "WARN")
         with _dispatch_lock:
             try:
                 DISPATCH_LOCK_FILE.write_text(json.dumps({
@@ -1188,6 +1454,35 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
                 return False
             # signed: beta — end clipboard retry block (now inside lock)
 
+            # Clipboard tampered -- external process modified clipboard between verify  # signed: alpha
+            # and paste. Retry once inside the lock since the external interference was
+            # transient (e.g., another app's clipboard copy that's now finished).
+            if "CLIPBOARD_TAMPERED" in stdout:
+                log(f"Ghost CLIPBOARD_TAMPERED for HWND={hwnd} -- external clipboard modification detected, retrying once (lock held)", "WARN")
+                time.sleep(0.3)
+                try:
+                    r2 = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command", ps],
+                        capture_output=True, text=True, timeout=20,
+                        creationflags=0x08000000
+                    )
+                    stdout2 = r2.stdout or ""
+                    if any(s in stdout2 for s in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK")):
+                        log(f"Ghost CLIPBOARD_TAMPERED retry succeeded for HWND={hwnd}", "OK")
+                        try:
+                            DISPATCH_LOCK_FILE.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        return True
+                    log(f"Ghost CLIPBOARD_TAMPERED retry also failed for HWND={hwnd}: {stdout2.strip()[:150]}", "ERR")
+                except Exception as e2:
+                    log(f"Ghost CLIPBOARD_TAMPERED retry exception: {e2}", "ERR")
+                try:
+                    DISPATCH_LOCK_FILE.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return False
+
             try:
                 DISPATCH_LOCK_FILE.unlink(missing_ok=True)
             except Exception:
@@ -1209,6 +1504,14 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
         if stderr:
             log(f"Ghost stderr: {stderr[:200]}", "WARN")
         return ok
+    except subprocess.TimeoutExpired:
+        # Explicit timeout handling: PS subprocess exceeded 20s  # signed: beta
+        log(f"Ghost type TIMEOUT: PowerShell exceeded 20s for HWND={hwnd}", "ERR")
+        try:
+            DISPATCH_LOCK_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
     except Exception as e:
         log(f"Ghost type failed: {e}", "ERR")
         try:
@@ -1216,6 +1519,9 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
         except Exception:
             pass
         return False
+    finally:
+        if mutex_acquired:
+            _release_dispatch_mutex()  # signed: beta
 
 
 def ghost_type_to_worker(hwnd, text, orch_hwnd, render_hwnd=None):
@@ -1234,8 +1540,12 @@ def ghost_type_to_worker(hwnd, text, orch_hwnd, render_hwnd=None):
         3. _execute_ghost_dispatch() runs script under dispatch lock, validates OK_ stdout
 
     Safety features:
+        - Cross-process clipboard isolation via named Windows Mutex (SkynetDispatchClipboard)
+        - Thread-level isolation via threading.Lock (backup for same-process concurrency)
         - Clipboard save/restore (user clipboard never lost)
-        - Clipboard verification (3x SetText/GetText readback loop)
+        - Clipboard verification (5x SetText/GetText readback loop with exponential backoff)
+        - Clipboard tamper detection (GetClipboardSequenceNumber before paste; aborts
+          with CLIPBOARD_TAMPERED if external process modified clipboard)  # signed: alpha
         - Focus race prevention (GetForegroundWindow check before paste)
         - Multi-pane disambiguation (FindAllRender + right-half area scoring)
         - AttachThreadInput for less-visible focus transfer (no Z-order flash)
@@ -1454,7 +1764,7 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
         return False
 
     if not workers:
-        workers = load_workers()
+        workers = load_all_workers()
     if not orch_hwnd:
         orch_hwnd = load_orch_hwnd()
 
@@ -1467,13 +1777,21 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
     t_start = time.time()
     target = next((w for w in workers if w["name"] == worker_name), None)
     if not target:
-        log(f"Target '{worker_name}' not found", "ERR")
-        return False
+        # Retry with load_all_workers() in case caller passed stale core-only list
+        all_workers = load_all_workers()  # signed: alpha
+        target = next((w for w in all_workers if w["name"] == worker_name), None)
+        if not target:
+            log(f"Target '{worker_name}' not found in core or external workers", "ERR")
+            return False
+
+    is_external = target.get("type") == "external"  # signed: alpha
+    if is_external:
+        log(f"[EXTERNAL] Dispatching to external worker {worker_name.upper()}", "SYS")
 
     hwnd = target["hwnd"]
     if not user32.IsWindowVisible(hwnd):
-        # HWND may be stale -- re-read workers.json in case discovery updated it
-        fresh_workers = load_workers()
+        # HWND may be stale -- re-read in case discovery updated it
+        fresh_workers = load_all_workers()  # signed: alpha — use load_all_workers for external too
         fresh_target = next((w for w in fresh_workers if w["name"] == worker_name), None)
         if fresh_target and fresh_target["hwnd"] != hwnd:
             hwnd = fresh_target["hwnd"]
@@ -1503,18 +1821,26 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
         log(f"Enrichment failed for {worker_name.upper()}: {e} -- dispatching raw task", "WARN")
         enriched_task = task  # Fall back to unenriched task
     try:
-        full_task = build_context_preamble(worker_name, enriched_task, context) if context else build_preamble(worker_name) + enriched_task
+        if context:
+            full_task = build_context_preamble(worker_name, enriched_task, context)
+        elif is_external:
+            full_task = build_external_preamble(worker_name, target) + enriched_task  # signed: alpha
+        else:
+            full_task = build_preamble(worker_name) + enriched_task
     except Exception as e:
         log(f"Preamble build failed for {worker_name.upper()}: {e} -- dispatching raw task", "WARN")
         full_task = enriched_task  # Fall back to task without preamble  # signed: alpha
 
     # Dispatch payload size logging + safeguard against oversized payloads  # signed: orchestrator
-    MAX_DISPATCH_LENGTH = 12000  # chars — beyond this, Copilot CLI may reject with "delegation cancelled"
+    MAX_DISPATCH_LENGTH = 12000  # chars -- beyond this, Copilot CLI may reject with "delegation cancelled"
     payload_len = len(full_task)
     if payload_len > MAX_DISPATCH_LENGTH:
         log(f"⚠ {worker_name.upper()} payload {payload_len} chars exceeds {MAX_DISPATCH_LENGTH} limit -- trimming preamble", "WARN")
         # Keep only task text (no preamble/enrichment) to stay under limit
-        full_task = build_preamble(worker_name) + task
+        if is_external:  # signed: alpha
+            full_task = build_external_preamble(worker_name, target) + task
+        else:
+            full_task = build_preamble(worker_name) + task
         payload_len = len(full_task)
     log(f"📦 {worker_name.upper()} dispatch payload: {payload_len} chars", "SYS")
 
@@ -1642,11 +1968,11 @@ def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
             if final_state == "PROCESSING":
                 log(f"✓ {worker_name.upper()} delivery VERIFIED (late transition): IDLE -> PROCESSING", "OK")
                 return True
-            # If pre_state was IDLE and we're still IDLE, the message was likely
-            # submitted and processed fast. Trust the delivery from the PS script.
+            # INCIDENT 017 FIX: IDLE->IDLE is ambiguous -- could mean Enter never reached
+            # chat input (focus stolen by Apply dialog). Return False to trigger retry logic.  # signed: alpha
             if pre_state == "IDLE" and final_state == "IDLE":
-                log(f"✓ {worker_name.upper()} delivery ASSUMED OK: CLI processed fast (IDLE->IDLE). HardwareEnter is reliable.", "OK")
-                return True
+                log(f"⚠ {worker_name.upper()} delivery UNVERIFIED: IDLE->IDLE, delivery not confirmed", "WARN")
+                return False
         except Exception:
             pass
         # Last resort: pyautogui Enter fallback (shouldn't be needed with HardwareEnter)
@@ -1666,10 +1992,10 @@ def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
                 if post != pre_state and post != "UNKNOWN":
                     log(f"✓ {worker_name.upper()} delivery VERIFIED after pyautogui fallback: {pre_state} -> {post}", "OK")
                     return True
-                # Same fast-processing logic for pyautogui fallback
+                # INCIDENT 017 FIX: IDLE->IDLE after pyautogui is also unverified  # signed: alpha
                 if pre_state == "IDLE" and post == "IDLE":
-                    log(f"✓ {worker_name.upper()} delivery ASSUMED OK after pyautogui fallback (fast processing)", "OK")
-                    return True
+                    log(f"⚠ {worker_name.upper()} delivery UNVERIFIED: IDLE->IDLE after pyautogui fallback", "WARN")
+                    return False
             except Exception:
                 pass
         except Exception as e:
@@ -2552,7 +2878,7 @@ Examples:
                         help="Skip CLI error detection/retry for --smart and --parallel (faster)")  # signed: alpha
     args = parser.parse_args()
 
-    workers = load_workers()
+    workers = load_all_workers()  # signed: alpha -- include external workers in CLI dispatch
     orch_hwnd = load_orch_hwnd()
 
     if _handle_state_query(args, workers):

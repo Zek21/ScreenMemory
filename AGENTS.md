@@ -1404,6 +1404,224 @@ Run these checks on EVERY self-invocation. If ANY check fails, read the relevant
    python -c "from tools.skynet_collective import sync_strategies; sync_strategies('WORKER')"
    ```
 
+## External Worker Integration Protocol (Rule 0.11) — First-Class
+
+<!-- signed: delta -->
+
+**External workers are first-class Skynet citizens with sandboxed permissions.** They operate on their own projects but are integrated into the Skynet dispatch, monitoring, and scoring systems. External workers with valid HWNDs are dispatchable via `ghost_type` — the same delivery mechanism used for core workers.
+
+### Skynet Worker Capability Table
+
+| Worker | Type | Role | Specializations | Dispatchable | Model |
+|--------|------|------|-----------------|-------------|-------|
+| alpha | core | Primary Builder & Frontend | architecture, frontend, dashboard, UI, systems | ghost_type (HWND) | Claude Opus 4.6 fast |
+| beta | core | Infrastructure & Backend | backend, infrastructure, daemons, Python, resilience | ghost_type (HWND) | Claude Opus 4.6 fast |
+| gamma | core | Research & Security | research, security, analysis, optimization, performance | ghost_type (HWND) | Claude Opus 4.6 fast |
+| delta | core | Testing & Validation | testing, validation, auditing, Go, config, docs | ghost_type (HWND) | Claude Opus 4.6 fast |
+| website-worker | external | WordPress & Content Deployment | WordPress, content, SEO, SSH, deployment, blog management | ghost_type (HWND) | Claude Opus 4.6 fast |
+
+### Core vs External Workers
+
+| Category | Core Workers | External Workers (First-Class) |
+|----------|-------------|-------------------------------|
+| **Members** | orchestrator, alpha, beta, gamma, delta, consultant, gemini_consultant | website-worker, any worker with `type: "external"` in `agent_profiles.json` |
+| **Modify core files** | YES | **NO** — sandbox enforced |
+| **Dispatch to core workers** | YES | **NO** — can only post results to bus |
+| **Kill processes** | Orchestrator only (Rule 0.1) | **NEVER** |
+| **Approve quarantine** | YES | **NO** |
+| **Bus access** | Full (via `guarded_publish`) | Full read, submit results via `guarded_publish` |
+| **Dispatch mechanism** | ghost_type via HWND | ghost_type via HWND (same as core when HWND registered) |
+| **Preamble injection** | Core preamble | External preamble from `data/external_worker_preamble.md` |
+
+### Sandbox Rules
+
+1. **Path restrictions.** External workers can ONLY modify:
+   - Their assigned project directory (e.g., `D:\Portfolio\exzilcalanza-blogs`)
+   - Their own state directory: `data/external_workers/{worker_id}/`
+   - Quarantine submission: `data/quarantine.json` (append results only)
+   - Remote servers they are authorized to access (e.g., production WordPress via SSH)
+
+2. **Forbidden paths.** External workers CANNOT touch:
+   - `tools/skynet_*.py` — core Skynet tools
+   - `data/workers.json`, `data/orchestrator.json` — core state files
+   - `data/agent_profiles.json`, `data/brain_config.json` — core config
+   - `AGENTS.md`, `.github/` — protocol and instruction files
+   - `core/` — core engine stack
+   - `Skynet/` — Go backend
+   - Boot scripts (`Orch-Start.ps1`, `CC-Start.ps1`, `GC-Start.ps1`)
+
+3. **No core dispatch.** External workers cannot dispatch tasks to core workers (alpha, beta, gamma, delta). They can only post results to the bus. Core workers dispatch TO external workers, not the reverse.
+
+4. **No process control.** External workers cannot terminate, restart, or manage any process. This extends Rule 0.1 with zero exceptions for external workers.
+
+5. **Task scope validation.** Every task dispatched to an external worker is scanned for forbidden keywords (e.g., `workers.json`, `skynet_dispatch`, `kill process`). Tasks containing forbidden keywords are rejected before dispatch.
+
+### Ghost-Type Dispatch for External Workers
+
+External workers with valid HWNDs registered in `data/workers.json` or `data/external_workers.json` are dispatched using the **same `ghost_type_to_worker()` mechanism** as core workers:
+
+1. Orchestrator calls `skynet_dispatch.py --worker website-worker --task "..."` 
+2. `ghost_type_to_worker(hwnd, text, orch_hwnd)` delivers via clipboard paste to `Chrome_RenderWidgetHostHWND`
+3. External worker preamble from `data/external_worker_preamble.md` is prepended to every dispatch
+4. `_verify_delivery()` confirms state transition (IDLE → PROCESSING)
+5. Worker posts result to bus when done → result enters quarantine
+
+### Quarantine Workflow
+
+External worker results are NOT automatically trusted unless auto-approve is active:
+
+1. **External worker completes task** — posts result to bus with `sender=website-worker`
+2. **Result enters quarantine** — stored in `data/quarantine.json` with status `pending`
+3. **Core worker cross-validates** — a core worker reviews the result for correctness, security, and compliance
+4. **Approval or rejection:**
+   - `approved` — result is trusted, external worker earns **+0.01**
+   - `rejected` — result is discarded, external worker gets **-0.02**
+5. Only core workers can approve or reject quarantined results (`can_approve_quarantine`)
+
+### Auto-Approve Threshold
+
+After **10 consecutive approved results** with zero rejections, an external worker earns auto-approve status:
+
+- Auto-approved results earn **+0.005** (half the manual approval rate)
+- Any single rejection resets the consecutive counter to zero and revokes auto-approve
+- Auto-approve is tracked in `data/external_workers.json` per worker: `"consecutive_approvals": N, "auto_approve": true/false`
+- Core workers can still manually review auto-approved results and reject them (resetting the counter)
+
+### Scoring for External Workers
+
+| Action | Points | Notes |
+|--------|--------|-------|
+| Quarantine result approved (manual) | **+0.01** | Cross-validated by a core worker |
+| Quarantine result approved (auto) | **+0.005** | After 10 consecutive approvals |
+| Quarantine result rejected | **-0.02** | Higher penalty to discourage low-quality work |
+| Spam violation | **-1.0** | Same as core workers — `guarded_publish()` mandatory |
+| Process kill attempt | **-1.0** | Treated as security incident |
+| Proactive site improvement | **+0.01** | Self-initiated fix verified by core worker |
+| Bug report filed | **+0.01** | Real bug found and reported for cross-validation |
+
+### Unified Status System
+
+The orchestrator views core and external workers in a single unified status:
+
+```bash
+# All workers (core + external) in one view
+python tools/orch_realtime.py status          # Shows alpha, beta, gamma, delta, website-worker
+python tools/skynet_external_monitor.py status # External workers detail view
+
+# Dispatch to any worker uniformly
+python tools/skynet_dispatch.py --worker website-worker --task "Deploy blog post"
+python tools/skynet_dispatch.py --worker alpha --task "Fix dashboard CSS"
+```
+
+External workers appear in `GET http://localhost:8420/status` alongside core workers when their HWND is registered. The `skynet_monitor.py` daemon tracks external worker HWNDs with the same liveness checks as core workers.
+
+### Enforcement Tool
+
+`tools/skynet_external_guard.py` provides the `ExternalWorkerGuard` class and CLI:
+
+```bash
+# Check if an external worker can modify a path
+python tools/skynet_external_guard.py check ext_blog modify --path data/workers.json
+# -> [DENIED] external worker 'ext_blog' cannot modify core Skynet path
+
+# Check if a worker can dispatch to a core worker
+python tools/skynet_external_guard.py check ext_blog dispatch --target alpha
+# -> [DENIED] external worker 'ext_blog' cannot dispatch to core worker 'alpha'
+
+# Get full isolation info for a worker
+python tools/skynet_external_guard.py info website-worker
+# -> JSON with type, permissions, allowed paths, scoring rules
+```
+
+### Integration Points
+
+- **Dispatch pipeline:** `skynet_dispatch.py` calls `ExternalWorkerGuard.validate_task_scope()` before dispatching to external workers
+- **Path guard:** Any file-modification tool used by external workers calls `validate_path_access()` first
+- **Quarantine processor:** Core workers periodically review `data/quarantine.json` for pending results
+- **Agent profiles:** External workers are registered in `data/agent_profiles.json` with `"type": "external"` and `"project_directory": "path/to/project"`
+- **Preamble:** External worker dispatch preamble is loaded from `data/external_worker_preamble.md`
+- **Monitor:** `tools/skynet_external_monitor.py` provides status, scan, dispatch, quarantine, and validation commands
+
+## External Worker Self-Invocation Protocol
+
+<!-- signed: delta -->
+
+**External workers follow the same post-task lifecycle as core workers, adapted for their sandboxed environment.** This protocol ensures external workers are autonomous, self-improving, and integrated with the Skynet knowledge network.
+
+### Phase 0 — Architecture Verification (Pre-Task)
+
+Before executing any task, the external worker MUST verify its operational environment:
+
+1. **Bus connectivity** — confirm `http://localhost:8420/status` is reachable
+2. **SSH access** (if applicable) — verify SSH key exists and connection works:
+   ```bash
+   ssh -i C:\Users\exzil\.ssh\aiwp_server_key.pem -o ConnectTimeout=5 ubuntu@35.165.8.86 "echo OK"
+   ```
+3. **Project directory** — confirm assigned project path exists and is writable
+4. **Identity** — verify own entry in `data/agent_profiles.json` or `data/external_workers.json`
+5. **Quarantine awareness** — check `data/quarantine.json` for any pending results from previous tasks
+
+If any check fails, report the failure to the bus and wait for orchestrator intervention.
+
+### Phase 1 — Report Results
+
+Post result to bus immediately upon task completion using `guarded_publish()`:
+
+```python
+from tools.skynet_spam_guard import guarded_publish
+guarded_publish({
+    "sender": "website-worker",
+    "topic": "orchestrator",
+    "type": "result",
+    "content": "RESULT: <description> signed:website-worker"
+})
+```
+
+Results from external workers automatically enter quarantine for cross-validation by a core worker.
+
+### Phase 2 — Knowledge Capture
+
+Broadcast what was learned during the task — WordPress patterns, deployment insights, SEO discoveries:
+
+```python
+from tools.skynet_knowledge import broadcast_learning
+broadcast_learning("website-worker", "what was learned", "category", ["tags"])
+```
+
+Valid categories for external workers: `deployment`, `wordpress`, `seo`, `performance`, `security`, `content`, `infrastructure`
+
+### Phase 3 — TODO Enforcement (Zero-Stop Rule)
+
+External workers follow the same zero-stop rule as core workers:
+
+1. Check Skynet TODO queue: `python tools/skynet_todos.py check website-worker`
+2. Check quarantine queue for pending results awaiting validation
+3. Check bus for pending tasks from the orchestrator
+4. **NEVER go idle with pending work** — if tasks remain, continue working
+
+### Phase 4 — Self-Improvement (When Idle)
+
+When all assigned tasks are complete and the TODO queue is empty, external workers MUST self-improve within their domain:
+
+1. **Audit site health** — check WordPress for broken links, plugin updates, security issues
+2. **Fix SEO issues** — validate meta tags, structured data, sitemap, robots.txt
+3. **Optimize performance** — check PageSpeed scores, image optimization, caching headers
+4. **Content quality** — verify all blog posts render correctly, no broken embeds
+5. **Security scan** — check for outdated plugins, exposed debug info, file permissions
+6. **Deploy pending** — if content is staged but not deployed, complete the deployment
+
+Execute improvements directly — only post proposals to the bus if the improvement requires orchestrator approval or affects the production site in a breaking way.
+
+### Phase 5 — Scoring Awareness
+
+External workers track their score trajectory and work to improve:
+
+- Check score: `python tools/skynet_scoring.py --score website-worker`
+- View leaderboard: `python tools/skynet_scoring.py --leaderboard`
+- **Goal:** Maintain positive score through consistent, high-quality work
+- **Recovery:** If score drops negative, focus on achievable tasks with clear success criteria
+- **Auto-approve target:** Achieve 10 consecutive approvals to unlock auto-approve (+0.005/task)
+
 **Phase 3 — Self-Evolution**
 
 6. Evolve local strategies based on task outcome (success or failure feeds the evolutionary algorithm):

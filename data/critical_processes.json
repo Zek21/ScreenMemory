@@ -10,78 +10,51 @@
   ],
   "processes": [
     {
-      "pid": 30468,
+      "pid": 47112,
       "name": "skynet.exe",
       "role": "backend",
       "protected": true
     },
     {
-      "pid": 17788,
+      "pid": 25344,
       "name": "god_console.py",
       "role": "god_console",
       "protected": true
     },
     {
-      "pid": 24784,
+      "pid": 21348,
       "name": "skynet_sse_daemon.py",
       "role": "sse_daemon",
       "protected": true
     },
     {
-      "pid": 8744,
+      "pid": 12156,
       "name": "skynet_monitor.py",
       "role": "monitor",
       "protected": true
     },
     {
-      "pid": 5896,
-      "name": "skynet_overseer.py",
-      "role": "overseer",
-      "protected": true
-    },
-    {
-      "pid": 25972,
+      "pid": 10836,
       "name": "skynet_watchdog.py",
       "role": "watchdog",
       "protected": true
     },
     {
-      "pid": 0,
-      "hwnd": 3344282,
+      "pid": 14152,
+      "hwnd": 2427486,
       "name": "alpha",
       "role": "worker",
       "protected": true
     },
     {
-      "pid": 0,
-      "hwnd": 2755410,
-      "name": "beta",
-      "role": "worker",
-      "protected": true
-    },
-    {
-      "pid": 0,
-      "hwnd": 657282,
-      "name": "gamma",
-      "role": "worker",
-      "protected": true
-    },
-    {
-      "pid": 0,
-      "hwnd": 722882,
-      "name": "delta",
-      "role": "worker",
-      "protected": true
-    },
-    {
-      "pid": 0,
-      "hwnd": 2296924,
+      "pid": 14152,
+      "hwnd": 657790,
       "name": "orchestrator",
       "role": "orchestrator",
       "protected": true
     }
   ],
-  "process_count": 11,
-  "updated_at": "2026-03-17T05:45:19",
+  "process_count": 7,
+  "updated_at": "2026-03-20T03:45:51",
   "updated_by": "skynet_process_guard.refresh_registry()"
 }

@@ -41,8 +41,11 @@ ARCHIVE_FILE = DATA_DIR / "bus_archive.jsonl"
 PID_FILE = DATA_DIR / "bus_persist.pid"
 STREAM_URL = "http://localhost:8420/stream"
 MAX_ARCHIVE_BYTES = 50 * 1024 * 1024  # 50 MB rotation threshold
+ROTATION_CHECK_INTERVAL = 100  # Check rotation every N archived messages
+MAX_ROTATED_FILES = 30  # Keep last N rotated files, delete older ones
 RECONNECT_DELAY_S = 5
 MAX_RECONNECT_DELAY_S = 60
+BUS_CATCHUP_URL = "http://localhost:8420/bus/messages?limit=100"  # signed: beta
 
 _running = True
 
@@ -86,20 +89,56 @@ def _release_pid_lock():
 
 
 def _rotate_if_needed():
-    """Rotate archive if it exceeds MAX_ARCHIVE_BYTES."""
+    """Rotate archive if it exceeds MAX_ARCHIVE_BYTES.
+
+    Uses date-based naming: bus_archive_YYYYMMDD.jsonl (with _N suffix
+    if multiple rotations occur on the same day). After rotation, cleans
+    up old rotated files beyond MAX_ROTATED_FILES retention limit.
+    """  # signed: beta
     if not ARCHIVE_FILE.exists():
         return
     try:
         size = ARCHIVE_FILE.stat().st_size
         if size > MAX_ARCHIVE_BYTES:
-            rotated = ARCHIVE_FILE.with_suffix(
-                f".{int(time.time())}.jsonl"
-            )
+            from datetime import datetime
+            date_str = datetime.now().strftime("%Y%m%d")
+            base_name = f"bus_archive_{date_str}"
+
+            # Find unique suffix if same-day rotation already exists
+            suffix = 0
+            rotated = DATA_DIR / f"{base_name}.jsonl"
+            while rotated.exists():
+                suffix += 1
+                rotated = DATA_DIR / f"{base_name}_{suffix}.jsonl"
+
             ARCHIVE_FILE.rename(rotated)
             print(f"[BUS_PERSIST] Rotated archive ({size // 1024}KB) -> {rotated.name}")
+
+            _cleanup_old_rotated_files()
     except OSError as e:
         print(f"[BUS_PERSIST] Rotation error: {e}")
-    # signed: gamma
+
+
+def _cleanup_old_rotated_files():
+    """Remove rotated archive files beyond MAX_ROTATED_FILES retention limit.
+
+    Keeps the most recent files by modification time. Only targets files
+    matching the bus_archive_*.jsonl pattern (not the active archive).
+    """  # signed: beta
+    try:
+        rotated = sorted(
+            DATA_DIR.glob("bus_archive_*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if len(rotated) > MAX_ROTATED_FILES:
+            for old_file in rotated[MAX_ROTATED_FILES:]:
+                old_size = old_file.stat().st_size
+                old_file.unlink()
+                print(f"[BUS_PERSIST] Deleted old archive: {old_file.name} "
+                      f"({old_size // 1024}KB)")
+    except OSError as e:
+        print(f"[BUS_PERSIST] Cleanup error: {e}")
 
 
 def _archive_message(msg: dict):
@@ -129,6 +168,38 @@ def _parse_sse_messages(line: str) -> list:
     # signed: gamma
 
 
+def _catchup_missed_messages(seen_ids: set) -> int:
+    """Fetch recent bus messages via HTTP to catch any missed during SSE downtime.
+
+    After an SSE disconnection, the ring buffer may contain messages that were
+    published while we were reconnecting. This queries /bus/messages to retrieve
+    them before resuming the SSE stream, closing the message loss window.
+
+    Returns the number of newly archived messages.
+    """  # signed: beta
+    import urllib.request
+    import urllib.error
+
+    caught = 0
+    try:
+        req = urllib.request.Request(BUS_CATCHUP_URL)
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        messages = data if isinstance(data, list) else data.get("messages", [])
+        for msg in messages:
+            msg_id = msg.get("id", "")
+            if msg_id and msg_id not in seen_ids:
+                seen_ids.add(msg_id)
+                _archive_message(msg)
+                caught += 1
+        if caught:
+            print(f"[BUS_PERSIST] Caught up {caught} missed messages after reconnect")
+    except Exception as e:
+        print(f"[BUS_PERSIST] Catchup failed (non-fatal): {e}")
+    return caught
+    # signed: beta
+
+
 def run_daemon():
     """Main daemon loop: subscribe to SSE stream, archive all bus messages."""
     import urllib.request
@@ -155,6 +226,9 @@ def run_daemon():
         while _running:
             try:
                 _rotate_if_needed()
+                # Catch up on messages missed during SSE downtime  # signed: beta
+                catchup_count = _catchup_missed_messages(seen_ids)
+                total_archived += catchup_count
                 req = urllib.request.Request(STREAM_URL)
                 req.add_header("Accept", "text/event-stream")
                 resp = urllib.request.urlopen(req, timeout=30)
@@ -164,6 +238,8 @@ def run_daemon():
                 # Keep seen_ids bounded (last 500 IDs)
                 if len(seen_ids) > 1000:
                     seen_ids = set(list(seen_ids)[-500:])
+
+                msgs_since_rotation_check = 0  # signed: beta
 
                 while _running:
                     raw = resp.readline()
@@ -180,8 +256,14 @@ def run_daemon():
                             seen_ids.add(msg_id)
                             _archive_message(msg)
                             total_archived += 1
+                            msgs_since_rotation_check += 1
                             if total_archived % 100 == 0:
                                 print(f"[BUS_PERSIST] Archived {total_archived} messages")
+
+                    # Periodic rotation check during continuous operation
+                    if msgs_since_rotation_check >= ROTATION_CHECK_INTERVAL:
+                        _rotate_if_needed()
+                        msgs_since_rotation_check = 0  # signed: beta
 
             except (urllib.error.URLError, OSError, ConnectionError) as e:
                 if _running:

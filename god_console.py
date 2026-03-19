@@ -59,6 +59,18 @@ def _real_version():
 ACCESS_LOG = ROOT / "data" / "console_access.log"
 TODOS_FILE = ROOT / "data" / "todos.json"
 _SERVER_START = _time.time()
+_last_error = None          # last error message (str) -- cleared on read
+_last_error_ts = 0          # timestamp of last error
+_last_error_lock = threading.Lock()  # signed: gamma
+
+
+def _record_error(msg: str):
+    """Record the most recent error for /health reporting."""
+    global _last_error, _last_error_ts
+    with _last_error_lock:
+        _last_error = str(msg)[:500]
+        _last_error_ts = _time.time()
+    # signed: gamma
 
 
 def _fetch_backend(url, timeout=2, retries=1):
@@ -599,6 +611,8 @@ def _start_precompute():
 # --------------- WebSocket Server (port 8423) ---------------
 _ws_clients = set()
 _ws_lock = threading.Lock()
+_sse_stream_count = 0  # active SSE /stream/dashboard connections -- signed: alpha
+_sse_lock = threading.Lock()
 
 def _ws_broadcast(data):
     """Broadcast data to all connected WebSocket clients."""
@@ -867,6 +881,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         except Exception as e:
             status_code = 500
             logger.error("GET %s failed: %s\n%s", self.path, e, traceback.format_exc())
+            _record_error(f"GET {self.path}: {e}")  # signed: gamma
             self._json_response({"error": str(e), "endpoint": self.path}, status=500)
         elapsed_ms = (_time.time() - t0) * 1000
         self._log_access(self.path, status_code, elapsed_ms)
@@ -886,6 +901,42 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             _ver, _lvl = _real_version()  # signed: gamma
             self._json_response({"version": _ver, "level": _lvl, "codename": f"Level {_lvl}", "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ")})
         elif self.path == "/health":
+            # Comprehensive health with real system state -- signed: alpha
+            now = _time.time()
+
+            # Backend connectivity probe
+            backend_ok = False
+            backend_uptime = None
+            try:
+                from urllib.request import urlopen
+                raw = json.loads(urlopen("http://localhost:8420/health", timeout=2).read())
+                backend_ok = raw.get("status") == "ok"
+                backend_uptime = raw.get("uptime")
+            except Exception:
+                pass
+
+            # Connected WS clients
+            with _ws_lock:
+                ws_count = len(_ws_clients)
+
+            # Active SSE streams
+            with _sse_lock:
+                sse_count = _sse_stream_count
+
+            # Engine probe cache age (seconds since last probe, None if never probed)
+            engine_cache_age = None
+            with _cache_lock:
+                if _cache["engines_t"]:
+                    engine_cache_age = round(now - _cache["engines_t"], 1)
+
+            # Cache freshness summary
+            cache_ages = {}
+            with _cache_lock:
+                for key in ("pulse", "status", "backend_status", "engines",
+                            "consultants", "bus", "dashboard_data", "windows"):
+                    t = _cache.get(f"{key}_t", 0)
+                    cache_ages[key] = round(now - t, 1) if t else None
+
             endpoints = ["/", "/dashboard", "/engines", "/version", "/health",
                          "/skynet/self/pulse", "/skynet/self/status",
                          "/skynet/self/introspect", "/skynet/self/goals",
@@ -895,14 +946,37 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                          "/processes", "/overseer", "/stream/dashboard",
                          "/kill/pending", "/kill/log", "/learner/health",
                          "/missions/active", "/system/health", "/metrics/throughput",
-                         "/leadership"]  # signed: beta
+                         "/leadership"]
+            # Last error snapshot  # signed: gamma
+            with _last_error_lock:
+                last_err = _last_error
+                last_err_ts = _last_error_ts
+            last_error_info = None
+            if last_err:
+                last_error_info = {
+                    "message": last_err,
+                    "age_s": round(now - last_err_ts, 1),
+                    "timestamp": _time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ",
+                        _time.gmtime(last_err_ts)),
+                }
+
             self._json_response({
                 "status": "ok",
-                "uptime_s": round(_time.time() - _SERVER_START, 1),
-                "endpoints_active": len(endpoints),
+                "uptime_s": round(now - _SERVER_START, 1),
                 "pid": os.getpid(),
                 "ws_port": WS_PORT,
-                "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ"),  # signed: delta
+                "connected_clients": ws_count,
+                "sse_stream_count": sse_count,
+                "engine_probe_cache_age_s": engine_cache_age,
+                "last_error": last_error_info,
+                "backend": {
+                    "connected": backend_ok,
+                    "uptime": backend_uptime,
+                },
+                "cache_ages_s": cache_ages,
+                "endpoints_active": len(endpoints),
+                "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             })
         elif self.path == "/bus" or self.path.startswith("/bus?") or self.path.startswith("/bus/messages"):
             limit = 20
@@ -1530,21 +1604,33 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
 
     def _handle_stream_dashboard(self):
         """SSE /stream/dashboard — push aggregated dashboard data every 2s."""
+        global _sse_stream_count
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
+        with _sse_lock:
+            _sse_stream_count += 1  # signed: alpha
         try:
             while True:
-                payload = self._build_sse_payload()
-                line = f"data: {json.dumps(payload, default=str)}\n\n"
+                try:
+                    payload = self._build_sse_payload()
+                    line = f"data: {json.dumps(payload, default=str)}\n\n"
+                except Exception:
+                    # Payload build or JSON serialization failed -- send empty  # signed: alpha
+                    line = "data: {}\n\n"
                 self.wfile.write(line.encode())
                 self.wfile.flush()
                 _time.sleep(2)
         except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
+            pass  # client disconnect -- normal
+        except Exception:
+            pass  # unexpected error -- don't crash the handler thread  # signed: alpha
+        finally:
+            with _sse_lock:
+                _sse_stream_count = max(0, _sse_stream_count - 1)  # signed: alpha
 
     @staticmethod
     def _build_sse_payload():
@@ -1757,6 +1843,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         except Exception as e:
             status_code = 500
             logger.error("POST %s failed: %s\n%s", self.path, e, traceback.format_exc())
+            _record_error(f"POST {self.path}: {e}")  # signed: gamma
             self._json_response({"error": str(e)}, status=500)
         self._log_access(f"POST {self.path}", status_code, (_time.time() - t0) * 1000)
 

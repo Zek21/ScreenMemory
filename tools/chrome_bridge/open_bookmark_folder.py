@@ -119,7 +119,7 @@ def collect_folder_urls(folder: Dict) -> List[str]:
 
 
 def build_args(profile_directory: str, folder_id: str, urls: List[str], mode: str) -> List[str]:
-    args = [f"--profile-directory={profile_directory}"]
+    args = [f'--profile-directory="{profile_directory}"']
     if mode in {"manager", "both"}:
         args.append(f"chrome://bookmarks/?id={folder_id}")
     if mode in {"urls", "both"}:
@@ -222,7 +222,7 @@ def _focus_existing_profile(profile: dict, force: bool) -> int | None:
 def _open_profile_only(chrome_path: str, profile: dict) -> int:
     """Open a Chrome profile without a specific folder."""
     subprocess.Popen(
-        [chrome_path, f"--profile-directory={profile['directory']}"],
+        [chrome_path, f"--profile-directory=\"{profile['directory']}\""],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     print(f'Opened profile "{profile["name"]}" ({profile["directory"]}).')

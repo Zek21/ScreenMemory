@@ -989,14 +989,25 @@ def _latest_consultant_message(limit: int = 100) -> Optional[Dict[str, Any]]:
 
 def build_live_state(interval_s: float = DEFAULT_INTERVAL_S,
                      stale_after_s: float = DEFAULT_STALE_AFTER_S,
-                     api_port: Optional[int] = DEFAULT_API_PORT) -> Dict[str, Any]:
+                     api_port: Optional[int] = DEFAULT_API_PORT,
+                     refresh_remote: bool = True,
+                     discover_surface: bool = True) -> Dict[str, Any]:
     profile = _load_profile()
     raw = _read_json(STATE_FILE)
-    routing = _resolve_prompt_routing(raw, bridge_promptable=True)
+    routing = _resolve_prompt_routing(
+        raw,
+        bridge_promptable=True,
+        discover_if_missing=discover_surface,
+    )
     prompt_stats = _prompt_stats()
     task_state = _load_task_state()
     workers = _load_worker_snapshot()
     score_summary = _load_score_summary(CONSULTANT_ID)
+    backend_connected = raw.get("backend_connected", False)
+    last_bus_message = raw.get("last_bus_message")
+    if refresh_remote:
+        backend_connected = bool(_http_get("/status", timeout=2.0))
+        last_bus_message = _latest_consultant_message(limit=100)
     return {
         "id": CONSULTANT_ID,
         "display_name": profile["display_name"],
@@ -1034,8 +1045,8 @@ def build_live_state(interval_s: float = DEFAULT_INTERVAL_S,
         "stale_after_s": stale_after_s,
         "api_port": api_port,
         "api_url": f"http://localhost:{api_port}/consultants" if api_port else None,
-        "backend_connected": bool(_http_get("/status", timeout=2.0)),
-        "last_bus_message": _latest_consultant_message(limit=100),
+        "backend_connected": backend_connected,
+        "last_bus_message": last_bus_message,
         "prompt_queue": prompt_stats,
         "task_state": task_state,
         "worker_snapshot": workers,
@@ -1233,9 +1244,47 @@ def _write_offline_snapshot() -> None:
 
 def _cleanup_pid(pid_file: Path = PID_FILE) -> None:
     try:
-        pid_file.unlink(missing_ok=True)
+        if pid_file.exists():
+            owner = pid_file.read_text(encoding="utf-8").strip()
+            if owner == str(os.getpid()):
+                pid_file.unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def _acquire_pid_lock(pid_file: Path) -> bool:
+    """Atomically claim the bridge PID file to prevent duplicate writers."""  # signed: consultant
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                old_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            except Exception:
+                old_pid = 0
+            if old_pid > 0 and _pid_alive(old_pid):
+                print(f"consultant bridge already running (PID {old_pid})", flush=True)
+                return False
+            try:
+                pid_file.unlink(missing_ok=True)
+            except Exception:
+                return False
+            continue
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(str(os.getpid()))
+            return True
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            try:
+                pid_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
 
 
 def run_daemon(interval_s: float = DEFAULT_INTERVAL_S,
@@ -1246,10 +1295,9 @@ def run_daemon(interval_s: float = DEFAULT_INTERVAL_S,
                once: bool = False) -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    if _existing_daemon_alive(pid_file):
+    if not _acquire_pid_lock(pid_file):
         return 0
 
-    pid_file.write_text(str(os.getpid()), encoding="utf-8")
     atexit.register(_cleanup_pid, pid_file)
 
     server = None
@@ -1290,27 +1338,17 @@ def run_daemon(interval_s: float = DEFAULT_INTERVAL_S,
             _write_offline_snapshot()
 
     return 0
-
-
-def _existing_daemon_alive(pid_file: Path) -> bool:
-    """Check if a daemon is already running from the PID file."""
-    if not pid_file.exists():
-        return False
-    try:
-        old_pid = int(pid_file.read_text(encoding="utf-8").strip())
-    except Exception:
-        return False
-    if _pid_alive(old_pid):
-        print(f"consultant bridge already running (PID {old_pid})", flush=True)
-        return True
-    return False
-
-
 def _heartbeat_loop(interval_s, stale_after_s, effective_port):
     """Continuously write live state at the heartbeat interval."""
     while True:
         try:
-            live_state = build_live_state(interval_s, stale_after_s, effective_port)
+            live_state = build_live_state(
+                interval_s,
+                stale_after_s,
+                effective_port,
+                refresh_remote=False,
+                discover_surface=False,
+            )
             _atomic_write(STATE_FILE, live_state)
             _refresh_consultant_registry(live_state)
         except Exception as exc:

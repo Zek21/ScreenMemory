@@ -1197,8 +1197,17 @@ def _run_guard_refresh(now, last_check, status):
     return now
 
 
+MAX_DISPATCH_STALE_AGE = 3600  # 1 hour -- dispatches older than this are abandoned, not stale
+# signed: gamma
+
+
 def _check_dispatch_timeouts(now, last_check, status):
-    """Check for dispatches that never received a result."""
+    """Check for dispatches that never received a result.
+
+    Only reports dispatches between 5min and MAX_DISPATCH_STALE_AGE old.
+    Entries older than MAX_DISPATCH_STALE_AGE are auto-expired as 'abandoned'
+    to prevent infinite bus spam from ancient unreceived dispatches.
+    """
     if now - last_check < SKYNET_CHECK_INTERVAL:
         return last_check
     try:
@@ -1206,19 +1215,31 @@ def _check_dispatch_timeouts(now, last_check, status):
         if dispatch_log.exists():
             all_entries = json.loads(dispatch_log.read_text(encoding="utf-8"))
             entries = all_entries[-100:] if len(all_entries) > 100 else all_entries
+            modified = False
             if len(all_entries) > 500:
                 try:
-                    dispatch_log.write_text(json.dumps(all_entries[-200:], indent=2), encoding="utf-8")
+                    all_entries = all_entries[-200:]
+                    modified = True
                 except Exception:
                     pass
-            del all_entries
             stale = []
             for e in entries:
                 if e.get("success") and not e.get("result_received"):
                     ts = datetime.fromisoformat(e["timestamp"])
                     age_s = (datetime.now() - ts).total_seconds()
-                    if age_s > 300:
-                        stale.append({"worker": e["worker"], "task": e["task_summary"][:60], "age_min": round(age_s / 60, 1)})
+                    if age_s > MAX_DISPATCH_STALE_AGE:
+                        # Auto-expire ancient dispatches -- they will never get results
+                        e["result_received"] = True
+                        e["result_status"] = "abandoned"
+                        e["abandoned_at"] = datetime.now().isoformat()
+                        modified = True
+                    elif age_s > 300:
+                        stale.append({"worker": e["worker"], "task": e.get("task_summary", "?")[:60], "age_min": round(age_s / 60, 1)})
+            if modified:
+                try:
+                    dispatch_log.write_text(json.dumps(all_entries, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
             if stale:
                 status["stale_dispatches"] = len(stale)
                 summary = ", ".join(f"{s['worker']}({s['age_min']}m)" for s in stale[:5])

@@ -216,7 +216,7 @@ class StealthLauncher:
             chrome_path,
             f"--remote-debugging-port={self._port}",
             f"--user-data-dir={self.get_user_data_dir()}",
-            f"--profile-directory={profile}",
+            f'--profile-directory="{profile}"',
             *self._BASE_CHROME_ARGS,
             *self._MODE_ARGS.get(mode.name, []),
             *(extra_args or []),

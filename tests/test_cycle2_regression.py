@@ -461,6 +461,13 @@ class TestBootScriptIntegrity:
         assert "8425" in content or "gemini" in content.lower()
         # signed: alpha
 
+    def test_consultant_boot_scripts_honor_self_prompt_kill_switch(self):
+        for name in ("CC-Start.ps1", "GC-Start.ps1"):
+            content = (ROOT / name).read_text(encoding="utf-8-sig")
+            assert "function Test-SelfPromptEnabled" in content
+            assert "Self-prompt daemon SKIPPED (brain_config self_prompt.enabled=false)" in content
+        # signed: consultant
+
     def test_skynet_start_port_open_checks_ipv4_and_ipv6_loopback(self):
         path = ROOT / "tools" / "skynet_start.py"
         assert path.exists(), "tools/skynet_start.py missing"

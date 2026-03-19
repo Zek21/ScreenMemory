@@ -370,5 +370,27 @@
     },
     "score": 1.0,
     "score_history": []
+  },
+  "website-worker": {
+    "name": "website-worker",
+    "role": "Website Manager",
+    "model": "Claude Opus 4.6 (fast mode)",
+    "type": "external",
+    "hwnd": 657970,
+    "domain": "WordPress/website management",
+    "project_path": "D:\\\\ML\\\\exzilcalanza-blogs",
+    "capabilities": [
+      "wordpress",
+      "blog-management",
+      "content-publishing",
+      "seo"
+    ],
+    "specializations": [
+      "exzilcalanza.info",
+      "WordPress REST API",
+      "WP-CLI",
+      "content updates"
+    ],
+    "current_status": "registered"
   }
 }

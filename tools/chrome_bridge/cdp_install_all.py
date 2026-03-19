@@ -65,7 +65,7 @@ def launch_chrome(profile_dir):
         f'--remote-debugging-port={CDP_PORT}',
         '--remote-allow-origins=*',
         f'--user-data-dir={USER_DATA}',
-        f'--profile-directory={profile_dir}',
+        f'--profile-directory="{profile_dir}"',
         '--no-first-run',
         'chrome://extensions',
     ]

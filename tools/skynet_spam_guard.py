@@ -211,8 +211,15 @@ class SpamGuard:
 
     # ── Pattern-Specific Spam Detection ─────────────────────────
 
-    def _check_spam_patterns(self, message: dict, fp: str) -> Optional[str]:
-        """Check for specific spam patterns. Returns reason if spam, None if OK."""
+    def _check_spam_patterns(self, message: dict, fp: str,
+                               record: bool = True) -> Optional[str]:
+        """Check for specific spam patterns. Returns reason if spam, None if OK.
+
+        Args:
+            record: If False, skip _record_fingerprint calls (read-only mode).
+                    Used by check_would_be_blocked() to avoid side effects.
+        """
+        # signed: gamma — fix: added record param to prevent side effects in read-only path
         sender = str(message.get("sender", "")).lower()
         topic = str(message.get("topic", "")).lower()
         msg_type = str(message.get("type", "")).lower()
@@ -233,8 +240,8 @@ class SpamGuard:
             if self.is_duplicate(vote_fp, PATTERN_WINDOWS["convene_gate_vote"]):
                 return (f"spam_convene_vote_dupe: {sender} already voted on "
                         f"{gate_id}")
-            # Record vote fingerprint
-            self._record_fingerprint(vote_fp)
+            if record:
+                self._record_fingerprint(vote_fp)
 
         # 3. Identical result messages from same sender within 300s
         if msg_type == "result":
@@ -248,7 +255,8 @@ class SpamGuard:
             if self.is_duplicate(daemon_fp, PATTERN_WINDOWS["daemon_health"]):
                 return (f"spam_daemon_health: {sender} sent daemon_health "
                         f"within 60s")
-            self._record_fingerprint(daemon_fp)
+            if record:
+                self._record_fingerprint(daemon_fp)
 
         # 5. knowledge/learning duplicates within 1800s
         if topic in ("knowledge", "learning") or msg_type == "learning":
@@ -265,7 +273,8 @@ class SpamGuard:
             if self.is_duplicate(dead_fp, PATTERN_WINDOWS["dead_alert"]):
                 return (f"spam_dead_alert_dupe: DEAD alert for {dead_worker} "
                         f"within 120s")
-            self._record_fingerprint(dead_fp)
+            if record:
+                self._record_fingerprint(dead_fp)
 
         return None
         # signed: alpha
@@ -295,12 +304,18 @@ class SpamGuard:
             return {"allowed": False, "reason": reason, "fingerprint": fp}
 
         # Check 3: Per-sender rate limiting (priority-aware)
-        # Messages with metadata.priority=critical bypass rate limits
-        # Messages with metadata.priority=low get stricter limits (2/min)
+        # Messages with metadata.priority=critical bypass rate limits,
+        # but ONLY from authorized senders (system, monitor, orchestrator).
+        # Untrusted senders with priority=critical are downgraded to normal.
+        # signed: gamma — fix: critical priority bypass security hole
+        _CRITICAL_AUTHORIZED = {"system", "monitor", "orchestrator", "watchdog"}
         priority = "normal"
         if isinstance(message.get("metadata"), dict):
             priority = message["metadata"].get("priority", "normal")
-        skip_rate_limit = (priority == "critical")
+        skip_rate_limit = (
+            priority == "critical"
+            and sender.lower().strip() in _CRITICAL_AUTHORIZED
+        )
 
         if not skip_rate_limit:
             if priority == "low" and "low" in PRIORITY_RATE_OVERRIDES:
@@ -621,11 +636,16 @@ def run_self_test():
     rl2 = guard.is_rate_limited("normal_sender", max_per_minute=5)
     check("rate_limit passes for clean sender", rl2 is None)
 
+    # Use per-run nonce in test content to avoid Go backend 60s dedup interference
+    # signed: gamma — fix: test isolation from Go server-side dedup
+    import os
+    _nonce = os.urandom(4).hex()
+
     # Test 7: Pattern -- convene gate-proposal dupe
     guard.reset()
     gate_msg = {"sender": "_test_delta", "topic": "convene",
                 "type": "gate-proposal",
-                "content": "proposal gate_789__test_delta some issue"}
+                "content": f"proposal gate_789__test_delta issue {_nonce}a"}
     r1 = guard.publish_guarded(gate_msg)
     check("first gate-proposal allowed", r1["allowed"])
     r2 = guard.publish_guarded(gate_msg)
@@ -636,7 +656,7 @@ def run_self_test():
     # Test 8: Pattern -- result dupe within 300s
     guard.reset()
     result_msg = {"sender": "_test_spam_sender", "topic": "orchestrator",
-                  "type": "result", "content": "task done successfully"}
+                  "type": "result", "content": f"task done {_nonce}b"}
     r3 = guard.publish_guarded(result_msg)
     check("first result allowed", r3["allowed"])
     r4 = guard.publish_guarded(result_msg)
@@ -645,15 +665,16 @@ def run_self_test():
     # Test 9: Pattern -- daemon_health within 60s
     guard.reset()
     health_msg = {"sender": "idle_monitor", "topic": "orchestrator",
-                  "type": "daemon_health", "content": "healthy"}
+                  "type": "daemon_health", "content": f"healthy {_nonce}c"}
     r5 = guard.publish_guarded(health_msg)
     check("first daemon_health allowed", r5["allowed"])
     r6 = guard.publish_guarded(health_msg)
     check("daemon_health within 60s blocked", not r6["allowed"])
 
-    # Test 10: Stats tracking
+    # Test 10: Stats tracking (after test 9's reset, only 1 block from daemon_health)
     stats = guard.get_stats()
-    check("stats tracks blocked count", stats["total_blocked"] >= 3)
+    check("stats tracks blocked count", stats["total_blocked"] >= 1)
+    # signed: gamma — fix: stats check reflects reset() between test pairs
     check("stats tracks by pattern",
           len(stats["blocked_by_pattern"]) >= 1)
 
@@ -737,6 +758,23 @@ def main():
 #        guarded_publish({"sender": "x", "topic": "y", "type": "z", "content": "..."})
 # signed: alpha — removed stray delta_identity_ack() (dead code, wrong module)
 
+# Fallback rate limiter: lightweight in-memory counter used when SpamGuard
+# initialization fails (e.g., corrupted state file). Prevents unguarded
+# bus flooding through the fallback path.  # signed: gamma
+_fallback_timestamps: dict = {}  # sender -> list of timestamps
+
+
+def _fallback_rate_ok(sender: str, max_per_minute: int = 5) -> bool:
+    """Basic in-memory rate check for the fallback publish path."""
+    now = time.time()
+    ts = _fallback_timestamps.get(sender, [])
+    ts = [t for t in ts if now - t < 60]
+    if len(ts) >= max_per_minute:
+        return False
+    ts.append(now)
+    _fallback_timestamps[sender] = ts
+    return True
+
 _singleton_guard: Optional[SpamGuard] = None
 
 
@@ -766,7 +804,12 @@ def guarded_publish(msg: dict) -> dict:
             _singleton_guard = SpamGuard()
         return _singleton_guard.publish_guarded(msg)
     except Exception:
-        # Fallback: publish directly if guard is broken -- never drop messages
+        # Fallback: publish with basic in-memory rate check to prevent abuse.
+        # Without this, a corrupted state file would disable all spam protection.
+        # signed: gamma — fix: fallback guard bypass vulnerability
+        if not _fallback_rate_ok(str(msg.get("sender", "unknown"))):
+            return {"allowed": False, "fallback": True,
+                    "reason": "fallback_rate_limited"}
         try:
             SpamGuard._bus_post(msg)
             return {"allowed": True, "fallback": True, "reason": "guard_init_failed"}
@@ -815,8 +858,8 @@ def check_would_be_blocked(msg: dict) -> dict:
         fp = guard.fingerprint(msg)
         checks = {"pattern": None, "dedup": None, "rate_limit": None}
 
-        # Check 1: Pattern-specific spam
-        pattern_reason = guard._check_spam_patterns(msg, fp)
+        # Check 1: Pattern-specific spam (read-only: no fingerprint recording)
+        pattern_reason = guard._check_spam_patterns(msg, fp, record=False)
         if pattern_reason:
             checks["pattern"] = pattern_reason
             return {

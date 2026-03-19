@@ -113,5 +113,75 @@
       "Can run --watch mode for continuous monitoring"
     ],
     "lesson": "VS Code user settings can change between sessions (auto-updates, sync, experiments). All critical settings must be verified at boot time, not assumed stable."
+  },
+  {
+    "id": "INCIDENT_017",
+    "title": "HardwareEnter Focus Theft -- Stuck Unsubmitted Prompt in Beta",
+    "date": "2026-03-19",
+    "severity": "HIGH",
+    "status": "OPEN",
+    "affected_worker": "beta",
+    "affected_hwnd": 5638328,
+    "symptom": "V8 paper revision task text visible in Beta input box but NEVER SUBMITTED. dispatch_log shows success=True result_received=False.",
+    "root_causes": [
+      {
+        "issue": "keybd_event(0x0D) HardwareEnter sends VK_RETURN to OS input queue, hitting whatever has keyboard focus -- NOT targeted to specific HWND. Apply dialog (30 files changed +7563 -129) at top of Beta window stole Chromium internal focus during 300ms gap between Ctrl+V paste and Enter.",
+        "code_location": "tools/skynet_dispatch.py lines 999-1003 (HardwareEnter), lines 1183/1205/1232/1255 (300ms Sleep before Enter)",
+        "mechanism": "Paste path: SendKeys.SendWait(^v) -> Sleep 300ms -> keybd_event(VK_RETURN). During 300ms gap, VS Code Apply dialog captures Chromium keyboard focus. keybd_event Enter goes to Apply area instead of chat input. Text sits in input box unsubmitted.",
+        "fix_proposed": "Replace keybd_event with PostMessage WM_KEYDOWN/WM_CHAR directly to renderHwnd (HWND-targeted, immune to focus theft). Alternative: reduce 300ms gap + add post-Enter verification."
+      },
+      {
+        "issue": "IDLE->IDLE false positive in _verify_delivery() masks the failure. Lines 1877-1879 assume IDLE->IDLE means CLI processed fast. In reality it means Enter never reached chat input.",
+        "code_location": "tools/skynet_dispatch.py lines 1877-1879",
+        "mechanism": "Worker stays IDLE (no task submitted). After 8s polling, _verify_delivery sees pre_state==IDLE and final_state==IDLE, returns True with log ASSUMED OK. This prevents retry logic (lines 1766-1798) from ever firing.",
+        "fix_proposed": "Remove IDLE->IDLE assumption. Return False when state unchanged after 8s. Let retry logic at lines 1766-1798 re-attempt delivery."
+      }
+    ],
+    "cascade_analysis": {
+      "ghost_type_to_worker": "Returns True -- PS script reports OK_RENDER_ATTACHED because paste succeeded. PS has no way to verify Enter reached correct target.",
+      "_execute_ghost_dispatch": "Returns True -- stdout contains OK_*, returncode==0.",
+      "_verify_delivery": "Returns True -- IDLE->IDLE false positive at line 1877.",
+      "dispatch_to_worker": "Returns True -- both ghost_type and verify report success.",
+      "dispatch_log": "Records success=True, result_received=False. No alarm raised.",
+      "net_effect": "Silent total delivery failure with no detection at any layer."
+    },
+    "proposed_fixes": [
+      {
+        "id": "FIX_A",
+        "title": "PostMessage WM_KEYDOWN to render widget HWND",
+        "priority": "HIGH",
+        "description": "Replace keybd_event(0x0D) with PostMessage(renderHwnd, WM_KEYDOWN, VK_RETURN, 0) + PostMessage(renderHwnd, WM_KEYUP, VK_RETURN, 0). HWND-targeted Enter is immune to focus theft. Fallback: PostMessage(renderHwnd, WM_CHAR, 0x000D, 0) if WM_KEYDOWN is ignored by Chromium.",
+        "risk": "MEDIUM -- Chromium may not process WM_KEYDOWN via PostMessage for all key codes. Needs testing. WM_CHAR with carriage return is more reliable for text input."
+      },
+      {
+        "id": "FIX_B",
+        "title": "Remove IDLE->IDLE false positive in _verify_delivery()",
+        "priority": "CRITICAL",
+        "description": "Lines 1877-1879: change return True to return False. IDLE->IDLE after 8s polling means delivery was NOT confirmed. This unblocks the retry logic at lines 1766-1798 which will re-attempt ghost_type + Enter.",
+        "risk": "LOW -- may cause extra retries for genuinely fast-processed messages, but that is preferable to silent delivery failure."
+      },
+      {
+        "id": "FIX_C",
+        "title": "Post-Enter input text consumption check",
+        "priority": "MEDIUM",
+        "description": "After HardwareEnter(), wait 500ms and check if render widget input still contains dispatch text (via UIA or clipboard re-read of input). If text remains, Enter was not received by chat input -- fire pyautogui.press(enter) as targeted fallback.",
+        "risk": "LOW -- adds 500ms latency per dispatch. UIA access to input content may be unreliable."
+      }
+    ],
+    "recommended_fix_order": [
+      "FIX_B (remove false positive -- safety net)",
+      "FIX_A (PostMessage -- prevent the failure)",
+      "FIX_C (post-Enter check -- defense in depth)"
+    ],
+    "related_incidents": [
+      "INCIDENT_013 (Chromium quickpick unreachable via Win32)",
+      "INCIDENT_014 (SendKeys ENTER fails on Chromium render widgets)"
+    ],
+    "architecture_knowledge": {
+      "keybd_event_is_untargeted": "keybd_event(VK_RETURN) sends through OS input queue to current focus owner. NOT HWND-targeted. Any focus change between paste and Enter causes misdelivery.",
+      "300ms_gap_is_vulnerability_window": "The 300ms Sleep between Ctrl+V and HardwareEnter exists to let Chromium process the paste. But any dialog/overlay/internal focus shift during this window causes Enter to go to wrong target.",
+      "apply_dialog_steals_focus": "VS Code Apply dialog (file diff review) is rendered at top of Copilot CLI window. It competes with chat input for Chromium internal keyboard focus. Particularly dangerous during paste operations.",
+      "idle_idle_is_ambiguous": "IDLE->IDLE after polling means EITHER (a) message submitted and processed fast OR (b) Enter never reached chat input. Cannot distinguish without checking input text state."
+    }
   }
 ]

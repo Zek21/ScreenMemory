@@ -384,7 +384,7 @@ def run_daemon():
         log("Activity feed shutting down (Ctrl+C)")
     finally:
         _save_activity(activity_data)
-        _cleanup_pid()
+        _release_singleton()  # signed: delta — fix: was calling undefined function
 
 
 def show_status():
