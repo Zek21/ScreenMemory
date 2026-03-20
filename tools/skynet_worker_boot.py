@@ -193,7 +193,8 @@ def _get_identity_prompt(name):
     """
     return (
         f"You are {name.upper()}, a Skynet worker. "
-        f"Run this command to announce yourself:\n\n"
+        f"DO NOT create, edit, or modify any files. DO NOT use the edit or create tools. "
+        f"ONLY run this exact command:\n\n"
         f"python -c \"import requests; "
         f"requests.post('http://localhost:8420/bus/publish', "
         f"json={{'sender':'{name}','topic':'orchestrator',"
