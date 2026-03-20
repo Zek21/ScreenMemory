@@ -90,11 +90,36 @@ class StealthLauncher:
 
     @staticmethod
     def get_user_data_dir() -> str:
-        """Get default Chrome user data directory."""
+        """Get default Chrome user data directory.
+
+        NOTE: This returns the REAL default Chrome dir, used for reading
+        profile metadata (Local State, info_cache). Do NOT pass this to
+        --user-data-dir when launching Chrome with CDP — Chrome v146+
+        refuses to bind --remote-debugging-port on the default dir.
+        Use get_cdp_user_data_dir() for CDP launches instead.
+        """
         return os.path.join(
             os.environ.get('LOCALAPPDATA', ''),
             "Google", "Chrome", "User Data"
         )
+
+    @staticmethod
+    def get_cdp_user_data_dir() -> str:
+        """Get non-default user data directory for CDP-enabled Chrome launches.
+
+        Chrome v146+ refuses to bind --remote-debugging-port when
+        --user-data-dir points to the default User Data directory. It prints:
+        'DevTools remote debugging requires a non-default data directory'
+        and silently skips the debug port.
+
+        This returns a separate directory under the ScreenMemory data/ folder.
+        Cookie encryption is path-bound — users must log in fresh when
+        switching to this non-default directory.
+        """  # signed: alpha
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        cdp_dir = os.path.join(repo_root, "data", "chrome_cdp_userdata")
+        os.makedirs(cdp_dir, exist_ok=True)
+        return cdp_dir
 
     @staticmethod
     def list_profiles() -> List[Dict]:
@@ -172,6 +197,70 @@ class StealthLauncher:
         except Exception:
             return False
 
+    @classmethod
+    def install_extension(cls, profile: str = "SOCIALS",
+                          url: str = "chrome://extensions") -> bool:
+        """Load Chrome Bridge extension into a real Chrome profile via --load-extension.
+
+        Launches Chrome with the REAL user data directory (not the CDP sandbox)
+        and the --load-extension flag. This registers the extension in the target
+        profile without any chrome://extensions UI automation.
+
+        No --remote-debugging-port is used because Chrome v146+ refuses CDP
+        on the default user data dir. The extension registers on launch anyway.
+
+        Args:
+            profile: Profile display name (e.g. "SOCIALS") or directory
+                     (e.g. "Profile 17"). Resolved via resolve_profile().
+            url: URL to open after launch (default: chrome://extensions for
+                 visual verification).
+
+        Returns:
+            True if Chrome launched successfully, False otherwise.
+        """  # signed: gamma
+        chrome_path = cls.find_chrome()
+        if not chrome_path:
+            logger.error("Chrome not found")
+            return False
+
+        ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'extension')
+        if not os.path.isfile(os.path.join(ext_dir, 'manifest.json')):
+            logger.error(f"Extension manifest not found at {ext_dir}")
+            return False
+
+        # Resolve profile name to directory
+        try:
+            resolved = cls.resolve_profile(profile)
+            profile_dir = resolved['directory']
+            profile_name = resolved['name']
+        except ValueError:
+            profile_dir = profile
+            profile_name = profile
+
+        user_data_dir = cls.get_user_data_dir()
+        args = [
+            chrome_path,
+            f'--user-data-dir={user_data_dir}',
+            f'--profile-directory="{profile_dir}"',
+            f'--load-extension={ext_dir}',
+            '--no-first-run',
+            '--no-default-browser-check',
+            url,
+        ]
+
+        logger.info(f"Installing Chrome Bridge extension to profile "
+                     f"{profile_dir} ({profile_name})")
+        creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        try:
+            subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             creationflags=creation_flags)
+            logger.info(f"Chrome launched with --load-extension for {profile_dir}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to launch Chrome: {e}")
+            return False
+
     _BASE_CHROME_ARGS = [
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
@@ -183,6 +272,9 @@ class StealthLauncher:
         "--no-default-browser-check",
         "--mute-audio",
     ]
+
+    # Auto-resolve Chrome Bridge extension path
+    _EXTENSION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'extension')
 
     _MODE_ARGS = {
         'HEADLESS': ["--headless=new", "--disable-gpu", "--window-size=1920,1080"],
@@ -211,17 +303,25 @@ class StealthLauncher:
         return cdp
 
     def _build_chrome_args(self, chrome_path, profile, mode, url, extra_args):
-        """Assemble Chrome command-line arguments."""
+        """Assemble Chrome command-line arguments.
+
+        Uses get_cdp_user_data_dir() instead of the default Chrome dir because
+        Chrome v146+ refuses --remote-debugging-port on the default directory.
+        """  # signed: alpha
         args = [
             chrome_path,
             f"--remote-debugging-port={self._port}",
-            f"--user-data-dir={self.get_user_data_dir()}",
+            f"--user-data-dir={self.get_cdp_user_data_dir()}",
             f'--profile-directory="{profile}"',
             *self._BASE_CHROME_ARGS,
             *self._MODE_ARGS.get(mode.name, []),
             *(extra_args or []),
             url,
         ]
+        # Auto-load Chrome Bridge extension
+        if not any('load-extension' in a for a in args):
+            if os.path.isfile(os.path.join(self._EXTENSION_DIR, 'manifest.json')):
+                args.insert(-1, f'--load-extension={self._EXTENSION_DIR}')
         return args
 
     def _spawn_chrome(self, args, mode, profile):
@@ -1315,7 +1415,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='Autonomous Agent -- AI-driven web navigation')
     parser.add_argument('command', choices=['interactive', 'script', 'profiles',
-                                            'stealth', 'perceive', 'status'],
+                                            'stealth', 'perceive', 'status',
+                                            'install-ext'],
                         help='Command to run')
     parser.add_argument('--url', default=None, help='Target URL')
     parser.add_argument('--profile', default=None,
@@ -1333,8 +1434,21 @@ def main():
         'interactive': lambda: _cmd_interactive(args),
         'script':      lambda: _cmd_script(args),
         'stealth':     lambda: _cmd_stealth(args),
+        'install-ext': lambda: _cmd_install_ext(args),
     }
     handlers[args.command]()
+
+
+def _cmd_install_ext(args):
+    """Install Chrome Bridge extension into a Chrome profile via --load-extension."""  # signed: gamma
+    profile = args.profile or 'SOCIALS'
+    print(f"Installing Chrome Bridge extension to profile: {profile}")
+    ok = StealthLauncher.install_extension(profile=profile)
+    if ok:
+        print(f"Chrome launched with --load-extension for {profile}")
+        print("Extension should appear in chrome://extensions within seconds.")
+    else:
+        print("FAILED: Could not launch Chrome for extension install")
 
 
 if __name__ == '__main__':

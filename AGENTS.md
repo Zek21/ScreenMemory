@@ -1165,6 +1165,8 @@ For the complete daemon lifecycle (startup, singleton enforcement, signal handli
 | World perception | `PerceptionEngine` from `tools/chrome_bridge/perception.py` (unified Win32+UIA+CDP spatial graph) | parsing window titles, manual DOM |
 | UI element detection | `SetOfMarkGrounding` from `core/grounding/set_of_mark.py` (visual grounding + markers) | coordinate guessing, pixel analysis |
 | Desktop input | `Desktop.hotkey()`, `.type_text()`, `.click_element()` | pyautogui.hotkey(), pyautogui.click() |
+| Mouse clicks (no cursor steal) | `ghost_mouse.py` — `ghost_click(hwnd,x,y)`, `ghost_right_click`, `ghost_double_click`, `ghost_scroll`, `invoke_by_name` via PostMessage/UIA InvokePattern | pyautogui.click(), SendInput, SetCursorPos, mouse_event |
+| Chromium element clicks | `ghost_mouse.py` — `ghost_click_render(hwnd,x,y)` finds Chrome_RenderWidgetHostHWND and PostMessages to it; `cdp_click(port,selector)` for JS-level clicks | pyautogui.click() on screen coords |
 
 ## Full Capability Stack
 

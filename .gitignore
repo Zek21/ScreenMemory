@@ -67,3 +67,6 @@ tools/.playwright-mcp/
 
 # Lance vector DB
 *.lance/
+
+# Chrome CDP non-default user data (Chrome v146+ requires this for --remote-debugging-port)
+data/chrome_cdp_userdata/

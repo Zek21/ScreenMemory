@@ -33,15 +33,8 @@ import os
 import sys
 import time
 
-# Lazy imports for pyautogui (not always available)
-_pyautogui = None
-
-def _get_pyautogui():
-    global _pyautogui
-    if _pyautogui is None:
-        import pyautogui
-        _pyautogui = pyautogui
-    return _pyautogui
+# Ghost mouse imports for cursor-free key presses  # signed: alpha
+from tools.ghost_mouse import ghost_key_press, ghost_hotkey, VK_F6, VK_CONTROL, VK_L
 
 
 def _get_uia():
@@ -100,8 +93,7 @@ def clear_apply_panel(hwnd, name="worker", f6_count=4, retries=2):
 
     Returns True if Apply was cleared, False if it persists.
     """
-    pyautogui = _get_pyautogui()
-    u = ctypes.windll.user32
+    u = ctypes.windll.user32  # signed: alpha
 
     for attempt in range(retries):
         # Focus the window
@@ -118,13 +110,13 @@ def clear_apply_panel(hwnd, name="worker", f6_count=4, retries=2):
             u.SetForegroundWindow(hwnd)
             time.sleep(0.5)
 
-        # F6 to cycle panel focus into chat panel
+        # F6 to cycle panel focus into chat panel (PostMessage, no cursor steal)
         for _ in range(f6_count):
-            pyautogui.press('f6')
+            ghost_key_press(hwnd, VK_F6)  # signed: alpha
             time.sleep(0.2)
 
-        # Ctrl+L to start new conversation
-        pyautogui.hotkey('ctrl', 'l')
+        # Ctrl+L to start new conversation (PostMessage, no cursor steal)
+        ghost_hotkey(hwnd, VK_CONTROL, VK_L)  # signed: alpha
         time.sleep(1.5)
 
         # Check if Apply is gone

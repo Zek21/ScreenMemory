@@ -258,7 +258,6 @@ class CDP:
         self._verify_connection()
 
     @classmethod
-    @classmethod
     def _compute_auto_position(cls, extra_args):
         """Compute window position/size args to avoid overlap. Modifies extra_args in place."""
         if sys.platform != 'win32':
@@ -354,20 +353,48 @@ class CDP:
 
     @classmethod
     def launch(cls, chrome_path=None, port=9222, user_data_dir=None,
-               headless=False, extra_args=None, timeout=30):
-        """Launch Chrome with remote debugging enabled."""
+               headless=False, extra_args=None, timeout=30,
+               profile_directory=None):
+        """Launch Chrome with remote debugging enabled.
+
+        Chrome v146+ refuses to bind --remote-debugging-port when
+        --user-data-dir is the default Chrome User Data directory. If no
+        user_data_dir is provided, this method auto-generates a non-default
+        directory under data/chrome_cdp_userdata/ to ensure CDP works.
+        Cookie encryption is path-bound — users must log in fresh with
+        non-default dirs.
+
+        Args:
+            profile_directory: Chrome profile directory name (e.g. "Profile 17").
+                If provided, adds --profile-directory flag. The extension is
+                always auto-loaded via --load-extension.
+        """  # signed: gamma
         if not chrome_path:
             chrome_path = cls._find_chrome()
         if not chrome_path:
             raise CDPError('Chrome not found. Provide chrome_path=...')
 
+        # Chrome v146+: MUST use non-default user-data-dir for CDP.
+        # If caller didn't specify one, generate a safe non-default path.
+        if not user_data_dir:
+            _repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            user_data_dir = os.path.join(_repo, "data", "chrome_cdp_userdata")
+            os.makedirs(user_data_dir, exist_ok=True)
+
         args = [chrome_path, f'--remote-debugging-port={port}', '--remote-allow-origins=*']
-        if user_data_dir:
-            args.append(f'--user-data-dir={user_data_dir}')
+        args.append(f'--user-data-dir={user_data_dir}')
+        if profile_directory:
+            args.append(f'--profile-directory="{profile_directory}"')
         if headless:
             args.append('--headless=new')
 
         extra_args = list(extra_args or [])
+
+        # Auto-load Chrome Bridge extension if not already specified
+        if not any('load-extension' in a for a in extra_args):
+            ext_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'extension')
+            if os.path.isfile(os.path.join(ext_dir, 'manifest.json')):
+                extra_args.append(f'--load-extension={ext_dir}')
 
         if not headless:
             try:

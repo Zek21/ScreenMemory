@@ -183,5 +183,56 @@
       "apply_dialog_steals_focus": "VS Code Apply dialog (file diff review) is rendered at top of Copilot CLI window. It competes with chat input for Chromium internal keyboard focus. Particularly dangerous during paste operations.",
       "idle_idle_is_ambiguous": "IDLE->IDLE after polling means EITHER (a) message submitted and processed fast OR (b) Enter never reached chat input. Cannot distinguish without checking input text state."
     }
+  },
+  {
+    "id": "INCIDENT_018",
+    "title": "Apply Panel Blocks Ghost-Type Enter Key Submission",
+    "date": "2026-03-20",
+    "severity": "HIGH",
+    "status": "MITIGATED",
+    "reporter": "delta",
+    "signed_by": "delta",
+    "root_cause": "When workers generate code changes in Copilot CLI mode, VS Code creates an Apply panel (showing N files changed). This Apply panel steals internal Chromium focus away from the chat input box. The ghost_type dispatch pipeline writes text to the chat input via clipboard paste (PostMessage WM_PASTE), which succeeds. However, the subsequent Enter key submission via keybd_event(0x0D) sends VK_RETURN to the OS input queue, which delivers it to whatever has focus -- the Apply panel, not the chat input. Result: prompt text appears in the input box but is never submitted. The worker appears IDLE with unsubmitted text.",
+    "symptoms": [
+      "Worker shows IDLE state but has unsubmitted text in chat input",
+      "_verify_delivery() returns False (IDLE->IDLE, no state transition)",
+      "dispatch_log.json shows success=True but result_received=False",
+      "Apply panel visible in worker window with N files changed banner"
+    ],
+    "affected_components": [
+      "tools/skynet_dispatch.py - ghost_type_to_worker()",
+      "tools/skynet_dispatch.py - _verify_delivery()",
+      "tools/skynet_dispatch.py - HardwareEnter / SafeEnter"
+    ],
+    "fix_applied": {
+      "description": "Three-layer fix by Beta+Alpha, cross-validated by Delta: (1) SafeEnter: checks GetForegroundWindow before and after Enter, restores focus if stolen. EDIT path now passes child Edit HWND instead of top-level window HWND. (2) PostMessageEnter: for CHROME_RENDER paths, sends WM_KEYDOWN/WM_KEYUP VK_RETURN directly to the render widget HWND via PostMessage, bypassing the OS input queue entirely. (3) _verify_delivery false positives removed: IDLE->IDLE no longer returns True with ASSUMED_OK -- now returns False with WARN UNVERIFIED, preventing dispatch_log from recording success=True on unsubmitted prompts.",
+      "files_changed": [
+        "tools/skynet_dispatch.py"
+      ],
+      "authors": [
+        "beta",
+        "alpha"
+      ],
+      "cross_validated_by": [
+        "delta"
+      ]
+    },
+    "recovery_procedure": "If an Apply panel is blocking a worker: (1) press Escape to dismiss the panel, (2) type /clear + Enter to clear session, (3) re-dispatch via ghost_type. This is keyboard-only -- no cursor movement. SetForegroundWindow ensures the correct window has focus before keyboard input.",
+    "prevention": [
+      "Workers MUST use Copilot CLI mode (not Agent/Edits) per INCIDENT 015",
+      "PostMessageEnter bypasses OS input queue for CHROME_RENDER paths",
+      "SafeEnter verifies focus before and after for EDIT paths",
+      "_verify_delivery catches IDLE->IDLE false positives"
+    ],
+    "related_incidents": [
+      "INCIDENT_015",
+      "INCIDENT_017"
+    ],
+    "lessons_learned": [
+      "keybd_event sends to OS input queue (whatever has focus), not to a target HWND",
+      "PostMessage WM_KEYDOWN/WM_KEYUP is the safe alternative for targeted key delivery",
+      "Apply panels in Copilot CLI steal Chromium focus silently",
+      "_verify_delivery must never assume IDLE->IDLE means success"
+    ]
   }
 ]

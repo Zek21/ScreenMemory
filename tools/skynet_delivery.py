@@ -453,7 +453,7 @@ def _focus_shared_orchestrator_pane(hwnd: int) -> bool:
         return False
 
     try:
-        import pyautogui
+        from tools.ghost_mouse import ghost_click_render  # signed: alpha
 
         rect = ctypes.wintypes.RECT()
         if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
@@ -463,9 +463,10 @@ def _focus_shared_orchestrator_pane(hwnd: int) -> bool:
         if width <= 0 or height <= 0:
             return False
 
-        focus_x = rect.left + int(width * 0.18)
-        focus_y = rect.top + int(height * 0.93)
-        pyautogui.click(focus_x, focus_y)
+        # Use client-relative coords with ghost_click_render (no cursor steal)
+        client_x = int(width * 0.18)
+        client_y = int(height * 0.93)
+        ghost_click_render(hwnd, client_x, client_y)
         time.sleep(0.2)
         return True
     except Exception:

@@ -311,16 +311,17 @@ def step6_dispatch_identity(name: str, hwnd: int, gx: int, gy: int, orch_hwnd: i
             u32.SetForegroundWindow(hwnd)
             time.sleep(1.0 if attempt == 0 else 1.5)
 
-            # Click in the input area
-            pyautogui.click(gx + cx, gy + cy)
+            # Click in the input area (PostMessage — no cursor steal)  # signed: alpha
+            from tools.ghost_mouse import ghost_click_render, ghost_keybd_press, ghost_keybd_hotkey, VK_RETURN, VK_CONTROL, VK_V
+            ghost_click_render(hwnd, cx, cy)
             time.sleep(0.5)
 
-            # Paste the prompt
-            pyautogui.hotkey('ctrl', 'v')
+            # Paste the prompt (keybd_event — no cursor steal, works with Chrome render)
+            ghost_keybd_hotkey(VK_CONTROL, VK_V)  # signed: alpha
             time.sleep(0.5)
 
-            # Submit
-            pyautogui.press('enter')
+            # Submit (keybd_event — no cursor steal, works with Chrome render)
+            ghost_keybd_press(VK_RETURN)  # signed: alpha
             time.sleep(1.0)
 
             # Restore clipboard and return focus to orchestrator

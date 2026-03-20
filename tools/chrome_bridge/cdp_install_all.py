@@ -57,15 +57,18 @@ def kill_chrome():
 
 
 def launch_chrome(profile_dir):
-    """Launch Chrome with CDP for a specific profile.
+    """Launch Chrome with --load-extension for a specific profile.
+    Uses --load-extension flag to auto-register the extension, avoiding the
+    fragile chrome://extensions UI automation entirely.
     Direct subprocess launch avoids PowerShell ArgumentList splitting profile
-    names like "Profile 3" into a bogus trailing URL ("0.0.0.3")."""
+    names like "Profile 3" into a bogus trailing URL ("0.0.0.3")."""  # signed: gamma
     args = [
         CHROME_PATH,
         f'--remote-debugging-port={CDP_PORT}',
         '--remote-allow-origins=*',
         f'--user-data-dir={USER_DATA}',
         f'--profile-directory="{profile_dir}"',
+        f'--load-extension={EXTENSION_PATH}',
         '--no-first-run',
         'chrome://extensions',
     ]
@@ -233,14 +236,17 @@ def main():
 
 
 def _install_profile(profile_dir, profile_name):
-    """Install extension on a single Chrome profile."""
+    """Install extension on a single Chrome profile.
+    Uses --load-extension flag (set in launch_chrome) for automatic registration.
+    Falls back to UI-based install_on_tab if CDP verification shows extension
+    was not loaded by the flag."""  # signed: gamma
     print(f"[{profile_dir}] ({profile_name})")
 
     killed = kill_chrome()
     if killed:
         print(f"    Killed {killed} Chrome processes")
 
-    print(f"    Launching Chrome...")
+    print(f"    Launching Chrome with --load-extension...")
     launch_chrome(profile_dir)
 
     chrome = wait_for_cdp()
@@ -254,6 +260,28 @@ def _install_profile(profile_dir, profile_name):
         return False
 
     tab = tabs[0]['id']
+    # --load-extension should have auto-registered it; verify via CDP
+    time.sleep(3)
+    check = chrome.eval(tab, """
+        (function() {
+            var mgr = document.querySelector('extensions-manager');
+            if (!mgr || !mgr.shadowRoot) return 'no-manager';
+            var list = mgr.shadowRoot.querySelector('extensions-item-list');
+            if (!list || !list.shadowRoot) return 'no-list';
+            var items = list.shadowRoot.querySelectorAll('.items-container extensions-item');
+            for (var i = 0; i < items.length; i++) {
+                var n = items[i].shadowRoot ? items[i].shadowRoot.querySelector('#name') : null;
+                if (n && n.textContent.trim() === 'Chrome Bridge') return 'installed';
+            }
+            return 'not-found';
+        })()
+    """)
+    if check == 'installed':
+        print(f"    OK (auto-loaded via --load-extension)")
+        print()
+        return True
+    # Fallback: try UI-based install
+    print(f"    --load-extension did not register, falling back to UI install...")
     success = install_on_tab(chrome, tab)
     print(f"    Result: {'OK' if success else 'FAILED'}")
     print()

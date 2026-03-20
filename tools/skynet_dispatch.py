@@ -702,8 +702,6 @@ Add-Type @"
 using System.Runtime.InteropServices;
 public class SteerCancel {{
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr h);
-    [DllImport("user32.dll")] public static extern void SetCursorPos(int x, int y);
-    [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint x, uint y, uint d, uint e);
 }}
 "@
 $hwnd = [IntPtr]{hwnd}
@@ -729,17 +727,16 @@ $allBtns = $wnd2.FindAll([System.Windows.Automation.TreeScope]::Descendants,
         [System.Windows.Automation.ControlType]::Button)))
 foreach ($b in $allBtns) {{
     if ($b.Current.Name -match 'Remove Pending') {{
-        $r = $b.Current.BoundingRectangle
-        $cx = [int]($r.Left + $r.Width/2); $cy = [int]($r.Top + $r.Height/2)
-        [SteerCancel]::SetCursorPos($cx, $cy)
-        Start-Sleep -Milliseconds 150
-        [SteerCancel]::mouse_event(2,0,0,0,0)
-        Start-Sleep -Milliseconds 80
-        [SteerCancel]::mouse_event(4,0,0,0,0)
-        Write-Host "REMOVED-PENDING"
+        try {{
+            $b.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            Write-Host "REMOVED-PENDING"
+        }} catch {{
+            Write-Host "REMOVE-PENDING-INVOKE-FAILED"
+        }}
         break
     }}
 }}
+# signed: alpha — replaced SetCursorPos+mouse_event with UIA InvokePattern
 Start-Sleep -Milliseconds 400
 [SteerCancel]::SetForegroundWindow($orch)
 Write-Host "OK-STEER-BYPASS"
@@ -1975,31 +1972,37 @@ def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
                 return False
         except Exception:
             pass
-        # Last resort: pyautogui Enter fallback (shouldn't be needed with HardwareEnter)
+        # Last resort: ghost_mouse Enter fallback (no cursor movement)  # signed: alpha
         try:
-            import pyautogui
+            from tools.ghost_mouse import ghost_click_render, find_render_widget, ghost_key_press, VK_RETURN
+            # Click the chat input area via PostMessage (no cursor steal)
             rect = ctypes.wintypes.RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            input_x = (rect.left + rect.right) // 2
-            input_y = rect.bottom - 80
-            pyautogui.click(input_x, input_y)
+            win_w = rect.right - rect.left
+            win_h = rect.bottom - rect.top
+            input_cx = win_w // 2
+            input_cy = win_h - 80
+            ghost_click_render(hwnd, input_cx, input_cy)
             time.sleep(0.2)
-            pyautogui.press('enter')
-            log(f"⚡ {worker_name.upper()} pyautogui Enter fallback fired at ({input_x},{input_y})", "WARN")
+            # Send Enter to the render widget via PostMessage
+            render = find_render_widget(hwnd)
+            if render:
+                ghost_key_press(render, VK_RETURN)
+            log(f"⚡ {worker_name.upper()} ghost_mouse Enter fallback fired at client ({input_cx},{input_cy})", "WARN")
             time.sleep(1.5)
             try:
                 post = engine.get_state(hwnd)
                 if post != pre_state and post != "UNKNOWN":
-                    log(f"✓ {worker_name.upper()} delivery VERIFIED after pyautogui fallback: {pre_state} -> {post}", "OK")
+                    log(f"✓ {worker_name.upper()} delivery VERIFIED after ghost_mouse fallback: {pre_state} -> {post}", "OK")
                     return True
-                # INCIDENT 017 FIX: IDLE->IDLE after pyautogui is also unverified  # signed: alpha
+                # INCIDENT 017 FIX: IDLE->IDLE after fallback is also unverified  # signed: alpha
                 if pre_state == "IDLE" and post == "IDLE":
-                    log(f"⚠ {worker_name.upper()} delivery UNVERIFIED: IDLE->IDLE after pyautogui fallback", "WARN")
+                    log(f"⚠ {worker_name.upper()} delivery UNVERIFIED: IDLE->IDLE after ghost_mouse fallback", "WARN")
                     return False
             except Exception:
                 pass
         except Exception as e:
-            log(f"pyautogui Enter fallback failed for {worker_name}: {e}", "WARN")
+            log(f"ghost_mouse Enter fallback failed for {worker_name}: {e}", "WARN")
         return False
     except Exception as e:
         log(f"Delivery verify error for {worker_name}: {e}", "WARN")
