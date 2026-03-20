@@ -80,11 +80,11 @@ def get_resolved_patterns() -> Dict[str, Any]:
         return {}
     try:
         return json.loads(_RESOLVED_PATTERNS_FILE.read_text())
-    except Exception:
+    except (json.JSONDecodeError, OSError, ValueError):  # signed: beta
         return {}
 
 
-def acknowledge_incident_pattern(pattern_name: str, reason: str = "resolved") -> bool:
+def resolve_pattern(pattern_name: str, reason: str = "resolved") -> bool:
     """Mark an incident pattern as resolved so it stops triggering alerts.
 
     Args:
@@ -103,7 +103,7 @@ def acknowledge_incident_pattern(pattern_name: str, reason: str = "resolved") ->
     try:
         _RESOLVED_PATTERNS_FILE.write_text(json.dumps(resolved, indent=2))
         return True
-    except Exception:
+    except (OSError, TypeError):  # signed: beta
         return False
 # signed: beta
 
@@ -116,7 +116,7 @@ def _http_get(path: str, timeout: float = 3) -> Optional[dict]:
     try:
         from urllib.request import urlopen
         return json.loads(urlopen(f"{SKYNET_URL}{path}", timeout=timeout).read())
-    except Exception:
+    except (OSError, ValueError, json.JSONDecodeError):  # signed: beta
         return None
 
 
@@ -128,7 +128,7 @@ def _http_post(path: str, payload: dict) -> bool:
                       headers={"Content-Type": "application/json"})
         urlopen(req, timeout=5)
         return True
-    except Exception:
+    except (OSError, ValueError):  # signed: beta
         return False
 
 
@@ -922,7 +922,7 @@ class SkynetIntrospection:
 
         try:
             incidents = json.loads(incidents_file.read_text())
-        except Exception:
+        except (json.JSONDecodeError, OSError, ValueError):  # signed: beta
             return []
 
         if not isinstance(incidents, list) or not incidents:
@@ -1302,6 +1302,16 @@ class SkynetSelf:
     @staticmethod
     def _compute_iq_components(checks):
         """Return list of (score, weight) tuples for IQ components.
+
+        Components (total weight = 1.0):
+          - workers alive:       0.20  (4/4 workers = 1.0)
+          - engines online:      0.15  (online/total ratio)
+          - bus healthy:         0.10  (UP = 1.0, DOWN = 0.0)
+          - knowledge facts:     0.15  (min(facts/500, 1.0))
+          - uptime:              0.05  (min(uptime/86400, 1.0))
+          - capability ratio:    0.10  (engines_online / engines_total)
+          - dispatch success:    0.15  (from dispatch_log.json)
+          - test health:         0.10  (from test results or defaults)
         # signed: delta
         """
         w = checks.get("workers", {})
@@ -1311,13 +1321,41 @@ class SkynetSelf:
         facts = checks.get("knowledge", {}).get("facts", 0)
         uptime_s = checks.get("backend", {}).get("uptime_s", 0)
 
+        # Dispatch success rate from log
+        dispatch_rate = 0.0
+        try:
+            dispatch_file = DATA / "dispatch_log.json"
+            if dispatch_file.exists():
+                raw = json.loads(dispatch_file.read_text())
+                entries = raw if isinstance(raw, list) else raw.get("dispatches", [])
+                if entries:
+                    successes = sum(1 for e in entries if e.get("success", False))
+                    dispatch_rate = successes / len(entries)
+        except Exception:
+            pass
+
+        # Test health: check if recent test results exist
+        test_score = 0.5  # neutral default
+        try:
+            test_results = DATA / "test_results.json"
+            if test_results.exists():
+                tr = json.loads(test_results.read_text())
+                passed = tr.get("passed", 0)
+                total_t = tr.get("total", 1)
+                if total_t > 0:
+                    test_score = passed / total_t
+        except Exception:
+            pass
+
         return [
-            (w.get("alive", 0) / total_workers, 0.25),                             # workers alive
-            (intel.get("engines_online", 0) / engines_total, 0.25),                 # engines online
+            (w.get("alive", 0) / total_workers, 0.20),                             # workers alive
+            (intel.get("engines_online", 0) / engines_total, 0.15),                 # engines online
             (1.0 if checks.get("bus", {}).get("status") == "UP" else 0.0, 0.10),    # bus healthy
             (min(facts / 500, 1.0), 0.15),                                          # knowledge facts
-            (min(uptime_s / 86400, 1.0), 0.10),                                     # uptime hours
-            (min(intel.get("ratio", 0), 1.0), 0.15),                                # capability ratio
+            (min(uptime_s / 86400, 1.0), 0.05),                                     # uptime
+            (min(intel.get("ratio", 0), 1.0), 0.10),                                # capability ratio
+            (dispatch_rate, 0.15),                                                   # dispatch success
+            (test_score, 0.10),                                                      # test health
         ]
 
     def _update_iq_history(self, current_iq: float) -> str:

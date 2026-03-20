@@ -68,14 +68,14 @@ class LLMConnector:
     Universal LLM interface. Connects to any provider with a single API.
 
     Usage:
-        # OpenAI
-        llm = LLMConnector(provider="openai", api_key="sk-...", model="gpt-4o")
+        # OpenAI (key from env OPENAI_API_KEY or data/secrets.json)
+        llm = LLMConnector(provider="openai", model="gpt-4o")
 
-        # Claude
-        llm = LLMConnector(provider="claude", api_key="sk-ant-...", model="claude-sonnet-4-20250514")
+        # Claude (key from env ANTHROPIC_API_KEY or data/secrets.json)
+        llm = LLMConnector(provider="claude", model="claude-sonnet-4-20250514")
 
-        # Gemini
-        llm = LLMConnector(provider="gemini", api_key="AIza...", model="gemini-2.0-flash")
+        # Gemini (key from env GOOGLE_API_KEY or data/secrets.json)
+        llm = LLMConnector(provider="gemini", model="gemini-2.0-flash")
 
         # Local Ollama
         llm = LLMConnector(provider="ollama", model="llama3.1")
@@ -137,6 +137,14 @@ class LLMConnector:
             env_var = self._ENV_KEYS.get(self.provider)
             if env_var:
                 self.api_key = os.environ.get(env_var, '')
+            # Fallback: try skynet_secrets loader  # signed: beta
+            if not self.api_key:
+                try:
+                    from tools.skynet_secrets import get_secret
+                    if env_var:
+                        self.api_key = get_secret(env_var, '') or ''
+                except ImportError:
+                    pass
         if not self.model:
             self.model = self._DEFAULT_MODELS.get(self.provider, 'default')
         if not self.base_url:
@@ -1160,8 +1168,8 @@ class Brain:
             {"action": "press", "value": "Enter"},
         ])
 
-        # Full: LLM-driven autonomous agent
-        brain = Brain(llm_provider="openai", llm_api_key="sk-...")
+        # Full: LLM-driven autonomous agent (key from env or data/secrets.json)
+        brain = Brain(llm_provider="openai")
         brain.execute_mission(
             "Go to Wikipedia and search for machine learning",
             start_url="https://en.wikipedia.org"

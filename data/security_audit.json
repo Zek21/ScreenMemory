@@ -1,0 +1,146 @@
+{
+  "audit_timestamp": "2026-03-20T19:26:00Z",
+  "auditor": "gamma",
+  "scan_scope": "tools/*.py",
+  "total_files_scanned": 160,
+  "summary": {
+    "critical": 0,
+    "high": 2,
+    "medium": 5,
+    "low": 4,
+    "info": 3
+  },
+  "findings": [
+    {
+      "id": "SEC-001",
+      "severity": "high",
+      "category": "missing_input_validation",
+      "file": "tools/skynet_audit_trail.py",
+      "line": 351,
+      "description": "json.loads(data) called without try/except wrapper — raw bus data parsed without validation. Malformed JSON will crash the audit trail recorder.",
+      "suggested_fix": "Wrap in try/except json.JSONDecodeError and log the error."
+    },
+    {
+      "id": "SEC-002",
+      "severity": "high",
+      "category": "missing_input_validation",
+      "file": "tools/skynet_overseer.py",
+      "line": 147,
+      "description": "json.loads(data) called without local error handling — raw HTTP response parsed without validation. Network errors or malformed responses will crash the overseer daemon.",
+      "suggested_fix": "Wrap in try/except (json.JSONDecodeError, ValueError) and return empty dict on failure."
+    },
+    {
+      "id": "SEC-003",
+      "severity": "medium",
+      "category": "open_without_encoding",
+      "file": "tools/boot_cleanup.py",
+      "line": 74,
+      "description": "json.load(open(wf)) — open() without encoding parameter. Relies on system default encoding (cp1252 on Windows). Will fail on files containing non-ASCII UTF-8 characters.",
+      "suggested_fix": "Use open(wf, encoding='utf-8') or Path(wf).read_text(encoding='utf-8')."
+    },
+    {
+      "id": "SEC-004",
+      "severity": "medium",
+      "category": "open_without_encoding",
+      "file": "tools/boot_preflight.py",
+      "line": 37,
+      "description": "with open(BOOT_CONFIG) as f — missing encoding parameter for JSON config file reading.",
+      "suggested_fix": "Add encoding='utf-8' to open() call."
+    },
+    {
+      "id": "SEC-005",
+      "severity": "medium",
+      "category": "open_without_encoding",
+      "file": "tools/skynet_apply_handler.py",
+      "line": 185,
+      "description": "with open(workers_path) as f — reads workers.json without explicit encoding.",
+      "suggested_fix": "Add encoding='utf-8' to open() call."
+    },
+    {
+      "id": "SEC-006",
+      "severity": "medium",
+      "category": "open_without_encoding",
+      "file": "tools/skynet_boot_workers.py",
+      "line": 710,
+      "description": "with open(workers_path, 'r') as f — reads workers.json without explicit encoding. Multiple instances in this file (lines 710, 744, 754).",
+      "suggested_fix": "Add encoding='utf-8' to all open() calls reading/writing JSON."
+    },
+    {
+      "id": "SEC-007",
+      "severity": "medium",
+      "category": "open_without_encoding",
+      "file": "tools/set_autopilot.py",
+      "line": 294,
+      "description": "with open(path) as f — reads settings JSON without explicit encoding.",
+      "suggested_fix": "Add encoding='utf-8' to open() call."
+    },
+    {
+      "id": "SEC-008",
+      "severity": "low",
+      "category": "hardcoded_path_in_docs",
+      "file": "tools/skynet_dispatch.py",
+      "line": 14,
+      "description": "Hardcoded path 'D:\\\\ML' in docstring example. Not a runtime risk but indicates potential hardcoded assumptions.",
+      "suggested_fix": "Use placeholder path in documentation: '<project_dir>' instead of literal paths."
+    },
+    {
+      "id": "SEC-009",
+      "severity": "low",
+      "category": "cdp_eval_usage",
+      "file": "tools/_install_ext_socials.py",
+      "line": 251,
+      "description": "c.eval(tab_id, ...) — Chrome DevTools Protocol JS evaluation. 9 instances across _install_ext_socials.py and ghost_mouse.py. NOT Python eval() — these execute JavaScript in the browser via CDP. Safe by design but should have input sanitization for user-provided values.",
+      "suggested_fix": "Ensure all JS strings passed to c.eval() are constructed from trusted internal values, never raw user input."
+    },
+    {
+      "id": "SEC-010",
+      "severity": "low",
+      "category": "credentials_env_vars",
+      "file": "tools/credentials.py",
+      "line": 19,
+      "description": "Credentials loaded exclusively from environment variables (AWS_SECRET_ACCESS_KEY, CF_API_KEY, SMTP_PASSWORD). No hardcoded secrets found. Clean implementation.",
+      "suggested_fix": "No action needed — this is the correct pattern."
+    },
+    {
+      "id": "SEC-011",
+      "severity": "low",
+      "category": "encryption_implementation",
+      "file": "tools/skynet_encryption.py",
+      "line": 138,
+      "description": "PBKDF2-HMAC-SHA256 with 100K iterations for key derivation. Industry-standard implementation. No hardcoded keys or passwords.",
+      "suggested_fix": "No action needed — implementation follows best practices."
+    },
+    {
+      "id": "SEC-012",
+      "severity": "info",
+      "category": "localhost_binding",
+      "file": "tools/skynet_agent_telemetry.py",
+      "line": 623,
+      "description": "All HTTP servers bind to 127.0.0.1 (localhost only). Files: skynet_agent_telemetry.py, skynet_consultant_bridge.py, skynet_daemon_health_dashboard.py, skynet_dashboard_api.py. NOT exposed to network. No authentication needed for localhost-only services.",
+      "suggested_fix": "No action needed — localhost binding is sufficient for single-machine deployment."
+    },
+    {
+      "id": "SEC-013",
+      "severity": "info",
+      "category": "subprocess_safety",
+      "file": "tools/*.py",
+      "line": 0,
+      "description": "Zero instances of subprocess with shell=True found across all tools/*.py files. All subprocess calls use shell=False (the safe default).",
+      "suggested_fix": "No action needed — subprocess usage follows security best practices."
+    },
+    {
+      "id": "SEC-014",
+      "severity": "info",
+      "category": "no_python_eval",
+      "file": "tools/*.py",
+      "line": 0,
+      "description": "Zero instances of Python eval() or exec() found. All 'eval' hits are CDP c.eval() calls (Chrome DevTools JS execution), not Python code evaluation.",
+      "suggested_fix": "No action needed."
+    }
+  ],
+  "recommendations": [
+    "Priority 1: Fix SEC-001 and SEC-002 (missing input validation) — these can crash daemons on malformed data.",
+    "Priority 2: Fix SEC-003 through SEC-007 (open without encoding) — systematic sweep to add encoding='utf-8' to all JSON file operations.",
+    "Priority 3: No urgent action needed for low/info findings."
+  ]
+}

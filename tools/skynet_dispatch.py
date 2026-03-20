@@ -58,7 +58,7 @@ def _acquire_dispatch_mutex(timeout_ms=15000):
         # WAIT_OBJECT_0 = 0, WAIT_TIMEOUT = 0x102, WAIT_ABANDONED = 0x80
         result = kernel32.WaitForSingleObject(_dispatch_mutex_handle, timeout_ms)
         return result in (0, 0x80)  # WAIT_OBJECT_0 or WAIT_ABANDONED
-    except Exception:
+    except (OSError, ValueError, ctypes.ArgumentError):  # signed: beta
         return False
 
 
@@ -68,13 +68,13 @@ def _release_dispatch_mutex():
     try:
         if _dispatch_mutex_handle:
             ctypes.windll.kernel32.ReleaseMutex(_dispatch_mutex_handle)
-    except Exception:
+    except (OSError, ValueError, ctypes.ArgumentError):  # signed: beta
         pass
 
 # Ensure UTF-8 output on Windows (emojis in log messages)
 if hasattr(sys.stdout, 'reconfigure'):
     try: sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    except Exception: pass
+    except (AttributeError, OSError): pass  # signed: beta
 from pathlib import Path
 from datetime import datetime
 
@@ -83,7 +83,7 @@ try:
     from tools.skynet_reflexion_hook import reflexion_hook as _reflexion_hook
     from tools.skynet_reflexion_hook import pre_dispatch_context as _pre_dispatch_context
     _REFLEXION_AVAILABLE = True
-except Exception:
+except (ImportError, ModuleNotFoundError):  # signed: beta
     _REFLEXION_AVAILABLE = False
 
 ROOT = Path(__file__).parent.parent
@@ -151,7 +151,7 @@ def guard_process_kill(pid=None, name=None, caller="unknown"):
         try:
             from tools.skynet_spam_guard import guarded_publish
             guarded_publish(msg)
-        except Exception:
+        except (ImportError, OSError, RuntimeError):  # signed: beta
             # Raw fallback for when SpamGuard is unavailable
             try:
                 import urllib.request

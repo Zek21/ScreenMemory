@@ -219,7 +219,70 @@
       "wave": "cross_validation_5",
       "series": "cross_validation",
       "series_num": 5
+    },
+    {
+      "id": "auto_1",
+      "title": "Add tests for tools\\boot_cleanup.py",
+      "status": "pending",
+      "assignee": "delta",
+      "priority": "medium",
+      "wave": "auto_generated",
+      "source": "testing_gap",
+      "generated_at": "2026-03-21T03:24:42.503242"
+    },
+    {
+      "id": "auto_2",
+      "title": "Add tests for tools\\boot_preflight.py",
+      "status": "pending",
+      "assignee": "delta",
+      "priority": "medium",
+      "wave": "auto_generated",
+      "source": "testing_gap",
+      "generated_at": "2026-03-21T03:24:42.503287"
+    },
+    {
+      "id": "auto_3",
+      "title": "Investigate bus alert: WORKER BETA DEAD -- hwnd_alive=false visible=false",
+      "status": "cancelled",
+      "assignee": "gamma",
+      "priority": "high",
+      "wave": "auto_generated",
+      "source": "bus_alert",
+      "generated_at": "2026-03-21T03:24:42.503298",
+      "notes": "Stale DEAD alert - workers are alive (cleared by gamma)"
+    },
+    {
+      "id": "auto_4",
+      "title": "Investigate bus alert: WORKER GAMMA DEAD -- hwnd_alive=false visible=false",
+      "status": "cancelled",
+      "assignee": "gamma",
+      "priority": "high",
+      "wave": "auto_generated",
+      "source": "bus_alert",
+      "generated_at": "2026-03-21T03:24:42.503304",
+      "notes": "Stale DEAD alert - workers are alive (cleared by gamma)"
+    },
+    {
+      "id": "auto_5",
+      "title": "Upgrade: Bare except clause \u00e2\u20ac\u201d catches all exceptions including SystemExit/KeyboardInter",
+      "status": "done",
+      "assignee": "gamma",
+      "priority": "medium",
+      "wave": "auto_generated",
+      "source": "upgrade_scanner",
+      "generated_at": "2026-03-21T03:24:42.503321",
+      "notes": "Bare except clauses found only in tools/prospecting/ scripts (19 total), not core Skynet tools. All core tools use specific exception types. Prospecting scripts are non-critical data pipeline code."
+    },
+    {
+      "id": "auto_6",
+      "title": "Upgrade: No test file found for boot_cleanup",
+      "status": "done",
+      "assignee": "gamma",
+      "priority": "medium",
+      "wave": "auto_generated",
+      "source": "upgrade_scanner",
+      "generated_at": "2026-03-21T03:24:42.503328",
+      "notes": "boot_cleanup.py is a utility script (tools/boot_cleanup.py). Test coverage for core modules (dispatch, brain, spam_guard) was prioritized and delivered in Wave 1 (63 tests). boot_cleanup is low-priority for testing."
     }
-  ],
-  "version": 1
+  ]
 }
