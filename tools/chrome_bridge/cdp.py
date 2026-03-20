@@ -384,7 +384,7 @@ class CDP:
         args = [chrome_path, f'--remote-debugging-port={port}', '--remote-allow-origins=*']
         args.append(f'--user-data-dir={user_data_dir}')
         if profile_directory:
-            args.append(f'--profile-directory="{profile_directory}"')
+            args.append(f'--profile-directory={profile_directory}')  # signed: beta — fixed quoting bug (INCIDENT_019)
         if headless:
             args.append('--headless=new')
 

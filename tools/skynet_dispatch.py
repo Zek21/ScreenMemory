@@ -1057,6 +1057,54 @@ if ($cancelBtn) {{
     }} catch {{ Write-Host "DEBUG: Cancel invoke failed: $_" }}
 }}
 
+# APPLY PANEL AUTO-DISMISS: Detect and dismiss Apply panel that steals focus from chat input.
+# The Apply panel appears when a worker generates code changes -- it shows "N files changed" text
+# and an "Apply" button. If present, Escape dismisses it, restoring focus to chat input.
+# See INCIDENT_018 for root cause analysis.  # signed: gamma
+$applyDetected = $false
+try {{
+    # Check 1: Look for Button named 'Apply' in UIA tree
+    $applyBtn = $wnd.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+        (New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::NameProperty, 'Apply')))
+    if ($applyBtn -and $applyBtn.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button) {{
+        $applyDetected = $true
+        Write-Host "DEBUG: Apply panel detected via Apply button"
+    }}
+}} catch {{}}
+if (-not $applyDetected) {{
+    try {{
+        # Check 2: Scan for text elements containing 'files changed'
+        $allText = $wnd.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+            (New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::Text)))
+        foreach ($t in $allText) {{
+            try {{
+                $tname = [string]$t.Current.Name
+                if ($tname -match '\d+\s+files?\s+changed') {{
+                    $applyDetected = $true
+                    Write-Host "DEBUG: Apply panel detected via text: $tname"
+                    break
+                }}
+            }} catch {{}}
+        }}
+    }} catch {{}}
+}}
+if ($applyDetected) {{
+    # Dismiss Apply panel with Escape key via SendKeys
+    try {{
+        [System.Windows.Automation.AutomationElement]::FromHandle($hwnd) | Out-Null
+        [GhostType]::SetForegroundWindow($hwnd)
+        Start-Sleep -Milliseconds 100
+        [System.Windows.Forms.SendKeys]::SendWait('{{ESC}}')
+        Start-Sleep -Milliseconds 500
+        Write-Host "DEBUG: Apply panel dismissed with Escape"
+    }} catch {{
+        Write-Host "DEBUG: Apply panel Escape failed: $_"
+    }}
+}}
+
 # Fast-path: when render_hwnd is pre-resolved, skip UIA Edit search entirely  # signed: beta
 $fastRenderHwnd = [IntPtr]{render_hwnd_val}
 $focusTarget = $null

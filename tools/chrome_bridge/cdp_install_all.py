@@ -67,7 +67,7 @@ def launch_chrome(profile_dir):
         f'--remote-debugging-port={CDP_PORT}',
         '--remote-allow-origins=*',
         f'--user-data-dir={USER_DATA}',
-        f'--profile-directory="{profile_dir}"',
+        f'--profile-directory={profile_dir}',  # signed: beta — fixed quoting bug (INCIDENT_019)
         f'--load-extension={EXTENSION_PATH}',
         '--no-first-run',
         'chrome://extensions',

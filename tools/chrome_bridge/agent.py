@@ -241,7 +241,7 @@ class StealthLauncher:
         args = [
             chrome_path,
             f'--user-data-dir={user_data_dir}',
-            f'--profile-directory="{profile_dir}"',
+            f'--profile-directory={profile_dir}',  # signed: beta — fixed quoting bug (INCIDENT_019)
             f'--load-extension={ext_dir}',
             '--no-first-run',
             '--no-default-browser-check',
@@ -312,7 +312,7 @@ class StealthLauncher:
             chrome_path,
             f"--remote-debugging-port={self._port}",
             f"--user-data-dir={self.get_cdp_user_data_dir()}",
-            f'--profile-directory="{profile}"',
+            f'--profile-directory={profile}',  # signed: orchestrator — fixed missed quoting bug (INCIDENT_019 BUG 2)
             *self._BASE_CHROME_ARGS,
             *self._MODE_ARGS.get(mode.name, []),
             *(extra_args or []),

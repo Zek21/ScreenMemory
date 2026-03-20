@@ -234,5 +234,42 @@
       "Apply panels in Copilot CLI steal Chromium focus silently",
       "_verify_delivery must never assume IDLE->IDLE means success"
     ]
+  },
+  {
+    "id": "INCIDENT_019",
+    "title": "CDP Extension Install Non-Functional - Session-Only Flag and Quoting Bugs",
+    "date": "2026-03-20",
+    "severity": "HIGH",
+    "status": "PARTIAL_FIX",
+    "reporter": "beta",
+    "signed_by": "beta",
+    "root_cause": "4 bugs in Gamma CDP extension install (cdp.py, agent.py, cdp_install_all.py): (1) --load-extension is session-only -- Chrome loads unpacked extensions for that launch session only, they do NOT persist to the Extensions directory and vanish on restart. (2) --profile-directory quoting bug in all 3 files -- f-string embeds literal quote chars inside subprocess list arg (--profile-directory='\"Profile 17\"') making Chrome match no real profile. (3) --load-extension flag is IGNORED when Chrome is already running -- Chrome just opens a new tab in the existing instance without applying the flag. (4) agent.py install_extension() uses get_user_data_dir() (real Chrome dir) but extension is session-only anyway.",
+    "what_failed": "Gamma added --load-extension flag to 3 files (cdp.py launch(), agent.py install_extension(), cdp_install_all.py launch_chrome()) but the Chrome Bridge extension never appeared in chrome://extensions on the SOCIALS profile (Profile 17). The extension was never persistently installed.",
+    "fix": "PARTIAL: Fixed BUG 2 (quoting bug) in all 3 files -- removed inner quotes from --profile-directory args. BUG 1 (session-only) requires a fundamentally different approach: either (a) use chrome.management API for persistent install, (b) manually copy extension to profile Extensions dir with Preferences entry, or (c) always include --load-extension on every Chrome CDP launch (cdp.py launch() already does this for the sandbox dir). BUG 3 (Chrome already running) requires killing Chrome before relaunching with the flag.",
+    "lesson": "Cross-validation MUST include functional runtime testing, not just py_compile syntax checks. Alpha cross-validated Gamma with verdict PASS_WITH_BUG but never tested if the extension actually loaded in Chrome. Syntax verification catches ~10% of real bugs. For external system integration tasks (Chrome, databases, APIs), cross-validation must verify the actual integration works end-to-end.",
+    "cross_validation_failure": {
+      "validator": "alpha",
+      "original_verdict": "PASS_WITH_BUG",
+      "missed_bugs": [
+        "BUG 1: --load-extension is session-only (fundamental design flaw)",
+        "BUG 2: --profile-directory quoting bug embeds literal quotes in all 3 files",
+        "BUG 3: --load-extension ignored when Chrome already running",
+        "BUG 4: agent.py uses incompatible real user data dir"
+      ],
+      "what_alpha_checked": "py_compile syntax, code logic presence of --load-extension flag",
+      "what_alpha_missed": "Actual Chrome extension loading, persistence across restarts, behavior with running Chrome, subprocess quoting semantics"
+    },
+    "affected_files": [
+      "tools/chrome_bridge/cdp.py (L387 -- quoting bug FIXED)",
+      "tools/chrome_bridge/agent.py (L244 -- quoting bug FIXED)",
+      "tools/chrome_bridge/cdp_install_all.py (L70 -- quoting bug FIXED)"
+    ],
+    "tags": [
+      "chrome",
+      "extension",
+      "cdp",
+      "cross-validation-failure",
+      "quoting-bug"
+    ]
   }
 ]
