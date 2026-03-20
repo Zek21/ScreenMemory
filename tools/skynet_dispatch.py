@@ -1550,9 +1550,41 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
             time.sleep(0.5)
 
         # Focus race detection: another window stole focus between clipboard set and paste  # signed: alpha
+        # FOCUS_STOLEN retry: restore orchestrator focus, wait 1s, retry once (signed: beta)
         if "FOCUS_STOLEN" in stdout:
-            log(f"Ghost FOCUS_STOLEN for HWND={hwnd} -- focus race detected, paste aborted safely", "ERR")
-            return False
+            log(f"Ghost FOCUS_STOLEN for HWND={hwnd} -- restoring orch focus and retrying once (1s delay)", "WARN")
+            try:
+                user32.SetForegroundWindow(orch_hwnd)
+            except Exception:
+                pass
+            time.sleep(1.0)
+            with _dispatch_lock:
+                try:
+                    r2 = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command", ps],
+                        capture_output=True, text=True, timeout=20,
+                        creationflags=0x08000000
+                    )
+                    stdout2 = r2.stdout or ""
+                    if any(s in stdout2 for s in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK")):
+                        log(f"Ghost FOCUS_STOLEN retry succeeded for HWND={hwnd}", "OK")
+                        _last_delivery_status = next(
+                            (s for s in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK") if s in stdout2), "")
+                        try:
+                            DISPATCH_LOCK_FILE.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        return True
+                    log(f"Ghost FOCUS_STOLEN retry also failed for HWND={hwnd}: {stdout2.strip()[:150]}", "ERR")
+                except subprocess.TimeoutExpired:
+                    log(f"Ghost FOCUS_STOLEN retry TIMEOUT for HWND={hwnd}", "ERR")
+                except Exception as e2:
+                    log(f"Ghost FOCUS_STOLEN retry exception: {e2}", "ERR")
+                try:
+                    DISPATCH_LOCK_FILE.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            return False  # signed: beta
         ok = (
             r.returncode == 0
             and any(s in stdout for s in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK"))
@@ -1931,9 +1963,22 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
 
     ok = ghost_type_to_worker(hwnd, full_task, orch_hwnd)
     if not ok:
-        log(f"✗ Failed to dispatch to {worker_name.upper()} -- trying steer-bypass", "WARN")
-        ok = clear_steering_and_send(hwnd, full_task, orch_hwnd)
-        _record_dispatch_outcome(worker_name, task, pre_state, hwnd, t_start, ok, 'steer-bypass' if ok else '')
+        # FOCUS_STOLEN-aware retry: if focus was stolen, restore and retry ghost_type
+        # directly instead of steer-bypass (steer-bypass is wrong fix for focus races)  # signed: beta
+        if _last_delivery_status == "FOCUS_STOLEN":
+            log(f"[RETRY] {worker_name.upper()} FOCUS_STOLEN -- restoring orch focus, retrying in 1s", "WARN")
+            try:
+                user32.SetForegroundWindow(orch_hwnd)
+            except Exception:
+                pass
+            time.sleep(1.0)
+            ok = ghost_type_to_worker(hwnd, full_task, orch_hwnd)
+            if ok:
+                log(f"✓ {worker_name.upper()} FOCUS_STOLEN retry succeeded", "OK")
+        if not ok:
+            log(f"✗ Failed to dispatch to {worker_name.upper()} -- trying steer-bypass", "WARN")
+            ok = clear_steering_and_send(hwnd, full_task, orch_hwnd)
+        _record_dispatch_outcome(worker_name, task, pre_state, hwnd, t_start, ok, 'steer-bypass' if ok and _last_delivery_status != "FOCUS_STOLEN" else '')
     else:
         _record_dispatch_outcome(worker_name, task, pre_state, hwnd, t_start, True)
 
@@ -1957,7 +2002,15 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
                     verified = True
                     _reset_dispatch_failures(worker_name)  # signed: beta
                     break
-                # Retry ghost_type
+                # Retry ghost_type with fresh clipboard clear  # signed: beta
+                try:
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::Clear()"],
+                        capture_output=True, timeout=5, creationflags=0x08000000
+                    )
+                except Exception:
+                    pass  # Best-effort clipboard clear before retry
                 retry_ok = ghost_type_to_worker(hwnd, full_task, orch_hwnd)
                 if retry_ok:
                     verified = _verify_delivery(hwnd, worker_name, "IDLE")

@@ -116,9 +116,14 @@ STUCK_DEDUP_WINDOW = 300          # suppress duplicate stuck alerts for 5 minute
 HEARTBEAT_CYCLE_INTERVAL = 15    # post heartbeat every N cycles (~7.5min at 30s interval)  # signed: alpha -- was 10, reduced frequency per Convention 4 bus saturation fix
 MODEL_FIX_BACKOFF = 600     # 10 minutes between fix attempts per worker (prevents infinite retry)
 MODEL_FIX_MAX_ATTEMPTS = 3  # max consecutive fix attempts before giving up until restart
+MONITOR_METRICS_FILE = DATA_DIR / "monitor_metrics.json"  # signed: delta
 
 # Per-worker model-fix attempt tracking: {worker_name: (attempt_count, last_attempt_ts)}
 _model_fix_attempts: dict = {}
+
+# ── Dispatch latency & completion rate tracking ──  # signed: delta
+_dispatch_latency: dict = {}  # {worker: deque of latency_ms values (rolling 10)}
+_completion_rates: dict = {}  # {worker: {started: int, completed: int, hour_start: float}}
 
 user32 = ctypes.windll.user32
 
@@ -1300,6 +1305,125 @@ def _track_productivity(workers: list, health: dict):
     _update_result_counts(now)
 
 
+def _update_dispatch_metrics():  # signed: delta
+    """Update dispatch latency and completion rate from dispatch_log.json."""
+    from collections import deque
+    global _dispatch_latency, _completion_rates
+    try:
+        log_path = DATA_DIR / "dispatch_log.json"
+        if not log_path.exists():
+            return
+        raw = json.loads(log_path.read_text(encoding="utf-8"))
+        entries = raw if isinstance(raw, list) else raw.get("dispatches", raw.get("log", []))
+        if not entries:
+            return
+
+        now = time.time()
+        # Initialize deques for rolling average
+        for entry in entries[-50:]:  # last 50 entries for efficiency
+            worker = entry.get("worker", entry.get("target", ""))
+            if not worker:
+                continue
+            if worker not in _dispatch_latency:
+                _dispatch_latency[worker] = deque(maxlen=10)
+            if worker not in _completion_rates:
+                _completion_rates[worker] = {"started": 0, "completed": 0, "hour_start": now}
+
+            # Reset hourly counters
+            cr = _completion_rates[worker]
+            if now - cr["hour_start"] >= 3600:
+                cr["started"] = 0
+                cr["completed"] = 0
+                cr["hour_start"] = now
+
+            # Dispatch latency from timestamp fields
+            dispatch_ts = entry.get("dispatched_at", entry.get("timestamp", ""))
+            result_ts = entry.get("result_at", entry.get("completed_at", ""))
+            if dispatch_ts and result_ts:
+                try:
+                    from datetime import datetime as _dt
+                    t0 = _dt.fromisoformat(dispatch_ts.replace("Z", "+00:00")).timestamp()
+                    t1 = _dt.fromisoformat(result_ts.replace("Z", "+00:00")).timestamp()
+                    latency_ms = max(0, (t1 - t0) * 1000)
+                    _dispatch_latency[worker].append(latency_ms)
+                except (ValueError, TypeError):
+                    pass
+
+            cr["started"] += 1
+            if entry.get("success") or entry.get("result_received"):
+                cr["completed"] += 1
+    except Exception as e:
+        log(f"Dispatch metrics update error: {e}", "DEBUG")
+
+
+def _write_monitor_metrics(health: dict, productivity: dict):  # signed: delta
+    """Write consolidated monitor metrics to data/monitor_metrics.json."""
+    try:
+        latency_avgs = {}
+        for worker, dq in _dispatch_latency.items():
+            if dq:
+                latency_avgs[worker] = round(sum(dq) / len(dq), 1)
+
+        comp_rates = {}
+        for worker, cr in _completion_rates.items():
+            started = cr.get("started", 0)
+            if started > 0:
+                comp_rates[worker] = round(cr["completed"] / started, 3)
+
+        metrics = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "dispatch_latency": latency_avgs,
+            "completion_rates": comp_rates,
+            "productivity": {k: {kk: vv for kk, vv in v.items() if kk != "idle_since"}
+                             for k, v in productivity.items()},
+            "worker_states": {k: v.get("status", "UNKNOWN")
+                              for k, v in health.items()
+                              if isinstance(v, dict) and "alive" in v},
+        }
+        MONITOR_METRICS_FILE.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"Failed to write monitor_metrics.json: {e}", "DEBUG")
+
+
+def _print_dashboard_line():  # signed: delta
+    """Print a compact single-line status to stdout and exit."""
+    health_file = DATA_DIR / "worker_health.json"
+    metrics_file = MONITOR_METRICS_FILE
+    h = {}
+    m = {}
+    try:
+        if health_file.exists():
+            h = json.loads(health_file.read_text(encoding="utf-8"))
+        if metrics_file.exists():
+            m = json.loads(metrics_file.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+
+    worker_names = ["alpha", "beta", "gamma", "delta"]
+    parts = []
+    alive = 0
+    for name in worker_names:
+        w = h.get(name, {})
+        st = w.get("status", "?")[:4].upper()
+        is_alive = bool(w.get("hwnd") and ctypes.windll.user32.IsWindow(int(w.get("hwnd", 0))))
+        if is_alive:
+            alive += 1
+        parts.append(f"{name[0].upper()}:{st}")
+
+    latency_parts = []
+    for name in worker_names:
+        lat = m.get("dispatch_latency", {}).get(name)
+        if lat is not None:
+            latency_parts.append(f"{name[0].upper()}:{lat:.0f}ms")
+
+    line = f"Workers: {alive}/4 [{' '.join(parts)}]"
+    if latency_parts:
+        line += f"  Latency: [{' '.join(latency_parts)}]"
+    ts = m.get("timestamp", "?")
+    line += f"  @{ts}"
+    print(line)
+
+
 def _get_productivity_summary() -> dict:
     """Build a productivity summary for all tracked workers."""
     now = time.time()
@@ -1569,7 +1693,13 @@ def main():
     parser.add_argument("--model-interval", type=int, default=MODEL_CHECK_INTERVAL)
     parser.add_argument("--max-runtime", type=int, default=0,
                         help="Max runtime in seconds (0=unlimited). Daemon exits gracefully after this.")
+    parser.add_argument("--dashboard", action="store_true",
+                        help="Output compact single-line status and exit")  # signed: delta
     args = parser.parse_args()
+
+    if args.dashboard:
+        _print_dashboard_line()
+        return
 
     if args.status:
         if HEALTH_FILE.exists():
@@ -1638,6 +1768,10 @@ def _run_monitor_cycle(workers, orch_hwnd, args, cycle, now, last_model_check, l
     productivity = _get_productivity_summary()
     pending_work = _get_pending_work_count()
     _record_health_trend(health, productivity, pending_work)
+
+    # Update dispatch metrics and write consolidated metrics file every cycle  # signed: delta
+    _update_dispatch_metrics()
+    _write_monitor_metrics(health, productivity)
 
     return health, do_model, do_orch, orch_hwnd, productivity, pending_work
 

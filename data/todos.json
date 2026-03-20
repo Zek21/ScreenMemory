@@ -283,6 +283,28 @@
       "source": "upgrade_scanner",
       "generated_at": "2026-03-21T03:24:42.503328",
       "notes": "boot_cleanup.py is a utility script (tools/boot_cleanup.py). Test coverage for core modules (dispatch, brain, spam_guard) was prioritized and delivered in Wave 1 (63 tests). boot_cleanup is low-priority for testing."
+    },
+    {
+      "id": "ec79be39",
+      "worker": "shared",
+      "task": "Cross-validate and enrich low-signal convene finding from alpha: found bug",
+      "status": "cancelled",
+      "priority": "normal",
+      "created_at": "2026-03-21T03:42:13",
+      "updated_at": "2026-03-21T05:28:43.941844",
+      "completed_at": "2026-03-21T05:28:43.941844",
+      "notes": "Cancelled: zero-detail convene finding, no actionable bug description. Cleared by alpha."
+    },
+    {
+      "id": "4c52a4ee",
+      "worker": "shared",
+      "task": "Cross-validate and enrich low-signal convene finding from alpha: found bug",
+      "status": "cancelled",
+      "priority": "normal",
+      "created_at": "2026-03-21T03:47:10",
+      "updated_at": "2026-03-21T05:28:43.941844",
+      "completed_at": "2026-03-21T05:28:43.941844",
+      "notes": "Cancelled: zero-detail convene finding, no actionable bug description. Cleared by alpha."
     }
   ]
 }
