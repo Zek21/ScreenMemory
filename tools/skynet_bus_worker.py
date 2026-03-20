@@ -220,8 +220,30 @@ def _build_type_ps_script(hwnd, orch_hwnd, safe_text):
     return _ps_csharp_addtype() + '\n' + _ps_find_edit_and_paste(hwnd, orch_hwnd, safe_text)
 
 
+def _read_brain_config_flag(key, default=False):
+    """Read a flag from brain_config.json. Re-reads every call for hot-reload."""
+    try:
+        cfg = json.loads((DATA_DIR / "brain_config.json").read_text(encoding="utf-8"))
+        parts = key.split(".")
+        val = cfg
+        for p in parts:
+            val = val.get(p, {}) if isinstance(val, dict) else default
+        return val if isinstance(val, bool) else default
+    except Exception:
+        return default
+    # signed: alpha
+
+
 def _type_into_window(hwnd, text, orch_hwnd=None):
     """Type text into a chat window via clipboard paste."""
+    # ── KILL SWITCH: bus_worker.ghost_type_enabled (re-read every call) ──  # signed: alpha
+    if not _read_brain_config_flag("bus_worker.ghost_type_enabled", default=False):
+        log("bus_worker", "ghost_type BLOCKED — bus_worker.ghost_type_enabled=false in brain_config.json", "WARN")
+        return False
+    if not _read_brain_config_flag("daemon_ghost_type_global_enabled", default=False):
+        log("bus_worker", "ghost_type BLOCKED — daemon_ghost_type_global_enabled=false", "WARN")
+        return False
+
     if orch_hwnd is None:
         orch_hwnd = hwnd
     safe_text = text.replace("'", "''").replace('"', '`"').replace("\n", " ")
@@ -468,6 +490,15 @@ def dispatch_via_bus(target_worker, task_content, sender="orchestrator"):
 
 
 def main():
+    # Kill switch: check brain_config.json before starting
+    try:
+        _cfg = json.loads((Path(__file__).parent.parent / "data" / "brain_config.json").read_text(encoding="utf-8"))
+        if not _cfg.get("bus_worker", {}).get("enabled", False):
+            print("bus_worker DISABLED in brain_config.json (ghost-types into windows, causes lllll garbage)")
+            sys.exit(0)
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(description="Skynet Bus Worker -- Poll-based task delivery")
     parser.add_argument("worker", help="Worker name (alpha, beta, gamma, delta)")
     parser.add_argument("--once", action="store_true", help="Single poll then exit")

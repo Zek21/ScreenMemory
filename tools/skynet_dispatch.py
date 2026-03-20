@@ -1630,6 +1630,27 @@ def ghost_type_to_worker(hwnd, text, orch_hwnd, render_hwnd=None):
         _execute_ghost_dispatch() (subprocess execution and validation)
         _verify_delivery() (post-dispatch UIA state verification)
     """  # signed: beta
+    # ── DAEMON GHOST-TYPE GUARD ──
+    # Block ghost-type calls from background daemons while allowing boot/manual dispatch.
+    # Daemons that ghost-type (bus_worker, bus_relay, bus_watcher, self_prompt) caused
+    # "lllll" garbage in worker windows (INCIDENT 016). This guard blocks them.
+    try:
+        _bc = json.loads(Path(ROOT, "data", "brain_config.json").read_text(encoding="utf-8"))
+        if not _bc.get("daemon_ghost_type_global_enabled", False):  # signed: gamma
+            import inspect
+            _caller_files = [f.filename for f in inspect.stack()[:8]]
+            _caller_str = "|".join(os.path.basename(f) for f in _caller_files)
+            # Allow: boot script, manual dispatch CLI, orchestrator context
+            _allowed = any(k in _caller_str for k in [
+                'worker_boot', 'skynet_dispatch.py', '<stdin>', '<string>',
+                'copilot', 'agent', 'main.py', 'orch_realtime',
+            ])
+            if not _allowed:
+                log(f"ghost_type BLOCKED by daemon guard — caller chain: {_caller_str}", "WARN")
+                return False
+    except Exception:
+        pass  # If config unreadable, allow (fail-open for boot)
+
     if not hwnd or not user32.IsWindow(hwnd):
         log(f"ghost_type: invalid target HWND={hwnd}", "ERR")  # signed: beta
         return False

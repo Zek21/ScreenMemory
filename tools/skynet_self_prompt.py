@@ -2693,6 +2693,14 @@ class SelfPromptDaemon:
 
     def _main_loop_cycle(self):
         """Single iteration of the main daemon loop."""
+        # ── KILL SWITCH: re-check self_prompt.enabled EVERY iteration ──  # signed: alpha
+        try:
+            _kill_cfg = json.loads(BRAIN_CONFIG_FILE.read_text(encoding="utf-8"))
+            if _kill_cfg.get("self_prompt", {}).get("enabled") is False:
+                return  # silently skip this cycle — daemon stays alive but dormant
+        except Exception:
+            pass
+
         try:
             _load_config_overrides()
             self._write_health_file()

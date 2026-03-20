@@ -497,8 +497,13 @@ $daemonSpecs = @(
     @{ Script = "tools\skynet_self_improve.py"; Pid = "data\self_improve.pid"; Name = "Self-improve"; Args = @("start") },
     @{ Script = "tools\skynet_bus_relay.py";    Pid = "data\bus_relay.pid";    Name = "Bus relay";    Args = $null },
     @{ Script = "tools\skynet_learner.py";      Pid = "data\learner.pid";      Name = "Learner";      Args = @("--daemon") },
-    @{ Script = "tools\skynet_knowledge_distill_daemon.py"; Pid = "data\knowledge_distill.pid"; Name = "Knowledge distill"; Args = $null },  # signed: gamma
-    @{ Script = "tools\skynet_proactive_handler.py"; Pid = "data\proactive_handler.pid"; Name = "Proactive handler"; Args = $null }  # signed: orchestrator -- auto-clears dialogs
+    @{ Script = "tools\skynet_knowledge_distill_daemon.py"; Pid = "data\knowledge_distill.pid"; Name = "Knowledge distill"; Args = $null }  # signed: gamma
+    # DISABLED: Proactive handler uses UIA InvokePattern on worker windows, causes interference
+    # @{ Script = "tools\skynet_proactive_handler.py"; Pid = "data\proactive_handler.pid"; Name = "Proactive handler"; Args = $null }
+    # DISABLED: Bus watcher calls dispatch_to_idle() which ghost-types into windows
+    # Kill switch: data/brain_config.json -> bus_watcher.enabled = false
+    # DISABLED: Bus worker ghost-types into worker windows via _type_into_window()
+    # Kill switch: data/brain_config.json -> bus_worker.enabled = false
 )
 
 foreach ($d in $daemonSpecs) {

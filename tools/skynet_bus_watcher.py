@@ -31,6 +31,20 @@ POLL_INTERVAL = 2.0
 MAX_LOG = 50
 
 
+def _read_brain_config_flag(key, default=False):
+    """Read a flag from brain_config.json. Re-reads every call for hot-reload."""
+    try:
+        cfg = json.loads((DATA_DIR / "brain_config.json").read_text(encoding="utf-8"))
+        parts = key.split(".")
+        val = cfg
+        for p in parts:
+            val = val.get(p, {}) if isinstance(val, dict) else default
+        return val if isinstance(val, bool) else default
+    except Exception:
+        return default
+    # signed: alpha
+
+
 class BusWatcher:
     """Polls Skynet bus for messages, tracks activity, auto-routes requests."""
 
@@ -78,6 +92,14 @@ class BusWatcher:
                 "content": content,
                 "time": datetime.now().isoformat(),
             })
+
+        # ── KILL SWITCH: bus_watcher.auto_dispatch_enabled (re-read every call) ──  # signed: alpha
+        if not _read_brain_config_flag("bus_watcher.auto_dispatch_enabled", default=False):
+            self._log("route_skip", f"Auto-dispatch BLOCKED — bus_watcher.auto_dispatch_enabled=false")
+            return
+        if not _read_brain_config_flag("daemon_ghost_type_global_enabled", default=False):
+            self._log("route_skip", f"Auto-dispatch BLOCKED — daemon_ghost_type_global_enabled=false")
+            return
 
         try:
             from tools.skynet_dispatch import dispatch_to_idle
@@ -225,6 +247,15 @@ def print_status():
 
 if __name__ == "__main__":
     import argparse
+
+    # Kill switch: check brain_config.json before starting
+    try:
+        _cfg = json.loads((ROOT / "data" / "brain_config.json").read_text(encoding="utf-8"))
+        if not _cfg.get("bus_watcher", {}).get("enabled", False):
+            print("bus_watcher DISABLED in brain_config.json (calls dispatch_to_idle which ghost-types)")
+            sys.exit(0)
+    except Exception:
+        pass
 
     parser = argparse.ArgumentParser(description="Skynet Bus Watcher Daemon")
     parser.add_argument("--once", action="store_true", help="Single poll cycle")

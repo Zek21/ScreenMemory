@@ -285,6 +285,20 @@ def _bus_post(sender, topic, msg_type, content):
         return False
 
 
+def _read_brain_config_flag(key, default=False):
+    """Read a flag from brain_config.json. Re-reads every call for hot-reload."""
+    try:
+        cfg = json.loads((DATA_DIR / "brain_config.json").read_text(encoding="utf-8"))
+        parts = key.split(".")
+        val = cfg
+        for p in parts:
+            val = val.get(p, {}) if isinstance(val, dict) else default
+        return val if isinstance(val, bool) else default
+    except Exception:
+        return default
+    # signed: alpha
+
+
 def _send_digest_to_orchestrator(messages, dry_run=False):
     digest = _format_digest(messages)
     if dry_run:
@@ -292,15 +306,9 @@ def _send_digest_to_orchestrator(messages, dry_run=False):
         return {"bus_ok": True, "prompt_ok": True, "count": len(messages)}
 
     bus_ok = _bus_post("bus_relay", "orchestrator", "bus_relay_digest", digest)
-    prompt_ok = False
-    try:
-        from skynet_delivery import deliver_to_orchestrator
-        result = deliver_to_orchestrator(digest, sender="bus_relay", also_bus=False)
-        prompt_ok = bool(result.get("success"))
-    except Exception as e:
-        log(f"Orchestrator direct delivery failed: {e}", "ERR")
-
-    return {"bus_ok": bus_ok, "prompt_ok": prompt_ok, "count": len(messages)}
+    # Ghost-type delivery permanently disabled — causes garbage in windows (INCIDENT 016).
+    # Orchestrator polls bus every turn, so bus-only delivery is sufficient.
+    return {"bus_ok": bus_ok, "prompt_ok": False, "count": len(messages)}
 
 
 def _flush_due_queue(queue_state, dry_run=False):

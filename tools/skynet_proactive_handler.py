@@ -41,6 +41,22 @@ LOG_FILE = DATA / "proactive_handler.log"
 SCAN_INTERVAL = 15  # seconds between scans
 PYTHON = sys.executable
 
+BRAIN_CONFIG_FILE = DATA / "brain_config.json"  # signed: alpha
+
+
+def _read_brain_config_flag(key, default=False):
+    """Read a flag from brain_config.json. Re-reads every call for hot-reload."""
+    try:
+        cfg = json.loads(BRAIN_CONFIG_FILE.read_text(encoding="utf-8"))
+        parts = key.split(".")
+        val = cfg
+        for p in parts:
+            val = val.get(p, {}) if isinstance(val, dict) else default
+        return val if isinstance(val, bool) else default
+    except Exception:
+        return default
+    # signed: alpha
+
 # ── Logging ─────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -334,6 +350,11 @@ def run_daemon():
 
     try:
         while _running:
+            # ── KILL SWITCH: proactive_handler.enabled (re-read every iteration) ──  # signed: alpha
+            if not _read_brain_config_flag("proactive_handler.enabled", default=False):
+                time.sleep(SCAN_INTERVAL)
+                continue  # dormant but alive — config change wakes it up
+
             workers = _load_worker_hwnds()
             if not workers:
                 time.sleep(SCAN_INTERVAL)
