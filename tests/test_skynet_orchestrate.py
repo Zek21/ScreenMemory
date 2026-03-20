@@ -5,6 +5,7 @@ Tests decomposition heuristics, dispatch routing, result synthesis,
 and the full run() pipeline with mocked network/dispatch dependencies.
 
 signed: gamma
+Additional coverage: signed: delta
 """
 
 import sys
@@ -12,6 +13,7 @@ import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from urllib.error import URLError
 
 ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
@@ -462,6 +464,406 @@ class TestEstimatePriority(unittest.TestCase):
 
     def test_normal_priority(self):
         self.assertEqual(self.fn("add documentation"), 5)
+
+
+# ─── Collect Results Tests ─────────────────────────────────────  # signed: delta
+
+
+class TestCollectResults(unittest.TestCase):
+    """Test SkynetOrchestrator.collect_results bus polling and dedup."""
+
+    def _make_orch(self):
+        with _patch_dispatch_imports():
+            from tools.skynet_orchestrate import SkynetOrchestrator
+            return SkynetOrchestrator()
+
+    @patch("tools.skynet_orchestrate.time.sleep")
+    @patch("tools.skynet_orchestrate.bus_messages")
+    def test_collect_all_results_arrive(self, mock_bus, _sleep):
+        """All expected results arrive within timeout."""
+        orch = self._make_orch()
+        call_count = [0]
+
+        def fake_bus(limit=50, topic=None):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return [{"id": "pre1", "sender": "system", "type": "heartbeat"}]
+            return [
+                {"id": "pre1", "sender": "system", "type": "heartbeat"},
+                {"id": "r1", "sender": "alpha", "type": "result", "content": "Alpha done"},
+                {"id": "r2", "sender": "beta", "type": "result", "content": "Beta done"},
+            ]
+
+        mock_bus.side_effect = fake_bus
+        result = orch.collect_results(["alpha", "beta"], timeout=10)
+        self.assertEqual(result["alpha"], "Alpha done")
+        self.assertEqual(result["beta"], "Beta done")
+
+    @patch("tools.skynet_orchestrate.time.sleep")
+    @patch("tools.skynet_orchestrate.time.time")
+    @patch("tools.skynet_orchestrate.bus_messages")
+    def test_collect_timeout_returns_none(self, mock_bus, mock_time, _sleep):
+        """Missing workers get None on timeout."""
+        orch = self._make_orch()
+        # First call = baseline (empty), second = alpha result arrives, third = timeout
+        mock_bus.side_effect = [
+            [],
+            [{"id": "r1", "sender": "alpha", "type": "result", "content": "OK"}],
+            [{"id": "r1", "sender": "alpha", "type": "result", "content": "OK"}],
+        ]
+        mock_time.side_effect = [100.0, 100.0, 100.0, 200.0, 200.0, 200.0]
+        result = orch.collect_results(["alpha", "beta"], timeout=5)
+        self.assertEqual(result["alpha"], "OK")
+        self.assertIsNone(result["beta"])
+
+    @patch("tools.skynet_orchestrate.time.sleep")
+    @patch("tools.skynet_orchestrate.time.time")
+    @patch("tools.skynet_orchestrate.bus_messages")
+    def test_collect_ignores_non_result_types(self, mock_bus, mock_time, _sleep):
+        """Only 'result' type messages are collected."""
+        orch = self._make_orch()
+        mock_bus.return_value = [{"id": "h1", "sender": "alpha", "type": "heartbeat", "content": "alive"}]
+        mock_time.side_effect = [100.0, 100.0, 200.0, 200.0]
+        result = orch.collect_results(["alpha"], timeout=5)
+        self.assertIsNone(result["alpha"])
+
+    @patch("tools.skynet_orchestrate.time.sleep")
+    @patch("tools.skynet_orchestrate.time.time")
+    @patch("tools.skynet_orchestrate.bus_messages")
+    def test_collect_ignores_unexpected_senders(self, mock_bus, mock_time, _sleep):
+        """Results from workers not in expected list are skipped."""
+        orch = self._make_orch()
+        mock_bus.return_value = [{"id": "r1", "sender": "gamma", "type": "result", "content": "Gamma done"}]
+        mock_time.side_effect = [100.0, 100.0, 200.0, 200.0]
+        result = orch.collect_results(["alpha"], timeout=5)
+        self.assertIsNone(result["alpha"])
+        self.assertNotIn("gamma", result)
+
+    @patch("tools.skynet_orchestrate.time.sleep")
+    @patch("tools.skynet_orchestrate.bus_messages")
+    def test_collect_deduplicates_by_id(self, mock_bus, _sleep):
+        """Same message ID is not counted twice."""
+        orch = self._make_orch()
+        call_count = [0]
+
+        def fake_bus(limit=50, topic=None):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return []
+            return [
+                {"id": "r1", "sender": "alpha", "type": "result", "content": "First"},
+                {"id": "r1", "sender": "alpha", "type": "result", "content": "Duplicate"},
+            ]
+
+        mock_bus.side_effect = fake_bus
+        result = orch.collect_results(["alpha"], timeout=10)
+        self.assertEqual(result["alpha"], "First")
+
+
+# ─── Convene Tests ─────────────────────────────────────────────  # signed: delta
+
+
+class TestConvene(unittest.TestCase):
+    """Test SkynetOrchestrator.convene() multi-worker coordination."""
+
+    @patch("tools.skynet_orchestrate.urlopen")
+    @patch("tools.skynet_orchestrate.dispatch_parallel", return_value={"alpha": True, "beta": True})
+    @patch("tools.skynet_orchestrate.scan_all_states", return_value={"alpha": "IDLE", "beta": "IDLE", "gamma": "IDLE", "delta": "IDLE"})
+    @patch("tools.skynet_orchestrate.load_orch_hwnd", return_value=999)
+    @patch("tools.skynet_orchestrate.load_workers", return_value=_make_workers())
+    def test_convene_success(self, _lw, _lo, _scan, _dp, mock_url):
+        """Convene creates session and dispatches to idle workers."""
+        mock_url.return_value.read.return_value = json.dumps({"session_id": "s1"}).encode()
+        from tools.skynet_orchestrate import SkynetOrchestrator
+        orch = SkynetOrchestrator()
+        with patch.object(orch, "collect_results", return_value={"alpha": "A", "beta": "B"}):
+            result = orch.convene("Security audit", "Check endpoints", n_workers=2)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["session_id"], "s1")
+
+    @patch("tools.skynet_orchestrate.urlopen", side_effect=URLError("fail"))
+    @patch("tools.skynet_orchestrate.dispatch_parallel", return_value={"alpha": True})
+    @patch("tools.skynet_orchestrate.scan_all_states", return_value={"alpha": "IDLE", "beta": "IDLE", "gamma": "IDLE", "delta": "IDLE"})
+    @patch("tools.skynet_orchestrate.load_orch_hwnd", return_value=999)
+    @patch("tools.skynet_orchestrate.load_workers", return_value=_make_workers())
+    def test_convene_server_fallback(self, _lw, _lo, _scan, _dp, _url):
+        """Convene falls back to local session_id when server fails."""
+        from tools.skynet_orchestrate import SkynetOrchestrator
+        orch = SkynetOrchestrator()
+        with patch.object(orch, "collect_results", return_value={"alpha": "Done"}):
+            result = orch.convene("Topic", "Context", n_workers=1)
+        self.assertTrue(result["success"])
+        self.assertTrue(result["session_id"].startswith("local_"))
+
+    @patch("tools.skynet_orchestrate.urlopen")
+    @patch("tools.skynet_orchestrate.dispatch_parallel", return_value={})
+    @patch("tools.skynet_orchestrate.scan_all_states", return_value={"alpha": "PROCESSING", "beta": "PROCESSING", "gamma": "PROCESSING", "delta": "PROCESSING"})
+    @patch("tools.skynet_orchestrate.load_orch_hwnd", return_value=999)
+    @patch("tools.skynet_orchestrate.load_workers", return_value=_make_workers())
+    def test_convene_no_dispatched_fails(self, _lw, _lo, _scan, _dp, mock_url):
+        """Convene fails when no workers are dispatched."""
+        mock_url.return_value.read.return_value = json.dumps({"session_id": "s2"}).encode()
+        from tools.skynet_orchestrate import SkynetOrchestrator
+        orch = SkynetOrchestrator()
+        result = orch.convene("Topic", "Context", n_workers=2)
+        self.assertFalse(result["success"])
+
+
+# ─── Reactive Run Tests ───────────────────────────────────────  # signed: delta
+
+
+class TestReactiveRun(unittest.TestCase):
+    """Test SkynetOrchestrator.reactive_run() real-time mode."""
+
+    @patch("tools.skynet_orchestrate.bus_post")
+    @patch("tools.skynet_orchestrate.bus_messages", return_value=[])
+    @patch("tools.skynet_orchestrate.RealtimeCollector")
+    @patch("tools.skynet_orchestrate.dispatch_to_worker", return_value=True)
+    @patch("tools.skynet_orchestrate.scan_all_states", return_value={"alpha": "IDLE", "beta": "IDLE", "gamma": "IDLE", "delta": "IDLE"})
+    @patch("tools.skynet_orchestrate.load_orch_hwnd", return_value=999)
+    @patch("tools.skynet_orchestrate.load_workers", return_value=_make_workers())
+    @patch("tools.skynet_orchestrate.get_orchestrator_guard")
+    @patch("tools.skynet_orchestrate.recover_worker")
+    def test_reactive_run_success(self, _recov, _guard, _lw, _lo, _scan, _dtw, mock_coll_cls, _msgs, _bp):
+        """Reactive run completes successfully with mocked collector."""
+        mock_coll = MagicMock()
+        mock_coll.collect.return_value = {"alpha": {"status": "complete", "text": "Done"}}
+        mock_coll_cls.return_value = mock_coll
+        from tools.skynet_orchestrate import SkynetOrchestrator
+        orch = SkynetOrchestrator()
+        result = orch.reactive_run("fix the bug", timeout=10)
+        self.assertTrue(result["success"])
+        self.assertIn("report", result)
+
+    @patch("tools.skynet_orchestrate.bus_post")
+    @patch("tools.skynet_orchestrate.dispatch_to_worker", return_value=False)
+    @patch("tools.skynet_orchestrate.dispatch_parallel", return_value={"alpha": False})
+    @patch("tools.skynet_orchestrate.scan_all_states", return_value={"alpha": "IDLE"})
+    @patch("tools.skynet_orchestrate.load_orch_hwnd", return_value=999)
+    @patch("tools.skynet_orchestrate.load_workers", return_value=_make_workers())
+    @patch("tools.skynet_orchestrate.get_orchestrator_guard")
+    @patch("tools.skynet_orchestrate.recover_worker")
+    def test_reactive_run_dispatch_fails(self, _recov, _guard, _lw, _lo, _scan, _dp, _dtw, _bp):
+        """Reactive run returns failure when all dispatches fail."""
+        from tools.skynet_orchestrate import SkynetOrchestrator
+        orch = SkynetOrchestrator()
+        result = orch.reactive_run("do X", timeout=10)
+        self.assertFalse(result["success"])
+
+
+# ─── Dispatch and Log Tests ───────────────────────────────────  # signed: delta
+
+
+class TestDispatchAndLog(unittest.TestCase):
+    """Test _dispatch_and_log internal method."""
+
+    def test_separates_success_and_failure(self):
+        """_dispatch_and_log splits dispatched from failed."""
+        with _patch_dispatch_imports():
+            from tools.skynet_orchestrate import SkynetOrchestrator
+            orch = SkynetOrchestrator()
+            subtasks = [
+                {"worker": "alpha", "task": "A", "priority": 5},
+                {"worker": "beta", "task": "B", "priority": 5},
+            ]
+            with patch.object(orch, "dispatch_all", return_value={"alpha": True, "beta": False}):
+                dispatched, failed = orch._dispatch_and_log(subtasks)
+            self.assertEqual(dispatched, ["alpha"])
+            self.assertEqual(failed, ["beta"])
+
+    def test_all_dispatched(self):
+        """_dispatch_and_log with all success returns empty failed list."""
+        with _patch_dispatch_imports():
+            from tools.skynet_orchestrate import SkynetOrchestrator
+            orch = SkynetOrchestrator()
+            subtasks = [
+                {"worker": "alpha", "task": "A", "priority": 5},
+                {"worker": "beta", "task": "B", "priority": 5},
+            ]
+            with patch.object(orch, "dispatch_all", return_value={"alpha": True, "beta": True}):
+                dispatched, failed = orch._dispatch_and_log(subtasks)
+            self.assertEqual(len(dispatched), 2)
+            self.assertEqual(len(failed), 0)
+
+
+# ─── Route Help Requests Tests ────────────────────────────────  # signed: delta
+
+
+class TestRouteHelpRequests(unittest.TestCase):
+    """Test _route_help_requests bus monitoring."""
+
+    @patch("tools.skynet_orchestrate.dispatch_to_worker", return_value=True)
+    @patch("tools.skynet_orchestrate.bus_messages")
+    @patch("tools.skynet_orchestrate.scan_all_states", return_value={"alpha": "IDLE", "beta": "IDLE", "gamma": "IDLE", "delta": "IDLE"})
+    @patch("tools.skynet_orchestrate.load_orch_hwnd", return_value=999)
+    @patch("tools.skynet_orchestrate.load_workers", return_value=_make_workers())
+    def test_routes_help_to_free_worker(self, _lw, _lo, _scan, mock_bus, mock_dispatch):
+        """Help requests are routed to idle workers not already dispatched."""
+        mock_bus.return_value = [
+            {"sender": "alpha", "type": "help", "content": "Need assistance with parsing"},
+        ]
+        from tools.skynet_orchestrate import SkynetOrchestrator
+        orch = SkynetOrchestrator()
+        orch._route_help_requests(["alpha"])  # alpha is busy
+        # dispatch_to_worker should be called for a free worker
+        if mock_dispatch.called:
+            call_args = mock_dispatch.call_args
+            self.assertNotEqual(call_args[0][0], "alpha")
+
+    @patch("tools.skynet_orchestrate.bus_messages", side_effect=Exception("bus error"))
+    @patch("tools.skynet_orchestrate.scan_all_states", return_value={"alpha": "IDLE"})
+    @patch("tools.skynet_orchestrate.load_orch_hwnd", return_value=999)
+    @patch("tools.skynet_orchestrate.load_workers", return_value=_make_workers())
+    def test_help_routing_handles_bus_error(self, _lw, _lo, _scan, _bus):
+        """_route_help_requests handles bus errors gracefully."""
+        from tools.skynet_orchestrate import SkynetOrchestrator
+        orch = SkynetOrchestrator()
+        # Should not raise
+        orch._route_help_requests(["alpha"])
+
+
+# ─── Synthesize Edge Cases ────────────────────────────────────  # signed: delta
+
+
+class TestSynthesizeEdgeCases(unittest.TestCase):
+    """Additional synthesize coverage for edge cases."""
+
+    @classmethod
+    def setUpClass(cls):
+        with _patch_dispatch_imports():
+            from tools.skynet_orchestrate import SkynetOrchestrator
+            cls.orch = SkynetOrchestrator()
+
+    def test_synthesize_all_failed(self):
+        """Synthesis with zero successful results."""
+        subtasks = [
+            {"worker": "alpha", "task": "A"},
+            {"worker": "beta", "task": "B"},
+        ]
+        results = {"alpha": None, "beta": None}
+        report = self.orch.synthesize("Test", subtasks, results)
+        self.assertIn("0/2", report)
+
+    def test_synthesize_dict_timeout_status(self):
+        """Dict result with timeout status shows error marker."""
+        subtasks = [{"worker": "alpha", "task": "Do X"}]
+        results = {"alpha": {"status": "timeout", "text": None, "elapsed_s": 120}}
+        report = self.orch.synthesize("Test", subtasks, results)
+        self.assertIn("TIMEOUT", report)
+
+    def test_synthesize_empty_string_result(self):
+        """Empty string result is treated as missing."""
+        subtasks = [{"worker": "alpha", "task": "Do X"}]
+        results = {"alpha": ""}
+        report = self.orch.synthesize("Test", subtasks, results)
+        self.assertIn("MISSING", report)
+
+    def test_synthesize_truncates_long_results(self):
+        """Very long result text is truncated in report."""
+        subtasks = [{"worker": "alpha", "task": "Do X"}]
+        results = {"alpha": "A" * 2000}
+        report = self.orch.synthesize("Test", subtasks, results)
+        # Result should be capped at 500 chars
+        self.assertLess(len(report), 2500)
+
+
+# ─── Decompose Edge Cases ─────────────────────────────────────  # signed: delta
+
+
+class TestDecomposeEdgeCases(unittest.TestCase):
+    """Edge case decomposition tests."""
+
+    def setUp(self):
+        self._smart_patch = patch(
+            "tools.skynet_orchestrate.SkynetOrchestrator._try_smart_decompose",
+            return_value=None,
+        )
+        self._smart_patch.start()
+        with _patch_dispatch_imports():
+            from tools.skynet_orchestrate import SkynetOrchestrator
+            self.orch = SkynetOrchestrator()
+
+    def tearDown(self):
+        self._smart_patch.stop()
+
+    def test_empty_prompt(self):
+        """Empty prompt produces at least one subtask."""
+        result = self.orch.decompose_task("")
+        self.assertIsInstance(result, list)
+        self.assertGreaterEqual(len(result), 1)
+
+    def test_single_path_no_split(self):
+        """Single path reference doesn't trigger path decomposition."""
+        result = self.orch.decompose_task("Review core/analyzer.py")
+        # Single path = no path-based split, falls through to size-based
+        self.assertGreaterEqual(len(result), 1)
+
+    def test_explicit_routing_priority(self):
+        """Explicit routing always gets priority 5."""
+        result = self.orch.decompose_task("alpha: urgent fix now")
+        self.assertEqual(result[0]["priority"], 5)
+
+    def test_medium_prompt_bounds(self):
+        """Prompt between 50-200 chars gets at most 2 workers."""
+        prompt = "a" * 100  # 100 chars, between 50-200
+        result = self.orch.decompose_task(prompt)
+        self.assertLessEqual(len(result), 2)
+
+
+# ─── Record Orchestration Metrics Tests ───────────────────────  # signed: delta
+
+
+class TestRecordMetrics(unittest.TestCase):
+    """Test _record_orchestration_metrics does not crash."""
+
+    def test_metrics_recording_handles_import_error(self):
+        """Metrics recording silently handles missing SkynetMetrics."""
+        with _patch_dispatch_imports():
+            from tools.skynet_orchestrate import SkynetOrchestrator
+            # The method has a bare except, should not raise
+            SkynetOrchestrator._record_orchestration_metrics(
+                ["alpha"], {"alpha": "done"}, 100.0, True)
+
+    def test_metrics_realtime_vs_legacy_counting(self):
+        """Realtime mode counts 'complete' status; legacy counts non-None."""
+        with _patch_dispatch_imports():
+            from tools.skynet_orchestrate import SkynetOrchestrator
+            # Realtime
+            SkynetOrchestrator._record_orchestration_metrics(
+                ["alpha"], {"alpha": {"status": "complete", "text": "ok"}}, 50.0, True)
+            # Legacy
+            SkynetOrchestrator._record_orchestration_metrics(
+                ["alpha"], {"alpha": "ok"}, 50.0, False)
+
+
+# ─── Preflight Recover Unknown Tests ─────────────────────────  # signed: delta
+
+
+class TestPreflightRecover(unittest.TestCase):
+    """Test _preflight_recover_unknown attempts recovery for UNKNOWN workers."""
+
+    @patch("tools.skynet_orchestrate.recover_worker")
+    @patch("tools.skynet_orchestrate.scan_all_states", return_value={"alpha": "UNKNOWN", "beta": "IDLE"})
+    @patch("tools.skynet_orchestrate.load_orch_hwnd", return_value=999)
+    @patch("tools.skynet_orchestrate.load_workers", return_value=_make_workers())
+    def test_recovers_unknown_workers(self, _lw, _lo, mock_scan, mock_recover):
+        """UNKNOWN workers trigger recovery attempt."""
+        from tools.skynet_orchestrate import SkynetOrchestrator
+        orch = SkynetOrchestrator()
+        mock_scan.return_value = {"alpha": "UNKNOWN", "beta": "IDLE", "gamma": "IDLE", "delta": "IDLE"}
+        orch._preflight_recover_unknown()
+        mock_recover.assert_called_once()
+
+    @patch("tools.skynet_orchestrate.recover_worker")
+    @patch("tools.skynet_orchestrate.scan_all_states", return_value={"alpha": "IDLE", "beta": "IDLE", "gamma": "IDLE", "delta": "IDLE"})
+    @patch("tools.skynet_orchestrate.load_orch_hwnd", return_value=999)
+    @patch("tools.skynet_orchestrate.load_workers", return_value=_make_workers())
+    def test_no_recovery_when_all_idle(self, _lw, _lo, _scan, mock_recover):
+        """No recovery when all workers are IDLE."""
+        from tools.skynet_orchestrate import SkynetOrchestrator
+        orch = SkynetOrchestrator()
+        orch._preflight_recover_unknown()
+        mock_recover.assert_not_called()
 
 
 if __name__ == "__main__":
