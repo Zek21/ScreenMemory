@@ -258,7 +258,7 @@ def main():
         print("[NAV] Not on extensions page, retrying...")
         try:
             c.navigate(tab_id, 'chrome://extensions', wait=False)
-        except:
+        except Exception:  # signed: beta
             pass
         time.sleep(3)
         url = c.eval(tab_id, 'window.location.href')

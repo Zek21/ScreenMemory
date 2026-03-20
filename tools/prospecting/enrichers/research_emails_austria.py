@@ -93,7 +93,7 @@ async def check_fb_page(page, slug, expected_city):
             if await close_btn.count() > 0:
                 await close_btn.first.click(timeout=2000)
                 await page.wait_for_timeout(500)
-        except:
+        except Exception:  # signed: beta
             pass
         
         text = await page.evaluate('() => document.body.innerText')
@@ -105,7 +105,7 @@ async def check_fb_page(page, slug, expected_city):
         }''')
         
         return page_name, list(emails)
-    except:
+    except Exception:  # signed: beta
         return None, None
 
 def _load_businesses_scored():
@@ -117,7 +117,7 @@ def _load_businesses_scored():
                 rating = float(row.get('rating', '0') or '0')
                 reviews = int((row.get('reviews', '0') or '0').replace(',', ''))
                 row['_score'] = rating * reviews
-            except:
+            except (ValueError, TypeError):  # signed: beta
                 row['_score'] = 0
             businesses.append(row)
     businesses.sort(key=lambda x: -x['_score'])

@@ -79,7 +79,7 @@ async def check_feed_for_no_website(page, timeout=3000):
         items = feed.locator('a[href*="/maps/place/"]')
         count = await items.count()
         return count
-    except:
+    except Exception:  # signed: beta
         return 0
 
 async def has_website_in_detail(page):
@@ -91,7 +91,7 @@ async def has_website_in_detail(page):
         auth_btn = page.locator('button[data-item-id="authority"]')
         if await auth_btn.count() > 0:
             return True
-    except:
+    except Exception:  # signed: beta
         pass
     return False
 
@@ -105,7 +105,7 @@ async def _extract_name(page):
             box = await el.bounding_box()
             if box and box["x"] > 400:
                 return await el.inner_text()
-    except:
+    except Exception:  # signed: beta
         pass
     return None
 
@@ -116,21 +116,21 @@ async def _extract_detail_fields(page, info):
         cat_btn = page.locator('button[jsaction*="category"]')
         if await cat_btn.count() > 0:
             info["google_category"] = await cat_btn.first.inner_text()
-    except:
+    except Exception:  # signed: beta
         pass
     try:
         addr_btn = page.locator('button[data-item-id="address"]')
         if await addr_btn.count() > 0:
             info["address"] = await addr_btn.first.get_attribute("aria-label") or ""
             info["address"] = info["address"].replace("Address: ", "")
-    except:
+    except Exception:  # signed: beta
         pass
     try:
         phone_btn = page.locator('button[data-item-id^="phone"]')
         if await phone_btn.count() > 0:
             info["phone"] = await phone_btn.first.get_attribute("aria-label") or ""
             info["phone"] = info["phone"].replace("Phone: ", "")
-    except:
+    except Exception:  # signed: beta
         pass
     try:
         rating_el = page.locator('div.F7nice span[aria-hidden="true"]')
@@ -142,7 +142,7 @@ async def _extract_detail_fields(page, info):
             nums = re.findall(r"[\d,]+", label)
             if nums:
                 info["reviews"] = nums[0]
-    except:
+    except Exception:  # signed: beta
         pass
 
 
@@ -178,9 +178,9 @@ async def _item_has_website(parent):
         web_links = parent.locator('a[aria-label*="Visit"]')
         if await web_links.count() > 0:
             return True
-    except:
+    except Exception:  # signed: beta
         pass
-    parent_text = await parent.inner_text() if await parent.count() > 0 else ""
+    parent_text= await parent.inner_text() if await parent.count() > 0 else ""
     return "Website" in parent_text
 
 
@@ -223,7 +223,7 @@ async def search_category_city(page, category, city, progress):
         feed = page.locator('div[role="feed"]')
         try:
             await feed.wait_for(state="attached", timeout=5000)
-        except:
+        except Exception:  # signed: beta
             progress["completed"].append(key)
             save_progress(progress)
             return []
@@ -273,7 +273,7 @@ async def _accept_cookies(page):
         if await accept_btn.count() > 0:
             await accept_btn.first.click()
             await asyncio.sleep(1)
-    except:
+    except Exception:  # signed: beta
         pass
 
 

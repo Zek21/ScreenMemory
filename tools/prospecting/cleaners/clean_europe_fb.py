@@ -32,7 +32,7 @@ def get_tld(email):
     try:
         domain = email.split('@')[1]
         return domain.split('.')[-1]
-    except:
+    except Exception:  # signed: beta
         return ''
 
 # Read all rows

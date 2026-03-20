@@ -1,17 +1,30 @@
-"""Skynet Self-Healing Dispatch -- detects stuck tasks and auto-recovers.
+"""Skynet Self-Healing — comprehensive automated recovery system.
 
-Monitors worker state, detects stuck/failed dispatches, auto-heals by
-re-dispatching or cancelling, and produces health reports.
+Detects stuck tasks, checks all critical systems, auto-fixes issues,
+and generates health reports.
 
 Usage:
-    python tools/skynet_self_heal.py detect     # Show stuck tasks
-    python tools/skynet_self_heal.py heal       # Auto-heal stuck tasks
-    python tools/skynet_self_heal.py report     # Full health report
-    python tools/skynet_self_heal.py run        # Continuous monitoring loop
+    python tools/skynet_self_heal.py                # Full check + fix (default)
+    python tools/skynet_self_heal.py --check-only   # Diagnose without fixing
+    python tools/skynet_self_heal.py --fix          # Explicit fix mode
+    python tools/skynet_self_heal.py --json         # JSON output
+    python tools/skynet_self_heal.py --daemon       # Run every 5 minutes
+    python tools/skynet_self_heal.py detect         # Legacy: show stuck tasks
+    python tools/skynet_self_heal.py heal           # Legacy: auto-heal stuck tasks
+    python tools/skynet_self_heal.py report         # Legacy: dispatch health report
+    python tools/skynet_self_heal.py run            # Legacy: continuous monitor loop
 """
+# signed: delta
 
+import argparse
+import ctypes
+import datetime
 import json
 import os
+import shutil
+import signal
+import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -21,10 +34,20 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
-DISPATCH_LOG = ROOT / "data" / "dispatch_log.json"
-WORKER_PERF = ROOT / "data" / "worker_performance.json"
-REALTIME_FILE = ROOT / "data" / "realtime.json"
-HEAL_LOG = ROOT / "data" / "heal_log.json"
+DATA = ROOT / "data"
+LOGS = ROOT / "logs"
+SKYNET_DIR = ROOT / "Skynet"
+
+DISPATCH_LOG = DATA / "dispatch_log.json"
+WORKER_PERF = DATA / "worker_performance.json"
+REALTIME_FILE = DATA / "realtime.json"
+HEAL_LOG = DATA / "heal_log.json"
+
+BACKEND_PORT = 8420
+GOD_CONSOLE_PORT = 8421
+DAEMON_INTERVAL = 300  # 5 minutes
+BUS_ARCHIVE_MAX_MB = 10
+LOG_ARCHIVE_AGE_DAYS = 1
 
 STUCK_THRESHOLDS = {
     "simple": 120,    # 2 min
@@ -33,6 +56,27 @@ STUCK_THRESHOLDS = {
 }
 
 ALL_WORKERS = ["alpha", "beta", "gamma", "delta"]
+
+# Known daemons and their PID file paths
+KNOWN_DAEMONS = {
+    "sse_daemon": DATA / "sse_daemon.pid",
+    "monitor": DATA / "monitor.pid",
+    "self_prompt": DATA / "self_prompt.pid",
+    "self_improve": DATA / "self_improve.pid",
+    "bus_relay": DATA / "bus_relay.pid",
+    "learner": DATA / "learner.pid",
+    "watchdog": DATA / "watchdog.pid",
+    "overseer": DATA / "overseer.pid",
+    "god_console": DATA / "god_console.pid",
+    "bus_persist": DATA / "bus_persist.pid",
+    "idle_monitor": DATA / "idle_monitor.pid",
+    "consultant_consumer": DATA / "consultant_consumer.pid",
+    "consultant_bridge": DATA / "consultant_bridge.pid",
+    "gemini_consultant_bridge": DATA / "gemini_consultant_bridge.pid",
+    "proactive_handler": DATA / "proactive_handler.pid",
+    "knowledge_distill": DATA / "knowledge_distill.pid",
+    "self_heal": DATA / "self_heal.pid",
+}
 
 
 def _load_json(path: Path) -> dict | list:
@@ -51,6 +95,485 @@ def _save_json(path: Path, data) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
     tmp.replace(path)
+
+
+def _ts() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process is alive using Windows kernel API."""
+    try:
+        PROCESS_QUERY_LIMITED = 0x1000
+        STILL_ACTIVE = 259
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED, False, pid)
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(h)
+        return code.value == STILL_ACTIVE
+    except Exception:
+        return False
+
+
+def _is_port_open(port: int, timeout: float = 1.0) -> bool:
+    """Check if a TCP port is listening."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except (ConnectionRefusedError, TimeoutError, OSError):
+        return False
+
+
+def _http_get(url: str, timeout: float = 2.0):
+    """Quick HTTP GET, returns parsed JSON or None."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+# ── Comprehensive system checks ──────────────────────────────────
+
+def check_backend() -> dict:
+    """Check Skynet backend on port 8420."""
+    result = {"name": "backend", "port": BACKEND_PORT, "status": "DEAD", "details": {}}
+    if _is_port_open(BACKEND_PORT):
+        result["status"] = "ALIVE"
+        status = _http_get(f"http://127.0.0.1:{BACKEND_PORT}/status")
+        if status:
+            result["details"]["uptime_s"] = status.get("uptime_s", 0)
+            result["details"]["version"] = status.get("version", "unknown")
+    return result
+
+
+def check_god_console() -> dict:
+    """Check GOD Console on port 8421."""
+    result = {"name": "god_console", "port": GOD_CONSOLE_PORT, "status": "DEAD", "details": {}}
+    if _is_port_open(GOD_CONSOLE_PORT):
+        result["status"] = "ALIVE"
+        health = _http_get(f"http://127.0.0.1:{GOD_CONSOLE_PORT}/health")
+        if health:
+            result["details"] = health
+    return result
+
+
+def check_workers_hwnd() -> dict:
+    """Check worker HWNDs via IsWindow."""
+    result = {"total": len(ALL_WORKERS), "alive": 0, "dead": [], "workers": {}}
+    health_file = DATA / "worker_health.json"
+    if not health_file.exists():
+        result["error"] = "worker_health.json missing"
+        return result
+    try:
+        health = json.loads(health_file.read_text(encoding="utf-8"))
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+    for name in ALL_WORKERS:
+        w = health.get(name, {})
+        hwnd = int(w.get("hwnd", 0))
+        alive = bool(hwnd and ctypes.windll.user32.IsWindow(hwnd))
+        result["workers"][name] = {
+            "hwnd": hwnd, "alive": alive,
+            "status": w.get("status", "UNKNOWN"),
+            "model": w.get("model", "unknown"),
+        }
+        if alive:
+            result["alive"] += 1
+        else:
+            result["dead"].append(name)
+    return result
+
+
+def check_daemons() -> dict:
+    """Cross-check PID files against live processes."""
+    result = {"total": 0, "alive": 0, "stale": [], "missing": [], "daemons": {}}
+    for name, pid_path in KNOWN_DAEMONS.items():
+        result["total"] += 1
+        if not pid_path.exists():
+            result["missing"].append(name)
+            result["daemons"][name] = {"status": "NO_PID", "pid": None}
+            continue
+        try:
+            pid = int(pid_path.read_text(encoding="utf-8").strip())
+        except (ValueError, OSError):
+            result["stale"].append(name)
+            result["daemons"][name] = {"status": "CORRUPT_PID", "pid": None}
+            continue
+        if _is_pid_alive(pid):
+            result["alive"] += 1
+            result["daemons"][name] = {"status": "ALIVE", "pid": pid}
+        else:
+            result["stale"].append(name)
+            result["daemons"][name] = {"status": "STALE", "pid": pid}
+
+    # Also check for unknown PID files
+    for f in DATA.glob("*.pid"):
+        daemon_name = f.stem
+        if daemon_name not in KNOWN_DAEMONS:
+            try:
+                pid = int(f.read_text(encoding="utf-8").strip())
+                alive = _is_pid_alive(pid)
+            except (ValueError, OSError):
+                pid, alive = None, False
+            result["daemons"][daemon_name] = {
+                "status": "ALIVE" if alive else "STALE",
+                "pid": pid, "unknown": True,
+            }
+            if alive:
+                result["alive"] += 1
+            else:
+                result["stale"].append(daemon_name)
+    return result
+
+
+def check_disk() -> dict:
+    """Check disk space and stale/large files in data/."""
+    result = {"data_dir_mb": 0, "stale_files": [], "large_files": []}
+    try:
+        usage = shutil.disk_usage(str(ROOT))
+        result["disk_free_gb"] = round(usage.free / (1024 ** 3), 2)
+        result["disk_total_gb"] = round(usage.total / (1024 ** 3), 2)
+        result["disk_used_pct"] = round((usage.used / usage.total) * 100, 1)
+    except Exception:
+        pass
+    total_size = 0
+    now = time.time()
+    for f in DATA.iterdir():
+        if f.is_file():
+            sz = f.stat().st_size
+            total_size += sz
+            age_days = (now - f.stat().st_mtime) / 86400
+            if sz > 10 * 1024 * 1024:
+                result["large_files"].append({"name": f.name, "size_mb": round(sz / (1024 ** 2), 2)})
+            if age_days > 30 and f.suffix in (".tmp", ".bak", ".old"):
+                result["stale_files"].append(f.name)
+    result["data_dir_mb"] = round(total_size / (1024 ** 2), 2)
+    bus_archive = DATA / "bus_archive.jsonl"
+    if bus_archive.exists():
+        sz_mb = bus_archive.stat().st_size / (1024 ** 2)
+        result["bus_archive_mb"] = round(sz_mb, 2)
+        result["bus_archive_needs_compact"] = sz_mb > BUS_ARCHIVE_MAX_MB
+    return result
+
+
+def check_logs() -> dict:
+    """Check log directory for old/large files."""
+    result = {"total_files": 0, "total_mb": 0, "old_logs": [], "old_images": []}
+    if not LOGS.exists():
+        return result
+    now = time.time()
+    total = 0
+    for f in LOGS.iterdir():
+        if not f.is_file():
+            continue
+        result["total_files"] += 1
+        sz = f.stat().st_size
+        total += sz
+        age_days = (now - f.stat().st_mtime) / 86400
+        if age_days > LOG_ARCHIVE_AGE_DAYS:
+            if f.suffix == ".log":
+                result["old_logs"].append(f.name)
+            elif f.suffix in (".png", ".jpg"):
+                result["old_images"].append(f.name)
+    result["total_mb"] = round(total / (1024 ** 2), 2)
+    return result
+
+
+# ── Fix functions ────────────────────────────────────────────────
+
+def fix_stale_pids(daemon_result: dict) -> list:
+    """Remove PID files for dead processes."""
+    fixed = []
+    for name in daemon_result.get("stale", []):
+        pid_path = KNOWN_DAEMONS.get(name, DATA / f"{name}.pid")
+        if pid_path.exists():
+            try:
+                pid_path.unlink()
+                fixed.append({"action": "removed_stale_pid", "daemon": name})
+            except OSError as e:
+                fixed.append({"action": "failed_remove_pid", "daemon": name, "error": str(e)})
+    return fixed
+
+
+def fix_archive_logs(log_result: dict) -> list:
+    """Move old log files to logs/archive/."""
+    fixed = []
+    archive_dir = LOGS / "archive"
+    old_files = log_result.get("old_logs", []) + log_result.get("old_images", [])
+    if not old_files:
+        return fixed
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for name in old_files:
+        src = LOGS / name
+        dst = archive_dir / name
+        if src.exists():
+            try:
+                shutil.move(str(src), str(dst))
+                fixed.append({"action": "archived_log", "file": name})
+            except OSError as e:
+                fixed.append({"action": "failed_archive", "file": name, "error": str(e)})
+    return fixed
+
+
+def fix_compact_bus_archive(disk_result: dict) -> list:
+    """Compact bus archive by keeping only last 5000 lines."""
+    fixed = []
+    if not disk_result.get("bus_archive_needs_compact"):
+        return fixed
+    archive = DATA / "bus_archive.jsonl"
+    if not archive.exists():
+        return fixed
+    try:
+        lines = archive.read_text(encoding="utf-8", errors="replace").splitlines()
+        original_count = len(lines)
+        keep = 5000
+        if len(lines) > keep:
+            compacted = lines[-keep:]
+            tmp = archive.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(compacted) + "\n", encoding="utf-8")
+            backup = archive.with_suffix(".jsonl.bak")
+            if backup.exists():
+                backup.unlink()
+            archive.rename(backup)
+            tmp.rename(archive)
+            new_sz = round(archive.stat().st_size / (1024 ** 2), 2)
+            fixed.append({"action": "compacted_bus_archive",
+                          "lines_before": original_count, "lines_after": keep,
+                          "size_mb": new_sz})
+        else:
+            fixed.append({"action": "bus_archive_ok", "lines": original_count})
+    except Exception as e:
+        fixed.append({"action": "compact_failed", "error": str(e)})
+    return fixed
+
+
+def fix_restart_backend() -> list:
+    """Restart crashed backend if skynet.exe exists."""
+    fixed = []
+    exe = SKYNET_DIR / "skynet.exe"
+    if not exe.exists():
+        fixed.append({"action": "skip_backend_restart", "reason": "skynet.exe not found"})
+        return fixed
+    try:
+        proc = subprocess.Popen(
+            [str(exe)], cwd=str(SKYNET_DIR),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=0x00000008 | 0x00000200,
+        )
+        time.sleep(3)
+        if _is_port_open(BACKEND_PORT, timeout=2.0):
+            fixed.append({"action": "restarted_backend", "pid": proc.pid})
+        else:
+            fixed.append({"action": "backend_restart_pending", "pid": proc.pid})
+    except Exception as e:
+        fixed.append({"action": "backend_restart_failed", "error": str(e)})
+    return fixed
+
+
+def fix_restart_god_console() -> list:
+    """Restart GOD Console if dead."""
+    fixed = []
+    script = ROOT / "god_console.py"
+    if not script.exists():
+        fixed.append({"action": "skip_god_console_restart", "reason": "god_console.py not found"})
+        return fixed
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(script)], cwd=str(ROOT),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=0x00000008 | 0x00000200,
+        )
+        time.sleep(2)
+        if _is_port_open(GOD_CONSOLE_PORT, timeout=2.0):
+            fixed.append({"action": "restarted_god_console", "pid": proc.pid})
+        else:
+            fixed.append({"action": "god_console_restart_pending", "pid": proc.pid})
+    except Exception as e:
+        fixed.append({"action": "god_console_restart_failed", "error": str(e)})
+    return fixed
+
+
+# ── Comprehensive check + fix orchestration ──────────────────────
+
+def run_system_checks() -> dict:
+    """Run all health checks and return structured report."""
+    report = {
+        "timestamp": _ts(),
+        "backend": check_backend(),
+        "god_console": check_god_console(),
+        "workers": check_workers_hwnd(),
+        "daemons": check_daemons(),
+        "disk": check_disk(),
+        "logs": check_logs(),
+        "stuck_tasks": detect_stuck_tasks(),
+        "issues": [],
+        "summary": {},
+    }
+    issues = report["issues"]
+    if report["backend"]["status"] == "DEAD":
+        issues.append({"severity": "CRITICAL", "system": "backend", "msg": "Backend is DOWN"})
+    if report["god_console"]["status"] == "DEAD":
+        issues.append({"severity": "HIGH", "system": "god_console", "msg": "GOD Console is DOWN"})
+    for w in report["workers"].get("dead", []):
+        issues.append({"severity": "HIGH", "system": "workers", "msg": f"Worker {w} HWND dead"})
+    for d in report["daemons"].get("stale", []):
+        issues.append({"severity": "MEDIUM", "system": "daemons", "msg": f"Stale PID: {d}"})
+    if report["disk"].get("bus_archive_needs_compact"):
+        sz = report["disk"].get("bus_archive_mb", 0)
+        issues.append({"severity": "LOW", "system": "disk",
+                        "msg": f"Bus archive {sz}MB > {BUS_ARCHIVE_MAX_MB}MB"})
+    if len(report["logs"].get("old_logs", [])) > 10:
+        issues.append({"severity": "LOW", "system": "logs",
+                        "msg": f"{len(report['logs']['old_logs'])} old log files"})
+    if report["stuck_tasks"]:
+        issues.append({"severity": "HIGH", "system": "dispatch",
+                        "msg": f"{len(report['stuck_tasks'])} stuck tasks"})
+
+    report["summary"] = {
+        "critical": sum(1 for i in issues if i["severity"] == "CRITICAL"),
+        "high": sum(1 for i in issues if i["severity"] == "HIGH"),
+        "medium": sum(1 for i in issues if i["severity"] == "MEDIUM"),
+        "low": sum(1 for i in issues if i["severity"] == "LOW"),
+        "total_issues": len(issues),
+        "backend": report["backend"]["status"],
+        "god_console": report["god_console"]["status"],
+        "workers_alive": report["workers"]["alive"],
+        "workers_total": report["workers"]["total"],
+        "daemons_alive": report["daemons"]["alive"],
+        "daemons_stale": len(report["daemons"].get("stale", [])),
+    }
+    return report
+
+
+def run_system_fixes(report: dict) -> list:
+    """Apply all auto-fixes based on check results."""
+    all_fixes = []
+    all_fixes.extend(fix_stale_pids(report["daemons"]))
+    all_fixes.extend(fix_archive_logs(report["logs"]))
+    all_fixes.extend(fix_compact_bus_archive(report["disk"]))
+    if report["backend"]["status"] == "DEAD":
+        all_fixes.extend(fix_restart_backend())
+    if report["god_console"]["status"] == "DEAD":
+        all_fixes.extend(fix_restart_god_console())
+    # Auto-heal stuck tasks
+    if report.get("stuck_tasks"):
+        actions = auto_heal()
+        for a in actions:
+            all_fixes.append({"action": f"heal_{a['action']}", "worker": a["worker"]})
+    return all_fixes
+
+
+def save_health_report(report: dict, fixes: list = None):
+    """Save health report to data/health_report.json."""
+    report["fixes_applied"] = fixes or []
+    report["generated_at"] = _ts()
+    out = DATA / "health_report.json"
+    out.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    return out
+
+
+def print_system_report(report: dict, fixes: list = None, as_json: bool = False):
+    """Print human-readable or JSON report."""
+    if as_json:
+        print(json.dumps({**report, "fixes_applied": fixes or []}, indent=2, default=str))
+        return
+
+    s = report["summary"]
+    print("=" * 60)
+    print(f"  SKYNET SELF-HEAL REPORT  --  {report['timestamp']}")
+    print("=" * 60)
+
+    be = report["backend"]
+    icon = "+" if be["status"] == "ALIVE" else "X"
+    uptime = be["details"].get("uptime_s", "?")
+    print(f"\n  Backend:      [{icon}] {be['status']}  (port {be['port']}, uptime {uptime}s)")
+
+    gc = report["god_console"]
+    icon = "+" if gc["status"] == "ALIVE" else "X"
+    print(f"  GOD Console:  [{icon}] {gc['status']}  (port {gc['port']})")
+
+    wk = report["workers"]
+    print(f"\n  Workers: {wk['alive']}/{wk['total']} alive")
+    for name, info in wk.get("workers", {}).items():
+        icon = "+" if info["alive"] else "X"
+        print(f"    [{icon}] {name:8s}  HWND={info['hwnd']}  {info['status']}")
+
+    dm = report["daemons"]
+    print(f"\n  Daemons: {dm['alive']} alive, {len(dm.get('stale', []))} stale, "
+          f"{len(dm.get('missing', []))} no PID")
+    for name, info in sorted(dm.get("daemons", {}).items()):
+        st = info["status"]
+        icon = "+" if st == "ALIVE" else ("X" if st == "STALE" else "-")
+        pid_str = f"PID={info['pid']}" if info.get("pid") else ""
+        print(f"    [{icon}] {name:30s}  {pid_str} {st}")
+
+    dk = report["disk"]
+    print(f"\n  Disk: {dk.get('disk_free_gb', '?')}GB free ({dk.get('disk_used_pct', '?')}% used)")
+    print(f"  Data dir: {dk.get('data_dir_mb', '?')}MB")
+    if dk.get("bus_archive_mb"):
+        flag = " !! NEEDS COMPACT" if dk.get("bus_archive_needs_compact") else ""
+        print(f"  Bus archive: {dk['bus_archive_mb']}MB{flag}")
+
+    lg = report["logs"]
+    print(f"\n  Logs: {lg['total_files']} files, {lg['total_mb']}MB total")
+    if lg.get("old_logs"):
+        print(f"    Old logs: {len(lg['old_logs'])} files (>{LOG_ARCHIVE_AGE_DAYS}d)")
+
+    if report.get("stuck_tasks"):
+        print(f"\n  Stuck tasks: {len(report['stuck_tasks'])}")
+        for st in report["stuck_tasks"]:
+            print(f"    {st['worker']}: {st['stuck_seconds']}s ({st['severity']})")
+
+    if report["issues"]:
+        print(f"\n  Issues ({s['total_issues']}):")
+        for iss in report["issues"]:
+            print(f"    [{iss['severity']:8s}] {iss['msg']}")
+    else:
+        print("\n  [+] No issues detected")
+
+    if fixes:
+        print(f"\n  Fixes applied ({len(fixes)}):")
+        for fix in fixes:
+            target = fix.get("daemon", fix.get("file", fix.get("worker", "")))
+            print(f"    -> {fix['action']}: {target}")
+
+    print("\n" + "=" * 60)
+
+
+def daemon_loop(fix_mode: bool = True, as_json: bool = False):
+    """Run self-heal every DAEMON_INTERVAL seconds."""
+    pid_file = DATA / "self_heal.pid"
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+
+    def _cleanup(signum=None, frame=None):
+        pid_file.unlink(missing_ok=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _cleanup)
+    try:
+        signal.signal(signal.SIGBREAK, _cleanup)
+    except AttributeError:
+        pass  # SIGBREAK is Windows-only
+
+    print(f"[SELF-HEAL] Daemon started (PID {os.getpid()}, interval {DAEMON_INTERVAL}s)")
+    try:
+        while True:
+            report = run_system_checks()
+            fixes = run_system_fixes(report) if fix_mode else []
+            save_health_report(report, fixes)
+            ts = _ts()
+            iss_count = report["summary"]["total_issues"]
+            fix_count = len(fixes)
+            print(f"[{ts}] Check: {iss_count} issues, {fix_count} fixes")
+            time.sleep(DAEMON_INTERVAL)
+    except KeyboardInterrupt:
+        _cleanup()
 
 
 def _get_worker_states() -> dict[str, dict]:
@@ -282,44 +805,52 @@ def run_continuous(interval_s: float = 30.0, max_iterations: int = 0):
 # ---------------------------------------------------------------------------
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: skynet_self_heal.py <detect|heal|report|run> [options]")
-        sys.exit(1)
+    # Legacy subcommand interface (detect, heal, report, run)
+    if len(sys.argv) > 1 and sys.argv[1] in ("detect", "heal", "report", "run"):
+        cmd = sys.argv[1]
+        if cmd == "detect":
+            stuck = detect_stuck_tasks()
+            if stuck:
+                print(f"Found {len(stuck)} stuck task(s):")
+                for s in stuck:
+                    print(f"  {s['worker']}: {s['stuck_seconds']}s ({s['severity']})")
+            else:
+                print("No stuck tasks detected.")
+        elif cmd == "heal":
+            dry = "--dry-run" in sys.argv
+            actions = auto_heal(dry_run=dry)
+            if actions:
+                for a in actions:
+                    print(f"  {a['worker']}: {a['action']} ({a.get('result', 'unknown')})")
+            else:
+                print("Nothing to heal.")
+        elif cmd == "report":
+            report = health_report()
+            print(json.dumps(report, indent=2))
+        elif cmd == "run":
+            interval = 30.0
+            for arg in sys.argv[2:]:
+                if arg.startswith("--interval="):
+                    interval = float(arg.split("=")[1])
+            run_continuous(interval_s=interval)
+        return
 
-    cmd = sys.argv[1]
+    # New comprehensive interface
+    parser = argparse.ArgumentParser(description="Skynet Self-Heal -- automated recovery system")
+    parser.add_argument("--check-only", action="store_true", help="Diagnose without fixing")
+    parser.add_argument("--fix", action="store_true", help="Explicit fix mode (default)")
+    parser.add_argument("--json", action="store_true", help="JSON output")
+    parser.add_argument("--daemon", action="store_true", help="Run every 5 minutes")
+    args = parser.parse_args()
 
-    if cmd == "detect":
-        stuck = detect_stuck_tasks()
-        if stuck:
-            print(f"Found {len(stuck)} stuck task(s):")
-            for s in stuck:
-                print(f"  {s['worker']}: {s['stuck_seconds']}s ({s['severity']})")
-        else:
-            print("No stuck tasks detected.")
+    if args.daemon:
+        daemon_loop(fix_mode=not args.check_only, as_json=args.json)
+        return
 
-    elif cmd == "heal":
-        dry = "--dry-run" in sys.argv
-        actions = auto_heal(dry_run=dry)
-        if actions:
-            for a in actions:
-                print(f"  {a['worker']}: {a['action']} ({a.get('result', 'unknown')})")
-        else:
-            print("Nothing to heal.")
-
-    elif cmd == "report":
-        report = health_report()
-        print(json.dumps(report, indent=2))
-
-    elif cmd == "run":
-        interval = 30.0
-        for arg in sys.argv[2:]:
-            if arg.startswith("--interval="):
-                interval = float(arg.split("=")[1])
-        run_continuous(interval_s=interval)
-
-    else:
-        print(f"Unknown command: {cmd}")
-        sys.exit(1)
+    report = run_system_checks()
+    fixes = [] if args.check_only else run_system_fixes(report)
+    save_health_report(report, fixes)
+    print_system_report(report, fixes, as_json=args.json)
 
 
 if __name__ == "__main__":

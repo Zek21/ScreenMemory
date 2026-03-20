@@ -61,7 +61,7 @@ for i, r in enumerate(rows):
             else:
                 status = 'live'
             break
-        except:
+        except Exception:  # signed: beta
             continue
     
     if status == 'unknown':
