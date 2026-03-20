@@ -540,17 +540,21 @@ class TestPriorityRateLimiting:
     """Tests for metadata.priority affecting rate limits."""
 
     def test_critical_bypasses_rate_limit(self, guard):
-        """Critical priority bypasses rate limiting."""
+        """Critical priority bypasses rate limiting for authorized senders only.
+
+        Only system/monitor/orchestrator/watchdog are authorized for critical
+        bypass (security fix by gamma). Workers like alpha are NOT authorized.
+        """
         now = time.time()
         guard._state["sender_timestamps"] = {
-            "alpha": [now - i for i in range(5)]
+            "orchestrator": [now - i for i in range(5)]
         }
-        msg = _msg(sender="alpha", content="critical message jkl",
+        msg = _msg(sender="orchestrator", content="critical message jkl",
                    metadata={"priority": "critical"})
         with patch.object(guard, '_bus_post', return_value=True):
             result = guard.publish_guarded(msg)
         assert result["allowed"] is True
-        # signed: delta
+        # signed: delta  # updated: gamma — fix test for critical bypass security
 
     def test_low_priority_stricter_limit(self, guard):
         """Low priority gets stricter rate limits (2/min)."""

@@ -105,6 +105,102 @@ def get_all_settings(pkg: dict) -> dict:
     return settings
 
 
+def validate_package_json(pkg: dict, *, check_vendor: bool = False) -> list:
+    """Validate package.json structure and required fields.
+
+    Args:
+        pkg: Parsed package.json dict.
+        check_vendor: If True, also verify Skynet vendor modifications are applied.
+
+    Returns:
+        List of validation error strings. Empty list = all checks passed.
+    """  # signed: alpha
+    errors = []
+
+    # Required top-level fields
+    for field in ("name", "version", "publisher"):
+        if not pkg.get(field):
+            errors.append(f"Missing required field: {field}")
+
+    # engines.vscode must exist
+    engines = pkg.get("engines", {})
+    if not engines.get("vscode"):
+        errors.append("Missing engines.vscode version constraint")
+
+    # contributes must be a dict
+    contributes = pkg.get("contributes")
+    if contributes is not None and not isinstance(contributes, dict):
+        errors.append(f"contributes must be a dict, got {type(contributes).__name__}")
+
+    # configuration must be dict or list of dicts
+    if contributes:
+        config = contributes.get("configuration")
+        if config is not None:
+            configs = [config] if isinstance(config, dict) else config
+            if not isinstance(configs, list):
+                errors.append(f"contributes.configuration must be dict or list, got {type(config).__name__}")
+            else:
+                for i, section in enumerate(configs):
+                    if not isinstance(section, dict):
+                        errors.append(f"configuration[{i}] is not a dict")
+                    elif "properties" not in section:
+                        errors.append(f"configuration[{i}] missing 'properties' key")
+
+    if check_vendor and contributes:
+        # Verify copilotcli vendor when-gate is removed
+        providers = contributes.get("languageModelChatProviders", [])
+        for p in providers:
+            if p.get("vendor") == "copilotcli":
+                if "when" in p:
+                    errors.append(
+                        f"copilotcli vendor still has when-gate: {p['when']!r}"
+                    )
+                break
+        else:
+            errors.append("copilotcli vendor not found in languageModelChatProviders")
+
+        # Verify copilotcli session when-gate removed and order=0
+        sessions = contributes.get("chatSessions", [])
+        for s in sessions:
+            if s.get("type") == "copilotcli":
+                if "when" in s:
+                    errors.append(
+                        f"copilotcli session still has when-gate: {s['when']!r}"
+                    )
+                if s.get("order") != 0:
+                    errors.append(
+                        f"copilotcli session order is {s.get('order')}, expected 0"
+                    )
+                break
+        else:
+            errors.append("copilotcli session not found in chatSessions")
+
+    return errors
+
+
+def _get_vendor_info(pkg: dict) -> dict:
+    """Extract vendor/session provider state from package.json for diffing.
+
+    Returns dict with provider when-gates and session configs.
+    """  # signed: alpha
+    contributes = pkg.get("contributes", {})
+    info = {}
+
+    providers = contributes.get("languageModelChatProviders", [])
+    for p in providers:
+        vendor = p.get("vendor", "unknown")
+        info[f"provider.{vendor}.when"] = p.get("when", "(none)")
+        info[f"provider.{vendor}.id"] = p.get("id", "(none)")
+
+    sessions = contributes.get("chatSessions", [])
+    for s in sessions:
+        stype = s.get("type", "unknown")
+        info[f"session.{stype}.when"] = s.get("when", "(none)")
+        info[f"session.{stype}.order"] = s.get("order", "(none)")
+
+    return info
+
+
 def modify_vendor_visibility(pkg: dict) -> dict:
     """Make Copilot CLI visible in the model provider dropdown and set it as preferred session type.
 
@@ -452,12 +548,60 @@ def cmd_repack(args):
             for key, change in changes.items():
                 print(f"  {key}: {change['old']} -> {change['new']}")
 
+        # Pre-repack validation  # signed: alpha
+        pre_errors = validate_package_json(pkg, check_vendor=True)
+        if pre_errors:
+            print(f"\nWARNING: {len(pre_errors)} validation issue(s) in modified package.json:")
+            for err in pre_errors:
+                print(f"  - {err}")
+
         write_package_json(tmpdir, pkg)
 
         print(f"Repackaging to {args.output}...")
         result = repackage_vsix(tmpdir, args.output)
         size_mb = os.path.getsize(result) / 1024 / 1024
         print(f"Done: {result} ({size_mb:.1f} MB)")
+
+    # Post-repack verification: re-extract and validate  # signed: alpha
+    print("\n=== Post-Repack Verification ===")
+    with tempfile.TemporaryDirectory(prefix="vsix_verify_") as vdir:
+        with zipfile.ZipFile(result, "r") as zf:
+            zf.extractall(vdir)
+
+        verify_pkg_path = os.path.join(vdir, "extension", "package.json")
+        if not os.path.exists(verify_pkg_path):
+            print("FAIL: package.json not found in repacked VSIX!")
+            return result
+
+        with open(verify_pkg_path, "r", encoding="utf-8") as f:
+            try:
+                verify_pkg = json.load(f)
+            except json.JSONDecodeError as e:
+                print(f"FAIL: package.json is invalid JSON: {e}")
+                return result
+
+        post_errors = validate_package_json(verify_pkg, check_vendor=True)
+        if post_errors:
+            print(f"FAIL: {len(post_errors)} issue(s) after re-extract:")
+            for err in post_errors:
+                print(f"  - {err}")
+        else:
+            print("PASS: package.json valid, vendor modifications persisted")
+
+        # Verify requested defaults persisted
+        if new_defaults:
+            verify_settings = get_all_settings(verify_pkg)
+            mismatches = []
+            for key, expected in new_defaults.items():
+                actual = verify_settings.get(key, {}).get("default")
+                if actual != expected:
+                    mismatches.append(f"{key}: expected {expected!r}, got {actual!r}")
+            if mismatches:
+                print(f"FAIL: {len(mismatches)} default(s) did not persist:")
+                for m in mismatches:
+                    print(f"  - {m}")
+            else:
+                print(f"PASS: all {len(new_defaults)} default(s) verified")
 
     return result
 
@@ -507,7 +651,8 @@ def cmd_roundtrip(args):
 
 
 def cmd_diff(args):
-    """Compare two VSIX files to show setting differences."""
+    """Compare two VSIX files to show setting and vendor/session differences."""
+    # signed: alpha
     with zipfile.ZipFile(args.input, "r") as z1, zipfile.ZipFile(args.second, "r") as z2:
         pkg1 = json.loads(z1.read("extension/package.json"))
         pkg2 = json.loads(z2.read("extension/package.json"))
@@ -532,6 +677,36 @@ def cmd_diff(args):
         print(f"=== {len(diffs)} Setting Differences ===")
         for key, old, new in diffs:
             print(f"  {key}: {old} -> {new}")
+
+    # Compare vendor/session provider state
+    vendor1 = _get_vendor_info(pkg1)
+    vendor2 = _get_vendor_info(pkg2)
+    vendor_diffs = []
+    vkeys = sorted(set(vendor1.keys()) | set(vendor2.keys()))
+    for key in vkeys:
+        v1 = vendor1.get(key, "(absent)")
+        v2 = vendor2.get(key, "(absent)")
+        if v1 != v2:
+            vendor_diffs.append((key, v1, v2))
+
+    if vendor_diffs:
+        print(f"\n=== {len(vendor_diffs)} Vendor/Session Differences ===")
+        for key, old, new in vendor_diffs:
+            print(f"  {key}: {old} -> {new}")
+    elif vendor1 or vendor2:
+        print("\nVendor/session configuration: IDENTICAL")
+
+    # Validate both packages
+    errs1 = validate_package_json(pkg1)
+    errs2 = validate_package_json(pkg2, check_vendor=True)
+    if errs1:
+        print(f"\n=== Validation Issues (first VSIX) ===")
+        for e in errs1:
+            print(f"  WARNING: {e}")
+    if errs2:
+        print(f"\n=== Validation Issues (second VSIX) ===")
+        for e in errs2:
+            print(f"  WARNING: {e}")
 
 
 def main():

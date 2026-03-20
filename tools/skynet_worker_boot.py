@@ -41,7 +41,7 @@ import os
 from pathlib import Path
 from datetime import datetime
 
-BOOT_VERSION = "2.0.0"
+BOOT_VERSION = "2.1.0"
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -180,27 +180,27 @@ CLI_OFFSET = (55, 484)         # RELATIVE fallback to worker window session targ
 INPUT_OFFSET = (465, 415)      # RELATIVE to worker window (chat input area)
 SEND_OFFSET = (880, 453)       # RELATIVE to worker window (Send button, for 2nd+ prompts)
 
-# Identity prompt — FULL POWER invocation from skynet_invocation.py
-# Falls back to basic prompt if invocation module unavailable.
+# Identity prompt — SHORT and safe. Does NOT trigger file creation or Apply dialogs.
+# The worker gets full context from AGENTS.md and .github/ instructions automatically
+# since it's in Copilot CLI mode with ScreenMemory agent attached.
 def _get_identity_prompt(name):
-    """Get the full-power boot invocation for a worker."""
-    try:
-        from tools.skynet_invocation import build_boot_invocation
-        return build_boot_invocation(name)
-    except Exception:
-        # Fallback: basic identity prompt
-        return (
-            "You are {NAME}, a Skynet worker. Post your identity to the bus. "
-            "Run this Python script:\n\n"
-            "import requests\n"
-            "requests.post('http://localhost:8420/bus/publish', json={{\n"
-            "    'sender': '{name}',\n"
-            "    'topic': 'orchestrator',\n"
-            "    'type': 'identity_ack',\n"
-            "    'content': '{NAME} ONLINE - Claude Opus 4.6 fast - Ready'\n"
-            "}})\n"
-            "print('Identity posted to bus')\n"
-        ).format(NAME=name.upper(), name=name)
+    """Get a short identity prompt that announces the worker on the bus.
+    
+    CRITICAL: This prompt must be SHORT (under 500 chars) and must NOT
+    cause the worker to create/edit files. Long prompts trigger the
+    Apply dialog which blocks all further interaction. The worker already
+    has full context from AGENTS.md and custom instructions.
+    """
+    return (
+        f"You are {name.upper()}, a Skynet worker. "
+        f"Run this command to announce yourself:\n\n"
+        f"python -c \"import requests; "
+        f"requests.post('http://localhost:8420/bus/publish', "
+        f"json={{'sender':'{name}','topic':'orchestrator',"
+        f"'type':'identity_ack',"
+        f"'content':'{name.upper()} ONLINE - Ready'}}); "
+        f"print('{name.upper()} identity posted')\""
+    )
 
 u32 = ctypes.windll.user32
 
@@ -646,6 +646,67 @@ def step7_verify(name: str, hwnd: int, timeout: int = 60) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Pre-boot: clean stale git worktrees
+# ---------------------------------------------------------------------------
+
+def _clean_git_worktrees() -> None:
+    """Remove stale git worktrees that cause Apply dialog failures.
+    
+    When Copilot CLI's isolation mode creates worktrees, the `edit` tool
+    tries to git-apply changes in a worktree context, which shows an
+    Apply dialog that permanently blocks the worker. This function cleans
+    all worktrees before booting to prevent that.
+    """
+    import shutil
+
+    # Clean .git/worktrees entries
+    worktrees_dir = ROOT / ".git" / "worktrees"
+    if worktrees_dir.exists():
+        entries = list(worktrees_dir.iterdir())
+        if entries:
+            log(f"PRE-BOOT: Found {len(entries)} stale worktree(s) in .git/worktrees")
+            for entry in entries:
+                try:
+                    # Use git worktree remove first (safe)
+                    result = subprocess.run(
+                        ["git", "worktree", "remove", "--force", str(entry)],
+                        capture_output=True, text=True, timeout=10,
+                        cwd=str(ROOT),
+                    )
+                    if result.returncode == 0:
+                        log(f"  Removed worktree: {entry.name}")
+                    else:
+                        # Fallback: manual cleanup
+                        shutil.rmtree(entry, ignore_errors=True)
+                        log(f"  Force-removed worktree dir: {entry.name}")
+                except Exception as e:
+                    log(f"  Failed to remove worktree {entry.name}: {e}")
+        else:
+            log("PRE-BOOT: No stale worktrees in .git/worktrees")
+    
+    # Clean external .worktrees directory (created by VS Code isolation)
+    ext_worktrees = ROOT.parent / f"{ROOT.name}.worktrees"
+    if ext_worktrees.exists():
+        log(f"PRE-BOOT: Removing external worktrees dir: {ext_worktrees}")
+        try:
+            shutil.rmtree(ext_worktrees, ignore_errors=True)
+            log("  External worktrees dir removed")
+        except Exception as e:
+            log(f"  Failed to remove external worktrees: {e}")
+
+    # Run git worktree prune to clean orphaned entries
+    try:
+        subprocess.run(
+            ["git", "worktree", "prune"],
+            capture_output=True, text=True, timeout=10,
+            cwd=str(ROOT),
+        )
+        log("PRE-BOOT: git worktree prune completed")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Composite: boot a single worker
 # ---------------------------------------------------------------------------
 
@@ -710,6 +771,9 @@ def boot_all_workers(orch_hwnd: int) -> dict:
     log(f"========== FULL WORKER BOOT v{BOOT_VERSION} ==========")
     log(f"Orchestrator HWND: {orch_hwnd}")
 
+    # Pre-boot: clean stale git worktrees that cause Apply dialog failures
+    _clean_git_worktrees()
+
     # Collect known HWNDs (orchestrator + any existing worker windows)
     known_hwnds = _collect_known_hwnds(orch_hwnd)
     log(f"Known HWNDs before boot: {known_hwnds}")
@@ -731,10 +795,110 @@ def boot_all_workers(orch_hwnd: int) -> dict:
     # Print summary
     _print_summary(results)
 
+    # Post-boot UIA verification: confirm model + agent for all workers  # signed: alpha
+    booted_hwnds = {
+        name: info['hwnd']
+        for name, info in results.items()
+        if info.get('hwnd') and info.get('success')
+    }
+    if booted_hwnds:
+        post_boot_uia_verify(booted_hwnds)
+
     # Return focus to orchestrator
     u32.SetForegroundWindow(orch_hwnd)
 
     return results
+
+
+def post_boot_uia_verify(worker_hwnds: dict, timeout: int = 30) -> dict:
+    """Post-boot UIA scan loop: confirm model_ok and agent_ok for all workers.
+
+    Polls UIA engine scan_all() every 3s for up to `timeout` seconds until all
+    workers report model_ok=True and agent_ok=True (Copilot CLI + Claude Opus
+    4.6 fast).
+
+    Args:
+        worker_hwnds: dict of {name: hwnd} for workers to verify.
+        timeout: max seconds to poll (default 30).
+
+    Returns:
+        dict of {name: {model_ok, agent_ok, model, agent, state, scan_ms}}.
+    """  # signed: alpha
+    try:
+        from tools.uia_engine import get_engine
+        engine = get_engine()
+    except Exception as e:
+        log(f"Post-boot UIA verify SKIPPED — UIA engine unavailable: {e}")
+        return {}
+
+    log("")
+    log("=" * 72)
+    log("POST-BOOT UIA VERIFICATION")
+    log(f"  Checking {len(worker_hwnds)} worker(s) for model_ok + agent_ok...")
+
+    deadline = time.time() + timeout
+    poll_interval = 3
+    final_results = {}
+
+    while time.time() < deadline:
+        try:
+            scans = engine.scan_all(worker_hwnds)
+        except Exception as e:
+            log(f"  UIA scan_all failed: {e}")
+            time.sleep(poll_interval)
+            continue
+
+        all_ok = True
+        for name, ws in scans.items():
+            final_results[name] = {
+                'model_ok': ws.model_ok,
+                'agent_ok': ws.agent_ok,
+                'model': ws.model,
+                'agent': ws.agent,
+                'state': ws.state,
+                'scan_ms': ws.scan_ms,
+            }
+            if not ws.model_ok or not ws.agent_ok:
+                all_ok = False
+
+        if all_ok:
+            remaining = int(deadline - time.time())
+            log(f"  ALL WORKERS VERIFIED in {timeout - remaining}s")
+            _print_uia_table(final_results)
+            log("POST-BOOT UIA VERIFICATION: PASS")
+            log("=" * 72)
+            return final_results
+
+        remaining = int(deadline - time.time())
+        problems = [
+            f"{n}: model_ok={r['model_ok']} agent_ok={r['agent_ok']}"
+            for n, r in final_results.items()
+            if not r['model_ok'] or not r['agent_ok']
+        ]
+        log(f"  Waiting... {remaining}s left — issues: {', '.join(problems)}")
+        time.sleep(poll_interval)
+
+    # Timeout — report final state
+    _print_uia_table(final_results)
+    failures = [n for n, r in final_results.items()
+                if not r.get('model_ok') or not r.get('agent_ok')]
+    if failures:
+        log(f"POST-BOOT UIA VERIFICATION: FAIL — {', '.join(failures)} not ready after {timeout}s")
+    else:
+        log("POST-BOOT UIA VERIFICATION: PASS")
+    log("=" * 72)
+    return final_results
+
+
+def _print_uia_table(results: dict) -> None:
+    """Print UIA verification results as a table."""  # signed: alpha
+    log(f"  {'Name':<8} {'State':<12} {'Model OK':<10} {'Agent OK':<10} {'Model':<30} {'ms'}")
+    log(f"  {'----':<8} {'-----':<12} {'--------':<10} {'--------':<10} {'-----':<30} {'--'}")
+    for name in sorted(results.keys()):
+        r = results[name]
+        model_str = (r.get('model') or '')[:28]
+        log(f"  {name:<8} {r.get('state','?'):<12} {str(r.get('model_ok','?')):<10} "
+            f"{str(r.get('agent_ok','?')):<10} {model_str:<30} {r.get('scan_ms', 0):.0f}")
 
 
 def _collect_known_hwnds(orch_hwnd: int) -> set:
@@ -931,6 +1095,15 @@ def verify_all_workers() -> bool:
         log(f"  {r['name']:<8} {r['hwnd']:<10} {str(r['alive']):<7} {str(r['title_ok']):<7} {str(r['bus_ack']):<9} {r['status']}")
 
     log(f"Overall: {'ALL OK' if all_ok else 'ISSUES FOUND'}")
+
+    # Also run UIA model/agent verification for alive workers  # signed: alpha
+    alive_hwnds = {r['name']: r['hwnd'] for r in rows if r['alive'] and r['hwnd']}
+    if alive_hwnds:
+        uia_results = post_boot_uia_verify(alive_hwnds, timeout=10)
+        for name, ur in uia_results.items():
+            if not ur.get('model_ok') or not ur.get('agent_ok'):
+                all_ok = False
+
     return all_ok
 
 

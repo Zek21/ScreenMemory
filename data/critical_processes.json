@@ -47,7 +47,7 @@
     },
     {
       "pid": 12212,
-      "hwnd": 395596,
+      "hwnd": 3345384,
       "name": "alpha",
       "role": "worker",
       "protected": true
@@ -61,6 +61,6 @@
     }
   ],
   "process_count": 8,
-  "updated_at": "2026-03-20T20:08:58",
+  "updated_at": "2026-03-20T23:57:24",
   "updated_by": "skynet_process_guard.refresh_registry()"
 }

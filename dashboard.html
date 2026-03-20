@@ -1389,7 +1389,7 @@ const AGENTS={
 };
 const CONSULTANT_COLOR='#00f0ff';
 const DEFAULT_ROLES={alpha:'Worker Core 0',beta:'Worker Core 1',gamma:'Worker Core 2',delta:'Worker Core 3'};
-const startTime=Date.now();
+let _srvUptimeBase=0,_srvUptimeRecvAt=0; /* server uptime truth: base + local offset  signed: alpha */
 let seenLogIds=new Set(),seenOrchIds=new Set(),totalTasks=0;
 let rafPaused=false;
 document.addEventListener('visibilitychange',()=>{rafPaused=document.hidden;if(!rafPaused)animate();});
@@ -1971,6 +1971,7 @@ function _applyStatus(d){
   let tt=0;for(const s of Object.values(d.agents||{}))tt+=(s.tasks_completed||0);
   document.getElementById('sb-tasks').textContent=tt;
   if(d.uptime_s!=null){
+    _srvUptimeBase=d.uptime_s;_srvUptimeRecvAt=Date.now(); /* truth anchor  signed: alpha */
     const u=Math.floor(d.uptime_s);
     const h=Math.floor(u/3600),m=Math.floor((u%3600)/60),s=u%60;
     document.getElementById('sb-uptime').textContent=(h?h+'h ':'')+(m?m+'m ':'')+s+'s';
@@ -1995,11 +1996,12 @@ function animate(){
   if(rafPaused)return;
   const t=Date.now()/1000;
   drawRadar(t);
-  const s=Math.floor((Date.now()-startTime)/1000);
+  /* TRUTH FIX: clock shows real server uptime, not page-load elapsed  signed: alpha */
+  const su=_srvUptimeRecvAt>0?Math.floor(_srvUptimeBase+(Date.now()-_srvUptimeRecvAt)/1000):0;
   document.getElementById('clock').textContent=
-    String(Math.floor(s/3600)).padStart(2,'0')+':'+
-    String(Math.floor((s%3600)/60)).padStart(2,'0')+':'+
-    String(s%60).padStart(2,'0');
+    String(Math.floor(su/3600)).padStart(2,'0')+':'+
+    String(Math.floor((su%3600)/60)).padStart(2,'0')+':'+
+    String(su%60).padStart(2,'0');
   requestAnimationFrame(animate);
 }
 animate();

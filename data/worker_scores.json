@@ -161,6 +161,28 @@
       "advisory_contribution_awards": 0,
       "cross_system_review_awards": 0,
       "base": 6.0
+    },
+    "delta_explotest": {
+      "total": -0.02,
+      "awards": 0,
+      "deductions": 1,
+      "refactor_deductions": 0,
+      "refactor_reversals": 0,
+      "bias_penalties": 0,
+      "proactive_ticket_clears": 0,
+      "autonomous_pull_awards": 0,
+      "bug_reports_filed": 0,
+      "bug_report_confirmations": 0,
+      "bug_cross_validations": 0,
+      "zero_ticket_bonus_awards": 0,
+      "uncleared_work_deductions": 0,
+      "tool_bypass_deductions": 0,
+      "repeat_offense_deductions": 0,
+      "cleanup_help_awards": 0,
+      "cleanup_cv_awards": 0,
+      "invalid_cleanup_awards": 0,
+      "advisory_contribution_awards": 0,
+      "cross_system_review_awards": 0
     }
   },
   "history": [
@@ -3080,6 +3102,16 @@
       "validator": "orchestrator",
       "timestamp": "2026-03-20T12:19:57.655598+00:00",
       "new_total": 8.01
+    },
+    {
+      "worker": "delta_explotest",
+      "action": "deduct",
+      "amount": 0.02,
+      "task_id": "SPAM_BLOCKED: rate_limit_minute: delta_explotest sent 5 messages in last 60s (limit=5)",
+      "validator": "spam_guard",
+      "timestamp": "2026-03-20T15:28:28.939024+00:00",
+      "new_total": -0.02,
+      "forced": true
     }
   ]
 }
