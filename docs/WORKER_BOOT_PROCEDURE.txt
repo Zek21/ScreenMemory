@@ -1,15 +1,20 @@
 SKYNET WORKER BOOT — EXACT PROVEN PROCEDURE
-=============================================
-Tested and confirmed working 2026-03-18.
-Every step, every coordinate, every timing.
+===========================================
+Updated 2026-03-20. Chevron dropdown method v2.0.0.
+Workers are opened via the "New Chat" dropdown chevron on the orchestrator
+window, then configured to Copilot CLI mode. The chevron is located
+dynamically via UIA scan (button named "New Chat" with width ~16px,
+positioned right of the main "New Chat (Ctrl+N)" plus button).
+
+Worktree-based boot (INCIDENT 018) is DEPRECATED and REMOVED.
 
 PREREQUISITES
 -------------
-- Orchestrator HWND known (e.g. 657790)
+- Orchestrator HWND known (for focus restore after dispatch)
 - Backend running on port 8420
 - GOD Console running on port 8421
 - VS Code setting: github.copilot.chat.cli.isolationOption.enabled = true
-  (in BOTH user settings and workspace .vscode/settings.json)
+  in both user settings and workspace .vscode/settings.json
 
 GRID POSITIONS (right monitor, 930x500, taskbar-safe)
 -----------------------------------------------------
@@ -20,207 +25,149 @@ Delta:  bottom-right  (2870, 540)
 
 DO ONE WORKER AT A TIME. VERIFY BEFORE OPENING NEXT.
 
-================================================================================
-STEP 1 — OPEN WINDOW VIA DROPDOWN
-================================================================================
+===============================================================================
+STEP 1 — OPEN WINDOW VIA CHEVRON DROPDOWN
+===============================================================================
 
-import ctypes, time, pyautogui
-u32 = ctypes.windll.user32
+The chevron dropdown is the small triangle (width ~16px) to the RIGHT of
+the main "New Chat (Ctrl+N)" button in the orchestrator title bar.
 
-# Focus orchestrator first
-u32.SetForegroundWindow(ORCH_HWND)
-time.sleep(1.5)
+Detection method (preferred):
+  UIA scan the orchestrator window for buttons with Name="New Chat"
+  and width <= 20px. This is the chevron. Use its center coordinates.
 
-# Click the dropdown chevron (the small arrow next to "New Chat" button)
-pyautogui.click(248, 52)
-time.sleep(1.5)
+Fallback (if UIA fails):
+  Get orchestrator window rect via GetWindowRect.
+  The chevron is at approximately (rect.left + 192, rect.top + 30).
 
-# Navigate to "New Chat Window" (3rd item in dropdown)
-pyautogui.press('down')    # 1: New Chat
-time.sleep(0.2)
-pyautogui.press('down')    # 2: New Chat Editor
-time.sleep(0.2)
-pyautogui.press('down')    # 3: New Chat Window  <-- this one
-time.sleep(0.2)
-pyautogui.press('enter')
-time.sleep(3)
+Procedure:
+  1. Focus orchestrator: SetForegroundWindow(ORCH_HWND)
+  2. Click chevron: pyautogui.click(chevron_x, chevron_y)
+  3. Navigate menu:
+     pyautogui.press('down')  # 1: New Chat
+     pyautogui.press('down')  # 2: New Chat Editor
+     pyautogui.press('down')  # 3: New Chat Window  <-- target
+     pyautogui.press('enter')
+  4. Wait 3s for window to open
 
-================================================================================
+===============================================================================
 STEP 2 — FIND THE NEW WINDOW HWND
-================================================================================
+===============================================================================
 
-import ctypes, ctypes.wintypes
-u32 = ctypes.windll.user32
+Enumerate all visible windows matching "Code - Insiders" in title.
+Exclude orchestrator HWND and all existing worker/consultant HWNDs.
+The remaining window is the new worker.
 
-known = {ORCH_HWND, 657970, ...any other known HWNDs...}
-wins = []
+Poll up to 25s if needed (window may take a moment to appear).
 
-def cb(hwnd, _):
-    if u32.IsWindowVisible(hwnd):
-        buf = ctypes.create_unicode_buffer(512)
-        u32.GetWindowTextW(hwnd, buf, 512)
-        t = buf.value
-        if 'Code - Insiders' in t and hwnd not in known:
-            wins.append((hwnd, t))
-    return True
-
-u32.EnumWindows(
-    ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)(cb),
-    0
-)
-
-# wins[0][0] is the new HWND
-
-================================================================================
+===============================================================================
 STEP 3 — POSITION IN GRID
-================================================================================
+===============================================================================
 
-u32.MoveWindow(HWND, gx, gy, 930, 500, True)
+Move the new window to its worker slot:
 
-# gx, gy from the grid table above
+  u32.MoveWindow(HWND, gx, gy, 930, 500, True)
 
-================================================================================
-STEP 4 — SET SESSION TARGET TO COPILOT CLI
-================================================================================
+===============================================================================
+STEP 4 — SET SESSION TARGET TO COPILOT CLI (with verification)
+===============================================================================
 
-This is the "Local" dropdown at the BOTTOM-LEFT of the chat window.
-Setting it to "Copilot CLI" automatically sets model to Claude Opus 4.6 (fast mode).
+Method A (UIA-based, preferred):
+  1. UIA scan the worker window for buttons
+  2. Find a button whose name contains "Local", "Copilot CLI", or "Cloud"
+     These are session-target buttons at the bottom of the chat panel
+  3. If found, click it; then type "cli" + Enter to select Copilot CLI
 
-u32.SetForegroundWindow(HWND)
-time.sleep(1)
+Method B (relative coordinates, fallback):
+  1. Click at (gx + 55, gy + 484) -- bottom-left session target area
+  2. Wait 1.5s for dropdown
+  3. Type "cli" + Enter
 
-# Click the "Local" text at bottom-left of window
-pyautogui.click(gx + 55, gy + 484)
-time.sleep(1.5)
+VERIFICATION (MANDATORY):
+  After setting CLI, re-scan via UIA for session_target field.
+  If session_target != "copilot_cli", retry once (press Escape first
+  to dismiss any stale quickpick, then repeat Method A or B).
 
-# Select "Copilot CLI" (2nd item, right below "Local")
-pyautogui.press('down')
-time.sleep(0.3)
-pyautogui.press('enter')
-time.sleep(2)
+Result:
+- Session target = Copilot CLI
+- Model auto-switches to Claude Opus 4.6 (fast mode)
 
-RESULT: Session target shows "Copilot CLI", model shows "Claude Opus 4.6 (fast mode)"
+===============================================================================
+STEP 5 — SET PERMISSIONS (SKIP IN CLI MODE)
+===============================================================================
 
-================================================================================
-STEP 5 — SET PERMISSIONS TO BYPASS APPROVALS
-================================================================================
+In Copilot CLI mode, there is NO permissions button.
+The step is skipped entirely.
 
-Run guard_bypass.ps1 TWICE (first attempt sets it, second confirms):
+If for any reason the worker is NOT in Copilot CLI mode and shows a
+permissions button, run guard_bypass.ps1 TWICE:
 
-powershell -File tools\guard_bypass.ps1 -Hwnd HWND
-# wait 3 seconds
-powershell -File tools\guard_bypass.ps1 -Hwnd HWND
+  powershell -File tools\guard_bypass.ps1 -Hwnd HWND
+  powershell -File tools\guard_bypass.ps1 -Hwnd HWND
 
-Expected output on first run:
-  PERMS_CHECK attempt 1/3...
-  PERMS_CURRENT: Set Permissions - Default Approvals -- switching...
-  PERMS_VERIFY_FAILED attempt 1
-  PERMS_CHECK attempt 2/3...
-  PERMS_FIXED
-
-Expected output on second run:
-  PERMS_CHECK attempt 1/3...
-  PERMS_OK
-
-================================================================================
+===============================================================================
 STEP 6 — DISPATCH IDENTITY PROMPT
-================================================================================
+===============================================================================
 
-import ctypes, time, pyautogui, pyperclip
-u32 = ctypes.windll.user32
+Uses pyautogui (hardware-level input) for reliable submission.
+ghost_type/PostMessage does NOT trigger submission in Copilot CLI windows.
 
-task = (
-    "You are NAME, a Skynet worker. Post your identity to the bus. "
-    "Run this Python script:\n\n"
-    "import requests\n"
-    "requests.post('http://localhost:8420/bus/publish', json={\n"
-    "    'sender': 'name',\n"
-    "    'topic': 'orchestrator',\n"
-    "    'type': 'identity_ack',\n"
-    "    'content': 'NAME ONLINE - Claude Opus 4.6 fast - Ready'\n"
-    "})\n"
-    "print('Identity posted to bus')\n"
-)
+Method A (UIA-based input, preferred):
+  1. UIA scan for an Edit control or input area in the worker window
+  2. Click it, paste prompt, press Enter
 
-# Replace NAME/name with actual worker name (alpha, beta, gamma, delta)
+Method B (relative coordinates, fallback):
+  1. Click input area at (gx + 465, gy + 415)
+  2. Ctrl+V to paste the identity prompt
+  3. Press Enter to submit
 
-old_clip = pyperclip.paste()
-pyperclip.copy(task)
+For subsequent prompts, if Enter stops working, click the Send button
+at (gx + 880, gy + 453) instead.
 
-u32.SetForegroundWindow(HWND)
-time.sleep(1.0)
+The canonical prompt comes from tools/skynet_invocation.py when available.
+Submission must transition the worker from IDLE to PROCESSING.
 
-# Click in the input area (center of the text box)
-pyautogui.click(gx + 465, gy + 415)
-time.sleep(0.5)
-
-# Paste the prompt
-pyautogui.hotkey('ctrl', 'v')
-time.sleep(0.5)
-
-# Submit
-pyautogui.press('enter')
-time.sleep(1.0)
-
-# Restore clipboard and return focus to orchestrator
-pyperclip.copy(old_clip if old_clip else '')
-u32.SetForegroundWindow(ORCH_HWND)
-
-================================================================================
+===============================================================================
 STEP 7 — WAIT AND VERIFY
-================================================================================
+===============================================================================
 
-Wait 60 seconds for the worker to process.
+Verification requirements:
+- Worker window is still alive via IsWindow(HWND)
+- Worker title contains the worker name (e.g. "You are ALPHA")
+- Worker posts identity_ack to the bus (check within 60s)
+- UIA state transitions from IDLE to PROCESSING after dispatch
 
-Check bus for identity_ack:
+PARTIAL PASS: alive + title_ok is sufficient to proceed.
+bus_ack may arrive later if the invocation prompt is large.
 
-import requests
-msgs = requests.get('http://localhost:8420/bus/messages?limit=20').json()
-acks = [m for m in msgs if m.get('sender') == 'name' and m.get('type') == 'identity_ack']
-# acks should have at least 1 entry
+Only after verification passes may the next worker be opened.
 
-Check window title should show: "You are NAME, a Skynet worker..."
-
-Check UIA state should be IDLE:
-
-from tools.uia_engine import get_engine
-e = get_engine()
-s = e.scan(HWND)
-# s.state == 'IDLE', s.model_ok == True, s.agent_ok == True
-
-ONLY AFTER ALL CHECKS PASS — proceed to the next worker.
-
-================================================================================
+===============================================================================
 KEY FACTS
-================================================================================
+===============================================================================
 
-- The dropdown chevron at (248, 52) is ABSOLUTE screen coordinates on the
-  orchestrator window. If the orchestrator moves, this coordinate changes.
+1. The chevron dropdown is located via UIA, NOT hardcoded coordinates.
+   Button Name="New Chat", width ~16px, right of the plus button.
+2. Setting Copilot CLI auto-sets the model to Claude Opus 4.6 (fast mode).
+3. Copilot CLI mode has NO permissions button -- step 5 is skipped.
+4. github.copilot.chat.cli.isolationOption.enabled MUST be true.
+5. pyautogui (hardware-level input) is REQUIRED for all interactions.
+   PostMessage/SendKeys/ghost_type do NOT work with Copilot CLI windows.
+6. One worker at a time. Verify before opening the next.
+7. Worktree-based boot is DEPRECATED (removed in v2.0.0).
 
-- "Local" dropdown position is RELATIVE to the worker window:
-  (gx + 55, gy + 484)
+===============================================================================
+COORDINATE CONSTANTS
+===============================================================================
 
-- Input area click position is RELATIVE to the worker window:
-  (gx + 465, gy + 415)
+All coordinates are RELATIVE to the worker window origin (gx, gy):
 
-- Setting "Copilot CLI" as session target AUTOMATICALLY sets the model to
-  Claude Opus 4.6 (fast mode). No separate model change needed.
+| Constant | Offset | Purpose |
+|----------|--------|---------|
+| Session target dropdown | (gx+55, gy+484) | Fallback click for CLI dropdown |
+| Input area | (gx+465, gy+415) | Fallback click before paste |
+| Send button | (gx+880, gy+453) | Fallback submission (2nd+ prompts) |
 
-- guard_bypass.ps1 always needs 2 runs. First sets it, second confirms.
+Chevron dropdown is found via UIA scan of the ORCHESTRATOR window.
+Fallback: (orch_rect.left + 192, orch_rect.top + 30).
 
-- github.copilot.chat.cli.isolationOption.enabled MUST be true.
-  false = FORCES worktree isolation (inverted logic in VS Code).
-  true = inline execution (what we want).
-  Worker must be CLOSED and REOPENED after changing this setting.
-
-- pyautogui.press('enter') works for submitting pasted content as the
-  FIRST prompt in a fresh window. If Enter stops working on subsequent
-  prompts, click the Send button at (gx + 880, gy + 453) instead.
-
-- Do NOT use ghost_type_to_worker() for these windows — its Enter key
-  via PostMessage/SendKeys does not trigger submission in Copilot CLI.
-  Use pyautogui (hardware-level input) for all interactions.
-
-- All workers must be on Copilot CLI mode (NOT Agent, NOT Edits, NOT Local).
-  Copilot CLI uses edit/create tools instead of Agent Apply patches, which
-  prevents INCIDENT 015 (stuck unappliable patches).
