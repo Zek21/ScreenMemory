@@ -223,7 +223,7 @@
     {
       "id": "auto_1",
       "title": "Add tests for tools\\boot_cleanup.py",
-      "status": "pending",
+      "status": "done",
       "assignee": "delta",
       "priority": "medium",
       "wave": "auto_generated",
@@ -233,7 +233,7 @@
     {
       "id": "auto_2",
       "title": "Add tests for tools\\boot_preflight.py",
-      "status": "pending",
+      "status": "done",
       "assignee": "delta",
       "priority": "medium",
       "wave": "auto_generated",

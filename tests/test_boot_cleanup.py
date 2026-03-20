@@ -122,7 +122,7 @@ class TestScanPidFiles(unittest.TestCase):
 class TestScanWorkerHwnds(unittest.TestCase):
 
     @patch("tools.boot_cleanup._hwnd_alive")
-    @patch("tools.boot_cleanup.DATA", new_callable=lambda: MagicMock)
+    @patch("tools.boot_cleanup.DATA")
     def test_alive_workers(self, mock_data, mock_alive):
         """Workers with alive HWNDs → stale=False."""
         workers_json = {"workers": [
@@ -131,7 +131,7 @@ class TestScanWorkerHwnds(unittest.TestCase):
         ]}
         wf = MagicMock()
         wf.exists.return_value = True
-        mock_data.__truediv__ = lambda self, k: wf
+        mock_data.__truediv__ = MagicMock(return_value=wf)
         mock_alive.return_value = True
 
         with patch("builtins.open", mock_open(read_data=json.dumps(workers_json))):
@@ -142,35 +142,35 @@ class TestScanWorkerHwnds(unittest.TestCase):
             self.assertFalse(r["stale"])
 
     @patch("tools.boot_cleanup._hwnd_alive", return_value=False)
-    @patch("tools.boot_cleanup.DATA", new_callable=lambda: MagicMock)
+    @patch("tools.boot_cleanup.DATA")
     def test_dead_workers(self, mock_data, _alive):
         """Dead HWNDs → stale=True."""
         workers_json = {"workers": [{"name": "gamma", "hwnd": 333}]}
         wf = MagicMock()
         wf.exists.return_value = True
-        mock_data.__truediv__ = lambda self, k: wf
+        mock_data.__truediv__ = MagicMock(return_value=wf)
 
         with patch("builtins.open", mock_open(read_data=json.dumps(workers_json))):
             results = bc.scan_worker_hwnds()
 
         self.assertTrue(results[0]["stale"])
 
-    @patch("tools.boot_cleanup.DATA", new_callable=lambda: MagicMock)
+    @patch("tools.boot_cleanup.DATA")
     def test_missing_workers_json(self, mock_data):
         """No workers.json → empty list."""
         wf = MagicMock()
         wf.exists.return_value = False
-        mock_data.__truediv__ = lambda self, k: wf
+        mock_data.__truediv__ = MagicMock(return_value=wf)
         self.assertEqual(bc.scan_worker_hwnds(), [])
 
     @patch("tools.boot_cleanup._hwnd_alive")
-    @patch("tools.boot_cleanup.DATA", new_callable=lambda: MagicMock)
+    @patch("tools.boot_cleanup.DATA")
     def test_zero_hwnd_not_stale(self, mock_data, mock_alive):
         """Worker with hwnd=0 (unassigned) → stale=False."""
         workers_json = {"workers": [{"name": "delta", "hwnd": 0}]}
         wf = MagicMock()
         wf.exists.return_value = True
-        mock_data.__truediv__ = lambda self, k: wf
+        mock_data.__truediv__ = MagicMock(return_value=wf)
 
         with patch("builtins.open", mock_open(read_data=json.dumps(workers_json))):
             results = bc.scan_worker_hwnds()
@@ -185,11 +185,11 @@ class TestScanWorkerHwnds(unittest.TestCase):
 class TestScanOrchestrator(unittest.TestCase):
 
     @patch("tools.boot_cleanup._hwnd_alive", return_value=True)
-    @patch("tools.boot_cleanup.DATA", new_callable=lambda: MagicMock)
+    @patch("tools.boot_cleanup.DATA")
     def test_alive_orchestrator(self, mock_data, _alive):
         of = MagicMock()
         of.exists.return_value = True
-        mock_data.__truediv__ = lambda self, k: of
+        mock_data.__truediv__ = MagicMock(return_value=of)
 
         with patch("builtins.open", mock_open(read_data=json.dumps({"hwnd": 555}))):
             result = bc.scan_orchestrator()
@@ -197,11 +197,11 @@ class TestScanOrchestrator(unittest.TestCase):
         self.assertTrue(result["alive"])
         self.assertFalse(result["stale"])
 
-    @patch("tools.boot_cleanup.DATA", new_callable=lambda: MagicMock)
+    @patch("tools.boot_cleanup.DATA")
     def test_missing_orchestrator_json(self, mock_data):
         of = MagicMock()
         of.exists.return_value = False
-        mock_data.__truediv__ = lambda self, k: of
+        mock_data.__truediv__ = MagicMock(return_value=of)
 
         result = bc.scan_orchestrator()
         self.assertFalse(result["exists"])
@@ -214,7 +214,7 @@ class TestScanOrchestrator(unittest.TestCase):
 class TestScanDispatchLog(unittest.TestCase):
 
     @patch("tools.boot_cleanup.time.time", return_value=10000.0)
-    @patch("tools.boot_cleanup.DATA", new_callable=lambda: MagicMock)
+    @patch("tools.boot_cleanup.DATA")
     def test_stale_entries_detected(self, mock_data, _time):
         """Old entries without result → stale."""
         entries = [
@@ -222,7 +222,7 @@ class TestScanDispatchLog(unittest.TestCase):
         ]
         dl = MagicMock()
         dl.exists.return_value = True
-        mock_data.__truediv__ = lambda self, k: dl
+        mock_data.__truediv__ = MagicMock(return_value=dl)
 
         with patch("builtins.open", mock_open(read_data=json.dumps(entries))):
             result = bc.scan_dispatch_log(max_age_hours=1)
@@ -231,7 +231,7 @@ class TestScanDispatchLog(unittest.TestCase):
         self.assertEqual(result[0]["worker"], "alpha")
 
     @patch("tools.boot_cleanup.time.time", return_value=10000.0)
-    @patch("tools.boot_cleanup.DATA", new_callable=lambda: MagicMock)
+    @patch("tools.boot_cleanup.DATA")
     def test_completed_entries_not_stale(self, mock_data, _time):
         """Entry with result_received=True → not stale."""
         entries = [
@@ -239,18 +239,18 @@ class TestScanDispatchLog(unittest.TestCase):
         ]
         dl = MagicMock()
         dl.exists.return_value = True
-        mock_data.__truediv__ = lambda self, k: dl
+        mock_data.__truediv__ = MagicMock(return_value=dl)
 
         with patch("builtins.open", mock_open(read_data=json.dumps(entries))):
             result = bc.scan_dispatch_log(max_age_hours=1)
 
         self.assertEqual(len(result), 0)
 
-    @patch("tools.boot_cleanup.DATA", new_callable=lambda: MagicMock)
+    @patch("tools.boot_cleanup.DATA")
     def test_missing_dispatch_log(self, mock_data):
         dl = MagicMock()
         dl.exists.return_value = False
-        mock_data.__truediv__ = lambda self, k: dl
+        mock_data.__truediv__ = MagicMock(return_value=dl)
         self.assertEqual(bc.scan_dispatch_log(), [])
 
 
@@ -306,13 +306,13 @@ class TestPrintReport(unittest.TestCase):
         """print_report returns the count of stale items."""
         results = {
             "pid_files": [{"file": "x.pid", "pid": 1, "stale": True, "alive": False}],
-            "workers": [],
-            "orchestrator": {"exists": False, "stale": True},
+            "workers": [{"name": "gamma", "hwnd": 333, "stale": True, "alive": False}],
+            "orchestrator": {"exists": True, "stale": True, "alive": False, "hwnd": 99},
             "consultants": [],
             "stale_dispatches": [],
         }
         count = bc.print_report(results, do_clean=False)
-        self.assertEqual(count, 2)  # 1 stale pid + 1 stale orchestrator
+        self.assertEqual(count, 3)  # 1 stale pid + 1 stale worker + 1 stale orchestrator
 
     def test_report_clean_zero(self):
         results = {
