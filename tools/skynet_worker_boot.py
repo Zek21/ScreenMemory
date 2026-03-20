@@ -910,16 +910,8 @@ def boot_all_workers(orch_hwnd: int) -> dict:
     if booted_hwnds:
         post_boot_uia_verify(booted_hwnds)
 
-    # Final git cleanup — revert any file changes workers introduced
-    try:
-        result = subprocess.run(
-            ["git", "checkout", "--", "."],
-            capture_output=True, text=True, timeout=10,
-            cwd=str(ROOT),
-        )
-        log("POST-BOOT: Git repo reverted to clean state")
-    except Exception:
-        pass
+    # NOTE: git checkout removed — runtime data files use assume-unchanged
+    # to prevent Apply dialog in workers (INCIDENT 016 fix)
 
     # Return focus to orchestrator
     u32.SetForegroundWindow(orch_hwnd)
