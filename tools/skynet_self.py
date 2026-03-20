@@ -604,16 +604,40 @@ class SkynetHealth:
 
     @staticmethod
     def _check_workers(checks):
-        status = _http_get("/status")
+        # Primary: fast local HWND liveness from worker_health.json (~1ms)
+        local_alive = 0
+        local_checked = False
+        try:
+            health_file = DATA / "worker_health.json"
+            if health_file.exists():
+                import ctypes
+                health = json.loads(health_file.read_text())
+                for name in WORKER_NAMES:
+                    w = health.get(name, {})
+                    hwnd = int(w.get("hwnd", 0))
+                    if hwnd and ctypes.windll.user32.IsWindow(hwnd):
+                        local_alive += 1
+                local_checked = True
+        except Exception:
+            pass
+
+        # Secondary: try backend with SHORT timeout (0.5s) for idle/working breakdown
+        status = _http_get("/status", timeout=0.5)
         if status:
             agents = status.get("agents", {})
             workers = {n: agents.get(n, {}) for n in WORKER_NAMES}
             alive = sum(1 for w in workers.values() if w.get("status") != "DEAD")
             idle = sum(1 for w in workers.values() if w.get("status") == "IDLE")
+            alive = max(alive, local_alive)
             checks["workers"] = {"total": len(WORKER_NAMES), "alive": alive, "idle": idle,
                                  "working": alive - idle, "all_healthy": alive == len(WORKER_NAMES)}
+        elif local_checked:
+            checks["workers"] = {"total": len(WORKER_NAMES), "alive": local_alive,
+                                 "all_healthy": local_alive == len(WORKER_NAMES),
+                                 "source": "local_hwnd"}
         else:
-            checks["workers"] = {"total": 0, "alive": 0, "all_healthy": False}
+            checks["workers"] = {"total": len(WORKER_NAMES), "alive": 0, "all_healthy": False}
+        # signed: delta
 
     @staticmethod
     def _check_consultants(checks):
@@ -1277,7 +1301,9 @@ class SkynetSelf:
 
     @staticmethod
     def _compute_iq_components(checks):
-        """Return list of (score, weight) tuples for IQ components."""
+        """Return list of (score, weight) tuples for IQ components.
+        # signed: delta
+        """
         w = checks.get("workers", {})
         total_workers = max(w.get("total", len(WORKER_NAMES)), 1)
         intel = checks.get("intelligence", {})
