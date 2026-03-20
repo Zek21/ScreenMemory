@@ -46,9 +46,30 @@
       "protected": true
     },
     {
-      "pid": 12212,
+      "pid": 0,
       "hwnd": 3345384,
       "name": "alpha",
+      "role": "worker",
+      "protected": true
+    },
+    {
+      "pid": 0,
+      "hwnd": 1116492,
+      "name": "beta",
+      "role": "worker",
+      "protected": true
+    },
+    {
+      "pid": 0,
+      "hwnd": 11603010,
+      "name": "gamma",
+      "role": "worker",
+      "protected": true
+    },
+    {
+      "pid": 0,
+      "hwnd": 10226734,
+      "name": "delta",
       "role": "worker",
       "protected": true
     },
@@ -60,7 +81,7 @@
       "protected": true
     }
   ],
-  "process_count": 8,
-  "updated_at": "2026-03-20T23:58:47",
+  "process_count": 11,
+  "updated_at": "2026-03-21T00:05:32",
   "updated_by": "skynet_process_guard.refresh_registry()"
 }
