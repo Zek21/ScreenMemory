@@ -73,8 +73,8 @@ def _load_delivered():
     if DELIVERED_FILE.exists():
         try:
             return set(json.loads(DELIVERED_FILE.read_text()))
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"_load_delivered parse error: {e}", "WARN")
     return set()
 
 
@@ -95,8 +95,8 @@ def _load_queue_state():
             raw = json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 state.update(raw)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"_load_queue_state parse error: {e}", "WARN")
     if not isinstance(state.get("messages"), list):
         state["messages"] = []
     return state

@@ -113,7 +113,7 @@ MODEL_CHECK_INTERVAL = 60   # seconds between model checks
 ORCH_MODEL_CHECK_INTERVAL = 30  # orchestrator checked more frequently (security-critical)
 STUCK_PROCESSING_THRESHOLD = 600  # seconds in PROCESSING before auto-recovery attempt (increased from 180 to avoid killing workers mid-task)
 STUCK_DEDUP_WINDOW = 300          # suppress duplicate stuck alerts for 5 minutes
-HEARTBEAT_CYCLE_INTERVAL = 10    # post heartbeat every N cycles (~5min at 30s interval)  # signed: alpha
+HEARTBEAT_CYCLE_INTERVAL = 15    # post heartbeat every N cycles (~7.5min at 30s interval)  # signed: alpha -- was 10, reduced frequency per Convention 4 bus saturation fix
 MODEL_FIX_BACKOFF = 600     # 10 minutes between fix attempts per worker (prevents infinite retry)
 MODEL_FIX_MAX_ATTEMPTS = 3  # max consecutive fix attempts before giving up until restart
 
@@ -204,7 +204,13 @@ DEAD_DEBOUNCE_THRESHOLD = 3  # must fail 3 consecutive checks before reporting D
 
 # Alert dedup: suppress repeated identical alerts per worker
 _last_alert: dict[str, float] = {}  # worker_name -> last alert timestamp
-ALERT_DEDUP_WINDOW = 300  # suppress same DEAD alert for 5 minutes after first post
+ALERT_DEDUP_WINDOW = 600  # suppress same DEAD alert for 10 minutes after first post  # signed: alpha -- was 300s, increased per Convention 4 finding (48% bus saturation)
+
+# Alert digest batching: collect alerts within a cycle and post as single digest  # signed: alpha
+MAX_ALERTS_PER_CYCLE = 5  # if more than this many alerts fire in one cycle, consolidate into summary
+ALERT_DIGEST_INTERVAL = 60  # seconds between digest posts
+_pending_alerts: list[dict] = []  # alerts queued for digest
+_last_digest_time: float = 0.0  # last time a digest was posted
 
 # Dispatch lock file path — suppress DEAD alerts during active dispatch
 _DISPATCH_LOCK_FILE = DATA_DIR / "dispatch_active.lock"
@@ -257,6 +263,43 @@ def _is_in_startup_grace() -> bool:
     for MONITOR_STARTUP_GRACE seconds after the monitor process starts.
     """  # signed: alpha
     return (time.time() - _monitor_start_time) < MONITOR_STARTUP_GRACE
+
+
+def _queue_alert(msg: dict) -> None:
+    """Queue an alert for digest batching instead of posting immediately.  # signed: alpha
+    If alerts exceed MAX_ALERTS_PER_CYCLE, they'll be consolidated into one digest."""
+    global _pending_alerts
+    _pending_alerts.append(msg)
+
+
+def _flush_alert_digest() -> None:
+    """Flush pending alerts as a single digest if enough have accumulated.  # signed: alpha
+    Called once per monitoring cycle. If <= MAX_ALERTS_PER_CYCLE alerts are pending,
+    posts them individually. If more, consolidates into a single summary message."""
+    global _pending_alerts, _last_digest_time
+    if not _pending_alerts:
+        return
+
+    now = time.time()
+    if (now - _last_digest_time) < ALERT_DIGEST_INTERVAL:
+        # Too soon since last digest -- hold alerts for next flush
+        return
+
+    if len(_pending_alerts) <= MAX_ALERTS_PER_CYCLE:
+        # Few enough alerts to post individually
+        for alert in _pending_alerts:
+            _guarded_bus_publish(alert)
+    else:
+        # Consolidate into a single digest
+        alert_summary = "; ".join(a.get("content", "?")[:80] for a in _pending_alerts)
+        _guarded_bus_publish({
+            "sender": "monitor",
+            "topic": "orchestrator",
+            "type": "alert_digest",
+            "content": f"ALERT DIGEST ({len(_pending_alerts)} alerts): {alert_summary[:500]}"
+        })
+    _last_digest_time = now
+    _pending_alerts = []
 
 
 def _try_refresh_hwnd(name: str, current_hwnd: int) -> int | None:
@@ -455,7 +498,7 @@ def _check_worker_dead(name: str, hwnd: int, alive: bool, visible: bool, h: dict
     now_ts = time.time()
     last_ts = _last_alert.get(name, 0)
     if (now_ts - last_ts) >= ALERT_DEDUP_WINDOW:
-        _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
+        _queue_alert({"sender": "monitor", "topic": "orchestrator", "type": "alert",  # signed: alpha -- batched via digest
             "content": f"WORKER {name.upper()} DEAD -- hwnd={hwnd} alive={alive} visible={visible} (confirmed {consecutive}x)"})
         _last_alert[name] = now_ts
     else:
@@ -564,7 +607,7 @@ def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_or
             now_ts = time.time()
             last_ts = _last_alert.get(name, 0)
             if (now_ts - last_ts) >= ALERT_DEDUP_WINDOW:
-                _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
+                _queue_alert({"sender": "monitor", "topic": "orchestrator", "type": "alert",  # signed: alpha -- batched via digest
                     "content": f"WORKER {name.upper()} has no HWND -- needs new-chat spawn"})
                 _last_alert[name] = now_ts
             health[name] = h
@@ -1720,6 +1763,9 @@ def _run_monitor(args):
                 last_daemon_restart_check = _handle_periodic_tasks(
                     cycle, health, workers, productivity, pending_work, now,
                     last_daemon_restart_check, DAEMON_CHECK_INTERVAL)
+
+                # Flush batched alerts as digest at end of each cycle  # signed: alpha
+                _flush_alert_digest()
 
                 _consecutive_loop_errors = 0  # reset on successful cycle  # signed: gamma
             except (ConnectionError, TimeoutError, OSError) as e:

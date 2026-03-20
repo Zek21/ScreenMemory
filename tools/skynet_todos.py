@@ -46,12 +46,21 @@ def _matches_actor(item: dict, actor: str, include_claimable: bool = False) -> b
 
 
 def _load():
-    """Load todos from disk (safe against corruption)."""
+    """Load todos from disk (safe against corruption).
+
+    Handles both legacy list format and canonical dict format.
+    If the file contains a plain list, wraps it as ``{"todos": [...], "version": 1}``.
+    """  # signed: gamma
     try:
         from tools.skynet_atomic import safe_read_json
     except ModuleNotFoundError:
         from skynet_atomic import safe_read_json
-    return safe_read_json(TODOS_FILE, default={"todos": [], "version": 1})
+    data = safe_read_json(TODOS_FILE, default={"todos": [], "version": 1})
+    if isinstance(data, list):
+        data = {"todos": data, "version": 1}
+    if "todos" not in data:
+        data["todos"] = []
+    return data
 
 
 def _save(data):

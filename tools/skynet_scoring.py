@@ -1,9 +1,12 @@
 """Skynet Worker Scoring System.
 
 Tracks cross-validated task completions, bug validation, ticket awareness,
-zero-ticket completion bonuses, refactor-review penalties, and workspace
-cleanliness accountability (Rule 0.9). Workers earn points when their work
-or findings are validated by a *different* actor.
+zero-ticket completion bonuses, refactor-review penalties, workspace
+cleanliness accountability (Rule 0.9), and consultant advisory contributions
+(Convention 3 fairness fixes).
+
+Workers earn points when their work or findings are validated by a
+*different* actor.
 
 Scoring defaults:
   - award:                        +0.01 pts per cross-validated task
@@ -25,6 +28,11 @@ Scoring defaults:
   - zero-ticket completion bonus: +1.00 pts to orchestrator when the queue
                                   truly reaches zero, and +1.00 pts to the
                                   actor that closed the final ticket
+                                  (300s cooldown per agent)
+  - advisory contribution:        +0.05 pts when a consultant's advisory
+                                  proposal is accepted and acted upon
+  - cross-system review:          +0.02 pts when a consultant performs a
+                                  cross-system review with actionable findings
 
 Rule 0.9 -- Workspace Cleanliness & Tool Usage Accountability:
   - uncleared work:               -0.02 orch / -0.01 workers/consultants
@@ -33,6 +41,17 @@ Rule 0.9 -- Workspace Cleanliness & Tool Usage Accountability:
   - cleanup help:                 +0.01 for helping clean the workspace
   - cleanup cross-validate:       +0.01 for cross-validating cleanup
   - invalid cleanup finder:       +0.02 for catching false/invalid cleanup
+
+Convention 3 Fairness Fixes:
+  - Consultants receive base=6.0 on first creation (same as workers)
+  - Zero-ticket bonus has 300s cooldown per agent to prevent inflation
+  - reset_illegitimate_deductions() reverses forced boot-window spam penalties
+
+Convention 4 Fairness Enhancements (coding_4, signed: beta):
+  - dispatch_evidence_for_all_deductions flag in brain_config.json
+  - All deduction functions check dispatch evidence when flag is True
+  - reset_illegitimate_deductions() now handles all deduction types, not just spam
+  - System-level deductions (spam_guard, process violations) always bypass evidence check
 
 Data:  data/worker_scores.json
 Bus:   Posts score changes to topic=scoring on localhost:8420
@@ -48,6 +67,9 @@ CLI:
   python tools/skynet_scoring.py --proactive-ticket-clear ACTOR --task-id TID [--validator VNAME]
   python tools/skynet_scoring.py --autonomous-pull WORKER --task-id TID [--validator VNAME]
   python tools/skynet_scoring.py --zero-ticket-bonus --task-id TID --last-worker WORKER [--validator VNAME]
+  python tools/skynet_scoring.py --advisory-contribution AGENT --task-id TID --validator VNAME
+  python tools/skynet_scoring.py --cross-system-review AGENT --task-id TID --validator VNAME
+  python tools/skynet_scoring.py --reset-illegitimate AGENT
   python tools/skynet_scoring.py --uncleared-work AGENT --task-id TID --validator VNAME
   python tools/skynet_scoring.py --tool-bypass AGENT --task-id TID --validator VNAME
   python tools/skynet_scoring.py --repeat-offense AGENT --task-id TID --validator VNAME
@@ -97,6 +119,9 @@ DEFAULT_BIASED_REFACTOR_REPORT_DEDUCT = 0.1
 DEFAULT_PROACTIVE_TICKET_CLEAR_AWARD = 0.2
 DEFAULT_AUTONOMOUS_PULL_AWARD = 0.2
 DEFAULT_TICKET_ZERO_BONUS_AWARD = 1.0
+DEFAULT_ADVISORY_CONTRIBUTION_AWARD = 0.05  # signed: gamma
+DEFAULT_CROSS_SYSTEM_REVIEW_AWARD = 0.02  # signed: gamma
+ZTB_COOLDOWN_SECONDS = 300  # Min seconds between zero-ticket bonuses per agent  # signed: gamma
 
 # Rule 0.9: Workspace Cleanliness & Tool Usage Accountability
 DEFAULT_UNCLEARED_WORK_DEDUCT_ORCH = 0.02
@@ -110,6 +135,12 @@ DEFAULT_INVALID_CLEANUP_AWARD = 0.02
 
 ORCHESTRATOR_ROLES = frozenset({"orchestrator"})
 CONSULTANT_ROLES = frozenset({"consultant", "gemini_consultant"})
+
+WORKER_ROLES = frozenset({"alpha", "beta", "gamma", "delta"})  # signed: gamma
+BASE_SCORE_AGENTS = WORKER_ROLES | CONSULTANT_ROLES | ORCHESTRATOR_ROLES  # signed: gamma
+
+# Adjusters that bypass dispatch evidence checks (system-level penalties).  # signed: beta
+SYSTEM_ADJUSTERS = frozenset({"spam_guard", "process_violation", "system"})
 
 _lock = threading.Lock()  # Guards all read-modify-write cycles on SCORES_FILE  # signed: gamma
 # Note: single lock instance for thread safety (duplicate at line 72 removed) # signed: alpha
@@ -222,6 +253,7 @@ def _load_protocol() -> dict:
         "autonomous_pull_award": DEFAULT_AUTONOMOUS_PULL_AWARD,
         "ticket_zero_bonus_award": DEFAULT_TICKET_ZERO_BONUS_AWARD,
         "require_independent_refactor_validation": True,
+        "dispatch_evidence_for_all_deductions": True,  # signed: beta
     }
     if not BRAIN_CONFIG_FILE.exists():
         return protocol
@@ -251,6 +283,10 @@ def _load_protocol() -> dict:
         protocol["require_independent_refactor_validation"] = bool(
             scoring["require_independent_refactor_validation"]
         )
+    if "dispatch_evidence_for_all_deductions" in scoring:  # signed: beta
+        protocol["dispatch_evidence_for_all_deductions"] = bool(
+            scoring["dispatch_evidence_for_all_deductions"]
+        )
     return protocol
 
 
@@ -274,6 +310,8 @@ def _normalize_worker_entry(entry: dict | None) -> dict:
     entry.setdefault("cleanup_help_awards", 0)
     entry.setdefault("cleanup_cv_awards", 0)
     entry.setdefault("invalid_cleanup_awards", 0)
+    entry.setdefault("advisory_contribution_awards", 0)  # signed: gamma
+    entry.setdefault("cross_system_review_awards", 0)  # signed: gamma
     return entry
 
 
@@ -359,9 +397,17 @@ def _bus_post(msg: dict) -> bool:
 
 
 def _ensure_worker(data: dict, worker: str) -> None:
-    """Initialize a worker entry if it doesn't exist."""
+    """Initialize a worker entry if it doesn't exist.
+
+    Grants base=6.0 to all real agents (workers, orchestrator, consultants)
+    on first creation to ensure equal starting scores per Rule 0.6.
+    """  # signed: gamma
     if worker not in data["scores"]:
-        data["scores"][worker] = _normalize_worker_entry({})
+        entry = _normalize_worker_entry({})
+        if worker in BASE_SCORE_AGENTS:
+            entry.setdefault("base", 6.0)
+            entry["total"] = entry.get("total", 0.0) + 6.0
+        data["scores"][worker] = entry
     else:
         data["scores"][worker] = _normalize_worker_entry(data["scores"][worker])
 
@@ -424,6 +470,28 @@ def _zero_ticket_bonus_exists(data: dict, task_id: str) -> bool:
         r.get("task_id") == task_id and r.get("protocol") == "ticket_zero_completion"
         for r in data.get("history", [])
     )
+
+
+def _ztb_cooldown_ok(data: dict, agent: str) -> bool:
+    """Check if enough time has passed since the last ZTB for this agent.
+
+    Enforces ZTB_COOLDOWN_SECONDS (300s) between consecutive zero-ticket
+    bonuses per agent to prevent rapid-fire inflation.
+    """  # signed: gamma
+    now = datetime.now(timezone.utc)
+    for record in reversed(data.get("history", [])):
+        if (record.get("worker") == agent
+                and record.get("action") == "zero_ticket_bonus"):
+            try:
+                ts_str = record["timestamp"]
+                ts = datetime.fromisoformat(ts_str)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                elapsed = (now - ts).total_seconds()
+                return elapsed >= ZTB_COOLDOWN_SECONDS
+            except (KeyError, ValueError):
+                return True  # Malformed timestamp, allow
+    return True  # No prior ZTB for this agent
 
 
 def _all_tickets_cleared() -> bool:
@@ -533,6 +601,37 @@ def verify_dispatch_evidence(worker: str, task_id: str) -> dict:
         pass
     return result
     # signed: alpha
+
+
+def _guard_dispatch_evidence(
+    worker: str, task_id: str, amount: float, action: str,
+    validator: str = "",
+) -> bool:
+    """Check dispatch evidence if the protocol requires it for all deductions.
+
+    Returns True if the deduction should proceed, False if it should be
+    rejected.  System-level validators (spam_guard, process_violation)
+    always bypass the check.
+    """  # signed: beta
+    if validator in SYSTEM_ADJUSTERS:
+        return True  # system penalties always apply
+    protocol = _load_protocol()
+    if not protocol.get("dispatch_evidence_for_all_deductions", True):
+        return True  # flag disabled -- allow all deductions
+    evidence = verify_dispatch_evidence(worker, task_id)
+    if not evidence["verified"]:
+        import sys
+        print(
+            f"[scoring] REJECTED {action} deduction of {amount} from {worker}: "
+            f"dispatch evidence not verified. "
+            f"found={evidence['dispatch_found']}, "
+            f"success={evidence['dispatch_success']}, "
+            f"result_received={evidence['result_received']}",
+            file=sys.stderr,
+        )
+        return False
+    return True
+    # signed: beta
 
 
 def deduct_points(
@@ -646,6 +745,11 @@ def deduct_for_refactor(
     protocol = _load_protocol()
     deduction = protocol["refactor_deduction"] if amount is None else amount
 
+    # Dispatch evidence guard  # signed: beta
+    if not _guard_dispatch_evidence(worker, task_id, deduction,
+                                    "refactor_deduct", validator):
+        return None
+
     with _lock:  # signed: gamma
         data = _load()
         _ensure_worker(data, worker)
@@ -729,6 +833,12 @@ def deduct_for_biased_refactor_report(
         protocol["biased_refactor_report_deduction"]
         if amount is None else amount
     )
+
+    # Dispatch evidence guard  # signed: beta
+    if not _guard_dispatch_evidence(worker, task_id, penalty,
+                                    "biased_refactor_report", validator):
+        return None
+
     with _lock:  # signed: gamma
         data = _load()
         _ensure_worker(data, worker)
@@ -928,6 +1038,18 @@ def award_zero_ticket_clear(
         if _zero_ticket_bonus_exists(data, task_id):
             raise ValueError(f"Zero-ticket bonus already recorded for task {task_id}")
 
+        # Cooldown check: prevent rapid-fire ZTB inflation  # signed: gamma
+        if not _ztb_cooldown_ok(data, "orchestrator"):
+            raise ValueError(
+                f"Zero-ticket bonus cooldown: orchestrator received ZTB "
+                f"within last {ZTB_COOLDOWN_SECONDS}s"
+            )
+        if not _ztb_cooldown_ok(data, actor):
+            raise ValueError(
+                f"Zero-ticket bonus cooldown: {actor} received ZTB "
+                f"within last {ZTB_COOLDOWN_SECONDS}s"
+            )
+
         _require_independent_validator("orchestrator", validator, "validate zero-ticket bonus for")
         _ensure_worker(data, "orchestrator")
         orchestrator_entry = data["scores"]["orchestrator"]
@@ -972,6 +1094,246 @@ def award_zero_ticket_clear(
     return {"orchestrator": orchestrator_entry, "last_worker": actor_entry}
 
 
+# ── Convention 3 Fix: Consultant Earning Mechanisms ──────────────────────
+
+def award_advisory_contribution(
+    agent: str,
+    task_id: str,
+    validator: str,
+    amount: float | None = None,
+) -> dict:
+    """Award +0.05 to a consultant for an advisory contribution acted upon.
+
+    Consultants (Codex, Gemini) earn points when their proposals, reviews,
+    or advisory insights are accepted and acted upon by the orchestrator
+    or a worker. This addresses Convention 3 Bias #2 (no earning mechanism
+    for consultants).
+
+    Args:
+        agent: The consultant being rewarded.
+        task_id: Identifier of the advisory contribution.
+        validator: The agent who validated the contribution was useful.
+        amount: Points to award (default 0.05).
+
+    Returns:
+        Updated score entry for the consultant.
+    """  # signed: gamma
+    amt = amount if amount is not None else DEFAULT_ADVISORY_CONTRIBUTION_AWARD
+    _require_independent_validator(agent, validator, "validate advisory contribution for")
+
+    with _lock:
+        data = _load()
+        _ensure_worker(data, agent)
+        entry = data["scores"][agent]
+        entry["total"] = round(entry["total"] + amt, 6)
+        entry["awards"] += 1
+        entry["advisory_contribution_awards"] = (
+            entry.get("advisory_contribution_awards", 0) + 1
+        )
+        record = {
+            "worker": agent,
+            "action": "advisory_contribution",
+            "amount": amt,
+            "task_id": task_id,
+            "validator": validator,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "new_total": entry["total"],
+            "protocol": "convention_3_fairness",
+            "finding": "consultant_advisory_accepted",
+        }
+        _append_record(data, record, "advisory_contribution")
+    return entry
+
+
+def award_cross_system_review(
+    agent: str,
+    task_id: str,
+    validator: str,
+    amount: float | None = None,
+) -> dict:
+    """Award +0.02 to a consultant for a cross-system code review.
+
+    Consultants earn points when they perform code reviews, architecture
+    assessments, or cross-system validations that produce actionable
+    findings. This addresses Convention 3 Bias #2.
+
+    Args:
+        agent: The consultant being rewarded.
+        task_id: Identifier of the review task.
+        validator: The agent who confirmed the review was valuable.
+        amount: Points to award (default 0.02).
+
+    Returns:
+        Updated score entry for the consultant.
+    """  # signed: gamma
+    amt = amount if amount is not None else DEFAULT_CROSS_SYSTEM_REVIEW_AWARD
+    _require_independent_validator(agent, validator, "validate cross-system review for")
+
+    with _lock:
+        data = _load()
+        _ensure_worker(data, agent)
+        entry = data["scores"][agent]
+        entry["total"] = round(entry["total"] + amt, 6)
+        entry["awards"] += 1
+        entry["cross_system_review_awards"] = (
+            entry.get("cross_system_review_awards", 0) + 1
+        )
+        record = {
+            "worker": agent,
+            "action": "cross_system_review",
+            "amount": amt,
+            "task_id": task_id,
+            "validator": validator,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "new_total": entry["total"],
+            "protocol": "convention_3_fairness",
+            "finding": "cross_system_review_validated",
+        }
+        _append_record(data, record, "cross_system_review")
+    return entry
+
+
+# ── Convention 3 Fix: Reset Illegitimate Deductions ──────────────────────
+
+def reset_illegitimate_deductions(
+    agent: str,
+    boot_window_seconds: int = 300,
+) -> dict:
+    """Remove forced/unverified deductions that lack dispatch evidence.
+
+    Two passes:
+    1. Forced spam_guard deductions within the boot window (original behavior)
+    2. Any deduction that lacks dispatch evidence when the flag is enabled
+
+    Previously only reversed spam_guard forced deductions within boot window.
+    Enhanced by coding_4 to check ALL deductions against dispatch evidence.
+
+    Args:
+        agent: Agent whose illegitimate deductions should be reversed.
+        boot_window_seconds: Seconds after first activity to consider
+            as boot window (default 300 = 5 minutes).
+
+    Returns:
+        Dict with keys: agent, reversed_count, reversed_amount, new_total,
+        pass1_count, pass2_count.
+    """  # signed: beta
+    with _lock:
+        data = _load()
+        _ensure_worker(data, agent)
+        history = data.get("history", [])
+
+        # Find earliest activity timestamp for this agent
+        agent_entries = [
+            h for h in history if h.get("worker") == agent
+        ]
+        if not agent_entries:
+            return {"agent": agent, "reversed_count": 0,
+                    "reversed_amount": 0.0, "new_total": data["scores"][agent]["total"],
+                    "pass1_count": 0, "pass2_count": 0}
+
+        try:
+            first_ts = min(
+                datetime.fromisoformat(h["timestamp"])
+                for h in agent_entries if "timestamp" in h
+            )
+            if first_ts.tzinfo is None:
+                first_ts = first_ts.replace(tzinfo=timezone.utc)
+        except (ValueError, KeyError):
+            return {"agent": agent, "reversed_count": 0,
+                    "reversed_amount": 0.0, "new_total": data["scores"][agent]["total"],
+                    "pass1_count": 0, "pass2_count": 0}
+
+        reversed_amount = 0.0
+        reversed_count = 0
+        pass1_count = 0
+        pass2_count = 0
+
+        # Deduction action types that should be checked  # signed: beta
+        deduction_actions = frozenset({
+            "deduct", "refactor_deduct", "biased_refactor_report",
+            "uncleared_work", "tool_bypass", "repeat_offense",
+        })
+
+        for entry in history:
+            if entry.get("worker") != agent:
+                continue
+            if entry.get("action") not in deduction_actions:
+                continue
+            if entry.get("_reversed_by_convention3") or entry.get("_reversed_by_coding4"):
+                continue  # already reversed
+
+            is_forced_spam = (
+                entry.get("action") == "deduct"
+                and entry.get("forced")
+                and entry.get("validator") == "spam_guard"
+            )
+
+            # Pass 1: forced spam deductions within boot window
+            if is_forced_spam:
+                try:
+                    entry_ts = datetime.fromisoformat(entry["timestamp"])
+                    if entry_ts.tzinfo is None:
+                        entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+                except (ValueError, KeyError):
+                    continue
+                elapsed = (entry_ts - first_ts).total_seconds()
+                if elapsed <= boot_window_seconds:
+                    amt = abs(float(entry.get("amount", 0)))
+                    reversed_amount += amt
+                    reversed_count += 1
+                    pass1_count += 1
+                    entry["_reversed_by_convention3"] = True
+                continue
+
+            # Pass 2: any non-system deduction without dispatch evidence
+            validator = entry.get("validator", "")
+            if validator in SYSTEM_ADJUSTERS:
+                continue  # system penalties are always legitimate
+            task_id = entry.get("task_id", "")
+            evidence = verify_dispatch_evidence(agent, task_id)
+            if not evidence["dispatch_found"]:
+                # No dispatch record at all -- deduction is illegitimate
+                amt = abs(float(entry.get("amount", 0)))
+                reversed_amount += amt
+                reversed_count += 1
+                pass2_count += 1
+                entry["_reversed_by_coding4"] = True
+
+        # Apply reversal
+        if reversed_amount > 0:
+            ws = data["scores"][agent]
+            ws["total"] = round(ws["total"] + reversed_amount, 6)
+            ws["awards"] += 1
+            data["history"].append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "worker": agent,
+                "action": "illegitimate_deduction_reversal",
+                "amount": reversed_amount,
+                "task_id": f"coding4_fairness_reset_{agent}",
+                "validator": "coding4_fairness_audit",
+                "new_total": ws["total"],
+                "protocol": "coding_4_fairness",
+                "finding": (
+                    f"reversed {reversed_count} illegitimate deductions "
+                    f"(pass1_boot_spam={pass1_count}, "
+                    f"pass2_no_dispatch={pass2_count})"
+                ),
+                "reversed_count": reversed_count,
+            })
+            _save(data)
+
+        entry_final = data["scores"][agent]
+        return {
+            "agent": agent,
+            "reversed_count": reversed_count,
+            "reversed_amount": round(reversed_amount, 6),
+            "new_total": entry_final["total"],
+            "pass1_count": pass1_count,
+            "pass2_count": pass2_count,
+        }
+    # signed: beta
+
+
 # ── Rule 0.9: Workspace Cleanliness & Tool Usage Accountability ──────────
 
 def _cleanliness_deduct_amount(agent: str) -> float:
@@ -993,6 +1355,12 @@ def deduct_uncleared_work(
     """
     _require_independent_validator(agent, validator, "audit uncleared work for")
     amt = amount if amount is not None else _cleanliness_deduct_amount(agent)
+
+    # Dispatch evidence guard  # signed: beta
+    if not _guard_dispatch_evidence(agent, task_id, amt,
+                                    "uncleared_work", validator):
+        return None
+
     with _lock:
         data = _load()
         _ensure_worker(data, agent)
@@ -1026,6 +1394,12 @@ def deduct_tool_bypass(
     """
     _require_independent_validator(agent, validator, "audit tool bypass for")
     amt = amount if amount is not None else _cleanliness_deduct_amount(agent)
+
+    # Dispatch evidence guard  # signed: beta
+    if not _guard_dispatch_evidence(agent, task_id, amt,
+                                    "tool_bypass", validator):
+        return None
+
     with _lock:
         data = _load()
         _ensure_worker(data, agent)
@@ -1059,6 +1433,12 @@ def deduct_repeat_offense(
     """
     _require_independent_validator(agent, validator, "audit repeat offense for")
     amt = amount if amount is not None else DEFAULT_REPEAT_OFFENSE_DEDUCT
+
+    # Dispatch evidence guard  # signed: beta
+    if not _guard_dispatch_evidence(agent, task_id, amt,
+                                    "repeat_offense", validator):
+        return None
+
     with _lock:
         data = _load()
         _ensure_worker(data, agent)
@@ -1344,6 +1724,19 @@ def main():
         "--invalid-cleanup", metavar="AGENT",
         help="Award +0.02 for finding invalid/false cleanup",
     )
+    # Convention 3 Fairness: Consultant earning mechanisms  # signed: gamma
+    parser.add_argument(
+        "--advisory-contribution", metavar="AGENT",
+        help="Award +0.05 for a consultant advisory contribution acted upon",
+    )
+    parser.add_argument(
+        "--cross-system-review", metavar="AGENT",
+        help="Award +0.02 for a consultant cross-system code review",
+    )
+    parser.add_argument(
+        "--reset-illegitimate", metavar="AGENT",
+        help="Reverse forced spam deductions within boot window for an agent",
+    )
 
     args = parser.parse_args()
 
@@ -1520,6 +1913,29 @@ def main():
         amt = args.amount if args.amount is not None else DEFAULT_INVALID_CLEANUP_AWARD
         result = award_invalid_cleanup_finder(args.invalid_cleanup, args.task_id, args.validator, amt)
         print(f"Awarded {amt} pts to {args.invalid_cleanup} for finding invalid cleanup (total: {result['total']})")
+
+    # Convention 3 Fairness CLI handlers  # signed: gamma
+    elif args.advisory_contribution:
+        if not args.task_id or not args.validator:
+            parser.error("--advisory-contribution requires --task-id and --validator")
+        amt = args.amount if args.amount is not None else DEFAULT_ADVISORY_CONTRIBUTION_AWARD
+        result = award_advisory_contribution(args.advisory_contribution, args.task_id, args.validator, amt)
+        print(f"Awarded {amt} pts to {args.advisory_contribution} for advisory contribution (total: {result['total']})")
+
+    elif args.cross_system_review:
+        if not args.task_id or not args.validator:
+            parser.error("--cross-system-review requires --task-id and --validator")
+        amt = args.amount if args.amount is not None else DEFAULT_CROSS_SYSTEM_REVIEW_AWARD
+        result = award_cross_system_review(args.cross_system_review, args.task_id, args.validator, amt)
+        print(f"Awarded {amt} pts to {args.cross_system_review} for cross-system review (total: {result['total']})")
+
+    elif args.reset_illegitimate:
+        result = reset_illegitimate_deductions(args.reset_illegitimate)
+        print(
+            f"Reset illegitimate deductions for {args.reset_illegitimate}: "
+            f"reversed {result['reversed_count']} deductions "
+            f"({result['reversed_amount']:.3f} pts) -> new total: {result['new_total']:.4f}"
+        )
 
     elif args.reset:
         reset_scores("cli_reset")

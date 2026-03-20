@@ -556,7 +556,32 @@ class SkynetBrain:
     # ─── ASSESS ────────────────────────────────────────
 
     def assess(self, goal: str) -> dict:
-        """Assess difficulty of a goal. Returns difficulty info dict."""
+        """Assess difficulty of a goal using the DAAORouter.
+
+        Routes the goal through the difficulty assessment pipeline and returns
+        a dict with difficulty level, confidence score, and domain tags.
+
+        Parameters
+        ----------
+        goal : str
+            The high-level task description to assess.
+
+        Returns
+        -------
+        dict
+            Keys: difficulty (str, e.g. 'TRIVIAL'|'SIMPLE'|'MODERATE'|'COMPLEX'|'ADVERSARIAL'),
+            confidence (float, 0-1), complexity_score (float), operator (str),
+            domain_tags (list[str]), reason (str). If router is unavailable,
+            defaults to MODERATE with confidence 0.5.
+
+        Examples
+        --------
+        >>> brain = SkynetBrain()
+        >>> brain.assess("fix a typo in README")
+        {'difficulty': 'TRIVIAL', 'confidence': 0.9, ...}
+        >>> brain.assess("redesign the entire auth system and migrate database")
+        {'difficulty': 'COMPLEX', 'confidence': 0.8, ...}
+        """  # signed: gamma
         if not self.router:
             result = {"difficulty": "MODERATE", "confidence": 0.5,
                     "reason": "Router unavailable, defaulting to MODERATE"}
@@ -632,7 +657,41 @@ class SkynetBrain:
         return reasoning
 
     def think(self, goal: str) -> BrainPlan:
-        """Given a goal, produce an intelligent execution plan."""
+        """Decompose a goal into an intelligent, context-enriched execution plan.
+
+        Full pipeline: assess difficulty -> recall learnings -> search context ->
+        apply cognitive strategy -> extract natural subtasks -> decompose ->
+        assign to idle workers -> build reasoning chain.
+
+        Parameters
+        ----------
+        goal : str
+            High-level objective (e.g. "audit security and fix all issues").
+            Supports natural language with multiple action verbs, numbered
+            items, semicolons, and 'and' conjunctions for automatic
+            multi-task decomposition.
+
+        Returns
+        -------
+        BrainPlan
+            Plan with: goal, difficulty, subtasks (List[Subtask] with worker
+            assignments and context), reasoning (str), relevant_learnings,
+            operator, domain_tags, strategy_id.
+
+        Notes
+        -----
+        Difficulty may be upgraded from router assessment when text signals
+        indicate multi-task goals (e.g. multiple action verbs, explicit
+        enumerations). Worker assignment uses idle detection with round-robin
+        fallback to all WORKER_NAMES.
+
+        Examples
+        --------
+        >>> brain = SkynetBrain()
+        >>> plan = brain.think("scan for bugs and fix them")
+        >>> print(plan.difficulty, len(plan.subtasks))
+        'MODERATE' 2
+        """  # signed: gamma
         assessment = self.assess(goal)
         difficulty = self._adjust_difficulty(goal, assessment.get("difficulty", "MODERATE"))
         operator = assessment.get("operator", "CHAIN_OF_THOUGHT")
@@ -917,7 +976,25 @@ class SkynetBrain:
             return {"worker": st.assigned_worker, "dispatched": False, "error": str(e)}
 
     def dispatch(self, plan: BrainPlan) -> dict:
-        """Execute the plan by dispatching subtasks to workers."""
+        """Dispatch subtasks from a BrainPlan to workers via ghost-type.
+
+        Independent subtasks (no dependencies) are dispatched first, then
+        dependent subtasks in order. Each subtask is sent to its assigned
+        worker via ``dispatch_to_worker()`` from ``skynet_dispatch.py``.
+
+        Parameters
+        ----------
+        plan : BrainPlan
+            Plan produced by ``think()``. Each subtask has an assigned_worker
+            and optional dependencies.
+
+        Returns
+        -------
+        dict
+            Keyed by ``'subtask_N'`` where N is the subtask index. Each value
+            is a dict with keys: dispatched (bool), worker (str), task (str),
+            error (str, if failed), result_content (str, if collected).
+        """  # signed: gamma
         from tools.skynet_dispatch import dispatch_to_worker
 
         completed = {}
@@ -937,7 +1014,25 @@ class SkynetBrain:
     # ─── SYNTHESIZE ────────────────────────────────────
 
     def synthesize(self, plan: BrainPlan, results: dict) -> str:
-        """Merge worker results into a coherent summary."""
+        """Merge worker dispatch results into a coherent text summary.
+
+        Groups results into COMPLETED and FAILED sections with worker
+        attribution. Used after ``dispatch()`` to produce a human-readable
+        report of what succeeded and what failed.
+
+        Parameters
+        ----------
+        plan : BrainPlan
+            The original plan (used for goal and difficulty in header).
+        results : dict
+            Output from ``dispatch()`` — keyed by ``'subtask_N'``.
+
+        Returns
+        -------
+        str
+            Multi-line text summary with sections for completed and failed
+            subtasks, including worker names and result content.
+        """  # signed: gamma
         lines = [f"SYNTHESIS for: {plan.goal}", f"Difficulty: {plan.difficulty}", ""]
 
         successes = []
@@ -968,7 +1063,26 @@ class SkynetBrain:
     # ─── LEARN ─────────────────────────────────────────
 
     def learn(self, plan: BrainPlan, results: dict, success: bool):
-        """Store learnings from completed task execution."""
+        """Store learnings from completed task execution into persistent memory.
+
+        Performs three learning actions:
+        1. Stores a summary fact in LearningStore (SQLite) with tags
+        2. Saves a full episode to ``data/episodes/`` (JSON file per run)
+        3. Feeds outcome back to DAAORouter for difficulty calibration
+
+        Also broadcasts the learning via ``skynet_knowledge.broadcast_learning()``
+        so peer workers can absorb it.
+
+        Parameters
+        ----------
+        plan : BrainPlan
+            The executed plan with goal, difficulty, subtasks, strategy_id.
+        results : dict
+            Dispatch results from ``dispatch()`` — used to count dispatched
+            vs failed subtasks.
+        success : bool
+            Whether the overall execution succeeded (all subtasks dispatched).
+        """  # signed: gamma
         strategy_id = getattr(plan, "strategy_id", "") or ""
 
         # Store in LearningStore
@@ -1020,7 +1134,33 @@ class SkynetBrain:
     # ─── EXECUTE (all-in-one) ──────────────────────────
 
     def execute(self, goal: str, wait_timeout: float = 90.0) -> dict:
-        """Full pipeline: think -> dispatch -> wait -> synthesize -> learn."""
+        """Full autonomous pipeline: think -> dispatch -> wait -> synthesize -> learn.
+
+        This is the highest-level entry point. It decomposes the goal into
+        subtasks, dispatches them to idle workers, waits for results via
+        the SSE state file, synthesizes a summary, and stores learnings.
+
+        Parameters
+        ----------
+        goal : str
+            High-level objective to execute.
+        wait_timeout : float, optional
+            Maximum seconds to wait for each worker's result (default 90).
+            Falls back to a 10-second sleep if SSE daemon is unavailable.
+
+        Returns
+        -------
+        dict
+            Keys: goal (str), plan (dict from BrainPlan), dispatch_results
+            (dict keyed by subtask), synthesis (str summary), success (bool).
+
+        Examples
+        --------
+        >>> brain = SkynetBrain()
+        >>> result = brain.execute("audit all endpoints for missing auth")
+        >>> print(result['success'], result['synthesis'][:100])
+        True 'SYNTHESIS for: audit all endpoints...'
+        """  # signed: gamma
         # Think
         plan = self.think(goal)
         print(f"\n[brain] Plan ready: {plan.difficulty}, {len(plan.subtasks)} subtasks")

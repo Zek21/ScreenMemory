@@ -10,51 +10,57 @@
   ],
   "processes": [
     {
-      "pid": 92796,
+      "pid": 2172,
       "name": "skynet.exe",
       "role": "backend",
       "protected": true
     },
     {
-      "pid": 25344,
+      "pid": 5796,
       "name": "god_console.py",
       "role": "god_console",
       "protected": true
     },
     {
-      "pid": 21348,
+      "pid": 6080,
       "name": "skynet_sse_daemon.py",
       "role": "sse_daemon",
       "protected": true
     },
     {
-      "pid": 12156,
+      "pid": 16856,
       "name": "skynet_monitor.py",
       "role": "monitor",
       "protected": true
     },
     {
-      "pid": 10836,
+      "pid": 20776,
+      "name": "skynet_overseer.py",
+      "role": "overseer",
+      "protected": true
+    },
+    {
+      "pid": 12472,
       "name": "skynet_watchdog.py",
       "role": "watchdog",
       "protected": true
     },
     {
-      "pid": 14152,
-      "hwnd": 2427486,
+      "pid": 12212,
+      "hwnd": 395596,
       "name": "alpha",
       "role": "worker",
       "protected": true
     },
     {
-      "pid": 14152,
-      "hwnd": 657790,
+      "pid": 12212,
+      "hwnd": 459496,
       "name": "orchestrator",
       "role": "orchestrator",
       "protected": true
     }
   ],
-  "process_count": 7,
-  "updated_at": "2026-03-20T11:12:42",
+  "process_count": 8,
+  "updated_at": "2026-03-20T20:08:58",
   "updated_by": "skynet_process_guard.refresh_registry()"
 }

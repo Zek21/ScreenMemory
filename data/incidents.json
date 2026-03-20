@@ -271,5 +271,35 @@
       "cross-validation-failure",
       "quoting-bug"
     ]
+  },
+  {
+    "id": "auto_restart_bus_persist_restart_1774004485",
+    "timestamp": "2026-03-20T19:01:25",
+    "what_happened": "Service bus_persist_restart died (PID 20972)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 15676)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "bus_persist_restart",
+    "timestamp": "2026-03-20T19:01:27.413926",
+    "old_pid": 20972,
+    "new_pid": 15676,
+    "type": "auto_restart"
+  },
+  {
+    "id": "auto_restart_bus_persist_restart_1774007058",
+    "timestamp": "2026-03-20T19:44:18",
+    "what_happened": "Service bus_persist_restart died (PID 0)",
+    "root_cause": "Service process exited or became unresponsive",
+    "fix_applied": "Watchdog auto-restarted service (new PID 6584)",
+    "rule_created": "Auto-restart on health check failure"
+  },
+  {
+    "id": "bus_persist_restart",
+    "timestamp": "2026-03-20T19:44:20.930196",
+    "old_pid": 0,
+    "new_pid": 6584,
+    "type": "auto_restart"
   }
 ]

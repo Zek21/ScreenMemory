@@ -6,7 +6,7 @@ Replaces bus-polling with direct UIA observation:
   1. Poll worker state every 1-2s via COM UIA
   2. Detect PROCESSING → IDLE transition = task complete
   3. Extract last response text from UIA accessibility tree
-  4. Auto-recover UNKNOWN/dead workers via new-chat
+  4. Auto-recover UNKNOWN/dead workers via canonical worker boot
 
 No dependency on workers posting to bus. Works with any LLM chat window.
 
@@ -30,7 +30,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 WORKERS_FILE = ROOT / "data" / "workers.json"
-NEW_CHAT_SCRIPT = ROOT / "tools" / "new_chat.ps1"
+WORKER_BOOT_SCRIPT = ROOT / "tools" / "skynet_worker_boot.py"
 
 user32 = ctypes.windll.user32
 
@@ -198,7 +198,7 @@ def recover_worker(worker_name, workers_data, orch_hwnd):
     """Attempt to recover an UNKNOWN/dead worker.
 
     Phase 1: Check if window still exists (IsWindowVisible)
-    Phase 2: If dead, spawn new-chat and assign to worker slot
+    Phase 2: If dead, run canonical single-worker boot and assign it to the slot
     Returns (success: bool, new_hwnd: int or None)
     """
     target = None
@@ -225,62 +225,51 @@ def recover_worker(worker_name, workers_data, orch_hwnd):
         # Model/agent might be wrong — fix it
         if not scan.model_ok or not scan.agent_ok:
             log(f"Recovery: {worker_name.upper()} has wrong model/agent — needs reconfiguration", "WARN")
-            # Let the model guard in new_chat handle this via dispatch
+            # Let the canonical boot path repair the next time the window is replaced.
             return True, hwnd
 
         log(f"Recovery: {worker_name.upper()} window visible but state still UNKNOWN", "WARN")
         return True, hwnd
 
-    # Phase 2: Window is dead — spawn new chat
-    log(f"Recovery: {worker_name.upper()} window DEAD (HWND={hwnd}) — spawning new chat", "SYS")
-    return _spawn_new_chat(worker_name, workers_data, orch_hwnd)
+    # Phase 2: Window is dead — run canonical boot for this worker.
+    log(f"Recovery: {worker_name.upper()} window DEAD (HWND={hwnd}) — running canonical worker boot", "SYS")
+    return _reboot_worker_window(worker_name, orch_hwnd)
 
 
-def _spawn_new_chat(worker_name, workers_data, orch_hwnd):
-    """Spawn a new chat window via new_chat.ps1 and assign it to the worker slot."""
-    if not NEW_CHAT_SCRIPT.exists():
-        log(f"new_chat.ps1 not found at {NEW_CHAT_SCRIPT}", "ERR")
+def _reboot_worker_window(worker_name, orch_hwnd):
+    """Reboot a worker window via the canonical single-worker boot path."""
+    if not WORKER_BOOT_SCRIPT.exists():
+        log(f"skynet_worker_boot.py not found at {WORKER_BOOT_SCRIPT}", "ERR")
         return False, None
 
     try:
-        # Snapshot existing VS Code windows
-        before_hwnds = _get_vscode_hwnds()
+        args = [sys.executable, str(WORKER_BOOT_SCRIPT), "--name", worker_name]
+        if orch_hwnd:
+            args.extend(["--orch-hwnd", str(int(orch_hwnd))])
 
         result = _hidden_run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(NEW_CHAT_SCRIPT)],
-            capture_output=True, encoding='utf-8', errors='replace', timeout=30, cwd=str(ROOT)
-        )  # signed: gamma — cp1252 fix: explicit utf-8 prevents Windows encoding crash
+            args,
+            capture_output=True, encoding="utf-8", errors="replace", timeout=180, cwd=str(ROOT)
+        )
 
         if result.returncode != 0:
-            log(f"new_chat.ps1 failed: {result.stderr[:200]}", "ERR")
+            detail = ((result.stderr or "") + "\n" + (result.stdout or "")).strip()
+            log(f"canonical worker boot failed for {worker_name}: {detail[:200]}", "ERR")
             return False, None
 
-        # Extract HWND from output: "OK HWND=12345 ..."
-        output = result.stdout
-        import re
-        m = re.search(r'HWND=(\d+)', output)
-        if not m:
-            # Try to find new window by diff
-            after_hwnds = _get_vscode_hwnds()
-            new_hwnds = [h for h in after_hwnds if h not in before_hwnds]
-            if new_hwnds:
-                new_hwnd = new_hwnds[0]
-            else:
-                log(f"Could not identify new chat window HWND", "ERR")
-                return False, None
-        else:
-            new_hwnd = int(m.group(1))
+        new_hwnd = _lookup_worker_hwnd(worker_name)
+        if not new_hwnd:
+            log(f"canonical worker boot completed but no HWND was recorded for {worker_name}", "ERR")
+            return False, None
 
-        # Update workers.json with new HWND
-        _update_worker_hwnd(worker_name, new_hwnd)
         log(f"Recovery: {worker_name.upper()} → new HWND={new_hwnd}", "OK")
         return True, new_hwnd
 
     except subprocess.TimeoutExpired:
-        log(f"new_chat.ps1 timed out after 30s", "ERR")
+        log(f"canonical worker boot timed out after 180s", "ERR")
         return False, None
     except Exception as e:
-        log(f"Spawn failed: {e}", "ERR")
+        log(f"Canonical boot failed: {e}", "ERR")
         return False, None
 
 
@@ -297,6 +286,21 @@ def _get_vscode_hwnds():
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
     user32.EnumWindows(WNDENUMPROC(callback), 0)
     return hwnds
+
+
+def _lookup_worker_hwnd(worker_name):
+    """Read the worker HWND from workers.json after canonical boot updates it."""
+    if not WORKERS_FILE.exists():
+        return None
+    try:
+        data = json.loads(WORKERS_FILE.read_text(encoding="utf-8"))
+        for worker in data.get("workers", []):
+            if worker.get("name") == worker_name:
+                hwnd = int(worker.get("hwnd", 0) or 0)
+                return hwnd or None
+    except Exception:
+        return None
+    return None
 
 
 def _update_worker_hwnd(worker_name, new_hwnd):

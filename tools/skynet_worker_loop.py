@@ -41,7 +41,8 @@ TERMINAL_STATUSES = ("done", "failed", "cancelled")
 def _fetch_json(url, timeout=5):
     try:
         return json.loads(urllib.request.urlopen(url, timeout=timeout).read())
-    except Exception:
+    except Exception as e:
+        _log("system", f"_fetch_json({url}): {e}", "WARN")
         return None
 
 
@@ -52,8 +53,9 @@ def _post_bus(sender, topic, msg_type, content):
         from tools.skynet_spam_guard import guarded_publish
         guarded_publish(msg)
         return True
-    except Exception:
+    except Exception as e:
         # Raw fallback for when SpamGuard is unavailable
+        _log(sender, f"_post_bus SpamGuard failed ({e}), trying raw HTTP", "WARN")
         try:
             payload = json.dumps(msg).encode()
             req = urllib.request.Request(
@@ -61,15 +63,17 @@ def _post_bus(sender, topic, msg_type, content):
                 {"Content-Type": "application/json"})
             urllib.request.urlopen(req, timeout=5)
             return True
-        except Exception:
+        except Exception as e2:
+            _log(sender, f"_post_bus raw fallback failed: {e2}", "ERROR")
             return False
-    # signed: alpha
+    # signed: alpha  # error-logging: signed: beta
 
 
 def _load_json(path):
     try:
         return json.loads(Path(path).read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        _log("system", f"_load_json({path}): {e}", "WARN")
         return None
 
 

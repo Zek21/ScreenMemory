@@ -40,14 +40,38 @@ def load_boot_config():
         print(f"[preflight] CRITICAL: Cannot load {BOOT_CONFIG}: {e}", file=sys.stderr)
         return {}  # return empty dict so callers degrade gracefully  # signed: gamma
 
-def check_isolation_option(fix=False):
-    """PREREQ_001: isolationOption.enabled must be true."""
+def set_jsonc_bool_key(path, key, value):
+    """Set a boolean key in a VS Code JSONC settings file without requiring full JSONC preservation."""
+    raw = open(path, encoding="utf-8").read()
+    value_str = "true" if value else "false"
+    pattern = re.compile(rf'("{re.escape(key)}"\s*:\s*)(true|false|null)', re.IGNORECASE)
+    replaced, count = pattern.subn(rf"\1{value_str}", raw, count=1)
+    if count:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(replaced)
+        return
+
+    idx = raw.rfind("}")
+    if idx < 0:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{\n" + f'  "{key}": {value_str}\n' + "}\n")
+        return
+
+    before = raw[:idx].rstrip()
+    after = raw[idx:].lstrip()
+    separator = "\n" if before.endswith("{") or before.endswith(",") else ",\n"
+    updated = before + separator + f'  "{key}": {value_str}\n' + after
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(updated)
+
+def check_boolean_setting(key, desired, prereq_id, name, severity, fix=False, rationale=""):
+    """Check a boolean VS Code setting in user/workspace settings and optionally fix it."""
     settings_path = os.path.join(
         os.environ.get("APPDATA", ""),
         "Code - Insiders", "User", "settings.json"
     )
     workspace_settings = os.path.join(REPO, ".vscode", "settings.json")
-    
+
     results = []
     for label, path in [("user", settings_path), ("workspace", workspace_settings)]:
         if not os.path.exists(path):
@@ -57,43 +81,69 @@ def check_isolation_option(fix=False):
             with open(path, encoding="utf-8") as f:
                 content = f.read()
             data = parse_jsonc(content)
-            key = "github.copilot.chat.cli.isolationOption.enabled"
             value = data.get(key)
-            
-            if value is True:
+
+            if value is desired:
                 results.append({"location": label, "status": "PASS", "value": value})
-            elif value is False:
+            elif value in (True, False):
                 if fix:
-                    # Re-read raw content and do targeted replacement to preserve JSONC format
-                    raw = open(path, encoding="utf-8").read()
-                    raw = raw.replace('"github.copilot.chat.cli.isolationOption.enabled": false',
-                                     '"github.copilot.chat.cli.isolationOption.enabled": true')
-                    with open(path, "w", encoding="utf-8") as f2:
-                        f2.write(raw)
-                    results.append({"location": label, "status": "FIXED", "old": False, "new": True})
+                    set_jsonc_bool_key(path, key, desired)
+                    results.append({"location": label, "status": "FIXED", "old": value, "new": desired})
                 else:
-                    results.append({"location": label, "status": "FAIL", "value": False,
-                                   "fix": f"Set {key} to true in {path}"})
+                    results.append({
+                        "location": label,
+                        "status": "FAIL",
+                        "value": value,
+                        "fix": f"Set {key} to {str(desired).lower()} in {path}",
+                    })
             elif value is None:
                 if fix:
-                    # Insert into JSONC file before last closing brace
-                    raw = open(path, encoding="utf-8").read()
-                    insert = f'    "{key}": true,\n'
-                    idx = raw.rfind("}")
-                    if idx >= 0:
-                        raw = raw[:idx] + insert + raw[idx:]
-                        with open(path, "w", encoding="utf-8") as f2:
-                            f2.write(raw)
-                    results.append({"location": label, "status": "FIXED", "old": None, "new": True})
+                    set_jsonc_bool_key(path, key, desired)
+                    results.append({"location": label, "status": "FIXED", "old": None, "new": desired})
                 else:
-                    results.append({"location": label, "status": "MISSING_KEY",
-                                   "fix": f"Add {key}: true to {path}"})
+                    results.append({
+                        "location": label,
+                        "status": "MISSING_KEY",
+                        "fix": f"Add {key}: {str(desired).lower()} to {path}",
+                    })
         except Exception as e:
             results.append({"location": label, "status": "ERROR", "error": str(e)})
-    
+
     all_pass = all(r["status"] in ("PASS", "FIXED") for r in results)
-    return {"id": "PREREQ_001", "name": "Isolation Option", "passed": all_pass,
-            "severity": "CRITICAL", "details": results}
+    payload = {
+        "id": prereq_id,
+        "name": name,
+        "passed": all_pass,
+        "severity": severity,
+        "details": results,
+    }
+    if rationale:
+        payload["rationale"] = rationale
+    return payload
+
+def check_isolation_option(fix=False):
+    """PREREQ_001: isolationOption.enabled must be true."""
+    return check_boolean_setting(
+        key="github.copilot.chat.cli.isolationOption.enabled",
+        desired=True,
+        prereq_id="PREREQ_001",
+        name="Isolation Option",
+        severity="CRITICAL",
+        fix=fix,
+        rationale="Copilot CLI worktree/session behavior depends on this remaining enabled.",
+    )
+
+def check_chat_restore_setting(fix=False):
+    """PREREQ_002: restoreLastPanelSession must be false to avoid stale copilotcli untitled restores."""
+    return check_boolean_setting(
+        key="chat.restoreLastPanelSession",
+        desired=False,
+        prereq_id="PREREQ_002",
+        name="Chat Session Restore",
+        severity="HIGH",
+        fix=fix,
+        rationale="Restoring the last chat panel session can reopen stale copilotcli:/untitled-* sessions and trigger provider resolution failures.",
+    )
 
 def check_port(port, name):
     """Check if a TCP port is reachable (IPv4 and IPv6)."""
@@ -201,6 +251,7 @@ def run_preflight(fix=False, json_output=False, quiet=False):
     
     # Critical checks
     results.append(check_isolation_option(fix=fix))
+    results.append(check_chat_restore_setting(fix=fix))
     results.append(check_port(8420, "Skynet Backend"))
     results.append(check_port(8421, "GOD Console"))
     results.append(check_ghost_type_fixes())

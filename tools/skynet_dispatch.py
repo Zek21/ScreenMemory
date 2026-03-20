@@ -199,6 +199,9 @@ DELIVERY_VERIFY_CONSECUTIVE_UNKNOWN_LIMIT = 3  # UIA UNKNOWN readings before FAI
 DELIVERY_RETRY_MAX = 2                # max auto-retries on unverified delivery
 DELIVERY_RETRY_BACKOFF_BASE = 2.0     # seconds; exponential: 2s, 4s, ...
 
+# Last delivery status from ghost_type_to_worker -- persisted to dispatch_log  # signed: alpha
+_last_delivery_status: str = ""
+
 # Self-dispatch identity: set via env var SKYNET_WORKER_NAME or marker file
 _SELF_WORKER_NAME = os.environ.get("SKYNET_WORKER_NAME", "")
 
@@ -213,8 +216,10 @@ def _get_self_identity():
     return ""
 
 
-def _log_dispatch(worker_name, task, state, success, target_hwnd=0):
+def _log_dispatch(worker_name, task, state, success, target_hwnd=0, delivery_status=""):
     """Append dispatch event to dispatch_log.json (atomic)."""
+    # Use explicit param or fall back to module-level last delivery status  # signed: alpha
+    ds = delivery_status or _last_delivery_status
     try:
         try:
             from tools.skynet_atomic import atomic_update_json
@@ -231,6 +236,7 @@ def _log_dispatch(worker_name, task, state, success, target_hwnd=0):
                 "success": success,
                 "target_hwnd": target_hwnd,
                 "result_received": False,
+                "delivery_status": ds,  # signed: alpha -- was always blank, now persisted
                 "strategy": os.environ.get("SKYNET_STRATEGY", "direct"),
                 "strategy_id": os.environ.get("SKYNET_STRATEGY_ID", ""),
             })
@@ -1082,7 +1088,7 @@ if (-not $applyDetected) {{
         foreach ($t in $allText) {{
             try {{
                 $tname = [string]$t.Current.Name
-                if ($tname -match '\d+\s+files?\s+changed') {{
+                if ($tname -match '\\d+\\s+files?\\s+changed') {{
                     $applyDetected = $true
                     Write-Host "DEBUG: Apply panel detected via text: $tname"
                     break
@@ -1334,7 +1340,7 @@ if ($focusMethod -ne "NONE") {{
                     foreach ($el in $allElems) {{
                         try {{
                             $name = $el.Current.Name
-                            if ($name -match "Cancel \(Alt\+Backspace\)") {{ $postEnterState = "STEERING"; break }}
+                            if ($name -match "Cancel \\(Alt\\+Backspace\\)") {{ $postEnterState = "STEERING"; break }}
                             if ($name -match "Generating|Searching|Thinking") {{ $postEnterState = "PROCESSING"; break }}
                         }} catch {{}}
                     }}
@@ -1382,7 +1388,7 @@ if ($focusMethod -ne "NONE") {{
                     foreach ($el in $allElems) {{
                         try {{
                             $name = $el.Current.Name
-                            if ($name -match "Cancel \(Alt\+Backspace\)") {{ $postEnterState = "STEERING"; break }}
+                            if ($name -match "Cancel \\(Alt\\+Backspace\\)") {{ $postEnterState = "STEERING"; break }}
                             if ($name -match "Generating|Searching|Thinking") {{ $postEnterState = "PROCESSING"; break }}
                         }} catch {{}}
                     }}
@@ -1527,6 +1533,15 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
                 except Exception:
                     pass
                 return False
+
+            # Extract delivery status BEFORE releasing lock to prevent race  # signed: alpha
+            global _last_delivery_status
+            _last_delivery_status = ""
+            for ds in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK", "FOCUS_STOLEN",
+                        "NO_EDIT", "NO_EDIT_NO_RENDER", "CLIPBOARD_VERIFY_FAILED"):
+                if ds in stdout:
+                    _last_delivery_status = ds
+                    break
 
             try:
                 DISPATCH_LOCK_FILE.unlink(missing_ok=True)

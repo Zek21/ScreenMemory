@@ -78,6 +78,17 @@ function Get-SkynetStatus {
     catch { return $null }
 }
 
+# Non-blocking preflight: keep VS Code settings aligned with the worker boot contract.
+try {
+    $preflightScript = Join-Path $repoRoot "tools\boot_preflight.py"
+    if (Test-Path $preflightScript) {
+        & $python $preflightScript --fix --quiet | Out-Null
+        Write-Status "Boot preflight settings guard applied" "OK"
+    }
+} catch {
+    Write-Status "Boot preflight settings guard failed: $_" "WARN"
+}
+
 Add-Type -Name "OrchUser32" -Namespace "Win32Orch" -MemberDefinition @"
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);

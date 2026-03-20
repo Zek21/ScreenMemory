@@ -405,6 +405,10 @@ def _enrich_consultant_liveness(consultant):
         consultant["live"] = True
         consultant["status"] = "LIVE"
         consultant["pid_alive"] = True
+    else:
+        consultant["live"] = False
+        consultant["status"] = "STALE"
+        consultant["pid_alive"] = False  # signed: alpha
 
 
 def _fallback_consultant_view():
@@ -532,7 +536,7 @@ def _build_dashboard_data():
         "status": results.get("status", {}),
         "pulse": results.get("pulse", {}),
         "bus": results.get("bus", []),
-        "consultants": results.get("status", {}).get("consultants", {}),
+        "consultants": _cached_consultants(),  # Use live bridge probe, not stale backend status  # signed: alpha
         "engines": {
             "online": eng_online,
             "available": eng_avail,

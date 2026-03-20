@@ -54,7 +54,8 @@ class TestSkynetScoringProtocol(unittest.TestCase):
 
     def test_refactor_deduction_applies_default_penalty(self):
         result = scoring.deduct_for_refactor("alpha", "refactor-task-1")
-        self.assertEqual(result["total"], -0.01)
+        # alpha is in BASE_SCORE_AGENTS, so starts with base=6.0
+        self.assertEqual(result["total"], 5.99)
         self.assertEqual(result["deductions"], 1)
         self.assertEqual(result["refactor_deductions"], 1)
 
@@ -67,7 +68,8 @@ class TestSkynetScoringProtocol(unittest.TestCase):
         result = scoring.cancel_refactor_deduction_if_necessary(
             "alpha", "refactor-task-2", "beta"
         )
-        self.assertEqual(result["total"], 0.0)
+        # alpha starts at 6.0, -0.01 deduct, +0.01 reversal = 6.0
+        self.assertEqual(result["total"], 6.0)
         self.assertEqual(result["awards"], 1)
         self.assertEqual(result["refactor_reversals"], 1)
 
@@ -87,7 +89,8 @@ class TestSkynetScoringProtocol(unittest.TestCase):
         result = scoring.deduct_for_biased_refactor_report(
             "alpha", "refactor-task-4", "gamma"
         )
-        self.assertEqual(result["total"], -0.11)
+        # alpha starts at 6.0, -0.01 refactor, -0.10 bias = 5.89
+        self.assertEqual(result["total"], 5.89)
         self.assertEqual(result["deductions"], 2)
         self.assertEqual(result["bias_penalties"], 1)
 
@@ -104,7 +107,8 @@ class TestSkynetScoringProtocol(unittest.TestCase):
         result = scoring.award_proactive_ticket_clear(
             "consultant", "ticket-clear-1", "god"
         )
-        self.assertEqual(result["total"], 0.2)
+        # consultant is in BASE_SCORE_AGENTS, starts at 6.0
+        self.assertEqual(result["total"], 6.2)
         self.assertEqual(result["awards"], 1)
         self.assertEqual(result["proactive_ticket_clears"], 1)
 
@@ -116,7 +120,8 @@ class TestSkynetScoringProtocol(unittest.TestCase):
         result = scoring.award_autonomous_pull(
             "alpha", "ticket-pull-1", "orchestrator"
         )
-        self.assertEqual(result["total"], 0.2)
+        # alpha starts at 6.0
+        self.assertEqual(result["total"], 6.2)
         self.assertEqual(result["awards"], 1)
         self.assertEqual(result["autonomous_pull_awards"], 1)
 
@@ -131,7 +136,8 @@ class TestSkynetScoringProtocol(unittest.TestCase):
 
     def test_bug_report_filing_awards_point_zero_one(self):
         result = scoring.award_bug_report("alpha", "bug-1", "orchestrator")
-        self.assertEqual(result["total"], 0.01)
+        # alpha starts at 6.0
+        self.assertEqual(result["total"], 6.01)
         self.assertEqual(result["awards"], 1)
         self.assertEqual(result["bug_reports_filed"], 1)
 
@@ -142,9 +148,11 @@ class TestSkynetScoringProtocol(unittest.TestCase):
         scoring.award_bug_report("alpha", "bug-2", "orchestrator")
         result = scoring.confirm_bug_report("alpha", "bug-2", "beta")
 
-        self.assertEqual(result["reporter"]["total"], 0.02)
+        # alpha: 6.0 base + 0.01 report + 0.01 confirmation = 6.02
+        self.assertEqual(result["reporter"]["total"], 6.02)
         self.assertEqual(result["reporter"]["bug_report_confirmations"], 1)
-        self.assertEqual(result["validator"]["total"], 0.01)
+        # beta: 6.0 base + 0.01 cross-validation = 6.01
+        self.assertEqual(result["validator"]["total"], 6.01)
         self.assertEqual(result["validator"]["bug_cross_validations"], 1)
 
         data = json.loads(self.scores_file.read_text(encoding="utf-8"))
@@ -159,9 +167,11 @@ class TestSkynetScoringProtocol(unittest.TestCase):
         with patch.object(scoring, "_all_tickets_cleared", return_value=True):
             result = scoring.award_zero_ticket_clear("todo-last-1", "delta", "god")
 
-        self.assertEqual(result["orchestrator"]["total"], 1.0)
+        # orchestrator: 6.0 base + 1.0 ZTB = 7.0
+        self.assertEqual(result["orchestrator"]["total"], 7.0)
         self.assertEqual(result["orchestrator"]["zero_ticket_bonus_awards"], 1)
-        self.assertEqual(result["last_worker"]["total"], 1.0)
+        # delta: 6.0 base + 1.0 ZTB = 7.0
+        self.assertEqual(result["last_worker"]["total"], 7.0)
         self.assertEqual(result["last_worker"]["zero_ticket_bonus_awards"], 1)
 
         data = json.loads(self.scores_file.read_text(encoding="utf-8"))

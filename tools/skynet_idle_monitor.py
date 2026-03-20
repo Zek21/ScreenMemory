@@ -89,8 +89,8 @@ def log(msg):
         LOG_FILE.parent.mkdir(exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[LOG_WRITE_FAIL] {e}", flush=True)  # signed: beta
 
 
 def bus_post(sender, topic, msg_type, content):
@@ -99,8 +99,9 @@ def bus_post(sender, topic, msg_type, content):
     try:
         from tools.skynet_spam_guard import guarded_publish
         guarded_publish(msg)
-    except Exception:
+    except Exception as e:
         # Raw fallback for when SpamGuard is unavailable
+        log(f"bus_post SpamGuard failed ({e}), trying raw HTTP")
         try:
             from urllib.request import Request, urlopen
             req = Request(
@@ -108,9 +109,9 @@ def bus_post(sender, topic, msg_type, content):
                 data=json.dumps(msg).encode(),
                 headers={"Content-Type": "application/json"})
             urlopen(req, timeout=5)
-        except Exception:
-            pass
-    # signed: alpha
+        except Exception as e2:
+            log(f"bus_post raw fallback also failed: {e2}")
+    # signed: alpha  # error-logging: signed: beta
 
 
 def get_workers():
@@ -212,8 +213,8 @@ def main():
             # Re-read workers on each cycle (handles HWND changes)
             try:
                 workers = get_workers()
-            except Exception:
-                pass
+            except Exception as e:
+                log(f"Failed to reload workers: {e}")
 
             # Re-init engine if too many scan errors
             if consecutive_scan_errors >= 3:

@@ -29,7 +29,7 @@
   },
   "self_prompt": {
     "enabled": false,
-    "disabled_reason": "INCIDENT 016 — self-prompt daemon types into orchestrator window, corrupts worker sessions and dispatches. Permanently disabled 2026-03-18. Do NOT re-enable without proven need and tested fix.",
+    "disabled_reason": "INCIDENT 016 \u00e2\u20ac\u201d self-prompt daemon types into orchestrator window, corrupts worker sessions and dispatches. Permanently disabled 2026-03-18. Do NOT re-enable without proven need and tested fix.",
     "loop_interval": 30,
     "min_prompt_gap": 600,
     "prompt_threshold": 45,
@@ -264,7 +264,8 @@
       "cleanup_help_award": 0.01,
       "cleanup_cross_validate_award": 0.01,
       "invalid_cleanup_finder_award": 0.02,
-      "grace_period_first_round": true
+      "grace_period_first_round": true,
+      "dispatch_evidence_for_all_deductions": true
     },
     "learnings": [
       "NEVER use wait-all or block on worker completion. Scan-idle-redispatch continuously.",
