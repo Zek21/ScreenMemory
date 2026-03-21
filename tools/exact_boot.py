@@ -221,6 +221,12 @@ def step5_set_permissions(hwnd):
 # STEP 6 — Dispatch identity prompt
 # ---------------------------------------------------------------------------
 def step6_dispatch_identity(hwnd, name, gx, gy, orch_hwnd):
+    """Dispatch identity prompt via ghost_type_to_worker() (Win32 clipboard paste).
+
+    Uses the Skynet dispatch pipeline (SetForegroundWindow + keybd_event paste)
+    which does NOT move the user's mouse cursor. Falls back to pyautogui only
+    if ghost_type is unavailable.
+    """  # signed: delta
     log(f"Step 6: Dispatching identity to {name}...")
     NAME = name.upper()
     task = (
@@ -236,7 +242,24 @@ def step6_dispatch_identity(hwnd, name, gx, gy, orch_hwnd):
         f"print('Identity posted to bus')\n"
     )
 
-    # Save and restore clipboard
+    # Primary path: ghost_type_to_worker (no mouse movement)
+    try:
+        from tools.skynet_dispatch import ghost_type_to_worker
+        log(f"Step 6: Using ghost_type_to_worker (Win32 paste, no mouse steal)")
+        ok = ghost_type_to_worker(hwnd, task, orch_hwnd)
+        if ok:
+            log(f"Step 6: Identity prompt delivered to {name} via ghost_type")
+            return True
+        else:
+            log(f"Step 6: ghost_type returned False for {name}, trying pyautogui fallback")
+    except ImportError:
+        log("Step 6: ghost_type_to_worker not available, using pyautogui fallback")
+    except Exception as e:
+        log(f"Step 6: ghost_type failed ({e}), using pyautogui fallback")
+
+    # Fallback: pyautogui (moves mouse but always works)
+    log(f"Step 6: Fallback: pyautogui dispatch to {name}")
+
     old_clip = ""
     if pyperclip:
         try:
@@ -245,7 +268,6 @@ def step6_dispatch_identity(hwnd, name, gx, gy, orch_hwnd):
             pass
         pyperclip.copy(task)
     else:
-        # Fallback: use ctypes clipboard
         import win32clipboard
         win32clipboard.OpenClipboard()
         win32clipboard.EmptyClipboard()
@@ -255,26 +277,20 @@ def step6_dispatch_identity(hwnd, name, gx, gy, orch_hwnd):
     u32.SetForegroundWindow(hwnd)
     time.sleep(1.0)
 
-    # Click in the input area
     pyautogui.click(gx + 465, gy + 415)
     time.sleep(0.5)
-
-    # Paste
     pyautogui.hotkey('ctrl', 'v')
     time.sleep(0.5)
-
-    # Submit
     pyautogui.press('enter')
     time.sleep(1.0)
 
-    # Restore clipboard and return focus
     if pyperclip:
         try:
             pyperclip.copy(old_clip if old_clip else "")
         except:
             pass
     u32.SetForegroundWindow(orch_hwnd)
-    log("Step 6: Done")
+    log("Step 6: Done (pyautogui fallback)")
     return True
 
 

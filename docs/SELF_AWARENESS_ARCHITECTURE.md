@@ -488,7 +488,7 @@ Each agent entry tracks:
 | Bug confirmed by different validator | +0.01 each (filer + validator) | `DEFAULT_BUG_REPORT_CONFIRMATION_AWARD` |
 | Proactive ticket clearance (orch/consultant) | +0.2 | `DEFAULT_PROACTIVE_TICKET_CLEAR_AWARD` |
 | Autonomous next-ticket pull (worker) | +0.2 | `DEFAULT_AUTONOMOUS_PULL_AWARD` |
-| Queue reaches zero (orch + closer) | +1.0 each | `DEFAULT_TICKET_ZERO_BONUS_AWARD` |
+| Queue reaches zero (closer +0.1, orch +0.05) | +0.1 / +0.05 | `DEFAULT_TICKET_ZERO_BONUS_AWARD` (cooldown 3600s, max 3/24h) |
 | Failed validation (broken code) | −0.005 | `DEFAULT_DEDUCT` |
 | Low-value refactoring (<150 lines) | −0.01 | `DEFAULT_REFACTOR_DEDUCT` |
 | Biased self-report / inflated claim | −0.1 | `DEFAULT_BIASED_REFACTOR_REPORT_DEDUCT` |

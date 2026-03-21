@@ -1,7 +1,9 @@
 """
-DXGI Desktop Duplication screen capture engine.
-Uses Windows Desktop Duplication API for GPU-accelerated capture (~1ms per frame).
-Falls back to PIL ImageGrab if DXGI is unavailable.
+Screen capture engine using mss (GDI BitBlt on Windows).
+
+The module is named after DXGI for historical reasons, but the actual capture
+mechanism uses the mss library which performs GDI BitBlt, not DXGI Desktop
+Duplication. Falls back to PIL ImageGrab if mss is unavailable.
 """
 import ctypes
 import ctypes.wintypes
@@ -38,8 +40,11 @@ class CaptureResult:
 
 class DXGICapture:
     """
-    GPU-accelerated screen capture using DXGI Desktop Duplication API.
-    Falls back to PIL.ImageGrab for reliability.
+    Screen capture using mss (GDI BitBlt on Windows).
+
+    Note: The class name DXGICapture is retained for backward compatibility,
+    but the implementation uses mss which performs GDI BitBlt, not DXGI
+    Desktop Duplication. Falls back to PIL.ImageGrab for reliability.
     """
 
     def __init__(self, use_dxgi: bool = True):
@@ -116,7 +121,7 @@ class DXGICapture:
             import mss
             self._mss = mss.mss()
             self._dxgi_available = True
-            logger.info("Using mss (DXGI-backed) capture")
+            logger.info("Using mss (GDI BitBlt) capture")
         except ImportError:
             raise RuntimeError("mss not available for DXGI capture")
 
@@ -143,7 +148,7 @@ class DXGICapture:
             return None
 
     def _capture_mss(self, monitor_index: int, start: float, raw_bgra: bool = False) -> CaptureResult:
-        """Capture using mss (DXGI-backed on Windows).
+        """Capture using mss (GDI BitBlt on Windows).
 
         When raw_bgra=True, returns the raw BGRA buffer as a PIL Image in RGBX mode
         without color conversion, saving ~10-50ms per frame.

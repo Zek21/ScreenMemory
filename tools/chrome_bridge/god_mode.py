@@ -69,7 +69,7 @@ class AccessibilityTreeParser:
     The AOM provides: roles, names, descriptions, states (aria-expanded, etc.)
     This is the browser-computed distilled view — no DOM bloat.
 
-    Reduces 100k+ DOM tokens to ~2k semantic tokens.
+    Reduces 100k+ DOM tokens to ~1400 semantic tokens.
     """
 
     # Roles that represent actionable/meaningful elements

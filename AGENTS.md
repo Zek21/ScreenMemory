@@ -305,7 +305,7 @@ Before stopping or posting `STANDING_BY`, every agent MUST:
 - A worker that autonomously pulls the next real ticket earns `+0.2` when independently verified.
 - A worker that finds a real bug and files it for cross-validation earns `+0.01` when independently recorded.
 - If a different validator proves that filed bug is true, the validator gets `+0.01` and the original filer gets another `+0.01`.
-- When the live Skynet ticket queue truly reaches zero, the orchestrator gets `+1.0` and the actor that closed the final signed ticket gets `+1.0`.
+- When the live Skynet ticket queue truly reaches zero, the actor that closed the final signed ticket gets `+0.1` and the orchestrator gets `+0.05` (half-rate). ZTB cooldown is 3600s and capped at 3 awards per agent per 24h (max +0.3/day). <!-- ZTB values updated by delta, Wave 5 -->
 
 ### Self-Generation of Work
 If a worker finishes all assigned TODOs and the bus has no pending tasks:
@@ -446,7 +446,7 @@ Skynet's goal is for EVERY agent to gain positive scores. The system succeeds wh
 **Principles:**
 1. The scoring system is NOT zero-sum. One agent's gain does NOT require another's loss.
 2. Every completed task awards points. Every improvement to the system creates more scoring opportunities for all agents.
-3. Agents should HELP each other succeed -- catching a peer's bug earns points for BOTH (reporter +1.0, fixer +0.5).
+3. Agents should HELP each other succeed -- catching a peer's bug earns points for BOTH (reporter +0.01, fixer +0.01 via cross-validation).
 4. System improvements (better tools, fewer errors, faster dispatch) create a rising tide that lifts all scores.
 5. Negative scores indicate a system failure, not an agent failure. If any agent has a negative score, the orchestrator must investigate what systemic issue is preventing that agent from earning points.
 
@@ -1665,7 +1665,7 @@ External workers track their score trajectory and work to improve:
     - +0.2 when a worker autonomously pulls the next real ticket instead of waiting idle
     - +0.01 when a worker files a real bug for cross-validation
     - +0.01 to the original filer and +0.01 to the independent validator when that bug is proven true
-    - +1.0 to `orchestrator` and +1.0 to the actor who closed the final signed ticket when the live queue hits zero
+    - +0.1 to the actor who closed the final signed ticket when the live queue hits zero; +0.05 to `orchestrator` (half-rate). ZTB cooldown: 3600s, max 3 per agent per 24h
 17. Cross-validation is **MANDATORY** for MODERATE+ difficulty tasks — a DIFFERENT worker must verify the implementation
 18. Workers should maintain awareness of their score trajectory and strive for positive balance
 19. **Mass deduction precedent:** 28 tasks were deducted −0.36 collectively for uncritical busywork acceptance — workers must question task value before executing
@@ -1749,7 +1749,7 @@ The scoring system is defined in `data/brain_config.json` under `dispatch_rules.
 | `bug_report_award` | +0.01 | Awarded when a worker files a real bug for cross-validation |
 | `bug_report_confirmation_award` | +0.01 | Added to the original filer when an independent validator proves the bug is true |
 | `bug_cross_validation_award` | +0.01 | Awarded to the independent validator that proves the filed bug is true |
-| `ticket_zero_bonus_award` | +1.0 | Awarded to orchestrator and the actor that closes the final signed ticket when the queue truly reaches zero |
+| `ticket_zero_bonus_award` | +0.1 (actor) / +0.05 (orchestrator) | Awarded when the queue truly reaches zero. Cooldown: 3600s. Capped at 3 per agent per 24h (max +0.3/day). Only valid scoring agents may receive. |
 | `require_independent_refactor_validation` | true | All refactoring MUST be validated by a different worker |
 
 **Mass Deduction Precedent:** 28 tasks were collectively deducted −0.36 points for uncritical acceptance of low-value busywork. Workers must question task value BEFORE executing — if a task is sub-150 lines of mechanical changes, challenge it or propose a higher-value alternative.

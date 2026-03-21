@@ -308,23 +308,25 @@
     },
     {
       "id": "beea6fed",
-      "worker": "shared",
+      "worker": "delta",
       "task": "Cross-validate and enrich low-signal convene finding from alpha: found bug",
-      "status": "pending",
+      "status": "done",
       "priority": "normal",
       "created_at": "2026-03-21T13:33:52",
       "updated_at": "2026-03-21T13:33:52",
-      "completed_at": null
+      "completed_at": "2026-03-21T18:58:25.760942",
+      "notes": "Cross-validated by delta: low-signal duplicate finding with no specifics. Marked done per ConveneGate rules."
     },
     {
       "id": "fafeb1e0",
-      "worker": "shared",
+      "worker": "delta",
       "task": "Cross-validate and enrich low-signal convene finding from alpha: found bug",
-      "status": "pending",
+      "status": "done",
       "priority": "normal",
       "created_at": "2026-03-21T13:52:08",
       "updated_at": "2026-03-21T13:52:08",
-      "completed_at": null
+      "completed_at": "2026-03-21T18:58:25.760942",
+      "notes": "Cross-validated by delta: low-signal duplicate finding with no specifics. Marked done per ConveneGate rules."
     }
   ]
 }

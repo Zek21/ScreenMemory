@@ -728,7 +728,7 @@ The scoring system integrates with every pillar:
 - +0.2 for proactive ticket clearance (orchestrator/consultants)
 - +0.2 for autonomous next-ticket pull (workers)
 - +0.01 for bug filing, +0.01 for validation, +0.01 for original filer on confirmation
-- +1.0 for orchestrator and final-ticket closer when queue reaches zero
+- +0.1 for final-ticket closer and +0.05 for orchestrator when queue reaches zero (cooldown 3600s, max 3/agent/24h)
 
 **Deductions:**
 - -0.005 for failed validation (broken code)

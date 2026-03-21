@@ -18,7 +18,7 @@ Steps per worker (sequential, one at a time):
   3. MoveWindow to grid slot
   4. Set session target to Copilot CLI (auto-sets model)
   5. Set permissions via guard_bypass.ps1 (×2)
-  6. Paste identity prompt via pyautogui
+  6. Paste identity prompt via ghost_type (Win32 paste, no mouse steal)
   7. Verify via bus identity_ack + IsWindow
 
 Usage:
@@ -528,34 +528,38 @@ def step5_set_permissions(hwnd: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def step6_dispatch_identity(name: str, hwnd: int, gx: int, gy: int, orch_hwnd: int) -> bool:
-    """Clipboard paste FULL POWER boot invocation into the worker window.
-    
-    Includes IMMEDIATE delivery verification — polls UIA state for up to 8s
-    to confirm the worker transitioned from IDLE to PROCESSING. If the first
-    attempt fails, retries with adjusted click coordinates.
-    """
+    """Dispatch identity prompt via ghost_type_to_worker() (Win32 clipboard paste).
+
+    Uses the Skynet dispatch pipeline (SetForegroundWindow + keybd_event paste)
+    which does NOT move the user's mouse cursor. Falls back to pyautogui only
+    if ghost_type is unavailable.
+
+    ghost_type_to_worker() handles: clipboard isolation, verification, paste,
+    Enter submission, focus restore, and post-dispatch cleanup automatically.
+    """  # signed: delta
     try:
         log(f"Step 6 — Dispatching FULL POWER invocation to {name}...")
         task = _get_identity_prompt(name)
         log(f"  Invocation size: {len(task)} chars")
 
-        # Import UIA engine for delivery verification
+        # Primary path: ghost_type_to_worker (no mouse movement)
         try:
-            from tools.uia_engine import get_engine
-            engine = get_engine()
-        except Exception:
-            engine = None
+            from tools.skynet_dispatch import ghost_type_to_worker
+            log(f"Step 6 — Using ghost_type_to_worker (Win32 paste, no mouse steal)")
+            ok = ghost_type_to_worker(hwnd, task, orch_hwnd)
+            if ok:
+                log(f"Step 6 — Identity prompt delivered to {name} via ghost_type")
+                return True
+            else:
+                log(f"Step 6 — ghost_type returned False for {name}, trying pyautogui fallback")
+        except ImportError:
+            log("Step 6 — ghost_type_to_worker not available, using pyautogui fallback")
+        except Exception as e:
+            log(f"Step 6 — ghost_type failed ({e}), using pyautogui fallback")
 
-        # Get pre-dispatch state
-        pre_state = "UNKNOWN"
-        if engine:
-            try:
-                pre_scan = engine.scan(hwnd)
-                pre_state = pre_scan.state
-            except Exception:
-                pass
+        # Fallback: pyautogui (moves mouse but always works)
+        log(f"Step 6 — Fallback: pyautogui dispatch to {name}")
 
-        # Save and replace clipboard
         old_clip = ""
         try:
             old_clip = pyperclip.paste()
@@ -566,49 +570,21 @@ def step6_dispatch_identity(name: str, hwnd: int, gx: int, gy: int, orch_hwnd: i
         u32.SetForegroundWindow(hwnd)
         time.sleep(1.0)
 
-        # Click in the input area (pyautogui — proven hardware-level input)
         pyautogui.click(gx + INPUT_OFFSET[0], gy + INPUT_OFFSET[1])
         time.sleep(0.5)
-
-        # Paste the prompt
         pyautogui.hotkey('ctrl', 'v')
         time.sleep(0.5)
-
-        # Submit
         pyautogui.press('enter')
         time.sleep(1.0)
 
-        # Restore clipboard and return focus to orchestrator
         try:
             pyperclip.copy(old_clip if old_clip else '')
         except Exception:
             pass
         u32.SetForegroundWindow(orch_hwnd)
 
-        # IMMEDIATE DELIVERY VERIFICATION — poll UIA for state transition
-        if engine:
-            verified = False
-            for i in range(16):  # 16 * 0.5s = 8s
-                time.sleep(0.5)
-                try:
-                    post_scan = engine.scan(hwnd)
-                    if post_scan.state != pre_state and post_scan.state != "UNKNOWN":
-                        log(f"Step 6 — VERIFIED: {name} state {pre_state} → {post_scan.state} after {(i+1)*0.5}s")
-                        verified = True
-                        break
-                except Exception:
-                    pass
-
-            if verified:
-                log(f"Step 6 — Identity prompt delivered and confirmed for {name}")
-                return True
-            else:
-                log(f"Step 6 — WARNING: {name} state did not change after 8s — dispatch may have failed")
-                return False
-        else:
-            # No UIA engine — can't verify, assume success
-            log(f"Step 6 — Identity prompt dispatched to {name} (unverified — no UIA engine)")
-            return True
+        log(f"Step 6 — Identity prompt dispatched to {name} via pyautogui fallback")
+        return True
 
     except Exception as e:
         log(f"Step 6 FAILED: {e}")

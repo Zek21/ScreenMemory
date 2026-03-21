@@ -30,6 +30,11 @@ Performance:
     PowerShell spawn: ~440ms per window (8-10x slower)
     Parallel 5 windows: ~200ms total
 
+    Note: The 30-50ms COM-based timing replaced an older PowerShell-based UIA
+    approach that took ~192ms per scan as reported in the research paper
+    (Section 5.4). The COM approach via comtypes provides ~4-6x speedup by
+    eliminating per-call process spawning overhead.
+
 Architecture:
     - comtypes COM interface to IUIAutomation (in-process, no PowerShell)
     - OrCondition(Button|ListItem|Edit) — single FindAll gets everything

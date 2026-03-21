@@ -149,7 +149,7 @@ Once the boot protocol completes, the orchestrator enters its normal operating l
 
 **Zero Idle Rule:** The orchestrator must NEVER let workers sit idle when there is work to do. If the TODO list is empty but the system can be improved, the orchestrator MUST generate improvement tasks (code quality, test coverage, documentation, performance, security). The system is NEVER finished — it is always improving.
 
-**Shared Ticket Awareness Rule:** The orchestrator and both consultants must remain aware of Skynet tickets, not just their currently assigned slice. If a real ticket is pending and they can clear it or surface it, they must act instead of stopping. Proactive ticket clearance by `orchestrator`, `consultant`, or `gemini_consultant` earns `+0.2` when independently verified. When the queue truly reaches zero, `orchestrator` gets `+1.0` and the actor that closed the final signed ticket gets `+1.0`.
+**Shared Ticket Awareness Rule:** The orchestrator and both consultants must remain aware of Skynet tickets, not just their currently assigned slice. If a real ticket is pending and they can clear it or surface it, they must act instead of stopping. Proactive ticket clearance by `orchestrator`, `consultant`, or `gemini_consultant` earns `+0.2` when independently verified. When the queue truly reaches zero, the actor that closed the final signed ticket gets `+0.1` and `orchestrator` gets `+0.05` (half-rate). ZTB cooldown: 3600s, max 3 per agent per 24h.
 
 **TODO List Hygiene:**
 - `data/todos.json` is the persistent TODO store. The orchestrator reads it on every turn.
@@ -412,7 +412,7 @@ Every agent MUST understand these architectural facts from CODE, not from assump
 - +0.2 for workers autonomously pulling the next real ticket
 - +0.01 when a worker files a real bug for cross-validation
 - +0.01 to the original filer and +0.01 to the independent validator when that bug is proven true
-- +1.0 to orchestrator and +1.0 to the actor that closes the final signed ticket when the queue truly reaches zero
+- +0.1 to the actor that closes the final signed ticket when the queue truly reaches zero; +0.05 to orchestrator (half-rate). ZTB cooldown: 3600s, max 3/agent/24h
 - Cross-validation by a DIFFERENT worker is REQUIRED for MODERATE+ tasks
 - Check score: `python tools/skynet_self.py pulse`
 

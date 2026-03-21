@@ -25,10 +25,9 @@ Scoring defaults:
                                   proactively clears or surfaces a Skynet ticket
   - autonomous pull:              +0.20 pts when a worker pulls the next
                                   ticket without waiting to be spoon-fed
-  - zero-ticket completion bonus: +1.00 pts to orchestrator when the queue
-                                  truly reaches zero, and +1.00 pts to the
-                                  actor that closed the final ticket
-                                  (300s cooldown per agent)
+  - zero-ticket completion bonus: +0.10 pts to the actor that closed
+                                  the final ticket, +0.05 to orchestrator
+                                  (3600s cooldown, max 3 per 24h per agent)
   - advisory contribution:        +0.05 pts when a consultant's advisory
                                   proposal is accepted and acted upon
   - cross-system review:          +0.02 pts when a consultant performs a
@@ -44,7 +43,7 @@ Rule 0.9 -- Workspace Cleanliness & Tool Usage Accountability:
 
 Convention 3 Fairness Fixes:
   - Consultants receive base=6.0 on first creation (same as workers)
-  - Zero-ticket bonus has 300s cooldown per agent to prevent inflation
+  - Zero-ticket bonus has 3600s cooldown + 3-per-24h cap per agent
   - reset_illegitimate_deductions() reverses forced boot-window spam penalties
 
 Convention 4 Fairness Enhancements (coding_4, signed: beta):
@@ -85,7 +84,7 @@ import argparse
 import json
 import threading
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -118,10 +117,11 @@ DEFAULT_REFACTOR_NECESSARY_REVERSAL = 0.01
 DEFAULT_BIASED_REFACTOR_REPORT_DEDUCT = 0.1
 DEFAULT_PROACTIVE_TICKET_CLEAR_AWARD = 0.2
 DEFAULT_AUTONOMOUS_PULL_AWARD = 0.2
-DEFAULT_TICKET_ZERO_BONUS_AWARD = 1.0
+DEFAULT_TICKET_ZERO_BONUS_AWARD = 0.1  # SF-1 fix: reduced from 1.0 to 0.1 (was 100:1 vs task awards)  # signed: delta
 DEFAULT_ADVISORY_CONTRIBUTION_AWARD = 0.05  # signed: gamma
 DEFAULT_CROSS_SYSTEM_REVIEW_AWARD = 0.02  # signed: gamma
-ZTB_COOLDOWN_SECONDS = 300  # Min seconds between zero-ticket bonuses per agent  # signed: gamma
+ZTB_COOLDOWN_SECONDS = 3600  # SF-1 fix: increased from 300s to 3600s (1 hour)  # signed: delta
+ZTB_MAX_PER_SESSION = 3  # SF-1 fix: max ZTB awards per agent per 24h (3 × 0.1 = 0.3 cap)  # signed: delta
 
 # Rule 0.9: Workspace Cleanliness & Tool Usage Accountability
 DEFAULT_UNCLEARED_WORK_DEDUCT_ORCH = 0.02
@@ -138,6 +138,13 @@ CONSULTANT_ROLES = frozenset({"consultant", "gemini_consultant"})
 
 WORKER_ROLES = frozenset({"alpha", "beta", "gamma", "delta"})  # signed: gamma
 BASE_SCORE_AGENTS = WORKER_ROLES | CONSULTANT_ROLES | ORCHESTRATOR_ROLES  # signed: gamma
+
+# SF-4 fix: valid agent names for scoring records — rejects test/fake accounts  # signed: delta
+VALID_SCORING_AGENTS = frozenset({
+    "alpha", "beta", "gamma", "delta", "orchestrator",
+    "consultant", "gemini_consultant", "website-worker",
+    "scoring", "system", "monitor", "ALL",  # system senders used in reset/bus
+})
 
 # Adjusters that bypass dispatch evidence checks (system-level penalties).  # signed: beta
 SYSTEM_ADJUSTERS = frozenset({"spam_guard", "process_violation", "system"})
@@ -420,7 +427,17 @@ def _require_independent_validator(worker: str, validator: str, action: str) -> 
 
 
 def _append_record(data: dict, record: dict, msg_type: str) -> None:
-    """Append a record and save. Caller MUST hold _lock."""  # signed: gamma
+    """Append a record and save. Caller MUST hold _lock.
+
+    SF-4 fix: validates worker name against VALID_SCORING_AGENTS to prevent
+    test/fake account contamination.
+    """  # signed: delta
+    worker = record.get("worker", "")
+    if worker and worker not in VALID_SCORING_AGENTS and worker not in SYSTEM_SENDERS:
+        raise ValueError(
+            f"Invalid agent '{worker}' in scoring record. "
+            f"Known agents: {sorted(VALID_SCORING_AGENTS)}"
+        )
     data["history"].append(record)
     _save(data)
     _bus_post({
@@ -494,6 +511,29 @@ def _ztb_cooldown_ok(data: dict, agent: str) -> bool:
     return True  # No prior ZTB for this agent
 
 
+def _ztb_session_cap_ok(data: dict, agent: str) -> bool:
+    """Check if agent hasn't exceeded the per-session ZTB cap (24h window).
+
+    Prevents ZTB inflation by limiting each agent to ZTB_MAX_PER_SESSION
+    awards within a rolling 24-hour window.
+    """  # signed: delta
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    count = 0
+    for record in data.get("history", []):
+        if (record.get("worker") == agent
+                and record.get("action") == "zero_ticket_bonus"):
+            try:
+                ts = datetime.fromisoformat(record["timestamp"])
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts > cutoff:
+                    count += 1
+            except (KeyError, ValueError):
+                continue
+    return count < ZTB_MAX_PER_SESSION
+
+
 def _all_tickets_cleared() -> bool:
     try:
         from tools import skynet_todos as todos
@@ -515,13 +555,18 @@ def award_points(
 
     Args:
         worker: The worker being rewarded.
-        task_id: Identifier of the validated task.
+        task_id: Identifier of the validated task (must be meaningful, not 'unknown').
         validator: The worker who validated the task (must differ from worker).
         amount: Points to award (default 0.01).
 
     Returns:
         Updated score entry for the worker.
     """
+    # SF-6 fix: require meaningful task_id for audit trail  # signed: delta
+    if not task_id or task_id in ("?", "unknown", ""):
+        raise ValueError(
+            "task_id is required and must be meaningful (not empty/'unknown'/'?')"
+        )
     _require_independent_validator(worker, validator, "validate")
 
     with _lock:  # signed: gamma
@@ -537,6 +582,7 @@ def award_points(
             "action": "award",
             "amount": amount,
             "task_id": task_id,
+            "reason": task_id,  # SF-6 fix: explicit reason field  # signed: delta
             "validator": validator,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "new_total": entry["total"],
@@ -645,7 +691,7 @@ def deduct_points(
 
     Args:
         worker: The worker being penalized.
-        task_id: Identifier of the failed task.
+        task_id: Identifier of the failed task (must be meaningful, not 'unknown').
         validator: The worker who found the failure.
         amount: Points to deduct (default 0.005).
         force: If True, skip dispatch evidence check (for system-level
@@ -654,6 +700,11 @@ def deduct_points(
     Returns:
         Updated score entry for the worker, or None if deduction rejected.
     """
+    # SF-6 fix: require meaningful task_id (system penalties can pass any)  # signed: delta
+    if not force and (not task_id or task_id in ("?", "unknown", "")):
+        raise ValueError(
+            "task_id is required and must be meaningful (not empty/'unknown'/'?')"
+        )
     _require_independent_validator(worker, validator, "penalize")
 
     # Dispatch evidence check -- reject unverified deductions unless forced
@@ -686,6 +737,7 @@ def deduct_points(
             "action": "deduct",
             "amount": amount,
             "task_id": task_id,
+            "reason": task_id,  # SF-6 fix: explicit reason field  # signed: delta
             "validator": validator,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "new_total": entry["total"],
@@ -1050,17 +1102,31 @@ def award_zero_ticket_clear(
                 f"within last {ZTB_COOLDOWN_SECONDS}s"
             )
 
+        # SF-1 fix: per-session cap — max ZTB_MAX_PER_SESSION per 24h  # signed: delta
+        if not _ztb_session_cap_ok(data, "orchestrator"):
+            raise ValueError(
+                f"Zero-ticket bonus session cap: orchestrator already received "
+                f"{ZTB_MAX_PER_SESSION} ZTBs in the last 24 hours"
+            )
+        if not _ztb_session_cap_ok(data, actor):
+            raise ValueError(
+                f"Zero-ticket bonus session cap: {actor} already received "
+                f"{ZTB_MAX_PER_SESSION} ZTBs in the last 24 hours"
+            )
+
         _require_independent_validator("orchestrator", validator, "validate zero-ticket bonus for")
         _ensure_worker(data, "orchestrator")
         orchestrator_entry = data["scores"]["orchestrator"]
-        orchestrator_entry["total"] = round(orchestrator_entry["total"] + reward, 6)
+        # SF-2 fix: orchestrator gets half ZTB since it doesn't do implementation  # signed: delta
+        orch_reward = round(reward * 0.5, 6)
+        orchestrator_entry["total"] = round(orchestrator_entry["total"] + orch_reward, 6)
         orchestrator_entry["awards"] += 1
         orchestrator_entry["zero_ticket_bonus_awards"] += 1
 
         orchestrator_record = {
             "worker": "orchestrator",
             "action": "zero_ticket_bonus",
-            "amount": reward,
+            "amount": orch_reward,
             "task_id": task_id,
             "validator": validator,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2003,6 +2069,26 @@ def main():
             print(separator)
             for i, entry in enumerate(system_board, 1):
                 _print_row(i, entry)
+
+        # SF-5 fix: Routing fairness diagnostic  # signed: delta
+        data = _load()
+        from collections import Counter
+        task_counts = Counter()
+        for h in data.get("history", []):
+            w = h.get("worker", "")
+            if h.get("action") == "award" and w in WORKER_ROLES:
+                task_counts[w] += 1
+        if task_counts:
+            print()
+            print("=== Task Distribution (awards by worker) ===")
+            total = sum(task_counts.values())
+            ideal_pct = 100.0 / len(WORKER_ROLES) if WORKER_ROLES else 25.0
+            for agent in sorted(WORKER_ROLES):
+                count = task_counts.get(agent, 0)
+                pct = (count / total * 100) if total > 0 else 0
+                bias = pct - ideal_pct
+                flag = " ⚠️ BIAS" if abs(bias) > 15 else ""
+                print(f"  {agent:<10} {count:>3} tasks ({pct:5.1f}%, deviation {bias:+.1f}%){flag}")
         # signed: delta
 
     elif args.history is not None:
