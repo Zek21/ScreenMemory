@@ -44,6 +44,11 @@ from pathlib import Path
 from datetime import datetime
 from urllib.request import Request, urlopen  # signed: gamma (removed unused URLError)
 
+try:
+    from tools.skynet_atomic import atomic_write_json
+except ImportError:
+    from skynet_atomic import atomic_write_json
+
 # Force UTF-8 output on Windows to handle emoji and box-drawing characters
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1579,7 +1584,8 @@ def phase_5_save(workers, engines):
         "engines": list(engines.keys()),
         "created": now_iso,
     }
-    WORKERS_FILE.write_text(json.dumps(state, indent=2, default=str))
+    WORKERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(WORKERS_FILE, state)  # signed: beta (K2 atomicity fix)
     log(f"State saved to {WORKERS_FILE}", "OK")
 
 
@@ -1674,7 +1680,7 @@ def _save_workers_state(workers, engines):
     for w in workers:
         w["updated_at"] = now_iso
         w.setdefault("last_seen", now_iso)
-    WORKERS_FILE.write_text(json.dumps(data, indent=2, default=str))
+    atomic_write_json(WORKERS_FILE, data)  # signed: beta (K2 atomicity fix)
 
 
 def reconnect():
@@ -1773,7 +1779,7 @@ def reconnect():
     data["workers"] = updated_workers
     data["engines"] = list(engines.keys())
     data["reconnected"] = now_iso
-    WORKERS_FILE.write_text(json.dumps(data, indent=2, default=str))
+    atomic_write_json(WORKERS_FILE, data)  # signed: beta (K2 atomicity fix)
 
     if adopted:
         log(f"Reconnect complete: {len(alive)} saved + {len(adopted)} adopted = {len(all_workers)} workers", "OK")

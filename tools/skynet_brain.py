@@ -39,6 +39,16 @@ WORKER_NAMES = ["alpha", "beta", "gamma", "delta"]
 
 @dataclass
 class Subtask:
+    """A single decomposed subtask within a BrainPlan.
+
+    Attributes:
+        task_text: The instruction text for this subtask.
+        assigned_worker: Name of the worker assigned to execute it.
+        context: Optional enrichment context (learnings, past solutions).
+        dependencies: Indices of subtasks that must complete first.
+        index: Position of this subtask in the plan.
+    """  # signed: alpha
+
     task_text: str
     assigned_worker: str
     context: str = ""
@@ -54,6 +64,19 @@ def _generate_strategy_id(goal: str) -> str:
 
 @dataclass
 class BrainPlan:
+    """An intelligent dispatch plan produced by SkynetBrain.
+
+    Attributes:
+        goal: The original high-level goal text.
+        difficulty: TRIVIAL/SIMPLE/MODERATE/COMPLEX/ADVERSARIAL.
+        subtasks: Ordered list of Subtask objects.
+        reasoning: Explanation of the decomposition strategy.
+        relevant_learnings: Past learnings relevant to this goal.
+        operator: Decomposition operator used (e.g. 'natural', 'template').
+        domain_tags: Detected domain tags (e.g. ['security', 'frontend']).
+        strategy_id: Unique SHA-256 ID linking plan to feedback outcomes.
+    """  # signed: alpha
+
     goal: str
     difficulty: str
     subtasks: List[Subtask]
@@ -207,6 +230,7 @@ class CognitiveStrategy:
     """
 
     def __init__(self):
+        """Initialize cognitive strategy selector with lazy-loaded reasoning engines."""  # signed: alpha
         self.got = None
         self.mcts = None
         self.reflexion = None
@@ -509,6 +533,11 @@ class SkynetBrain:
     """Intelligent dispatch brain for Skynet multi-agent system."""
 
     def __init__(self):
+        """Initialize SkynetBrain with fault-tolerant engine loading.
+
+        Loads DAAORouter, DAGBuilder, HybridRetriever, LearningStore,
+        and CognitiveStrategy. Each is optional; Brain degrades gracefully.
+        """  # signed: alpha
         self.router = None
         self.dag_builder = None
         self.retriever = None
@@ -1207,6 +1236,7 @@ class SkynetBrain:
 # ─── CLI ───────────────────────────────────────────────
 
 def main():
+    """CLI entry point: think (plan), execute (full pipeline), or assess (difficulty only)."""  # signed: alpha
     parser = argparse.ArgumentParser(description="Skynet Brain -- Intelligent Dispatch")
     parser.add_argument("command", choices=["think", "execute", "assess"],
                         help="Command: think (plan only), execute (full pipeline), assess (difficulty only)")

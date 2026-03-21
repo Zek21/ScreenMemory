@@ -114,7 +114,8 @@ class TestCheckUrl:
     def test_url_failure(self):
         """Returns False on connection error."""
         from tools.skynet_watchdog import check_url
-        with patch("tools.skynet_watchdog.urllib.request.urlopen", side_effect=Exception("refused")):
+        import urllib.error  # signed: delta
+        with patch("tools.skynet_watchdog.urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
             assert check_url("http://dead.local") is False
 
     def test_url_non_200(self):

@@ -48,11 +48,22 @@ _lock = threading.Lock()
 # ─── Atomic File Write ─────────────────────────────────
 
 def _atomic_write(path: Path, data):
-    """Write JSON atomically: write .tmp then rename."""
+    """Write JSON atomically: write .tmp then rename.
+
+    On failure, cleans up the temp file to prevent stale .tmp accumulation.
+    """
     tmp = path.with_suffix(".tmp")
-    content = json.dumps(data, indent=2, default=str) if isinstance(data, dict) else json.dumps(data, default=str)
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    try:
+        content = json.dumps(data, indent=2, default=str) if isinstance(data, dict) else json.dumps(data, default=str)
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except (OSError, TypeError, ValueError) as e:
+        # Clean up stale temp file on failure
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(f"Atomic write failed for {path}: {e}") from e
 
 
 # ─── Consumed IDs Management ──────────────────────────
@@ -339,6 +350,14 @@ def run_daemon(host: str = "127.0.0.1", port: int = 8420,
     - Response object properly closed alongside connection
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Clean up stale .tmp files from prior crashes  # signed: beta (K2 arch fix)
+    for tmp in DATA_DIR.glob("*.tmp"):
+        try:
+            tmp.unlink(missing_ok=True)
+            print(f"[sse-daemon] Cleaned stale temp file: {tmp.name}", flush=True)
+        except OSError:
+            pass
 
     # ── Signal handlers for graceful shutdown ──
     # Registered BEFORE _init_pid_guard so the PID guard chains to them  # signed: gamma

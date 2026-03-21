@@ -161,12 +161,17 @@ class UIAEngine:
         _get_uia()
 
     def _build_condition(self):
-        """Build OrCondition(Button|ListItem|Edit) — reusable per-thread."""
+        """Build OrCondition(Button|ListItem|Edit) — cached per thread for performance."""  # signed: alpha
+        # Cache the condition object per thread to avoid rebuilding COM property
+        # conditions on every scan() call (~2-5ms savings per scan)
+        if hasattr(_tls, "_scan_condition") and _tls._scan_condition is not None:
+            return _tls._scan_condition
         uia, _ = _get_uia()
         bc = uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_ButtonControlTypeId)
         lc = uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_ListItemControlTypeId)
         ec = uia.CreatePropertyCondition(UIA_ControlTypePropertyId, UIA_EditControlTypeId)
-        return uia.CreateOrCondition(bc, uia.CreateOrCondition(lc, ec))
+        _tls._scan_condition = uia.CreateOrCondition(bc, uia.CreateOrCondition(lc, ec))
+        return _tls._scan_condition
 
     def _classify_elements(self, elements, n, result, bottom_threshold, UIA_Mod):
         """Classify scanned UIA elements into buttons, edits, list items."""

@@ -140,6 +140,7 @@ class SkynetIdentity:
     """Skynet's self-model: who it is, who its agents are, what roles they play."""
 
     def __init__(self):
+        """Initialize Skynet identity with default values and load persistent overrides."""  # signed: alpha
         self.name = "SKYNET"
         self.version = "4.0"  # signed: delta — Level 4 Cognition upgrade
         self.level = 4  # signed: delta — Level 4 Cognition upgrade
@@ -377,6 +378,11 @@ class SkynetIdentity:
         # signed: delta
 
     def report(self) -> dict:
+        """Build a full identity report including all agents and consultant status.
+
+        Returns:
+            Dict with identity info, agent statuses, alive/online counts.
+        """  # signed: alpha
         agents = self.agents()
         consultants = self.get_consultant_status()
         alive = sum(1 for a in agents.values() if a["status"] != "DEAD")
@@ -1117,6 +1123,7 @@ class SkynetSelf:
     """
 
     def __init__(self):
+        """Compose all self-awareness subsystems into a single conscious kernel."""  # signed: alpha
         self.identity = SkynetIdentity()
         self.capabilities = SkynetCapabilities()
         self.health = SkynetHealth()
@@ -1451,6 +1458,11 @@ class SkynetSelf:
 # ══════════════════════════════════════════════════════════════════
 
 def main():
+    """CLI entry point for Skynet self-awareness commands.
+
+    Supports: status, identity, capabilities, health, introspect, goals,
+    pulse, validate, patterns, assess.
+    """  # signed: alpha
     if len(sys.argv) < 2:
         print("Usage: skynet_self.py <command>")
         print("Commands: status, identity, capabilities, health, introspect, goals, pulse, validate, patterns")

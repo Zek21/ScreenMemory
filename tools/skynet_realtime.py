@@ -290,16 +290,15 @@ def _get_vscode_hwnds():
 
 def _lookup_worker_hwnd(worker_name):
     """Read the worker HWND from workers.json after canonical boot updates it."""
-    if not WORKERS_FILE.exists():
-        return None
     try:
-        data = json.loads(WORKERS_FILE.read_text(encoding="utf-8"))
-        for worker in data.get("workers", []):
-            if worker.get("name") == worker_name:
-                hwnd = int(worker.get("hwnd", 0) or 0)
-                return hwnd or None
-    except Exception:
-        return None
+        from tools.skynet_atomic import safe_read_json
+    except ImportError:
+        from skynet_atomic import safe_read_json
+    data = safe_read_json(WORKERS_FILE, default={"workers": []})  # signed: beta (K2 safe read)
+    for worker in data.get("workers", []):
+        if worker.get("name") == worker_name:
+            hwnd = int(worker.get("hwnd", 0) or 0)
+            return hwnd or None
     return None
 
 

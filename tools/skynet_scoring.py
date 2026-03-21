@@ -277,7 +277,7 @@ def _load_protocol() -> dict:
         "autonomous_pull_award",
         "ticket_zero_bonus_award",
     ):
-        if key in scoring:
+        if key in scoring and scoring[key] is not None:  # signed: alpha — guard null values
             protocol[key] = float(scoring[key])
     if "require_independent_refactor_validation" in scoring:
         protocol["require_independent_refactor_validation"] = bool(

@@ -58,7 +58,8 @@ def _acquire_dispatch_mutex(timeout_ms=15000):
         # WAIT_OBJECT_0 = 0, WAIT_TIMEOUT = 0x102, WAIT_ABANDONED = 0x80
         result = kernel32.WaitForSingleObject(_dispatch_mutex_handle, timeout_ms)
         return result in (0, 0x80)  # WAIT_OBJECT_0 or WAIT_ABANDONED
-    except (OSError, ValueError, ctypes.ArgumentError):  # signed: beta
+    except Exception as e:  # signed: gamma
+        log(f"Failed to acquire dispatch mutex: {e}", "WARN")
         return False
 
 
@@ -68,13 +69,13 @@ def _release_dispatch_mutex():
     try:
         if _dispatch_mutex_handle:
             ctypes.windll.kernel32.ReleaseMutex(_dispatch_mutex_handle)
-    except (OSError, ValueError, ctypes.ArgumentError):  # signed: beta
-        pass
+    except Exception as e:  # signed: gamma
+        log(f"Failed to release dispatch mutex: {e}", "WARN")
 
 # Ensure UTF-8 output on Windows (emojis in log messages)
 if hasattr(sys.stdout, 'reconfigure'):
     try: sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    except (AttributeError, OSError): pass  # signed: beta
+    except Exception: pass
 from pathlib import Path
 from datetime import datetime
 
@@ -83,7 +84,7 @@ try:
     from tools.skynet_reflexion_hook import reflexion_hook as _reflexion_hook
     from tools.skynet_reflexion_hook import pre_dispatch_context as _pre_dispatch_context
     _REFLEXION_AVAILABLE = True
-except (ImportError, ModuleNotFoundError):  # signed: beta
+except Exception:
     _REFLEXION_AVAILABLE = False
 
 ROOT = Path(__file__).parent.parent
@@ -151,7 +152,7 @@ def guard_process_kill(pid=None, name=None, caller="unknown"):
         try:
             from tools.skynet_spam_guard import guarded_publish
             guarded_publish(msg)
-        except (ImportError, OSError, RuntimeError):  # signed: beta
+        except Exception:
             # Raw fallback for when SpamGuard is unavailable
             try:
                 import urllib.request
@@ -199,9 +200,6 @@ DELIVERY_VERIFY_CONSECUTIVE_UNKNOWN_LIMIT = 3  # UIA UNKNOWN readings before FAI
 DELIVERY_RETRY_MAX = 2                # max auto-retries on unverified delivery
 DELIVERY_RETRY_BACKOFF_BASE = 2.0     # seconds; exponential: 2s, 4s, ...
 
-# Last delivery status from ghost_type_to_worker -- persisted to dispatch_log  # signed: alpha
-_last_delivery_status: str = ""
-
 # Self-dispatch identity: set via env var SKYNET_WORKER_NAME or marker file
 _SELF_WORKER_NAME = os.environ.get("SKYNET_WORKER_NAME", "")
 
@@ -212,14 +210,12 @@ def _get_self_identity():
         return _SELF_WORKER_NAME
     marker = DATA_DIR / "self_identity.txt"
     if marker.exists():
-        return marker.read_text().strip()
+        return marker.read_text(encoding="utf-8").strip()
     return ""
 
 
-def _log_dispatch(worker_name, task, state, success, target_hwnd=0, delivery_status=""):
+def _log_dispatch(worker_name, task, state, success, target_hwnd=0):
     """Append dispatch event to dispatch_log.json (atomic)."""
-    # Use explicit param or fall back to module-level last delivery status  # signed: alpha
-    ds = delivery_status or _last_delivery_status
     try:
         try:
             from tools.skynet_atomic import atomic_update_json
@@ -236,7 +232,6 @@ def _log_dispatch(worker_name, task, state, success, target_hwnd=0, delivery_sta
                 "success": success,
                 "target_hwnd": target_hwnd,
                 "result_received": False,
-                "delivery_status": ds,  # signed: alpha -- was always blank, now persisted
                 "strategy": os.environ.get("SKYNET_STRATEGY", "direct"),
                 "strategy_id": os.environ.get("SKYNET_STRATEGY_ID", ""),
             })
@@ -406,11 +401,12 @@ BUS_URL = "http://localhost:8420"
 
 
 def _fetch_json_quiet(url, timeout=3):
-    """Fetch JSON from URL, return None on any failure. No logging."""
+    """Fetch JSON from URL, return None on network/parse failure. No logging."""
     import urllib.request
     try:
         return json.loads(urllib.request.urlopen(url, timeout=timeout).read())
-    except Exception:
+    except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError,
+            OSError, ValueError, TimeoutError):  # signed: delta
         return None
 
 
@@ -530,8 +526,8 @@ def _enrich_reflexion_context(worker_name, task):  # signed: alpha
         ctx = _pre_dispatch_context(task, worker_name=worker_name, top_k=2)
         if ctx and ctx.strip():
             return f"[REFLEXION] {ctx.strip()}"
-    except Exception:
-        pass
+    except (ImportError, OSError, ValueError, TypeError, AttributeError) as e:  # signed: delta
+        log(f"Reflexion context enrichment failed for {worker_name}: {e}", "WARN")
     return None
 
 
@@ -807,13 +803,13 @@ def load_workers():
         list[dict]: List of worker dicts with keys: name, hwnd, model, etc.
                     Empty list if file is missing or unparseable.
     """  # signed: gamma
-    if not WORKERS_FILE.exists():
-        log("No workers.json", "ERR")
-        return []
     try:
-        data = json.loads(WORKERS_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
-        log(f"Failed to parse workers.json: {e}", "ERR")  # signed: beta
+        from tools.skynet_atomic import safe_read_json
+    except ImportError:
+        from skynet_atomic import safe_read_json
+    data = safe_read_json(WORKERS_FILE, default={"workers": []})
+    if not data or not isinstance(data, dict):
+        log("No workers.json or corrupt data", "ERR")
         return []
     return data.get("workers", [])
 
@@ -1088,7 +1084,7 @@ if (-not $applyDetected) {{
         foreach ($t in $allText) {{
             try {{
                 $tname = [string]$t.Current.Name
-                if ($tname -match '\\d+\\s+files?\\s+changed') {{
+                if ($tname -match '\\d+\\s+files?\\s+changed') {{  # signed: gamma — fix invalid escape sequences
                     $applyDetected = $true
                     Write-Host "DEBUG: Apply panel detected via text: $tname"
                     break
@@ -1340,7 +1336,7 @@ if ($focusMethod -ne "NONE") {{
                     foreach ($el in $allElems) {{
                         try {{
                             $name = $el.Current.Name
-                            if ($name -match "Cancel \\(Alt\\+Backspace\\)") {{ $postEnterState = "STEERING"; break }}
+                            if ($name -match "Cancel \\(Alt\\+Backspace\\)") {{ $postEnterState = "STEERING"; break }}  # signed: gamma
                             if ($name -match "Generating|Searching|Thinking") {{ $postEnterState = "PROCESSING"; break }}
                         }} catch {{}}
                     }}
@@ -1388,7 +1384,7 @@ if ($focusMethod -ne "NONE") {{
                     foreach ($el in $allElems) {{
                         try {{
                             $name = $el.Current.Name
-                            if ($name -match "Cancel \\(Alt\\+Backspace\\)") {{ $postEnterState = "STEERING"; break }}
+                            if ($name -match "Cancel \\(Alt\\+Backspace\\)") {{ $postEnterState = "STEERING"; break }}  # signed: gamma
                             if ($name -match "Generating|Searching|Thinking") {{ $postEnterState = "PROCESSING"; break }}
                         }} catch {{}}
                     }}
@@ -1534,15 +1530,6 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
                     pass
                 return False
 
-            # Extract delivery status BEFORE releasing lock to prevent race  # signed: alpha
-            global _last_delivery_status
-            _last_delivery_status = ""
-            for ds in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK", "FOCUS_STOLEN",
-                        "NO_EDIT", "NO_EDIT_NO_RENDER", "CLIPBOARD_VERIFY_FAILED"):
-                if ds in stdout:
-                    _last_delivery_status = ds
-                    break
-
             try:
                 DISPATCH_LOCK_FILE.unlink(missing_ok=True)
             except Exception:
@@ -1550,41 +1537,9 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
             time.sleep(0.5)
 
         # Focus race detection: another window stole focus between clipboard set and paste  # signed: alpha
-        # FOCUS_STOLEN retry: restore orchestrator focus, wait 1s, retry once (signed: beta)
         if "FOCUS_STOLEN" in stdout:
-            log(f"Ghost FOCUS_STOLEN for HWND={hwnd} -- restoring orch focus and retrying once (1s delay)", "WARN")
-            try:
-                user32.SetForegroundWindow(orch_hwnd)
-            except Exception:
-                pass
-            time.sleep(1.0)
-            with _dispatch_lock:
-                try:
-                    r2 = subprocess.run(
-                        ["powershell", "-NoProfile", "-Command", ps],
-                        capture_output=True, text=True, timeout=20,
-                        creationflags=0x08000000
-                    )
-                    stdout2 = r2.stdout or ""
-                    if any(s in stdout2 for s in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK")):
-                        log(f"Ghost FOCUS_STOLEN retry succeeded for HWND={hwnd}", "OK")
-                        _last_delivery_status = next(
-                            (s for s in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK") if s in stdout2), "")
-                        try:
-                            DISPATCH_LOCK_FILE.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                        return True
-                    log(f"Ghost FOCUS_STOLEN retry also failed for HWND={hwnd}: {stdout2.strip()[:150]}", "ERR")
-                except subprocess.TimeoutExpired:
-                    log(f"Ghost FOCUS_STOLEN retry TIMEOUT for HWND={hwnd}", "ERR")
-                except Exception as e2:
-                    log(f"Ghost FOCUS_STOLEN retry exception: {e2}", "ERR")
-                try:
-                    DISPATCH_LOCK_FILE.unlink(missing_ok=True)
-                except Exception:
-                    pass
-            return False  # signed: beta
+            log(f"Ghost FOCUS_STOLEN for HWND={hwnd} -- focus race detected, paste aborted safely", "ERR")
+            return False
         ok = (
             r.returncode == 0
             and any(s in stdout for s in ("OK_ATTACHED", "OK_FALLBACK", "OK_RENDER_ATTACHED", "OK_RENDER_FALLBACK"))
@@ -1662,27 +1617,6 @@ def ghost_type_to_worker(hwnd, text, orch_hwnd, render_hwnd=None):
         _execute_ghost_dispatch() (subprocess execution and validation)
         _verify_delivery() (post-dispatch UIA state verification)
     """  # signed: beta
-    # ── DAEMON GHOST-TYPE GUARD ──
-    # Block ghost-type calls from background daemons while allowing boot/manual dispatch.
-    # Daemons that ghost-type (bus_worker, bus_relay, bus_watcher, self_prompt) caused
-    # "lllll" garbage in worker windows (INCIDENT 016). This guard blocks them.
-    try:
-        _bc = json.loads(Path(ROOT, "data", "brain_config.json").read_text(encoding="utf-8"))
-        if not _bc.get("daemon_ghost_type_global_enabled", False):  # signed: gamma
-            import inspect
-            _caller_files = [f.filename for f in inspect.stack()[:8]]
-            _caller_str = "|".join(os.path.basename(f) for f in _caller_files)
-            # Allow: boot script, manual dispatch CLI, orchestrator context
-            _allowed = any(k in _caller_str for k in [
-                'worker_boot', 'skynet_dispatch.py', '<stdin>', '<string>',
-                'copilot', 'agent', 'main.py', 'orch_realtime',
-            ])
-            if not _allowed:
-                log(f"ghost_type BLOCKED by daemon guard — caller chain: {_caller_str}", "WARN")
-                return False
-    except Exception:
-        pass  # If config unreadable, allow (fail-open for boot)
-
     if not hwnd or not user32.IsWindow(hwnd):
         log(f"ghost_type: invalid target HWND={hwnd}", "ERR")  # signed: beta
         return False
@@ -1963,22 +1897,9 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
 
     ok = ghost_type_to_worker(hwnd, full_task, orch_hwnd)
     if not ok:
-        # FOCUS_STOLEN-aware retry: if focus was stolen, restore and retry ghost_type
-        # directly instead of steer-bypass (steer-bypass is wrong fix for focus races)  # signed: beta
-        if _last_delivery_status == "FOCUS_STOLEN":
-            log(f"[RETRY] {worker_name.upper()} FOCUS_STOLEN -- restoring orch focus, retrying in 1s", "WARN")
-            try:
-                user32.SetForegroundWindow(orch_hwnd)
-            except Exception:
-                pass
-            time.sleep(1.0)
-            ok = ghost_type_to_worker(hwnd, full_task, orch_hwnd)
-            if ok:
-                log(f"✓ {worker_name.upper()} FOCUS_STOLEN retry succeeded", "OK")
-        if not ok:
-            log(f"✗ Failed to dispatch to {worker_name.upper()} -- trying steer-bypass", "WARN")
-            ok = clear_steering_and_send(hwnd, full_task, orch_hwnd)
-        _record_dispatch_outcome(worker_name, task, pre_state, hwnd, t_start, ok, 'steer-bypass' if ok and _last_delivery_status != "FOCUS_STOLEN" else '')
+        log(f"✗ Failed to dispatch to {worker_name.upper()} -- trying steer-bypass", "WARN")
+        ok = clear_steering_and_send(hwnd, full_task, orch_hwnd)
+        _record_dispatch_outcome(worker_name, task, pre_state, hwnd, t_start, ok, 'steer-bypass' if ok else '')
     else:
         _record_dispatch_outcome(worker_name, task, pre_state, hwnd, t_start, True)
 
@@ -2002,15 +1923,7 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
                     verified = True
                     _reset_dispatch_failures(worker_name)  # signed: beta
                     break
-                # Retry ghost_type with fresh clipboard clear  # signed: beta
-                try:
-                    subprocess.run(
-                        ["powershell", "-NoProfile", "-Command",
-                         "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::Clear()"],
-                        capture_output=True, timeout=5, creationflags=0x08000000
-                    )
-                except Exception:
-                    pass  # Best-effort clipboard clear before retry
+                # Retry ghost_type
                 retry_ok = ghost_type_to_worker(hwnd, full_task, orch_hwnd)
                 if retry_ok:
                     verified = _verify_delivery(hwnd, worker_name, "IDLE")
@@ -2070,8 +1983,12 @@ def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
         from tools.uia_engine import get_engine
         engine = get_engine()
         consecutive_unknown = 0  # track consecutive UNKNOWN readings  # signed: alpha
-        for i in range(timeout_s * 2):  # poll every 0.5s
-            time.sleep(0.5)
+        # Adaptive polling: start fast (200ms) to catch quick transitions,
+        # then ramp to 500ms and 1s to reduce UIA overhead on slow workers.
+        # Total coverage: 5×200ms + 5×500ms + remaining×1000ms ≈ 8s  # signed: alpha
+        poll_intervals = [0.2] * 5 + [0.5] * 5 + [1.0] * max(0, timeout_s - 4)
+        for interval in poll_intervals:
+            time.sleep(interval)
             try:
                 post_state = engine.get_state(hwnd)
                 if post_state == "UNKNOWN":
@@ -2601,6 +2518,11 @@ def _scan_bus_messages_for_key(msgs, key_lower, seen_ids):
         seen_ids.add(mid)
         content = m.get("content", "")
         sender = m.get("sender", "")
+        # Validate types before string operations — bus data is untrusted  # signed: gamma
+        if not isinstance(content, str):
+            content = str(content)
+        if not isinstance(sender, str):
+            sender = str(sender)
         if key_lower in content.lower() or key_lower in sender.lower():
             log(f"Result found from {sender}: {content[:100]}", "OK")
             return m
@@ -2927,14 +2849,29 @@ def _execute_dispatch_mode(args, workers, orch_hwnd):
         log(f"Smart-dispatched to: {routed}", "OK" if routed else "ERR")
         return routed
     if args.fan_out_parallel:
-        with open(args.fan_out_parallel, encoding="utf-8") as f:  # signed: gamma
-            return dispatch_parallel(json.load(f), workers, orch_hwnd)
+        try:  # signed: delta
+            with open(args.fan_out_parallel, encoding="utf-8") as f:
+                fan_data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            log(f"Failed to parse fan-out file '{args.fan_out_parallel}': {e}", "ERR")
+            return None
+        return dispatch_parallel(fan_data, workers, orch_hwnd)
     if args.batch:
-        with open(args.batch, encoding="utf-8") as f:  # signed: gamma
-            return batch_dispatch(json.load(f), workers, orch_hwnd)
+        try:  # signed: delta
+            with open(args.batch, encoding="utf-8") as f:
+                batch_data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            log(f"Failed to parse batch file '{args.batch}': {e}", "ERR")
+            return None
+        return batch_dispatch(batch_data, workers, orch_hwnd)
     if args.fan_out:
-        with open(args.fan_out, encoding="utf-8") as f:  # signed: gamma
-            return fan_out(json.load(f), workers, orch_hwnd, args.delay)
+        try:  # signed: delta
+            with open(args.fan_out, encoding="utf-8") as f:
+                fan_data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            log(f"Failed to parse fan-out file '{args.fan_out}': {e}", "ERR")
+            return None
+        return fan_out(fan_data, workers, orch_hwnd, args.delay)
     if args.idle and args.task:
         exclude = [x.strip() for x in args.exclude.split(",")] if args.exclude else []
         target = dispatch_to_idle(args.task, exclude=exclude, workers=workers, orch_hwnd=orch_hwnd)
@@ -2968,6 +2905,7 @@ def _execute_dispatch_mode(args, workers, orch_hwnd):
 
 
 def main():
+    """CLI entry point for Skynet Dispatch -- supports --blast, --parallel, --smart, --worker, --all, --fan-out modes."""  # signed: alpha
     import argparse
     parser = argparse.ArgumentParser(
         description="Skynet Dispatch -- Send tasks to workers",

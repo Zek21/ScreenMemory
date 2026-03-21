@@ -69,7 +69,7 @@ def _resolve_real_python():
     cfg = venv_dir / "pyvenv.cfg"
     base_python = None
     if cfg.exists():
-        for line in cfg.read_text().splitlines():
+        for line in cfg.read_text(encoding="utf-8").splitlines():  # signed: beta
             if line.strip().startswith("executable"):
                 _, _, val = line.partition("=")
                 candidate = val.strip()
@@ -97,8 +97,8 @@ def _load_watchdog_config():
             data = json.loads(cfg_path.read_text(encoding="utf-8"))
             wd = data.get("watchdog", {})
             return {k: wd.get(k, defaults[k]) for k in defaults}
-    except Exception:
-        pass
+    except (json.JSONDecodeError, OSError, KeyError, TypeError) as e:  # signed: delta
+        print(f"[watchdog] Config load failed ({cfg_path}): {e}, using defaults", file=sys.stderr)
     return defaults
 
 _WD_CFG = _load_watchdog_config()
@@ -205,10 +205,16 @@ def _hidden_subprocess_kwargs(**kwargs):
 
 
 def _hidden_run(args, **kwargs):
+    # Enforce timeout to prevent indefinite hangs (default 60s)  # signed: delta
+    if "timeout" not in kwargs:
+        kwargs["timeout"] = 60
     return subprocess.run(args, **_hidden_subprocess_kwargs(**kwargs))
 
 
 def _hidden_check_output(args, **kwargs):
+    # Enforce timeout to prevent indefinite hangs (default 60s)  # signed: delta
+    if "timeout" not in kwargs:
+        kwargs["timeout"] = 60
     return subprocess.check_output(args, **_hidden_subprocess_kwargs(**kwargs))
 
 
@@ -252,20 +258,26 @@ def log(msg: str):
     DATA_DIR.mkdir(exist_ok=True)
     try:
         if LOG_FILE.exists() and LOG_FILE.stat().st_size > MAX_LOG_SIZE:
-            # Keep last 500KB
+            # Atomic rotation: write truncated content to temp, then rename  # signed: delta
+            tmp = LOG_FILE.with_suffix(".log.tmp")
             content = LOG_FILE.read_text(encoding="utf-8", errors="replace")
-            LOG_FILE.write_text(content[-500_000:], encoding="utf-8")
-    except Exception:
-        pass
-    with open(LOG_FILE, "a") as f:
-        f.write(line + "\n")
+            tmp.write_text(content[-500_000:], encoding="utf-8")
+            tmp.replace(LOG_FILE)
+    except Exception as e:
+        print(f"[watchdog] Log rotation failed: {e}", file=sys.stderr)  # signed: delta
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:  # signed: beta
+            f.write(line + "\n")
+    except OSError as e:
+        print(f"[watchdog] Log write failed: {e}", file=sys.stderr)  # signed: delta
 
 
 def check_url(url: str, timeout: int = 5) -> bool:
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return r.status == 200
-    except Exception:
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError,  # signed: delta
+            ValueError):  # ValueError for malformed URLs
         return False
 
 
@@ -426,7 +438,7 @@ def restart_sse_daemon():
     sse_pid_file = DATA_DIR / "sse_daemon.pid"
     if sse_pid_file.exists():
         try:
-            old_pid_val = int(sse_pid_file.read_text().strip())
+            old_pid_val = int(sse_pid_file.read_text(encoding="utf-8").strip())
             if _pid_alive_and_correct(old_pid_val, "skynet_sse_daemon"):  # signed: beta
                 log(f"SSE daemon already running (PID {old_pid_val}) -- skipping restart")
                 _record_restart_result("sse_daemon", True)
@@ -478,7 +490,7 @@ def restart_learner():
     learner_pid_file = DATA_DIR / "learner.pid"
     if learner_pid_file.exists():
         try:
-            old_pid_val = int(learner_pid_file.read_text().strip())
+            old_pid_val = int(learner_pid_file.read_text(encoding="utf-8").strip())
             if _pid_alive_and_correct(old_pid_val, "skynet_learner"):  # signed: beta
                 log(f"Learner daemon already running (PID {old_pid_val}) -- skipping restart")
                 _record_restart_result("learner", True)
@@ -503,7 +515,7 @@ def restart_learner():
         time.sleep(3)
         if learner_pid_file.exists():
             try:
-                new_pid_val = int(learner_pid_file.read_text().strip())
+                new_pid_val = int(learner_pid_file.read_text(encoding="utf-8").strip())
                 import os
                 os.kill(new_pid_val, 0)
                 log(f"Learner daemon restarted (old={old_pid}, new={new_pid_val})")
@@ -575,7 +587,7 @@ def restart_bus_persist():
     pid_file = DATA_DIR / "bus_persist.pid"
     if pid_file.exists():
         try:
-            old_pid_val = int(pid_file.read_text().strip())
+            old_pid_val = int(pid_file.read_text(encoding="utf-8").strip())
             if _pid_alive_and_correct(old_pid_val, "skynet_bus_persist"):
                 log(f"Bus persist already running (PID {old_pid_val}) -- skipping restart")
                 _record_restart_result("bus_persist", True)
@@ -590,7 +602,7 @@ def restart_bus_persist():
     old_pid = 0
     if pid_file.exists():
         try:
-            old_pid = int(pid_file.read_text().strip())
+            old_pid = int(pid_file.read_text(encoding="utf-8").strip())
         except (ValueError, OSError):
             pass
     try:
@@ -605,7 +617,7 @@ def restart_bus_persist():
         time.sleep(3)
         if pid_file.exists():
             try:
-                new_pid_val = int(pid_file.read_text().strip())
+                new_pid_val = int(pid_file.read_text(encoding="utf-8").strip())
                 import os
                 os.kill(new_pid_val, 0)
                 log(f"Bus persist restarted (old={old_pid}, new={new_pid_val})")
@@ -636,7 +648,7 @@ def restart_consultant_consumer(port: int):
     pid_file = DATA_DIR / f"consultant_consumer_{port}.pid"
     if pid_file.exists():
         try:
-            old_pid_val = int(pid_file.read_text().strip())
+            old_pid_val = int(pid_file.read_text(encoding="utf-8").strip())
             if _pid_alive_and_correct(old_pid_val, "skynet_consultant_consumer"):
                 log(f"Consultant consumer ({port}) already running (PID {old_pid_val}) -- skipping restart")
                 _record_restart_result(svc_name, True)
@@ -651,7 +663,7 @@ def restart_consultant_consumer(port: int):
     old_pid = 0
     if pid_file.exists():
         try:
-            old_pid = int(pid_file.read_text().strip())
+            old_pid = int(pid_file.read_text(encoding="utf-8").strip())
         except (ValueError, OSError):
             pass
     try:
@@ -666,7 +678,7 @@ def restart_consultant_consumer(port: int):
         time.sleep(3)
         if pid_file.exists():
             try:
-                new_pid_val = int(pid_file.read_text().strip())
+                new_pid_val = int(pid_file.read_text(encoding="utf-8").strip())
                 import os
                 os.kill(new_pid_val, 0)
                 log(f"Consultant consumer ({port}) restarted (old={old_pid}, new={new_pid_val})")
@@ -732,7 +744,7 @@ def _get_service_pid(service_name):
             learner_pid_file = DATA_DIR / "learner.pid"
             if learner_pid_file.exists():
                 try:
-                    pid_val = int(learner_pid_file.read_text().strip())
+                    pid_val = int(learner_pid_file.read_text(encoding="utf-8").strip())
                     import os
                     os.kill(pid_val, 0)
                     return pid_val
@@ -955,7 +967,7 @@ def _check_sse_daemon(now, last_check, status):
     sse_pid_file = DATA_DIR / "sse_daemon.pid"
     if sse_pid_file.exists():
         try:
-            sse_pid_val = int(sse_pid_file.read_text().strip())
+            sse_pid_val = int(sse_pid_file.read_text(encoding="utf-8").strip())
             if sse_pid_val > 0:
                 if sys.platform == "win32":
                     import ctypes
@@ -1009,7 +1021,7 @@ def _check_learner_daemon(now, last_check, status):
     learner_pid_file = DATA_DIR / "learner.pid"
     if learner_pid_file.exists():
         try:
-            learner_pid_val = int(learner_pid_file.read_text().strip())
+            learner_pid_val = int(learner_pid_file.read_text(encoding="utf-8").strip())
             import os
             os.kill(learner_pid_val, 0)
             learner_ok = True
@@ -1053,7 +1065,7 @@ def _check_bus_persist(now, last_check, status):
     bp_pid_file = DATA_DIR / "bus_persist.pid"
     if bp_pid_file.exists():
         try:
-            bp_pid_val = int(bp_pid_file.read_text().strip())
+            bp_pid_val = int(bp_pid_file.read_text(encoding="utf-8").strip())
             import os
             os.kill(bp_pid_val, 0)
             bp_ok = True
@@ -1084,7 +1096,7 @@ def _check_consultant_consumers(now, last_check, status):
         cc_pid_file = DATA_DIR / f"consultant_consumer_{port}.pid"
         if cc_pid_file.exists():
             try:
-                cc_pid_val = int(cc_pid_file.read_text().strip())
+                cc_pid_val = int(cc_pid_file.read_text(encoding="utf-8").strip())
                 import os
                 os.kill(cc_pid_val, 0)
                 cc_ok = True
@@ -1384,7 +1396,7 @@ def run_daemon(args=None):
 
 def show_status():
     if STATUS_FILE.exists():
-        print(STATUS_FILE.read_text())
+        print(STATUS_FILE.read_text(encoding="utf-8"))
     else:
         print("No watchdog status yet -- run 'python skynet_watchdog.py start' first")
 

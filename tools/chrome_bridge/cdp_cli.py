@@ -750,6 +750,12 @@ def _run_command(chrome, args):
         script_path = Path(args.script).resolve()
         if not script_path.is_file():
             raise FileNotFoundError(f"Script not found: {args.script}")
+        # Security: restrict exec to scripts within the repo tree  # signed: delta
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        try:
+            script_path.relative_to(repo_root)
+        except ValueError:
+            raise PermissionError(f"Script must be within repo: {script_path} is outside {repo_root}")
         code = compile(script_path.read_text(encoding="utf-8"), str(script_path), "exec")
         exec(code, {'chrome': chrome, 'CDP': CDP, '__name__': '__main__', '__builtins__': __builtins__})
     elif args.command in _CLI_COMMANDS:

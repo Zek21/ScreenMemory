@@ -82,8 +82,8 @@ def _read_realtime() -> dict:
                 if "bus_recent" in data and "bus" not in data:
                     data["bus"] = data["bus_recent"]
                 return data
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError, AttributeError, TypeError):
+            pass  # signed: alpha — handles null/non-dict JSON gracefully
 
     # Fallback: fetch from Skynet HTTP
     try:

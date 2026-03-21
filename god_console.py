@@ -108,7 +108,8 @@ _BACKEND_TTL = 3     # backend status cached 3s
 _CONSULTANT_TTL = 2  # consultant bridge state cached 2s
 _CONSULTANT_PORTS = (8422, 8424, 8425)
 _BUS_TTL = 2         # bus messages cached 2s
-_ENGINES_TTL = 30    # engine probes are expensive; 30s cache
+_ENGINES_TTL = 120    # engine probes are expensive (up to 2.1s for ML model loads);
+                      # 120s cache reduces probe frequency by 75% vs 30s  # signed: alpha
 _DASHBOARD_TTL = 3   # combined dashboard data
 _WINDOWS_TTL = 5     # window scan cached 5s
 
@@ -886,7 +887,8 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             status_code = 500
             logger.error("GET %s failed: %s\n%s", self.path, e, traceback.format_exc())
             _record_error(f"GET {self.path}: {e}")  # signed: gamma
-            self._json_response({"error": str(e), "endpoint": self.path}, status=500)
+            # Sanitize error: only expose exception type, not internal details  # signed: delta
+            self._json_response({"error": f"Internal server error: {type(e).__name__}", "endpoint": self.path}, status=500)
         elapsed_ms = (_time.time() - t0) * 1000
         self._log_access(self.path, status_code, elapsed_ms)
 
@@ -988,7 +990,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 import urllib.parse
                 qs = urllib.parse.parse_qs(self.path.split("?", 1)[1])
                 try:
-                    limit = max(1, min(1000, int(qs.get("limit", [20])[0])))
+                    limit = max(1, min(200, int(qs.get("limit", [20])[0])))  # signed: delta — cap to 200 (ring buffer is 100)
                 except (ValueError, TypeError):
                     limit = 20
             data = _cached_bus(limit)
@@ -1224,10 +1226,13 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
             result = {"running": False, "pid": None, "status": None}
             if os.path.exists(pid_file):
                 try:
-                    pid = int(open(pid_file).read().strip())
-                    result["pid"] = pid
-                    result["running"] = _pid_alive(pid)
-                except Exception:
+                    raw_pid = open(pid_file).read().strip()
+                    # Validate PID is a reasonable integer (1-999999)  # signed: delta
+                    if raw_pid.isdigit() and 1 <= int(raw_pid) <= 999999:
+                        pid = int(raw_pid)
+                        result["pid"] = pid
+                        result["running"] = _pid_alive(pid)
+                except (OSError, ValueError):
                     pass
             if os.path.exists(status_file):
                 try:
@@ -1613,7 +1618,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", self._cors_origin())  # signed: delta
         self.end_headers()
         with _sse_lock:
             _sse_stream_count += 1  # signed: alpha
@@ -1842,20 +1847,38 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
                 self._log_access(f"POST {self.path}", 413, (_time.time() - t0) * 1000)
                 return
             body = self.rfile.read(length) if length else b"{}"
-            data = json.loads(body)
+            try:  # signed: delta — validate JSON before routing
+                data = json.loads(body)
+            except (json.JSONDecodeError, ValueError):
+                self._json_response({"error": "invalid JSON body"}, status=400)
+                self._log_access(f"POST {self.path}", 400, (_time.time() - t0) * 1000)
+                return
+            if not isinstance(data, dict):  # signed: delta — reject non-object JSON
+                self._json_response({"error": "JSON body must be an object"}, status=400)
+                self._log_access(f"POST {self.path}", 400, (_time.time() - t0) * 1000)
+                return
             status_code = self._route_post(data, body)
         except Exception as e:
             status_code = 500
             logger.error("POST %s failed: %s\n%s", self.path, e, traceback.format_exc())
             _record_error(f"POST {self.path}: {e}")  # signed: gamma
-            self._json_response({"error": str(e)}, status=500)
+            # Sanitize error: only expose exception type, not internal details  # signed: delta
+            self._json_response({"error": f"Internal server error: {type(e).__name__}"}, status=500)
         self._log_access(f"POST {self.path}", status_code, (_time.time() - t0) * 1000)
 
     def _route_post(self, data, body):
         """Dispatch POST requests to handlers. Returns HTTP status code."""
         if self.path == "/todos":
             sender = data.get("sender", "unknown")
+            # Validate sender: must be alphanumeric/underscore, max 50 chars  # signed: delta
+            import re as _re_mod
+            if not isinstance(sender, str) or not _re_mod.match(r'^[a-zA-Z0-9_]{1,50}$', sender):
+                self._json_response({"error": "Invalid sender name"}, status=400)
+                return 400
             items = data.get("items", [])
+            if not isinstance(items, list):
+                self._json_response({"error": "items must be a list"}, status=400)
+                return 400
             result = _update_worker_todos(sender, items)
             self._json_response({"ok": True, "sender": sender, "total_workers": len(result)})
             return 200
@@ -2093,9 +2116,26 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # silent — we use _log_access instead
 
+    # Allowed CORS origins — restrict to localhost to prevent cross-origin attacks  # signed: delta
+    _CORS_ALLOWED_ORIGINS = {
+        "http://localhost:8421", "http://127.0.0.1:8421",
+        "http://localhost:8420", "http://127.0.0.1:8420",
+        "http://localhost", "http://127.0.0.1",
+    }
+
+    def _cors_origin(self):
+        """Return the CORS origin header value, restricting to localhost."""
+        origin = self.headers.get("Origin", "")
+        if origin in self._CORS_ALLOWED_ORIGINS:
+            return origin
+        # Allow any localhost port for dev flexibility  # signed: delta
+        if origin.startswith("http://localhost:") or origin.startswith("http://127.0.0.1:"):
+            return origin
+        return "http://localhost:8421"  # default safe fallback
+
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", self._cors_origin())
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
@@ -2121,7 +2161,7 @@ class ConsoleHandler(SimpleHTTPRequestHandler):
         del data, text  # free source objects before sending
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin", self._cors_origin())  # signed: delta
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

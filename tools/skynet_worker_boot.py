@@ -1072,7 +1072,10 @@ def update_workers_json(results: dict) -> None:
     }
 
     workers_file.parent.mkdir(parents=True, exist_ok=True)
-    workers_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    # Atomic write: temp file + rename to prevent corruption on crash  # signed: delta
+    tmp = workers_file.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(workers_file)
     log(f"Updated {workers_file}")
 
 
@@ -1120,7 +1123,10 @@ def close_all_workers() -> None:
         'boot_version': BOOT_VERSION,
         'note': 'Cleared by close_all_workers()',
     }
-    workers_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    # Atomic write: temp file + rename to prevent corruption on crash  # signed: delta
+    tmp = workers_file.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(workers_file)
     log(f"Closed {closed} worker(s), workers.json cleared")
 
 

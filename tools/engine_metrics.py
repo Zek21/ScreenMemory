@@ -13,7 +13,9 @@ sys.path.insert(0, str(ROOT / "tools" / "chrome_bridge"))
 
 _cache = {}
 _cache_time = 0
-CACHE_TTL = 30
+CACHE_TTL = 120  # Engine probes are expensive (up to 2.1s for ML models). 120s cache
+                 # reduces probe frequency by 75% vs 30s. Engine status rarely changes
+                 # within 2 minutes during normal operation.  # signed: alpha
 
 # All engine probes: (name, module_path, class_name, engine_type, import_only)
 # import_only=True skips instantiation for engines with expensive constructors
@@ -105,6 +107,8 @@ def _run_probes(probes: list) -> dict:
     # signed: delta
     from concurrent.futures import ThreadPoolExecutor
     engines = {}
+    if not probes:
+        return engines  # signed: delta — fix: empty list crasher (ValueError: max_workers must be > 0)
     n_workers = min(len(probes), 18)  # cap at 18 to avoid thread explosion
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_probe, n, m, c, t, io): n

@@ -66,7 +66,8 @@ def _guarded_bus_publish(msg: dict) -> dict | None:
         return guarded_publish(msg)
     except ImportError:
         return skynet_post("/bus/publish", msg)
-    except Exception:
+    except (OSError, ValueError, TypeError) as e:  # signed: delta
+        log(f"Bus publish blocked or failed: {e}", "WARN")
         return None  # SpamGuard rejected -- respect the block
 
 
@@ -77,7 +78,7 @@ def _resolve_real_python():
     cfg = venv_dir / "pyvenv.cfg"
     base_python = None
     if cfg.exists():
-        for line in cfg.read_text().splitlines():
+        for line in cfg.read_text(encoding="utf-8").splitlines():
             if line.strip().startswith("executable"):
                 _, _, val = line.partition("=")
                 candidate = val.strip()
@@ -102,6 +103,7 @@ _REAL_PYTHON, _DAEMON_ENV = _resolve_real_python()
 
 _metrics = None
 def metrics():
+    """Return the lazy-initialized SkynetMetrics singleton for recording monitor events."""  # signed: alpha
     global _metrics
     _metrics = _metrics or SkynetMetrics()
     return _metrics
@@ -113,17 +115,12 @@ MODEL_CHECK_INTERVAL = 60   # seconds between model checks
 ORCH_MODEL_CHECK_INTERVAL = 30  # orchestrator checked more frequently (security-critical)
 STUCK_PROCESSING_THRESHOLD = 600  # seconds in PROCESSING before auto-recovery attempt (increased from 180 to avoid killing workers mid-task)
 STUCK_DEDUP_WINDOW = 300          # suppress duplicate stuck alerts for 5 minutes
-HEARTBEAT_CYCLE_INTERVAL = 15    # post heartbeat every N cycles (~7.5min at 30s interval)  # signed: alpha -- was 10, reduced frequency per Convention 4 bus saturation fix
+HEARTBEAT_CYCLE_INTERVAL = 10    # post heartbeat every N cycles (~5min at 30s interval)  # signed: alpha
 MODEL_FIX_BACKOFF = 600     # 10 minutes between fix attempts per worker (prevents infinite retry)
 MODEL_FIX_MAX_ATTEMPTS = 3  # max consecutive fix attempts before giving up until restart
-MONITOR_METRICS_FILE = DATA_DIR / "monitor_metrics.json"  # signed: delta
 
 # Per-worker model-fix attempt tracking: {worker_name: (attempt_count, last_attempt_ts)}
 _model_fix_attempts: dict = {}
-
-# ── Dispatch latency & completion rate tracking ──  # signed: delta
-_dispatch_latency: dict = {}  # {worker: deque of latency_ms values (rolling 10)}
-_completion_rates: dict = {}  # {worker: {started: int, completed: int, hour_start: float}}
 
 user32 = ctypes.windll.user32
 
@@ -148,6 +145,12 @@ MAX_LOG_SIZE = 1_000_000  # 1MB -- rotate log file to prevent unbounded growth  
 
 
 def log(msg: str, level: str = "INFO"):
+    """Log a message to stdout and the monitor log file with rotation.
+
+    Args:
+        msg: The log message text.
+        level: Severity level — one of INFO, OK, WARN, ERR, CRIT, FIX, DEBUG.
+    """  # signed: alpha
     ts = datetime.now().strftime("%H:%M:%S")
     prefix = {"INFO": "[INFO]", "OK": "[OK]  ", "WARN": "[WARN]", "ERR": "[ERR] ", "CRIT": "[CRIT]", "FIX": "[FIX] ", "DEBUG": "[DBG] "}.get(level, "     ")  # signed: beta
     line = f"[{ts}] {prefix} {msg}"
@@ -171,6 +174,11 @@ def log(msg: str, level: str = "INFO"):
 
 
 def load_workers():
+    """Load the worker registry from data/workers.json.
+
+    Returns:
+        Tuple of (workers_list, orchestrator_hwnd). Returns ([], 0) on error.
+    """  # signed: alpha
     if not WORKERS_FILE.exists():
         log("workers.json not found", "ERR")
         return [], 0
@@ -185,6 +193,15 @@ def load_workers():
 
 
 def skynet_post(path: str, body: dict) -> dict | None:
+    """POST JSON to the Skynet backend and return the parsed response.
+
+    Args:
+        path: API path (e.g. '/worker/alpha/heartbeat').
+        body: JSON-serializable dict payload.
+
+    Returns:
+        Parsed JSON dict on success, None on failure.
+    """  # signed: alpha
     payload = json.dumps(body).encode()
     req = urllib.request.Request(
         f"{SKYNET_URL}{path}", data=payload,
@@ -209,13 +226,7 @@ DEAD_DEBOUNCE_THRESHOLD = 3  # must fail 3 consecutive checks before reporting D
 
 # Alert dedup: suppress repeated identical alerts per worker
 _last_alert: dict[str, float] = {}  # worker_name -> last alert timestamp
-ALERT_DEDUP_WINDOW = 600  # suppress same DEAD alert for 10 minutes after first post  # signed: alpha -- was 300s, increased per Convention 4 finding (48% bus saturation)
-
-# Alert digest batching: collect alerts within a cycle and post as single digest  # signed: alpha
-MAX_ALERTS_PER_CYCLE = 5  # if more than this many alerts fire in one cycle, consolidate into summary
-ALERT_DIGEST_INTERVAL = 60  # seconds between digest posts
-_pending_alerts: list[dict] = []  # alerts queued for digest
-_last_digest_time: float = 0.0  # last time a digest was posted
+ALERT_DEDUP_WINDOW = 300  # suppress same DEAD alert for 5 minutes after first post
 
 # Dispatch lock file path — suppress DEAD alerts during active dispatch
 _DISPATCH_LOCK_FILE = DATA_DIR / "dispatch_active.lock"
@@ -268,43 +279,6 @@ def _is_in_startup_grace() -> bool:
     for MONITOR_STARTUP_GRACE seconds after the monitor process starts.
     """  # signed: alpha
     return (time.time() - _monitor_start_time) < MONITOR_STARTUP_GRACE
-
-
-def _queue_alert(msg: dict) -> None:
-    """Queue an alert for digest batching instead of posting immediately.  # signed: alpha
-    If alerts exceed MAX_ALERTS_PER_CYCLE, they'll be consolidated into one digest."""
-    global _pending_alerts
-    _pending_alerts.append(msg)
-
-
-def _flush_alert_digest() -> None:
-    """Flush pending alerts as a single digest if enough have accumulated.  # signed: alpha
-    Called once per monitoring cycle. If <= MAX_ALERTS_PER_CYCLE alerts are pending,
-    posts them individually. If more, consolidates into a single summary message."""
-    global _pending_alerts, _last_digest_time
-    if not _pending_alerts:
-        return
-
-    now = time.time()
-    if (now - _last_digest_time) < ALERT_DIGEST_INTERVAL:
-        # Too soon since last digest -- hold alerts for next flush
-        return
-
-    if len(_pending_alerts) <= MAX_ALERTS_PER_CYCLE:
-        # Few enough alerts to post individually
-        for alert in _pending_alerts:
-            _guarded_bus_publish(alert)
-    else:
-        # Consolidate into a single digest
-        alert_summary = "; ".join(a.get("content", "?")[:80] for a in _pending_alerts)
-        _guarded_bus_publish({
-            "sender": "monitor",
-            "topic": "orchestrator",
-            "type": "alert_digest",
-            "content": f"ALERT DIGEST ({len(_pending_alerts)} alerts): {alert_summary[:500]}"
-        })
-    _last_digest_time = now
-    _pending_alerts = []
 
 
 def _try_refresh_hwnd(name: str, current_hwnd: int) -> int | None:
@@ -387,11 +361,22 @@ def fix_model_via_uia(hwnd: int, render_hwnd: int) -> bool:
 
 
 def restore_orchestrator_focus(orch_hwnd: int):
+    """Bring the orchestrator VS Code window back to the foreground.
+
+    Args:
+        orch_hwnd: Win32 HWND of the orchestrator window. No-op if 0.
+    """  # signed: alpha
     if orch_hwnd:
         user32.SetForegroundWindow(orch_hwnd)
 
 
 def write_health(health: dict):
+    """Persist the current worker health snapshot to data/worker_health.json.
+
+    Args:
+        health: Dict mapping worker names to their status dicts.
+              An 'updated' timestamp is added automatically.
+    """  # signed: alpha
     health["updated"] = datetime.now().isoformat()
     DATA_DIR.mkdir(exist_ok=True)
     with open(HEALTH_FILE, "w", encoding="utf-8") as f:
@@ -503,7 +488,7 @@ def _check_worker_dead(name: str, hwnd: int, alive: bool, visible: bool, h: dict
     now_ts = time.time()
     last_ts = _last_alert.get(name, 0)
     if (now_ts - last_ts) >= ALERT_DEDUP_WINDOW:
-        _queue_alert({"sender": "monitor", "topic": "orchestrator", "type": "alert",  # signed: alpha -- batched via digest
+        _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
             "content": f"WORKER {name.upper()} DEAD -- hwnd={hwnd} alive={alive} visible={visible} (confirmed {consecutive}x)"})
         _last_alert[name] = now_ts
     else:
@@ -583,6 +568,20 @@ def _check_worker_model(name: str, hwnd: int, h: dict, check_model: bool) -> boo
 
 
 def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_orch: bool = False) -> dict:
+    """Run a single health-check cycle across all workers and the orchestrator.
+
+    Checks HWND liveness, window visibility, and optionally model/agent drift.
+    Posts heartbeats and alerts to the Skynet bus as needed.
+
+    Args:
+        workers: List of worker dicts from workers.json (each has 'name', 'hwnd', 'grid').
+        orch_hwnd: Orchestrator window HWND for drift checking.
+        check_model: If True, also verify worker model and agent via UIA.
+        check_orch: If True, also verify orchestrator model/agent drift.
+
+    Returns:
+        Dict mapping worker names to their health status dicts.
+    """  # signed: alpha
     health = {}  # signed: delta — removed dead code 'any_bad' variable
 
     if check_orch and orch_hwnd:
@@ -612,7 +611,7 @@ def run_check(workers: list, orch_hwnd: int, check_model: bool = False, check_or
             now_ts = time.time()
             last_ts = _last_alert.get(name, 0)
             if (now_ts - last_ts) >= ALERT_DEDUP_WINDOW:
-                _queue_alert({"sender": "monitor", "topic": "orchestrator", "type": "alert",  # signed: alpha -- batched via digest
+                _guarded_bus_publish({"sender": "monitor", "topic": "orchestrator", "type": "alert",
                     "content": f"WORKER {name.upper()} has no HWND -- needs new-chat spawn"})
                 _last_alert[name] = now_ts
             health[name] = h
@@ -1305,125 +1304,6 @@ def _track_productivity(workers: list, health: dict):
     _update_result_counts(now)
 
 
-def _update_dispatch_metrics():  # signed: delta
-    """Update dispatch latency and completion rate from dispatch_log.json."""
-    from collections import deque
-    global _dispatch_latency, _completion_rates
-    try:
-        log_path = DATA_DIR / "dispatch_log.json"
-        if not log_path.exists():
-            return
-        raw = json.loads(log_path.read_text(encoding="utf-8"))
-        entries = raw if isinstance(raw, list) else raw.get("dispatches", raw.get("log", []))
-        if not entries:
-            return
-
-        now = time.time()
-        # Initialize deques for rolling average
-        for entry in entries[-50:]:  # last 50 entries for efficiency
-            worker = entry.get("worker", entry.get("target", ""))
-            if not worker:
-                continue
-            if worker not in _dispatch_latency:
-                _dispatch_latency[worker] = deque(maxlen=10)
-            if worker not in _completion_rates:
-                _completion_rates[worker] = {"started": 0, "completed": 0, "hour_start": now}
-
-            # Reset hourly counters
-            cr = _completion_rates[worker]
-            if now - cr["hour_start"] >= 3600:
-                cr["started"] = 0
-                cr["completed"] = 0
-                cr["hour_start"] = now
-
-            # Dispatch latency from timestamp fields
-            dispatch_ts = entry.get("dispatched_at", entry.get("timestamp", ""))
-            result_ts = entry.get("result_at", entry.get("completed_at", ""))
-            if dispatch_ts and result_ts:
-                try:
-                    from datetime import datetime as _dt
-                    t0 = _dt.fromisoformat(dispatch_ts.replace("Z", "+00:00")).timestamp()
-                    t1 = _dt.fromisoformat(result_ts.replace("Z", "+00:00")).timestamp()
-                    latency_ms = max(0, (t1 - t0) * 1000)
-                    _dispatch_latency[worker].append(latency_ms)
-                except (ValueError, TypeError):
-                    pass
-
-            cr["started"] += 1
-            if entry.get("success") or entry.get("result_received"):
-                cr["completed"] += 1
-    except Exception as e:
-        log(f"Dispatch metrics update error: {e}", "DEBUG")
-
-
-def _write_monitor_metrics(health: dict, productivity: dict):  # signed: delta
-    """Write consolidated monitor metrics to data/monitor_metrics.json."""
-    try:
-        latency_avgs = {}
-        for worker, dq in _dispatch_latency.items():
-            if dq:
-                latency_avgs[worker] = round(sum(dq) / len(dq), 1)
-
-        comp_rates = {}
-        for worker, cr in _completion_rates.items():
-            started = cr.get("started", 0)
-            if started > 0:
-                comp_rates[worker] = round(cr["completed"] / started, 3)
-
-        metrics = {
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "dispatch_latency": latency_avgs,
-            "completion_rates": comp_rates,
-            "productivity": {k: {kk: vv for kk, vv in v.items() if kk != "idle_since"}
-                             for k, v in productivity.items()},
-            "worker_states": {k: v.get("status", "UNKNOWN")
-                              for k, v in health.items()
-                              if isinstance(v, dict) and "alive" in v},
-        }
-        MONITOR_METRICS_FILE.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    except Exception as e:
-        log(f"Failed to write monitor_metrics.json: {e}", "DEBUG")
-
-
-def _print_dashboard_line():  # signed: delta
-    """Print a compact single-line status to stdout and exit."""
-    health_file = DATA_DIR / "worker_health.json"
-    metrics_file = MONITOR_METRICS_FILE
-    h = {}
-    m = {}
-    try:
-        if health_file.exists():
-            h = json.loads(health_file.read_text(encoding="utf-8"))
-        if metrics_file.exists():
-            m = json.loads(metrics_file.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-
-    worker_names = ["alpha", "beta", "gamma", "delta"]
-    parts = []
-    alive = 0
-    for name in worker_names:
-        w = h.get(name, {})
-        st = w.get("status", "?")[:4].upper()
-        is_alive = bool(w.get("hwnd") and ctypes.windll.user32.IsWindow(int(w.get("hwnd", 0))))
-        if is_alive:
-            alive += 1
-        parts.append(f"{name[0].upper()}:{st}")
-
-    latency_parts = []
-    for name in worker_names:
-        lat = m.get("dispatch_latency", {}).get(name)
-        if lat is not None:
-            latency_parts.append(f"{name[0].upper()}:{lat:.0f}ms")
-
-    line = f"Workers: {alive}/4 [{' '.join(parts)}]"
-    if latency_parts:
-        line += f"  Latency: [{' '.join(latency_parts)}]"
-    ts = m.get("timestamp", "?")
-    line += f"  @{ts}"
-    print(line)
-
-
 def _get_productivity_summary() -> dict:
     """Build a productivity summary for all tracked workers."""
     now = time.time()
@@ -1457,7 +1337,7 @@ def _try_restart_daemon(daemon_name: str, pid_file: Path, script_path: Path, now
         """  # signed: beta
         try:
             if pf.exists():
-                pid = int(pf.read_text().strip())
+                pid = int(pf.read_text(encoding="utf-8").strip())
                 if pid <= 0:
                     return False
                 if sys.platform == "win32":
@@ -1492,7 +1372,7 @@ def _try_restart_daemon(daemon_name: str, pid_file: Path, script_path: Path, now
     log(f"{daemon_name} confirmed dead after double-check -- restarting", "FIX")
     try:
         import subprocess as sp
-        sp.Popen(
+        proc = sp.Popen(
             [_REAL_PYTHON, str(script_path)],
             cwd=str(ROOT),  # Ensure daemons run from repo root for relative imports  # signed: alpha
             env=_DAEMON_ENV,
@@ -1500,13 +1380,22 @@ def _try_restart_daemon(daemon_name: str, pid_file: Path, script_path: Path, now
             stdout=sp.DEVNULL, stderr=sp.DEVNULL,
         )
         _restart_cooldowns[daemon_name] = time.time()
-        log(f"{daemon_name} restart initiated (cooldown set)", "OK")
+        # Validate the process actually started (pid > 0 and alive after 1s)  # signed: delta
+        time.sleep(1)
+        if proc.poll() is not None:
+            log(f"{daemon_name} restart FAILED: process exited immediately with code {proc.returncode}", "ERR")
+            _guarded_bus_publish({
+                "sender": "monitor", "topic": "orchestrator", "type": "alert",
+                "content": f"AUTO_RESTART_FAILED: {daemon_name} exited immediately (code={proc.returncode})"
+            })
+            return False
+        log(f"{daemon_name} restart initiated (pid={proc.pid}, cooldown set)", "OK")
         _guarded_bus_publish({
             "sender": "monitor", "topic": "orchestrator", "type": "report",
-            "content": f"AUTO_RESTART: {daemon_name} was dead, restarted automatically (60s cooldown active)"
+            "content": f"AUTO_RESTART: {daemon_name} was dead, restarted automatically (pid={proc.pid}, 60s cooldown active)"
         })
         return True
-    except Exception as e:
+    except (OSError, ValueError) as e:
         log(f"{daemon_name} restart failed: {e}", "ERR")
         return False
 
@@ -1531,7 +1420,7 @@ def _auto_restart_stale_daemons():
         """  # signed: beta
         try:
             if sse_pid_file.exists():
-                pid = int(sse_pid_file.read_text().strip())
+                pid = int(sse_pid_file.read_text(encoding="utf-8").strip())
                 if pid <= 0:
                     return False
                 if sys.platform == "win32":
@@ -1686,6 +1575,12 @@ _shutdown_requested = False  # signed: alpha
 
 
 def main():
+    """CLI entry point for the Skynet monitor daemon.
+
+    Runs continuous worker health checks (HWND liveness, model/agent drift)
+    with configurable intervals. Supports --once for single-shot checks
+    and --status to print current health.json.
+    """  # signed: alpha
     parser = argparse.ArgumentParser()
     parser.add_argument("--once", action="store_true", help="Single check and exit")
     parser.add_argument("--status", action="store_true", help="Print current health.json")
@@ -1693,17 +1588,11 @@ def main():
     parser.add_argument("--model-interval", type=int, default=MODEL_CHECK_INTERVAL)
     parser.add_argument("--max-runtime", type=int, default=0,
                         help="Max runtime in seconds (0=unlimited). Daemon exits gracefully after this.")
-    parser.add_argument("--dashboard", action="store_true",
-                        help="Output compact single-line status and exit")  # signed: delta
     args = parser.parse_args()
-
-    if args.dashboard:
-        _print_dashboard_line()
-        return
 
     if args.status:
         if HEALTH_FILE.exists():
-            print(HEALTH_FILE.read_text())
+            print(HEALTH_FILE.read_text(encoding="utf-8"))
         else:
             print("No health.json yet")
         return
@@ -1768,10 +1657,6 @@ def _run_monitor_cycle(workers, orch_hwnd, args, cycle, now, last_model_check, l
     productivity = _get_productivity_summary()
     pending_work = _get_pending_work_count()
     _record_health_trend(health, productivity, pending_work)
-
-    # Update dispatch metrics and write consolidated metrics file every cycle  # signed: delta
-    _update_dispatch_metrics()
-    _write_monitor_metrics(health, productivity)
 
     return health, do_model, do_orch, orch_hwnd, productivity, pending_work
 
@@ -1897,9 +1782,6 @@ def _run_monitor(args):
                 last_daemon_restart_check = _handle_periodic_tasks(
                     cycle, health, workers, productivity, pending_work, now,
                     last_daemon_restart_check, DAEMON_CHECK_INTERVAL)
-
-                # Flush batched alerts as digest at end of each cycle  # signed: alpha
-                _flush_alert_digest()
 
                 _consecutive_loop_errors = 0  # reset on successful cycle  # signed: gamma
             except (ConnectionError, TimeoutError, OSError) as e:

@@ -65,7 +65,11 @@ class ScreenMemoryDB:
             try:
                 import pysqlcipher3.dbapi2 as sqlcipher
                 conn = sqlcipher.connect(db_path)
-                # Sanitize key to prevent SQL injection in PRAGMA (which doesn't support parameters)
+                # Validate key format: only allow alphanumeric + safe punctuation to
+                # prevent SQL injection in PRAGMA (which doesn't support parameters)  # signed: delta
+                import re as _re
+                if not _re.match(r'^[A-Za-z0-9!@#$%^&*()_+\-=\[\]{}|;:,.<>?/~`]{1,256}$', encryption_key):
+                    raise ValueError("Encryption key contains disallowed characters or exceeds 256 chars")
                 safe_key = encryption_key.replace("'", "''")
                 conn.execute(f"PRAGMA key = '{safe_key}'")
                 conn.execute("PRAGMA cipher_memory_security = ON")
