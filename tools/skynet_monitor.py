@@ -312,9 +312,19 @@ def get_model_and_agent_uia(hwnd: int) -> tuple:
 
 
 def is_model_correct(model_str: str) -> bool:
-    """Check if model string indicates Claude Opus 4.6 (fast mode)."""
+    """Check if model string indicates Claude Opus 4.6 (any variant).
+    
+    UIA returns the Pick Model button text which may be:
+      - "Pick Model, Claude Opus 4.6"      (Copilot CLI mode — correct)
+      - "Pick Model, Claude Opus 4.6 (fast mode)"  (explicit fast — correct)
+      - "Claude Opus 4.6 (fast mode)"      (legacy label — correct)
+      - "Claude Opus 4.6"                   (short form — correct)
+    All of these are valid. The key check is "opus" + "4.6" present.
+    Setting Copilot CLI as session target auto-sets Opus 4.6 fast,
+    even if UIA doesn't show "(fast mode)" in the label.
+    """
     lower = model_str.lower()
-    return "opus" in lower and "fast" in lower
+    return "opus" in lower and "4.6" in lower
 
 
 def is_agent_cli(agent_str: str) -> bool:

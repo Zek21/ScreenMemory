@@ -96,7 +96,7 @@ try {{
         $n=$b.Current.Name
         if($n -match 'Pick Model') {{
             $modelName=$n
-            if($n -match 'Opus 4\\.6.*fast') {{ $modelOk=$true }}
+            if($n -match 'Opus 4\.6') {{ $modelOk=$true }}
         }}
         if($n -match 'Copilot CLI') {{ $targetOk=$true }}
     }}

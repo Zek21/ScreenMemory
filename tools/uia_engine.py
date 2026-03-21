@@ -263,11 +263,13 @@ class UIAEngine:
 
             # Model/agent correctness
             ml = result.model.lower()
-            # "Pick Model" button contains "opus" and "fast" when correct
+            # "Pick Model" button contains "opus" and "4.6" when correct
+            # UIA may return "Pick Model, Claude Opus 4.6" (without "fast")
+            # because Copilot CLI mode auto-sets Opus 4.6 fast without showing "(fast mode)"
             # "Set Permissions" or "Autopilot" means premium UI layout — no model button
             # When we can't determine model, assume OK (True) to avoid false drift alerts
             if "pick model" in ml:
-                result.model_ok = bool("opus" in ml and "fast" in ml)
+                result.model_ok = bool("opus" in ml and "4.6" in ml)
             else:
                 # Can't determine model from permissions/autopilot button — assume OK
                 # to prevent infinite model-fix retry loops when premium is exhausted
