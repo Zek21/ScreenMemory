@@ -1251,11 +1251,16 @@ if ($focusMethod -ne "NONE") {{
     if ($focusMethod -eq "EDIT") {{
         $attached = [GhostType]::FocusViaAttach($hwnd)
         if ($attached) {{
+            # CRITICAL FIX: SetForegroundWindow REQUIRED before keybd_event paste.
+            # FocusViaAttach only does AttachThreadInput+SetFocus (thread-level focus).
+            # keybd_event sends to the OS foreground window, NOT the thread-focused window.
+            [GhostType]::SetForegroundWindow($hwnd)
+            Start-Sleep -Milliseconds 50
             try {{ $edit.SetFocus() }} catch {{}}
             Start-Sleep -Milliseconds 80
-            # Focus race check: verify foreground window is still ours before paste  # signed: alpha
+            # Focus race check: verify foreground window is our target  # signed: alpha
             $postFocusFg = [GhostType]::GetForegroundWindow()
-            if ($postFocusFg -ne $prePasteFgHwnd -and $postFocusFg -ne $hwnd) {{
+            if ($postFocusFg -ne $hwnd) {{
                 Write-Host "FOCUS_STOLEN"
                 [GhostType]::DetachThread($hwnd)
                 try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
@@ -1304,11 +1309,17 @@ if ($focusMethod -ne "NONE") {{
         # CHROME_RENDER path: focus render widget, then paste  # signed: orchestrator
         $attached = [GhostType]::FocusViaAttach($hwnd)
         if ($attached) {{
+            # CRITICAL FIX: SetForegroundWindow REQUIRED before keybd_event paste.
+            # FocusViaAttach only does AttachThreadInput+SetFocus (thread-level focus).
+            # keybd_event sends to the OS foreground window, NOT the thread-focused window.
+            # Without SetForegroundWindow, paste goes to whatever window the user has active.
+            [GhostType]::SetForegroundWindow($hwnd)
+            Start-Sleep -Milliseconds 50
             [GhostType]::SetFocus($renderHwnd)
             Start-Sleep -Milliseconds 120
-            # Focus race check: verify foreground hasn't been stolen  # signed: alpha
+            # Focus race check: verify foreground is our target window  # signed: alpha
             $postFocusFg = [GhostType]::GetForegroundWindow()
-            if ($postFocusFg -ne $prePasteFgHwnd -and $postFocusFg -ne $hwnd) {{
+            if ($postFocusFg -ne $hwnd) {{
                 Write-Host "FOCUS_STOLEN"
                 [GhostType]::DetachThread($hwnd)
                 try {{ [System.Windows.Forms.Clipboard]::Clear() }} catch {{}}
@@ -1350,6 +1361,8 @@ if ($focusMethod -ne "NONE") {{
                 Write-Host "ENTER_VERIFY_FAILED: $($_.Exception.Message)"
             }}
             [GhostType]::DetachThread($hwnd)
+            # Restore orchestrator foreground after dispatch
+            [GhostType]::SetForegroundWindow($orchHwnd)
             $deliveryStatus = "OK_RENDER_ATTACHED"
         }} else {{
             [GhostType]::SetForegroundWindow($hwnd)
