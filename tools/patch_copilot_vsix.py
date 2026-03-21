@@ -2,11 +2,15 @@
 """
 VSIX Patcher for GitHub Copilot Chat Extension
 ================================================
-Applies 3 surgical patches to make Copilot CLI mode work properly:
+Applies 7 surgical patches to make Copilot CLI mode work properly:
 
 PATCH 1 — cli.js: Disable Statsig feature gate that blocks bypass permissions
 PATCH 2 — extension.js: Make canUseTool() auto-approve all tool calls (no Apply dialogs)
 PATCH 3 — package.json: Enable Copilot CLI vendor entry (remove "when": "false" gate)
+PATCH 4 — cli.js: Enable stream watchdog (prevents infinite hang on dropped SSE streams)
+PATCH 5 — cli.js: Reduce stream idle timeout (30s hard timeout instead of 60s)
+PATCH 6 — cli.js: Reduce stall detection threshold (15s instead of 30s)
+PATCH 7 — extension.js: Add 5-minute total timeout to task status polling loop
 
 Usage:
     python tools/patch_copilot_vsix.py              # Auto-detect extension dir
@@ -280,6 +284,251 @@ def patch_package_json(ext_dir, verify_only=False):
     return True
 
 
+def patch_stream_watchdog(ext_dir, verify_only=False):
+    """
+    PATCH 4: Enable stream watchdog always-on in cli.js
+
+    The CLI has a stream idle watchdog that detects dropped SSE connections
+    and aborts after a timeout. However, it's gated behind an environment
+    variable CLAUDE_ENABLE_STREAM_WATCHDOG which is OFF by default.
+
+    Without the watchdog, if the SSE stream drops (network issue, server hang,
+    rate limit), the `for await` loop waits forever and the UI shows "Working..."
+    indefinitely with no recovery.
+
+    FIND:    let g6=X1(process.env.CLAUDE_ENABLE_STREAM_WATCHDOG)
+    REPLACE: let g6=!0/*PATCHED:stream_watchdog_enabled*/        
+
+    This makes the watchdog always active so dropped streams are detected
+    and aborted after the idle timeout (default 60s, reduced by PATCH 5).
+    """
+    cli_path = os.path.join(ext_dir, "dist", "cli.js")
+    if not os.path.isfile(cli_path):
+        print("PATCH 4 [cli.js]: FILE NOT FOUND")
+        return False
+
+    content = open(cli_path, "r", encoding="utf-8", errors="replace").read()
+
+    PATCHED_MARKER = "/*PATCHED:stream_watchdog_enabled*/"
+    if PATCHED_MARKER in content:
+        print("PATCH 4 [cli.js]: ALREADY APPLIED \u2713")
+        return True
+
+    # Find the watchdog gate pattern with flexible minified variable names
+    pattern = re.search(
+        r'let (\w+)=(\w+)\(process\.env\.CLAUDE_ENABLE_STREAM_WATCHDOG\)',
+        content,
+    )
+    if not pattern:
+        print("PATCH 4 [cli.js]: WATCHDOG GATE NOT FOUND -- extension may have changed")
+        return False
+
+    var_name = pattern.group(1)
+    original = pattern.group(0)
+    patched = f"let {var_name}=!0/*PATCHED:stream_watchdog_enabled*/"
+
+    if verify_only:
+        print("PATCH 4 [cli.js]: NOT APPLIED -- needs patching")
+        return False
+
+    backup_file(cli_path)
+    content = content.replace(original, patched, 1)
+    open(cli_path, "w", encoding="utf-8").write(content)
+    print(f"PATCH 4 [cli.js]: APPLIED \u2713 (watchdog var: {var_name})")
+    return True
+
+
+def patch_stream_timeout(ext_dir, verify_only=False):
+    """
+    PATCH 5: Reduce stream idle timeout in cli.js
+
+    The stream watchdog (enabled by PATCH 4) has two timers:
+    - Warning timer: fires after y6 ms (default 30000 = 30s)
+    - Hard timeout: fires after r ms (default 60000 = 60s), aborts stream
+
+    We reduce these for faster recovery from dropped connections:
+    - Warning: 30s -> 15s
+    - Hard timeout: 60s -> 30s
+
+    The pattern is: y6=30000,r=60000,Z6=!1
+    We change to:   y6=15000,r=30000,Z6=!1
+    """
+    cli_path = os.path.join(ext_dir, "dist", "cli.js")
+    if not os.path.isfile(cli_path):
+        print("PATCH 5 [cli.js]: FILE NOT FOUND")
+        return False
+
+    content = open(cli_path, "r", encoding="utf-8", errors="replace").read()
+
+    # Find the timeout pattern with flexible variable names
+    # Pattern: <var1>=30000,<var2>=60000,<var3>=!1
+    pattern = re.search(
+        r'(\w{1,3})=30000,(\w{1,3})=60000,(\w{1,3})=!1',
+        content,
+    )
+    if not pattern:
+        # Check if already patched
+        already = re.search(r'(\w{1,3})=15000,(\w{1,3})=30000,(\w{1,3})=!1', content)
+        if already:
+            print("PATCH 5 [cli.js]: ALREADY APPLIED \u2713")
+            return True
+        print("PATCH 5 [cli.js]: TIMEOUT PATTERN NOT FOUND -- extension may have changed")
+        return False
+
+    # Verify this is the right context (near STREAM_WATCHDOG)
+    match_pos = pattern.start()
+    context_start = max(0, match_pos - 200)
+    context = content[context_start:match_pos]
+    if "STREAM_WATCHDOG" not in context and "stream_watchdog" not in context.lower():
+        # Check broader context
+        broader = content[max(0, match_pos - 500):match_pos]
+        if "STREAM_WATCHDOG" not in broader and "api_request_sent" not in broader:
+            print("PATCH 5 [cli.js]: WARNING -- pattern found but not near watchdog context, applying anyway")
+
+    v1, v2, v3 = pattern.group(1), pattern.group(2), pattern.group(3)
+    original = pattern.group(0)
+    patched = f"{v1}=15000,{v2}=30000,{v3}=!1"
+
+    if verify_only:
+        print("PATCH 5 [cli.js]: NOT APPLIED -- needs patching")
+        return False
+
+    backup_file(cli_path)
+    content = content.replace(original, patched, 1)
+    open(cli_path, "w", encoding="utf-8").write(content)
+    print(f"PATCH 5 [cli.js]: APPLIED \u2713 (warning: 15s, timeout: 30s)")
+    return True
+
+
+def patch_stall_threshold(ext_dir, verify_only=False):
+    """
+    PATCH 6: Reduce stall detection threshold in cli.js
+
+    The streaming code detects "stalls" -- gaps between chunks that exceed
+    a threshold. Currently set to 30s, we reduce to 15s for earlier detection.
+
+    The stall detector logs warnings and sends telemetry but does NOT abort.
+    This patch improves observability for debugging stall issues.
+
+    Pattern: t6=30000,D1=0,j1=0
+    Change:  t6=15000,D1=0,j1=0
+    """
+    cli_path = os.path.join(ext_dir, "dist", "cli.js")
+    if not os.path.isfile(cli_path):
+        print("PATCH 6 [cli.js]: FILE NOT FOUND")
+        return False
+
+    content = open(cli_path, "r", encoding="utf-8", errors="replace").read()
+
+    # Find the stall threshold pattern with flexible variable names
+    pattern = re.search(
+        r'(\w{1,3})=30000,(\w{1,3})=0,(\w{1,3})=0;for await',
+        content,
+    )
+    if not pattern:
+        # Try without the for-await anchor
+        pattern = re.search(
+            r'(\w{1,3})=30000,(\w{1,3})=0,(\w{1,3})=0',
+            content,
+        )
+        if not pattern:
+            # Check if already patched
+            already = re.search(r'(\w{1,3})=15000,(\w{1,3})=0,(\w{1,3})=0', content)
+            if already:
+                print("PATCH 6 [cli.js]: ALREADY APPLIED \u2713")
+                return True
+            print("PATCH 6 [cli.js]: STALL THRESHOLD PATTERN NOT FOUND")
+            return False
+
+    # Verify context -- should be near streaming stall detection
+    match_pos = pattern.start()
+    context = content[match_pos:min(len(content), match_pos + 300)]
+    if "stall" not in context.lower() and "streaming" not in context.lower():
+        # Could be a different 30000,0,0 pattern -- look for streaming context nearby
+        broader = content[max(0, match_pos - 300):min(len(content), match_pos + 500)]
+        if "Streaming stall" not in broader and "stall_duration" not in broader:
+            print("PATCH 6 [cli.js]: WARNING -- pattern found but may not be stall threshold")
+
+    v1, v2, v3 = pattern.group(1), pattern.group(2), pattern.group(3)
+    search_str = f"{v1}=30000,{v2}=0,{v3}=0"
+    replace_str = f"{v1}=15000,{v2}=0,{v3}=0"
+
+    if replace_str in content:
+        print("PATCH 6 [cli.js]: ALREADY APPLIED \u2713")
+        return True
+
+    if verify_only:
+        print("PATCH 6 [cli.js]: NOT APPLIED -- needs patching")
+        return False
+
+    backup_file(cli_path)
+    content = content.replace(search_str, replace_str, 1)
+    open(cli_path, "w", encoding="utf-8").write(content)
+    print(f"PATCH 6 [cli.js]: APPLIED \u2713 (stall threshold: 15s)")
+    return True
+
+
+def patch_polling_timeout(ext_dir, verify_only=False):
+    """
+    PATCH 7: Add total timeout to task status polling loop in extension.js
+
+    The Responses API task polling loop uses for(;;) with NO total timeout.
+    Each individual getTask() call has a 60s timeout, but the outer loop
+    polls FOREVER when task status stays "working". The _setupTimeout()
+    infrastructure with maxTotalTimeout exists but is NOT connected to
+    this polling loop.
+
+    We inject a 5-minute (300000ms) total timeout by adding a start
+    timestamp and elapsed-time check inside the loop.
+
+    FIND:    for(;;){let c=await this.getTask({taskId:o},r)
+    REPLACE: for(let _$=Date.now();;){if(Date.now()-_$>3e5)throw new Error("Task polling timeout");let c=await this.getTask({taskId:o},r)
+    """
+    ext_path = os.path.join(ext_dir, "dist", "extension.js")
+    if not os.path.isfile(ext_path):
+        print("PATCH 7 [extension.js]: FILE NOT FOUND")
+        return False
+
+    content = open(ext_path, "r", encoding="utf-8", errors="replace").read()
+
+    PATCHED_MARKER = "Task polling timeout"
+    if PATCHED_MARKER in content:
+        print("PATCH 7 [extension.js]: ALREADY APPLIED \u2713")
+        return True
+
+    # Find the polling loop with flexible variable names
+    pattern = re.search(
+        r'for\(;;\)\{let (\w+)=await this\.getTask\(\{taskId:(\w+)\},(\w+)\)',
+        content,
+    )
+    if not pattern:
+        print("PATCH 7 [extension.js]: POLLING LOOP NOT FOUND -- extension may have changed")
+        # Try to find any getTask polling pattern
+        idx = content.find("getTask({taskId:")
+        if idx >= 0:
+            snippet = content[max(0, idx - 80):idx + 80]
+            print(f"  Found getTask at offset {idx}: ...{snippet[:120]}...")
+        return False
+
+    v_task, v_id, v_req = pattern.group(1), pattern.group(2), pattern.group(3)
+    original = pattern.group(0)
+    patched = (
+        f'for(let _$=Date.now();;){{if(Date.now()-_$>3e5)'
+        f'throw new Error("Task polling timeout");'
+        f'let {v_task}=await this.getTask({{taskId:{v_id}}},{v_req})'
+    )
+
+    if verify_only:
+        print("PATCH 7 [extension.js]: NOT APPLIED -- needs patching")
+        return False
+
+    backup_file(ext_path)
+    content = content.replace(original, patched, 1)
+    open(ext_path, "w", encoding="utf-8").write(content)
+    print(f"PATCH 7 [extension.js]: APPLIED \u2713 (5-minute polling timeout)")
+    return True
+
+
 def revert_patches(ext_dir):
     """Revert all patches from .bak backups."""
     files = ["dist/cli.js", "dist/extension.js", "package.json"]
@@ -318,22 +567,27 @@ def main():
     results.append(patch_cli_js(ext_dir, verify_only=args.verify))
     results.append(patch_extension_js(ext_dir, verify_only=args.verify))
     results.append(patch_package_json(ext_dir, verify_only=args.verify))
+    results.append(patch_stream_watchdog(ext_dir, verify_only=args.verify))
+    results.append(patch_stream_timeout(ext_dir, verify_only=args.verify))
+    results.append(patch_stall_threshold(ext_dir, verify_only=args.verify))
+    results.append(patch_polling_timeout(ext_dir, verify_only=args.verify))
 
+    total = len(results)
     print()
     applied = sum(results)
     if args.verify:
-        if applied == 3:
-            print(f"ALL 3 PATCHES VERIFIED ✓")
+        if applied == total:
+            print(f"ALL {total} PATCHES VERIFIED \u2713")
         else:
-            print(f"{applied}/3 patches applied. Run without --verify to patch.")
+            print(f"{applied}/{total} patches applied. Run without --verify to patch.")
     else:
-        if applied == 3:
-            print("ALL 3 PATCHES APPLIED ✓")
-            print("Reload VS Code windows to activate (Ctrl+Shift+P → Reload Window)")
+        if applied == total:
+            print(f"ALL {total} PATCHES APPLIED \u2713")
+            print("Reload VS Code windows to activate (Ctrl+Shift+P -> Reload Window)")
         else:
-            print(f"{applied}/3 patches succeeded. Check errors above.")
+            print(f"{applied}/{total} patches succeeded. Check errors above.")
 
-    sys.exit(0 if applied == 3 else 1)
+    sys.exit(0 if applied == total else 1)
 
 
 if __name__ == "__main__":
