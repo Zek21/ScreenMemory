@@ -1,5 +1,13 @@
 #!/usr/bin/env python
 """
+DEPRECATED (2026-03-21) — DO NOT USE FOR WORKER BOOT
+
+The canonical boot method is: python tools/exact_boot.py --all --orch-hwnd HWND
+Step 4 of exact_boot.py handles Copilot CLI session target setting automatically.
+This file is retained for reference only.
+
+---
+
 set_copilot_cli.py — Enforce Copilot CLI mode + Bypass Approvals on worker windows.
 
 Two MANDATORY settings enforced by this script:

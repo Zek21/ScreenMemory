@@ -1,8 +1,11 @@
 """
-skynet_worker_boot.py -- Canonical Worker Boot Script (Rule #0.06)
+skynet_worker_boot.py -- DEPRECATED (2026-03-21)
 
-THE ONLY AUTHORIZED METHOD to open Skynet worker windows.
-Implements the PROVEN 7-step chevron-dropdown procedure.
+THIS FILE IS DEPRECATED. The canonical boot script is now:
+    tools/exact_boot.py
+
+exact_boot.py implements the PROVEN 7-step chevron-dropdown procedure
+with dynamic UIA chevron detection. This file is retained for reference only.
 
 The chevron dropdown (▾) next to the "New Chat" (+) button in the
 orchestrator window is located via UIA on every boot.  This avoids
@@ -222,13 +225,17 @@ def log(msg: str) -> None:
 def _find_chevron_dropdown(orch_hwnd: int) -> tuple[int, int]:
     """Locate the chevron dropdown (▾) next to the New Chat (+) button.
 
-    Uses UIA to find the button named exactly "New Chat" (WITHOUT the
-    keyboard shortcut suffix like "(Ctrl+N)").  That small 16px-wide
-    button IS the dropdown chevron.
+    Strategy:
+      1. UIA scan for ALL buttons named "New Chat" or "New Chat (Ctrl+N)"
+         in the top 150px of the orchestrator window.
+      2. The PLUS button is "New Chat (Ctrl+N)" (wider, ~22px).
+         The CHEVRON is "New Chat" (exact match, narrow, ~16px), sitting
+         immediately to the right of the plus button.
+      3. If UIA finds both, use the chevron. If only the plus, click
+         a few pixels to its right (the chevron is always adjacent).
+      4. Fallback: window-relative offset from GetWindowRect.
 
     Returns (cx, cy) absolute screen coordinates of the chevron centre.
-    Falls back to relative coordinates from the orchestrator window rect
-    if UIA fails.
     """
     ps = (
         'Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes\n'
@@ -242,11 +249,13 @@ def _find_chevron_dropdown(orch_hwnd: int) -> tuple[int, int]:
         'foreach ($b in $btns) {\n'
         '    $nm = $b.Current.Name\n'
         '    $r = $b.Current.BoundingRectangle\n'
-        '    if ($r.Y -lt 150 -and $nm -eq "New Chat") {\n'
-        '        Write-Output "$([int]$r.X)|$([int]$r.Y)|$([int]$r.Width)|$([int]$r.Height)"\n'
+        '    if ($r.Y -lt 150 -and ($nm -eq "New Chat" -or $nm -eq "New Chat (Ctrl+N)")) {\n'
+        '        Write-Output "$nm|$([int]$r.X)|$([int]$r.Y)|$([int]$r.Width)|$([int]$r.Height)"\n'
         '    }\n'
         '}\n'
     )
+    chevron = None
+    plus_btn = None
     try:
         result = subprocess.run(
             ["powershell", "-STA", "-NoProfile", "-Command", ps],
@@ -255,57 +264,81 @@ def _find_chevron_dropdown(orch_hwnd: int) -> tuple[int, int]:
         )
         for line in (result.stdout or "").strip().splitlines():
             parts = line.strip().split("|")
-            if len(parts) >= 4:
-                x, y, w, h = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-                # The chevron is the small one (width ≤ 20)
-                cx, cy = x + w // 2, y + h // 2
-                log(f"CHEVRON: UIA found at ({cx}, {cy})  rect=({x},{y},{w},{h})")
-                return (cx, cy)
+            if len(parts) >= 5:
+                nm, x, y, w, h = parts[0], int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
+                if nm == "New Chat" and w <= 20:
+                    chevron = (x, y, w, h)
+                    log(f"CHEVRON: UIA found chevron button at rect=({x},{y},{w},{h})")
+                elif "Ctrl+N" in nm:
+                    plus_btn = (x, y, w, h)
+                    log(f"CHEVRON: UIA found plus button at rect=({x},{y},{w},{h})")
     except Exception as e:
         log(f"CHEVRON: UIA scan failed: {e}")
 
-    # Fallback — compute relative to orchestrator window rect
+    # Best case: chevron found directly
+    if chevron:
+        cx, cy = chevron[0] + chevron[2] // 2, chevron[1] + chevron[3] // 2
+        log(f"CHEVRON: using UIA chevron at ({cx}, {cy})")
+        return (cx, cy)
+
+    # Good case: plus button found, chevron is immediately to its right
+    if plus_btn:
+        cx = plus_btn[0] + plus_btn[2] + 8  # 8px right of plus button's right edge
+        cy = plus_btn[1] + plus_btn[3] // 2
+        log(f"CHEVRON: derived from plus button — clicking ({cx}, {cy})")
+        return (cx, cy)
+
+    # Fallback: window-relative offset from GetWindowRect
     try:
         rect = ctypes.wintypes.RECT()
         u32.GetWindowRect(orch_hwnd, ctypes.byref(rect))
         ox, oy = rect.left, rect.top
-        # The chevron sits ≈ 192px from left edge, 52px from top edge
-        cx, cy = ox + 192, oy + 52
+        # Chevron is ~180px from left edge, ~52px from top edge
+        cx, cy = ox + 180, oy + 52
         log(f"CHEVRON: fallback relative coords ({cx}, {cy}) from window ({ox}, {oy})")
         return (cx, cy)
     except Exception as e:
         log(f"CHEVRON: fallback failed: {e}")
-        return (192, 52)  # last-resort absolute
+        return (180, 52)  # last-resort absolute
 
 
 # ---------------------------------------------------------------------------
 # Step 1 — Open window via chevron dropdown
 # ---------------------------------------------------------------------------
 
-def step1_open_window(orch_hwnd: int) -> bool:
-    """Click the chevron dropdown → 'New Chat Window' on the orchestrator."""
+def step1_open_window(orch_hwnd: int, retry: int = 0) -> bool:
+    """Click the chevron dropdown → 'New Chat Window' on the orchestrator.
+    
+    Uses longer delays (0.5s between Down presses) to ensure the Chromium
+    dropdown menu registers each keypress reliably.
+    """
     try:
         log("Step 1 — Opening new chat window via chevron dropdown...")
 
-        # Focus orchestrator
+        # Focus orchestrator and verify
         u32.SetForegroundWindow(orch_hwnd)
-        time.sleep(1.5)
+        time.sleep(1.0)
+        fg = u32.GetForegroundWindow()
+        if fg != orch_hwnd:
+            log(f"Step 1 — Focus retry: expected {orch_hwnd}, got {fg}")
+            u32.SetForegroundWindow(orch_hwnd)
+            time.sleep(1.0)
 
         # Find and click the chevron
         cx, cy = _find_chevron_dropdown(orch_hwnd)
         log(f"Step 1 — Clicking chevron at ({cx}, {cy})")
         pyautogui.click(cx, cy)
-        time.sleep(1.5)
+        time.sleep(2.0)  # 2s for Chromium dropdown to fully render
 
         # Navigate to "New Chat Window" (3rd item in dropdown)
         # Menu: 1) New Chat, 2) New Chat Editor, 3) New Chat Window,
         #        4) New Copilot CLI Session
         pyautogui.press('down')   # 1: New Chat
-        time.sleep(0.2)
+        time.sleep(0.5)
         pyautogui.press('down')   # 2: New Chat Editor
-        time.sleep(0.2)
+        time.sleep(0.5)
         pyautogui.press('down')   # 3: New Chat Window
-        time.sleep(0.2)
+        time.sleep(0.5)
         pyautogui.press('enter')
         time.sleep(3)
 
@@ -380,9 +413,16 @@ def step3_position(hwnd: int, gx: int, gy: int) -> bool:
 
 def step4_set_copilot_cli(hwnd: int, gx: int, gy: int) -> bool:
     """Click the bottom-left 'Local' dropdown, select 'Copilot CLI'.
+
+    PROVEN PROCEDURE (2026-03-18):
+      1. Click the "Local" text at bottom-left of window: (gx+55, gy+484)
+      2. Press Down (selects "Copilot CLI", right below "Local")
+      3. Press Enter
+
     This automatically sets model to Claude Opus 4.6 (fast mode).
-    Retries up to 2 times with verification after each attempt."""
-    for attempt in range(1, 3):
+    Retries up to 2 times with verification after each attempt.
+    """
+    for attempt in range(1, 4):
         try:
             log(f"Step 4 — Setting session target to Copilot CLI (attempt {attempt})...")
             u32.SetForegroundWindow(hwnd)
@@ -395,19 +435,20 @@ def step4_set_copilot_cli(hwnd: int, gx: int, gy: int) -> bool:
                 log("Step 4 — Already in Copilot CLI mode")
                 return True
 
-            click_x = scan.get("session_cx", 0) or (gx + CLI_OFFSET[0])
-            click_y = scan.get("session_cy", 0) or (gy + CLI_OFFSET[1])
+            # Use proven offset (gx+55, gy+484) — UIA coordinates can be unreliable
+            click_x = gx + CLI_OFFSET[0]
+            click_y = gy + CLI_OFFSET[1]
 
-            # Click the session-target control
+            # Click the session-target "Local" dropdown at bottom-left
             log(f"Step 4 — Clicking session target at ({click_x}, {click_y})")
             pyautogui.click(click_x, click_y)
-            time.sleep(1.5)
+            time.sleep(2.0)  # Longer wait for Chromium quickpick to render
 
-            # Filter to Copilot CLI directly
-            pyautogui.typewrite('cli', interval=0.05)
-            time.sleep(0.4)
+            # Select "Copilot CLI" — it's the item right below "Local"
+            pyautogui.press('down')
+            time.sleep(0.5)
             pyautogui.press('enter')
-            time.sleep(3)
+            time.sleep(2.5)
 
             # Verify it actually changed
             verify = _scan_window_controls(hwnd)
@@ -424,12 +465,12 @@ def step4_set_copilot_cli(hwnd: int, gx: int, gy: int) -> bool:
 
             # Dismiss any stray quickpick by pressing Escape
             pyautogui.press('escape')
-            time.sleep(0.5)
+            time.sleep(1.0)
 
         except Exception as e:
             log(f"Step 4 — Attempt {attempt} error: {e}")
 
-    log("Step 4 FAILED: Could not set Copilot CLI after 2 attempts")
+    log("Step 4 FAILED: Could not set Copilot CLI after 3 attempts")
     return False
 
 
@@ -840,14 +881,13 @@ def boot_single_worker(name: str, orch_hwnd: int, known_hwnds: set) -> tuple:
         time.sleep(1.0)
         step3_position(hwnd, gx, gy)
 
-    # Step 5: Permissions — SKIPPED
-    # Extension patched: cli.js Statsig gate disabled + extension.js canUseTool auto-approves.
-    # No Apply dialogs will appear. The dropdown is unreachable via automation (INCIDENT 013+).
-    log(f"Step 5 — Permissions: SKIPPED (extension patched for auto-approve)")
-
     # Step 4: Set Copilot CLI (also sets model to Claude Opus 4.6 fast)
     if not step4_set_copilot_cli(hwnd, gx, gy):
         log(f"WARNING: {name} — step 4 failed (Copilot CLI), continuing...")
+
+    # Step 5: Permissions — guard_bypass.ps1 × 2 (proven procedure)
+    if not step5_set_permissions(hwnd):
+        log(f"WARNING: {name} — step 5 failed (permissions), continuing...")
 
     # Step 6: Dispatch identity
     if not step6_dispatch_identity(name, hwnd, gx, gy, orch_hwnd):
@@ -1059,16 +1099,20 @@ def update_workers_json(results: dict) -> None:
         workers.append({
             'name': name,
             'hwnd': hwnd,
-            'grid': {'x': grid[0], 'y': grid[1], 'w': WINDOW_SIZE[0], 'h': WINDOW_SIZE[1]},
             'model': 'Claude Opus 4.6 (fast mode)',
             'agent': 'Copilot CLI',
-            'status': 'online' if hwnd else 'dead',
+            'grid_x': grid[0],
+            'grid_y': grid[1],
+            'window_w': WINDOW_SIZE[0],
+            'window_h': WINDOW_SIZE[1],
+            'booted': bool(hwnd),
+            'boot_version': BOOT_VERSION,
         })
 
     payload = {
         'workers': workers,
-        'created': datetime.now().strftime('%Y-%m-%d'),
-        'boot_method': f'chevron_dropdown_v{BOOT_VERSION}',
+        'created': datetime.now().isoformat(),
+        'boot_version': BOOT_VERSION,
     }
 
     workers_file.parent.mkdir(parents=True, exist_ok=True)

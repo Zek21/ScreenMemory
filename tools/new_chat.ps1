@@ -1,3 +1,12 @@
+# ========================================================================
+# DEPRECATED (2026-03-21) — DO NOT USE FOR WORKER BOOT
+# ========================================================================
+# The canonical boot method is: python tools/exact_boot.py --all --orch-hwnd HWND
+# This file is retained for reference only. All worker window opening
+# MUST go through exact_boot.py which implements the proven 7-step procedure
+# with dynamic UIA chevron detection and pyautogui hardware-level input.
+# ========================================================================
+#
 # new_chat.ps1 - Opens a new detached Copilot CLI chat window via invisible automation
 # Uses UIA patterns (ExpandCollapsePattern, InvokePattern, TogglePattern) and
 # PostMessage ghost clicks — never moves the user's cursor.

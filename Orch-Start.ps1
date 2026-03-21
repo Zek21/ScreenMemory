@@ -298,12 +298,12 @@ if ($SkipInfra) {
 }
 
 # -- Execute startup with timeout protection --
-# PROVEN BOOT PROCEDURE -- Rule #0.06 (2026-03-18)
-# Uses tools/skynet_worker_boot.py -- the ONLY authorized method to open worker windows.
-# Do NOT revert to tools/skynet_start.py for window opening without tested proof.
+# PROVEN BOOT PROCEDURE -- Rule #0.06 (2026-03-18, updated 2026-03-21)
+# Uses tools/exact_boot.py -- the ONLY authorized method to open worker windows.
+# Do NOT use tools/skynet_worker_boot.py, tools/new_chat.ps1, or tools/skynet_start.py for window opening.
 
 if ($action -ne "none") {
-    $bootScript = Join-Path $repoRoot "tools\skynet_worker_boot.py"
+    $bootScript = Join-Path $repoRoot "tools\exact_boot.py"
     $startScript = Join-Path $repoRoot "tools\skynet_start.py"
     
     if (Test-Path $bootScript) {
@@ -316,7 +316,7 @@ if ($action -ne "none") {
         
         if ($orchHwnd -eq 0) {
             Write-Status "Cannot determine orchestrator HWND -- boot script needs it" "WARN"
-            Write-Status "Set HWND manually: python tools/skynet_worker_boot.py --all --orch-hwnd HWND" "SYS"
+            Write-Status "Set HWND manually: python tools/exact_boot.py --all --orch-hwnd HWND" "SYS"
         } else {
             $pyArgs = @($bootScript, "--all", "--orch-hwnd", "$orchHwnd")
             Write-Status "Running PROVEN boot: python $($pyArgs -join ' ')" "SYS"
@@ -339,8 +339,8 @@ if ($action -ne "none") {
         }
     } elseif (Test-Path $startScript) {
         # DEPRECATED FALLBACK -- tools/skynet_start.py (Rule #0.06 violation warning)
-        Write-Status "WARNING: tools/skynet_worker_boot.py not found -- using DEPRECATED skynet_start.py" "WARN"
-        Write-Status "This method is DEPRECATED per Rule #0.06. Restore skynet_worker_boot.py." "WARN"
+        Write-Status "WARNING: tools/exact_boot.py not found -- using DEPRECATED skynet_start.py" "WARN"
+        Write-Status "This method is DEPRECATED per Rule #0.06. Restore exact_boot.py." "WARN"
         $pyArgs = @($startScript)
         switch ($action) {
             "reconnect" { $pyArgs += "--reconnect" }
@@ -365,7 +365,7 @@ if ($action -ne "none") {
             Write-Status "Services may be partially started -- check dashboard" "WARN"
         }
     } else {
-        Write-Status "No boot script found (skynet_worker_boot.py or skynet_start.py)" "ERR"
+        Write-Status "No boot script found (exact_boot.py or skynet_start.py)" "ERR"
     }
 }
 
