@@ -106,8 +106,36 @@ EnumChildWindows = u32.EnumChildWindows
 WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL,
                                   ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
 
+# SendInput structures for hardware-level mouse events
+MOUSEEVENTF_MOVE       = 0x0001
+MOUSEEVENTF_LEFTDOWN   = 0x0002
+MOUSEEVENTF_LEFTUP     = 0x0004
+MOUSEEVENTF_ABSOLUTE   = 0x8000
+INPUT_MOUSE = 0
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+class INPUT(ctypes.Structure):
+    class _INPUT(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT)]
+    _fields_ = [("type", ctypes.c_ulong), ("_input", _INPUT)]
+
 # Clipboard functions
 CF_UNICODETEXT = 13
+
+
+def _screen_to_absolute(sx: int, sy: int) -> tuple:
+    """Convert screen coords to SendInput absolute coords (0-65535 range)."""
+    sw = u32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+    sh = u32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+    ox = u32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+    oy = u32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+    ax = int(((sx - ox) * 65535) / (sw - 1))
+    ay = int(((sy - oy) * 65535) / (sh - 1))
+    return ax, ay
 
 
 def _make_lparam(x: int, y: int) -> int:
@@ -175,6 +203,52 @@ class ShadowInput:
         pt = ctypes.wintypes.POINT(sx, sy)
         ScreenToClient(target, ctypes.byref(pt))
         return self.click(target, pt.x, pt.y, pause)
+
+    def hardware_click(self, sx: int, sy: int, pause: float = 0.05) -> bool:
+        """Hardware-level click at screen coords with cursor save/restore.
+
+        Uses SendInput (same as pyautogui) but saves and restores cursor
+        position so the user's mouse returns to where it was.
+        This is the ONLY way to click inside Chromium-rendered UI elements.
+        """
+        # Save current cursor position
+        saved = ctypes.wintypes.POINT()
+        u32.GetCursorPos(ctypes.byref(saved))
+
+        # Convert screen coords to absolute SendInput range
+        ax, ay = _screen_to_absolute(sx, sy)
+        flags_move = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
+
+        # Build SendInput array: move, down, up
+        inputs = (INPUT * 3)()
+        # Move to target
+        inputs[0].type = INPUT_MOUSE
+        inputs[0]._input.mi.dx = ax
+        inputs[0]._input.mi.dy = ay
+        inputs[0]._input.mi.dwFlags = flags_move
+        # Mouse down
+        inputs[1].type = INPUT_MOUSE
+        inputs[1]._input.mi.dx = ax
+        inputs[1]._input.mi.dy = ay
+        inputs[1]._input.mi.dwFlags = flags_move | MOUSEEVENTF_LEFTDOWN
+        # Mouse up
+        inputs[2].type = INPUT_MOUSE
+        inputs[2]._input.mi.dx = ax
+        inputs[2]._input.mi.dy = ay
+        inputs[2]._input.mi.dwFlags = flags_move | MOUSEEVENTF_LEFTUP
+
+        u32.SendInput(3, ctypes.byref(inputs), ctypes.sizeof(INPUT))
+        time.sleep(pause)
+
+        # Restore cursor position
+        rax, ray = _screen_to_absolute(saved.x, saved.y)
+        restore = (INPUT * 1)()
+        restore[0].type = INPUT_MOUSE
+        restore[0]._input.mi.dx = rax
+        restore[0]._input.mi.dy = ray
+        restore[0]._input.mi.dwFlags = flags_move
+        u32.SendInput(1, ctypes.byref(restore), ctypes.sizeof(INPUT))
+        return True
 
     # ─── Keyboard (PostMessage — window-targeted) ─────────────────
 
@@ -351,52 +425,33 @@ class ShadowInput:
         return True
 
     def paste_and_submit(self, hwnd: int, text: str, restore_focus: int = 0) -> bool:
-        """Set clipboard, paste into window, submit with Enter.
+        """Set clipboard, paste into window, submit with Enter + Send button fallback.
 
-        Complete text input without moving the mouse cursor.
+        Uses hardware_click (SendInput with cursor save/restore) for Chromium clicks.
+        The user's cursor returns to its original position after each click.
         Steps:
             1. Save clipboard, set new text
-            2. Find Chrome render widget inside VS Code window
-            3. PostMessage click at input area coords (focuses Chromium textarea — no cursor movement)
-            4. AttachThreadInput + SetFocus on render widget (reliable OS-level focus)
-            5. keybd_event Ctrl+V (paste — no cursor movement)
-            6. keybd_event Enter (submit — no cursor movement)
-            7. Detach thread, restore clipboard, restore focus
+            2. hardware_click input area (focuses Chromium textarea, restores cursor)
+            3. SetForegroundWindow + keybd_event Ctrl+V (paste)
+            4. keybd_event Enter (submit — works for first prompt)
+            5. hardware_click Send button (fallback for subsequent prompts, restores cursor)
+            6. Restore clipboard, restore focus
         """
         old_clip = self.get_clipboard()
         self.set_clipboard(text)
         time.sleep(0.2)
 
-        render = self._find_render(hwnd)
-        target = render or hwnd
+        # Get window position for relative coordinate calculations
+        rect = ctypes.wintypes.RECT()
+        GetWindowRect(hwnd, ctypes.byref(rect))
+        gx, gy = rect.left, rect.top
 
-        # Step 1: PostMessage click at input area to focus the textarea in Chromium
-        # Input area is approximately at center-bottom of the worker window
-        # We use coords relative to the render widget
-        if render:
-            rect = ctypes.wintypes.RECT()
-            GetWindowRect(hwnd, ctypes.byref(rect))
-            gx, gy = rect.left, rect.top
-            # Input area at (gx + 465, gy + 415) in screen coords
-            input_pt = ctypes.wintypes.POINT(gx + 465, gy + 415)
-            ScreenToClient(render, ctypes.byref(input_pt))
-            lp = _make_lparam(input_pt.x, input_pt.y)
-            PostMessageW(render, WM_LBUTTONDOWN, MK_LBUTTON, lp)
-            time.sleep(0.05)
-            PostMessageW(render, WM_LBUTTONUP, 0, lp)
-            time.sleep(0.3)
+        # Step 1: Click input area via hardware click (cursor returns to original pos)
+        self.hardware_click(gx + 465, gy + 415, pause=0.3)
 
-        # Step 2: AttachThreadInput + SetFocus for reliable keyboard delivery
-        my_tid = k32.GetCurrentThreadId()
-        target_tid = u32.GetWindowThreadProcessId(target, None)
-        attached = u32.AttachThreadInput(my_tid, target_tid, True)
-
+        # Step 2: Ctrl+V via keybd_event (paste — no mouse cursor movement)
         SetForegroundWindow(hwnd)
         time.sleep(0.15)
-        u32.SetFocus(target)
-        time.sleep(0.15)
-
-        # Step 3: Ctrl+V via keybd_event (paste — no mouse cursor movement)
         u32.keybd_event(VK_CONTROL, 0, 0, 0)
         time.sleep(0.05)
         u32.keybd_event(VK_V, 0, 0, 0)
@@ -406,16 +461,15 @@ class ShadowInput:
         u32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
         time.sleep(0.3)
 
-        # Step 4: Enter via keybd_event (submit — no mouse cursor movement)
+        # Step 3: Enter via keybd_event (works for first prompt in fresh window)
         u32.keybd_event(VK_RETURN, 0, 0, 0)
         time.sleep(0.05)
         u32.keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0)
-
-        # Detach thread input
-        if attached:
-            u32.AttachThreadInput(my_tid, target_tid, False)
-
         time.sleep(0.5)
+
+        # Step 4: Click Send button via hardware click (fallback for subsequent prompts)
+        # Cursor saves/restores automatically — user's mouse returns to original position
+        self.hardware_click(gx + 880, gy + 453, pause=0.1)
 
         # Restore clipboard
         try:
