@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Optional  # signed: gamma (removed unused Any, Dict, List)
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 DATA_DIR = ROOT / "data"
 STATE_FILE = DATA_DIR / "realtime.json"
 CONSUMED_FILE = DATA_DIR / "realtime_consumed.json"

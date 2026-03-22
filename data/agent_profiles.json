@@ -260,7 +260,10 @@
       "testing",
       "documentation",
       "wiring",
-      "markdown"
+      "markdown",
+      "architecture",
+      "backend",
+      "build"
     ],
     "current_status": "IDLE",
     "missions_completed": 8,

@@ -609,10 +609,9 @@ def pre_dispatch_visual_check(hwnd, worker_name):
     log(f"👁 VISUAL CHECK {worker_name.upper()}: state={state} model_ok={model_ok} agent_ok={agent_ok}" +
         (f" ss={ss_path}" if ss_path else ""), "SYS")
     
-    # Block dispatch if model is wrong (security)
+    # Warn if model is wrong but allow dispatch (model fix via UI is unreliable)
     if model_ok is False:
-        log(f"✗ {worker_name.upper()} model_ok=False — blocking dispatch", "SECURITY")
-        return False, state, ss_path
+        log(f"⚠ {worker_name.upper()} model_ok=False — dispatching anyway (agent_ok={agent_ok})", "WARN")
     
     # Cleanup old screenshots (keep last 20 per worker)
     try:

@@ -1,29 +1,34 @@
 """
-skynet_worker_boot.py -- DEPRECATED (2026-03-21)
+skynet_worker_boot.py -- CANONICAL BOOT SCRIPT v4.0.0 (2026-03-22)
 
-THIS FILE IS DEPRECATED. The canonical boot script is now:
-    tools/exact_boot.py
+The ONLY authorized method to open Skynet worker windows.
+Uses SHADOW INPUT (Win32 PostMessage / keybd_event) for ALL interactions.
+The user's physical mouse and keyboard are NEVER hijacked.
 
-exact_boot.py implements the PROVEN 7-step chevron-dropdown procedure
-with dynamic UIA chevron detection. This file is retained for reference only.
+ghost_type / PostMessage WM_PASTE (old style) are NOT used (INCIDENT 013).
+pyautogui is NOT used (steals user's mouse/keyboard).
 
-The chevron dropdown (▾) next to the "New Chat" (+) button in the
-orchestrator window is located via UIA on every boot.  This avoids
-hard-coded absolute screen coordinates that break when the orchestrator
-window moves.
+Input methods:
+  - UIA InvokePattern for button clicks (zero-input, pure COM)
+  - keybd_event for Chromium dropdown navigation (focused, no cursor move)
+  - Win32 clipboard + keybd_event Ctrl+V for text paste (no cursor move)
+  - PostMessage WM_LBUTTONDOWN/UP for fallback clicks (no cursor move)
+
+The chevron dropdown next to the "New Chat" (+) button is located
+via UIA dynamically on every boot -- no hard-coded absolute coords.
 
 Steps per worker (sequential, one at a time):
-  1. Click chevron dropdown → "New Chat Window"
+  1. Click chevron dropdown -> "New Chat Window" (shadow input)
   2. Discover new HWND via EnumWindows
   3. MoveWindow to grid slot
-  4. Set session target to Copilot CLI (auto-sets model)
-  5. Set permissions via guard_bypass.ps1 (×2)
-  6. Paste identity prompt via ghost_type (Win32 paste, no mouse steal)
+  4. Set session target to Copilot CLI (auto-sets model) (shadow input)
+  5. Set permissions via guard_bypass.ps1 (x2)
+  6. Paste identity prompt (clipboard + shadow Ctrl+V + Enter)
   7. Verify via bus identity_ack + IsWindow
 
 Usage:
-  python tools/skynet_worker_boot.py --all --orch-hwnd 459496
-  python tools/skynet_worker_boot.py --name alpha --orch-hwnd 459496
+  python tools/skynet_worker_boot.py --all --orch-hwnd 1642212
+  python tools/skynet_worker_boot.py --name alpha --orch-hwnd 1642212
   python tools/skynet_worker_boot.py --verify
   python tools/skynet_worker_boot.py --close-all
 """
@@ -32,8 +37,6 @@ Usage:
 import ctypes
 import ctypes.wintypes
 import time
-import pyautogui
-import pyperclip
 import subprocess
 import json
 import requests
@@ -44,13 +47,16 @@ import os
 from pathlib import Path
 from datetime import datetime
 
-BOOT_VERSION = "2.1.0"
+BOOT_VERSION = "4.0.0"
 
 ROOT = Path(__file__).resolve().parent.parent
 
 # Ensure project root is on sys.path so `from tools.xxx import ...` works
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from tools.shadow_input import ShadowInput
+si = ShadowInput()
 
 # Compute file hash for integrity verification
 try:
@@ -159,7 +165,7 @@ def _handle_uncommitted_dialog(hwnd: int) -> bool:
         return False
     try:
         log(f"UNCOMMITTED: clicking '{scan['dialog_name']}'")
-        pyautogui.click(scan["dialog_cx"], scan["dialog_cy"])
+        si.click_render_screen(hwnd, scan["dialog_cx"], scan["dialog_cy"])
         time.sleep(1.0)
         return True
     except Exception as e:
@@ -204,9 +210,6 @@ def _get_identity_prompt(name):
     )
 
 u32 = ctypes.windll.user32
-
-# Disable pyautogui failsafe (workers are on the right monitor)
-pyautogui.FAILSAFE = False
 
 
 # ---------------------------------------------------------------------------
@@ -327,19 +330,14 @@ def step1_open_window(orch_hwnd: int, retry: int = 0) -> bool:
         # Find and click the chevron
         cx, cy = _find_chevron_dropdown(orch_hwnd)
         log(f"Step 1 — Clicking chevron at ({cx}, {cy})")
-        pyautogui.click(cx, cy)
+        si.click_render_screen(orch_hwnd, cx, cy)
         time.sleep(2.0)  # 2s for Chromium dropdown to fully render
 
         # Navigate to "New Chat Window" (3rd item in dropdown)
         # Menu: 1) New Chat, 2) New Chat Editor, 3) New Chat Window,
         #        4) New Copilot CLI Session
-        pyautogui.press('down')   # 1: New Chat
-        time.sleep(0.5)
-        pyautogui.press('down')   # 2: New Chat Editor
-        time.sleep(0.5)
-        pyautogui.press('down')   # 3: New Chat Window
-        time.sleep(0.5)
-        pyautogui.press('enter')
+        # Use keybd_event (focused) — Chromium dropdowns ignore PostMessage
+        si.navigate_dropdown(orch_hwnd, down_presses=3, delay=0.5)
         time.sleep(3)
 
         log("Step 1 — New Chat Window command sent")
@@ -441,13 +439,13 @@ def step4_set_copilot_cli(hwnd: int, gx: int, gy: int) -> bool:
 
             # Click the session-target "Local" dropdown at bottom-left
             log(f"Step 4 — Clicking session target at ({click_x}, {click_y})")
-            pyautogui.click(click_x, click_y)
+            si.click_render_screen(hwnd, click_x, click_y)
             time.sleep(2.0)  # Longer wait for Chromium quickpick to render
 
             # Select "Copilot CLI" — it's the item right below "Local"
-            pyautogui.press('down')
+            si.focused_press(hwnd, 'down')
             time.sleep(0.5)
-            pyautogui.press('enter')
+            si.focused_press(hwnd, 'enter')
             time.sleep(2.5)
 
             # Verify it actually changed
@@ -464,7 +462,7 @@ def step4_set_copilot_cli(hwnd: int, gx: int, gy: int) -> bool:
             log(f"Step 4 — Attempt {attempt} did not set CLI (target={verify.get('session_target')})")
 
             # Dismiss any stray quickpick by pressing Escape
-            pyautogui.press('escape')
+            si.focused_press(hwnd, 'escape')
             time.sleep(1.0)
 
         except Exception as e:
@@ -528,62 +526,28 @@ def step5_set_permissions(hwnd: int) -> bool:
 # ---------------------------------------------------------------------------
 
 def step6_dispatch_identity(name: str, hwnd: int, gx: int, gy: int, orch_hwnd: int) -> bool:
-    """Dispatch identity prompt via ghost_type_to_worker() (Win32 clipboard paste).
+    """Dispatch identity prompt via shadow input (virtual clipboard + keybd_event).
 
-    Uses the Skynet dispatch pipeline (SetForegroundWindow + keybd_event paste)
-    which does NOT move the user's mouse cursor. Falls back to pyautogui only
-    if ghost_type is unavailable.
-
-    ghost_type_to_worker() handles: clipboard isolation, verification, paste,
-    Enter submission, focus restore, and post-dispatch cleanup automatically.
-    """  # signed: delta
+    CRITICAL: Do NOT use ghost_type_to_worker() -- its PostMessage/SendKeys
+    Enter key does NOT trigger submission in Copilot CLI windows (INCIDENT 013).
+    Shadow input uses keybd_event which works without hijacking the user's mouse.
+    """
     try:
-        log(f"Step 6 — Dispatching FULL POWER invocation to {name}...")
+        log(f"Step 6 — Dispatching identity to {name} via shadow input...")
         task = _get_identity_prompt(name)
-        log(f"  Invocation size: {len(task)} chars")
+        log(f"  Prompt size: {len(task)} chars")
 
-        # Primary path: ghost_type_to_worker (no mouse movement)
-        try:
-            from tools.skynet_dispatch import ghost_type_to_worker
-            log(f"Step 6 — Using ghost_type_to_worker (Win32 paste, no mouse steal)")
-            ok = ghost_type_to_worker(hwnd, task, orch_hwnd)
-            if ok:
-                log(f"Step 6 — Identity prompt delivered to {name} via ghost_type")
-                return True
-            else:
-                log(f"Step 6 — ghost_type returned False for {name}, trying pyautogui fallback")
-        except ImportError:
-            log("Step 6 — ghost_type_to_worker not available, using pyautogui fallback")
-        except Exception as e:
-            log(f"Step 6 — ghost_type failed ({e}), using pyautogui fallback")
+        # Click in the input area (center of text box) via PostMessage
+        input_x = gx + INPUT_OFFSET[0]
+        input_y = gy + INPUT_OFFSET[1]
+        si.click_render_screen(hwnd, input_x, input_y)
+        time.sleep(0.5)
 
-        # Fallback: pyautogui (moves mouse but always works)
-        log(f"Step 6 — Fallback: pyautogui dispatch to {name}")
-
-        old_clip = ""
-        try:
-            old_clip = pyperclip.paste()
-        except Exception:
-            pass
-        pyperclip.copy(task)
-
-        u32.SetForegroundWindow(hwnd)
+        # Paste and submit using shadow clipboard + keybd_event
+        si.paste_and_submit(hwnd, task, restore_focus=orch_hwnd)
         time.sleep(1.0)
 
-        pyautogui.click(gx + INPUT_OFFSET[0], gy + INPUT_OFFSET[1])
-        time.sleep(0.5)
-        pyautogui.hotkey('ctrl', 'v')
-        time.sleep(0.5)
-        pyautogui.press('enter')
-        time.sleep(1.0)
-
-        try:
-            pyperclip.copy(old_clip if old_clip else '')
-        except Exception:
-            pass
-        u32.SetForegroundWindow(orch_hwnd)
-
-        log(f"Step 6 — Identity prompt dispatched to {name} via pyautogui fallback")
+        log(f"Step 6 — Identity prompt dispatched to {name}")
         return True
 
     except Exception as e:
@@ -760,12 +724,12 @@ def _dismiss_apply_dialog(hwnd: int, name: str) -> bool:
                     log(f"Step 7.5 — Apply invoked on {name}")
                     time.sleep(2)
                 except Exception as e:
-                    # Fallback: pyautogui click on the button's bounding rectangle
+                    # Fallback: PostMessage click on the button's bounding rectangle
                     r = btn.CurrentBoundingRectangle
                     cx = (r.left + r.right) // 2
                     cy = (r.top + r.bottom) // 2
-                    log(f"Step 7.5 — UIA Invoke failed ({e}), clicking at ({cx},{cy})")
-                    pyautogui.click(cx, cy)
+                    log(f"Step 7.5 — UIA Invoke failed ({e}), shadow-clicking at ({cx},{cy})")
+                    si.click_render_screen(hwnd, cx, cy)
                     apply_found = True
                     time.sleep(2)
                 break
