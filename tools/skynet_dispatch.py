@@ -1584,74 +1584,91 @@ def _execute_ghost_dispatch(ps, hwnd, orch_hwnd):
 
 
 def ghost_type_to_worker(hwnd, text, orch_hwnd, render_hwnd=None):
-    """Type text into a worker/consultant chat window via clipboard paste (Level 4.2 dispatch).
+    """Type text into a worker/consultant chat window via shadow input (v4.0 dispatch).
 
-    This is the core delivery mechanism for all Skynet prompt dispatch. It writes the dispatch
-    text to a temp file, builds an inline PowerShell script with C# Win32 interop, and executes
-    it in a subprocess to paste the text into the target window's chat input.
+    Uses ShadowInput (PostMessage/keybd_event) instead of the old PowerShell/C# approach.
+    The user's physical mouse and keyboard are NEVER hijacked.
 
-    Architecture (see docs/DELIVERY_PIPELINE.md Section 4 for full details):
-        1. Text written to temp file at data/.dispatch_tmp_{hwnd}.txt (no clipboard truncation)
-        2. _build_ghost_type_ps() generates PS script with: STEERING cancel, Edit scoring,
-           multi-pane Chrome render widget disambiguation, focus race prevention,
-           clipboard verification (3x retry), AttachThreadInput paste, clipboard cleanup
-           **Fast-path**: when render_hwnd is provided, skips UIA Edit search entirely
-        3. _execute_ghost_dispatch() runs script under dispatch lock, validates OK_ stdout
+    Architecture:
+        1. Finds Chrome_RenderWidgetHostHWND child inside the target window
+        2. Sets clipboard via Win32 API (no pyperclip)
+        3. Focuses the target window briefly with SetForegroundWindow
+        4. Sends Ctrl+V via keybd_event (pastes clipboard — no mouse movement)
+        5. Sends Enter via keybd_event (submits prompt)
+        6. Restores focus to orchestrator window
+        7. Clears clipboard to prevent stale text
 
     Safety features:
         - Cross-process clipboard isolation via named Windows Mutex (SkynetDispatchClipboard)
-        - Thread-level isolation via threading.Lock (backup for same-process concurrency)
+        - Thread-level isolation via threading.Lock
         - Clipboard save/restore (user clipboard never lost)
-        - Clipboard verification (5x SetText/GetText readback loop with exponential backoff)
-        - Clipboard tamper detection (GetClipboardSequenceNumber before paste; aborts
-          with CLIPBOARD_TAMPERED if external process modified clipboard)  # signed: alpha
-        - Focus race prevention (GetForegroundWindow check before paste)
-        - Multi-pane disambiguation (FindAllRender + right-half area scoring)
-        - AttachThreadInput for less-visible focus transfer (no Z-order flash)
-        - CREATE_NO_WINDOW flag on subprocess (no console flash)
-        - Post-paste Clipboard.Clear() to prevent stale dispatch text lingering
+        - PostMessage mouse clicks (no cursor movement for input area click)
+        - keybd_event for keyboard (no mouse involvement — only brief window focus)
 
     Args:
         hwnd: Target window HWND (int). Must be valid (IsWindow check).
-        text: Dispatch text content. Newlines replaced with spaces before writing to temp file.
-        orch_hwnd: Orchestrator HWND for focus restore after delivery. Can be invalid (warn only).
-        render_hwnd: Optional pre-resolved Chrome_RenderWidgetHostHWND (int). When provided,
-                     _build_ghost_type_ps() skips UIA Edit search and FindAllRender DFS,
-                     going directly to CHROME_RENDER paste path. Eliminates UIA tree
-                     traversal overhead for repeated dispatches to the same window.
+        text: Dispatch text content. Newlines replaced with spaces.
+        orch_hwnd: Orchestrator HWND for focus restore after delivery.
+        render_hwnd: Optional pre-resolved Chrome_RenderWidgetHostHWND (unused in v4, kept for API compat).
 
     Returns:
-        bool: True if delivery succeeded (PS reported OK_*), False on any failure.
-
-    See Also:
-        docs/DELIVERY_PIPELINE.md (full architecture reference)
-        _build_ghost_type_ps() (PS script generation)
-        _execute_ghost_dispatch() (subprocess execution and validation)
-        _verify_delivery() (post-dispatch UIA state verification)
-    """  # signed: beta
+        bool: True if delivery succeeded, False on any failure.
+    """
     if not hwnd or not user32.IsWindow(hwnd):
-        log(f"ghost_type: invalid target HWND={hwnd}", "ERR")  # signed: beta
+        log(f"ghost_type: invalid target HWND={hwnd}", "ERR")
         return False
     if not orch_hwnd or not user32.IsWindow(orch_hwnd):
-        log(f"ghost_type: invalid orchestrator HWND={orch_hwnd}, proceeding without focus restore", "WARN")  # signed: beta
+        log(f"ghost_type: invalid orchestrator HWND={orch_hwnd}, proceeding without focus restore", "WARN")
 
-    dispatch_file = Path(ROOT) / "data" / f".dispatch_tmp_{hwnd}.txt"
+    # Flatten newlines (VS Code chat input is single-line)
+    flat_text = text.replace("\n", " ")
+
+    mutex_acquired = False
     try:
-        dispatch_file.write_text(text.replace("\n", " "), encoding="utf-8")
-    except OSError as e:
-        log(f"ghost_type: failed to write dispatch temp file: {e}", "ERR")  # signed: beta
-        return False
-    dispatch_file_path = str(dispatch_file).replace("\\", "\\\\")
-    ps = _build_ghost_type_ps(hwnd, orch_hwnd, dispatch_file_path, render_hwnd=render_hwnd)
-    try:
-        return _execute_ghost_dispatch(ps, hwnd, orch_hwnd)
-    finally:
-        # Always clean up temp file even if dispatch fails/times out (prevents resource leak)
+        # Cross-process mutex for clipboard isolation
+        mutex_acquired = _acquire_dispatch_mutex(timeout_ms=15000)
+        if not mutex_acquired:
+            log(f"Ghost dispatch: failed to acquire cross-process mutex for HWND={hwnd}, proceeding with thread lock only", "WARN")
+
+        with _dispatch_lock:
+            try:
+                DISPATCH_LOCK_FILE.write_text(json.dumps({
+                    "hwnd": hwnd, "orch_hwnd": orch_hwnd,
+                    "timestamp": datetime.now().isoformat()
+                }), encoding="utf-8")
+            except Exception:
+                pass
+
+            log(f"Shadow dispatch targeting HWND={hwnd} (orch={orch_hwnd})", "SYS")
+
+            # Use shadow input for delivery
+            from tools.shadow_input import ShadowInput
+            si = ShadowInput()
+            ok = si.paste_and_submit(hwnd, flat_text, restore_focus=orch_hwnd)
+
+            try:
+                DISPATCH_LOCK_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            if ok:
+                log(f"Shadow dispatch OK for HWND={hwnd}", "OK")
+            else:
+                log(f"Shadow dispatch FAILED for HWND={hwnd}", "ERR")
+
+            time.sleep(0.5)
+            return ok
+
+    except Exception as e:
+        log(f"Shadow dispatch failed: {e}", "ERR")
         try:
-            dispatch_file.unlink(missing_ok=True)
+            DISPATCH_LOCK_FILE.unlink(missing_ok=True)
         except Exception:
-            pass  # Best-effort cleanup; PS script may have already removed it
-        # signed: alpha
+            pass
+        return False
+    finally:
+        if mutex_acquired:
+            _release_dispatch_mutex()
 
 
 def _dispatch_to_orchestrator(task, self_id, orch_hwnd):
