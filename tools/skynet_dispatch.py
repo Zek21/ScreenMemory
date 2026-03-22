@@ -998,6 +998,25 @@ public class GhostType {{
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
     private const uint WM_KEYDOWN = 0x0100;
     private const uint WM_KEYUP   = 0x0101;
+    private const uint WM_LBUTTONDOWN = 0x0201;
+    private const uint WM_LBUTTONUP   = 0x0202;
+    private static readonly IntPtr MK_LBUTTON_PTR = (IntPtr)0x0001;
+    // ClickInputArea: PostMessage mouse click to the chat input area inside
+    // Chrome render widget. This gives Chromium DOM focus to the input element
+    // WITHOUT moving the user's physical cursor. Coordinates are relative to
+    // the render widget (input area = center-x, ~85px from bottom).
+    public static void ClickInputArea(IntPtr renderHwnd) {{
+        RECT r; GetWindowRect(renderHwnd, out r);
+        int rw = r.Right - r.Left;
+        int rh = r.Bottom - r.Top;
+        if (rw <= 0 || rh <= 0) return;
+        int inputX = rw / 2;
+        int inputY = rh - 85;
+        IntPtr lParam = (IntPtr)((inputY << 16) | (inputX & 0xFFFF));
+        PostMessage(renderHwnd, WM_LBUTTONDOWN, MK_LBUTTON_PTR, lParam);
+        System.Threading.Thread.Sleep(50);
+        PostMessage(renderHwnd, WM_LBUTTONUP, IntPtr.Zero, lParam);
+    }}
     private static readonly IntPtr VK_RETURN_PTR = (IntPtr)0x0D;
     // Hardware-level Ctrl+V paste -- replaces SendKeys::SendWait("^v") which fails
     // with "Access is denied" due to UIPI when target window has different integrity.
@@ -1316,6 +1335,11 @@ if ($focusMethod -ne "NONE") {{
             Start-Sleep -Milliseconds 50
             [GhostType]::SetFocus($renderHwnd)
             Start-Sleep -Milliseconds 120
+            # DOM FOCUS FIX: PostMessage click to input area gives Chromium internal
+            # DOM focus to the chat input element. Without this, keybd_event Ctrl+V
+            # may paste into the output area or be silently dropped.
+            [GhostType]::ClickInputArea($renderHwnd)
+            Start-Sleep -Milliseconds 100
             # Focus race check: verify foreground is our target window  # signed: alpha
             $postFocusFg = [GhostType]::GetForegroundWindow()
             if ($postFocusFg -ne $hwnd) {{
@@ -1368,6 +1392,9 @@ if ($focusMethod -ne "NONE") {{
             Start-Sleep -Milliseconds 80
             [GhostType]::SetFocus($renderHwnd)
             Start-Sleep -Milliseconds 120
+            # DOM FOCUS FIX: PostMessage click to input area (render fallback path)
+            [GhostType]::ClickInputArea($renderHwnd)
+            Start-Sleep -Milliseconds 100
             # Focus race check for render fallback path  # signed: alpha
             $postFocusFg = [GhostType]::GetForegroundWindow()
             if ($postFocusFg -ne $hwnd) {{

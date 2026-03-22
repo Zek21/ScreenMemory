@@ -425,51 +425,84 @@ class ShadowInput:
         return True
 
     def paste_and_submit(self, hwnd: int, text: str, restore_focus: int = 0) -> bool:
-        """Set clipboard, paste into window, submit with Enter + Send button fallback.
+        """Shadow paste and submit — ZERO cursor movement, ZERO hardware mouse.
 
-        Uses hardware_click (SendInput with cursor save/restore) for Chromium clicks.
-        The user's cursor returns to its original position after each click.
-        Steps:
-            1. Save clipboard, set new text
-            2. hardware_click input area (focuses Chromium textarea, restores cursor)
-            3. SetForegroundWindow + keybd_event Ctrl+V (paste)
-            4. keybd_event Enter (submit — works for first prompt)
-            5. hardware_click Send button (fallback for subsequent prompts, restores cursor)
-            6. Restore clipboard, restore focus
+        The user's physical mouse cursor is NEVER moved. All input uses:
+          - Win32 clipboard API for text (no user interaction)
+          - AttachThreadInput + SetFocus on Chrome render widget (no cursor)
+          - PostMessage WM_LBUTTONDOWN/UP to give Chromium DOM focus to input (no cursor)
+          - keybd_event for Ctrl+V paste (keyboard only, no mouse)
+          - keybd_event Enter (keyboard only, no mouse)
+          - UIA InvokePattern Send button as fallback (pure COM)
+
+        Key discovery: SetFocus on the Chrome render widget gives it Win32 keyboard
+        focus, but Chromium manages its own internal DOM focus separately. If the DOM
+        focus is on the output/response area (not the input box), keybd_event Ctrl+V
+        pastes into the wrong element (or nowhere). PostMessage WM_LBUTTONDOWN/UP to
+        the render widget at the input area coordinates forces Chromium to set DOM
+        focus on the chat input — all without moving the user's physical cursor.
         """
         old_clip = self.get_clipboard()
-        self.set_clipboard(text)
+        if not self.set_clipboard(text):
+            return False
         time.sleep(0.2)
 
-        # Get window position for relative coordinate calculations
-        rect = ctypes.wintypes.RECT()
-        GetWindowRect(hwnd, ctypes.byref(rect))
-        gx, gy = rect.left, rect.top
+        # Verify clipboard was set correctly
+        verify = self.get_clipboard()
+        if not verify or verify[:50] != text[:50]:
+            time.sleep(0.1)
+            self.set_clipboard(text)
+            time.sleep(0.2)
 
-        # Step 1: Click input area via hardware click (cursor returns to original pos)
-        self.hardware_click(gx + 465, gy + 415, pause=0.3)
+        # Find Chrome render widget for direct focus
+        render = self._find_render(hwnd)
+        target = render or hwnd
 
-        # Step 2: Ctrl+V via keybd_event (paste — no mouse cursor movement)
+        # Attach our thread to the target's input queue
+        my_tid = k32.GetCurrentThreadId()
+        target_tid = u32.GetWindowThreadProcessId(target, None)
+        attached = False
+        if my_tid != target_tid:
+            attached = bool(u32.AttachThreadInput(my_tid, target_tid, True))
+
+        # Bring window to foreground and set focus on render widget
         SetForegroundWindow(hwnd)
         time.sleep(0.15)
+        if render:
+            u32.SetFocus(render)
+        time.sleep(0.15)
+
+        # CRITICAL: PostMessage click to input area gives Chromium DOM focus
+        # to the chat input element. Without this, keybd_event Ctrl+V may paste
+        # into the output area or be silently dropped. PostMessage is zero-cursor:
+        # it sends the click message directly to the render widget without
+        # moving the user's physical mouse.
+        if render:
+            self._focus_chat_input(hwnd, render)
+            time.sleep(0.15)
+
+        # Ctrl+V via keybd_event (keyboard only — user's cursor stays put)
         u32.keybd_event(VK_CONTROL, 0, 0, 0)
-        time.sleep(0.05)
+        time.sleep(0.03)
         u32.keybd_event(VK_V, 0, 0, 0)
-        time.sleep(0.05)
+        time.sleep(0.03)
         u32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
-        time.sleep(0.05)
+        time.sleep(0.03)
         u32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
         time.sleep(0.3)
 
-        # Step 3: Enter via keybd_event (works for first prompt in fresh window)
+        # Submit: Enter via keybd_event (keyboard only, no mouse)
         u32.keybd_event(VK_RETURN, 0, 0, 0)
         time.sleep(0.05)
         u32.keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0)
         time.sleep(0.5)
 
-        # Step 4: Click Send button via hardware click (fallback for subsequent prompts)
-        # Cursor saves/restores automatically — user's mouse returns to original position
-        self.hardware_click(gx + 880, gy + 453, pause=0.1)
+        # Fallback: try UIA InvokePattern on Send button (pure COM, zero input)
+        self._try_uia_submit(hwnd)
+
+        # Detach thread input
+        if attached:
+            u32.AttachThreadInput(my_tid, target_tid, False)
 
         # Restore clipboard
         try:
@@ -482,6 +515,43 @@ class ShadowInput:
             SetForegroundWindow(restore_focus)
 
         return True
+
+    def _focus_chat_input(self, hwnd: int, render: int) -> None:
+        """PostMessage click to the chat input area inside the Chrome render widget.
+
+        This gives Chromium's DOM focus to the chat input element without moving
+        the user's physical cursor. The coordinates are calculated relative to
+        the render widget's bounding rectangle.
+
+        The input area in a 930x500 Copilot CLI window is approximately at:
+          - X: center of window (width/2)
+          - Y: ~85px from the bottom (height - 85)
+        """
+        rect = ctypes.wintypes.RECT()
+        if not GetWindowRect(render, ctypes.byref(rect)):
+            return
+        rw = rect.right - rect.left
+        rh = rect.bottom - rect.top
+        if rw <= 0 or rh <= 0:
+            return
+        # Input area: horizontally centered, ~85px from bottom
+        input_x = rw // 2
+        input_y = rh - 85
+        lparam = _make_lparam(input_x, input_y)
+        PostMessageW(render, WM_LBUTTONDOWN, MK_LBUTTON, lparam)
+        time.sleep(0.05)
+        PostMessageW(render, WM_LBUTTONUP, 0, lparam)
+
+    def _try_uia_submit(self, hwnd: int) -> bool:
+        """Try submitting via UIA InvokePattern on Send/Submit button.
+
+        Pure COM call — zero mouse, zero keyboard, zero cursor movement.
+        Tries multiple possible button names.
+        """
+        for name in ["Send", "Submit", "Send Message", "Send (Enter)"]:
+            if self.invoke_button(hwnd, name):
+                return True
+        return False
 
     # ─── UIA InvokePattern ────────────────────────────────────────
 
