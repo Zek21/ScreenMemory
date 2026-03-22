@@ -258,41 +258,73 @@ class ShadowInput:
     def set_clipboard(self, text: str) -> bool:
         """Set clipboard text via Win32 API (no pyperclip needed)."""
         data = text.encode('utf-16-le') + b'\x00\x00'
-        u32.OpenClipboard(0)
-        u32.EmptyClipboard()
-        k32.GlobalAlloc.restype = ctypes.c_void_p
-        h = k32.GlobalAlloc(0x0042, len(data))
-        p = k32.GlobalLock(h)
-        ctypes.cdll.msvcrt.memcpy(p, data, len(data))
-        k32.GlobalUnlock(h)
-        u32.SetClipboardData(CF_UNICODETEXT, h)
-        u32.CloseClipboard()
-        return True
+        if not u32.OpenClipboard(0):
+            return False
+        try:
+            u32.EmptyClipboard()
+            # Proper 64-bit pointer handling
+            _GlobalAlloc = k32.GlobalAlloc
+            _GlobalAlloc.restype = ctypes.c_void_p
+            _GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+            _GlobalLock = k32.GlobalLock
+            _GlobalLock.restype = ctypes.c_void_p
+            _GlobalLock.argtypes = [ctypes.c_void_p]
+            _GlobalUnlock = k32.GlobalUnlock
+            _GlobalUnlock.argtypes = [ctypes.c_void_p]
+            _SetClipboardData = u32.SetClipboardData
+            _SetClipboardData.restype = ctypes.c_void_p
+            _SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+
+            h = _GlobalAlloc(0x0042, len(data))  # GMEM_MOVEABLE | GMEM_ZEROINIT
+            if not h:
+                return False
+            p = _GlobalLock(h)
+            if not p:
+                k32.GlobalFree(h)
+                return False
+            ctypes.memmove(p, data, len(data))
+            _GlobalUnlock(h)
+            _SetClipboardData(CF_UNICODETEXT, h)
+            return True
+        except Exception:
+            return False
+        finally:
+            u32.CloseClipboard()
 
     def get_clipboard(self) -> str:
         """Get clipboard text via Win32 API."""
-        u32.OpenClipboard(0)
+        if not u32.OpenClipboard(0):
+            return ""
         try:
-            h = u32.GetClipboardData(CF_UNICODETEXT)
+            _GetClipboardData = u32.GetClipboardData
+            _GetClipboardData.restype = ctypes.c_void_p
+            _GetClipboardData.argtypes = [ctypes.c_uint]
+            _GlobalLock = k32.GlobalLock
+            _GlobalLock.restype = ctypes.c_void_p
+            _GlobalLock.argtypes = [ctypes.c_void_p]
+            _GlobalUnlock = k32.GlobalUnlock
+            _GlobalUnlock.argtypes = [ctypes.c_void_p]
+
+            h = _GetClipboardData(CF_UNICODETEXT)
             if not h:
                 return ""
-            p = k32.GlobalLock(h)
+            p = _GlobalLock(h)
             if not p:
                 return ""
             text = ctypes.wstring_at(p)
-            k32.GlobalUnlock(h)
+            _GlobalUnlock(h)
             return text
+        except Exception:
+            return ""
         finally:
             u32.CloseClipboard()
 
     def paste_to_render(self, parent_hwnd: int) -> bool:
-        """Send Ctrl+V to the Chrome render widget via keybd_event.
+        """Send Ctrl+V to the target window via keybd_event.
 
-        Focuses the render widget briefly, sends Ctrl+V, then returns.
+        Focuses the window briefly, sends Ctrl+V, then returns.
         Does NOT move the mouse cursor.
         """
-        render = self._find_render(parent_hwnd)
-        target = render or parent_hwnd
         SetForegroundWindow(parent_hwnd)
         time.sleep(0.15)
         # Ctrl+V via keybd_event (works for Chromium)
@@ -399,20 +431,27 @@ class ShadowInput:
     # ─── Chrome Render Widget Discovery ───────────────────────────
 
     def _find_render(self, parent_hwnd: int) -> Optional[int]:
-        """Find Chrome_RenderWidgetHostHWND child window."""
-        results: List[int] = []
+        """Find Chrome_RenderWidgetHostHWND child window.
 
-        def _enum_cb(child, _lp):
-            buf = ctypes.create_unicode_buffer(256)
-            GetClassNameW(child, buf, 256)
-            if buf.value.startswith("Chrome_RenderWidgetHost"):
-                results.append(child)
-                return False
-            return True
-
-        cb = WNDENUMPROC(_enum_cb)
-        EnumChildWindows(parent_hwnd, cb, 0)
-        return results[0] if results else None
+        Uses FindWindowExW loop instead of EnumChildWindows callback
+        to avoid access violations in subprocess contexts.
+        """
+        if not IsWindow(parent_hwnd):
+            return None
+        try:
+            child = 0
+            target_class = "Chrome_RenderWidgetHostHWND"
+            for _ in range(100):  # safety limit
+                child = u32.FindWindowExW(parent_hwnd, child, target_class, None)
+                if not child:
+                    break
+                if u32.IsWindowVisible(child):
+                    return child
+            # If no visible one found, try any match
+            child = u32.FindWindowExW(parent_hwnd, 0, target_class, None)
+            return child if child else None
+        except Exception:
+            return None
 
     # ─── Window Management ────────────────────────────────────────
 
