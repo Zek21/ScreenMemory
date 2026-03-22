@@ -354,18 +354,67 @@ class ShadowInput:
         """Set clipboard, paste into window, submit with Enter.
 
         Complete text input without moving the mouse cursor.
-        Restores focus to restore_focus HWND if provided.
+        Steps:
+            1. Save clipboard, set new text
+            2. Find Chrome render widget inside VS Code window
+            3. PostMessage click at input area coords (focuses Chromium textarea — no cursor movement)
+            4. AttachThreadInput + SetFocus on render widget (reliable OS-level focus)
+            5. keybd_event Ctrl+V (paste — no cursor movement)
+            6. keybd_event Enter (submit — no cursor movement)
+            7. Detach thread, restore clipboard, restore focus
         """
         old_clip = self.get_clipboard()
         self.set_clipboard(text)
         time.sleep(0.2)
 
-        # Focus + paste
-        self.paste_to_render(hwnd)
+        render = self._find_render(hwnd)
+        target = render or hwnd
+
+        # Step 1: PostMessage click at input area to focus the textarea in Chromium
+        # Input area is approximately at center-bottom of the worker window
+        # We use coords relative to the render widget
+        if render:
+            rect = ctypes.wintypes.RECT()
+            GetWindowRect(hwnd, ctypes.byref(rect))
+            gx, gy = rect.left, rect.top
+            # Input area at (gx + 465, gy + 415) in screen coords
+            input_pt = ctypes.wintypes.POINT(gx + 465, gy + 415)
+            ScreenToClient(render, ctypes.byref(input_pt))
+            lp = _make_lparam(input_pt.x, input_pt.y)
+            PostMessageW(render, WM_LBUTTONDOWN, MK_LBUTTON, lp)
+            time.sleep(0.05)
+            PostMessageW(render, WM_LBUTTONUP, 0, lp)
+            time.sleep(0.3)
+
+        # Step 2: AttachThreadInput + SetFocus for reliable keyboard delivery
+        my_tid = k32.GetCurrentThreadId()
+        target_tid = u32.GetWindowThreadProcessId(target, None)
+        attached = u32.AttachThreadInput(my_tid, target_tid, True)
+
+        SetForegroundWindow(hwnd)
+        time.sleep(0.15)
+        u32.SetFocus(target)
+        time.sleep(0.15)
+
+        # Step 3: Ctrl+V via keybd_event (paste — no mouse cursor movement)
+        u32.keybd_event(VK_CONTROL, 0, 0, 0)
+        time.sleep(0.05)
+        u32.keybd_event(VK_V, 0, 0, 0)
+        time.sleep(0.05)
+        u32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+        time.sleep(0.05)
+        u32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
         time.sleep(0.3)
 
-        # Submit
-        self.submit_enter(hwnd)
+        # Step 4: Enter via keybd_event (submit — no mouse cursor movement)
+        u32.keybd_event(VK_RETURN, 0, 0, 0)
+        time.sleep(0.05)
+        u32.keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0)
+
+        # Detach thread input
+        if attached:
+            u32.AttachThreadInput(my_tid, target_tid, False)
+
         time.sleep(0.5)
 
         # Restore clipboard
@@ -374,7 +423,7 @@ class ShadowInput:
         except Exception:
             pass
 
-        # Restore focus
+        # Restore focus to orchestrator
         if restore_focus and IsWindow(restore_focus):
             SetForegroundWindow(restore_focus)
 
