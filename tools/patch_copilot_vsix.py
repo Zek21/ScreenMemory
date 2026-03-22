@@ -2,7 +2,7 @@
 """
 VSIX Patcher for GitHub Copilot Chat Extension
 ================================================
-Applies 7 surgical patches to make Copilot CLI mode work properly:
+Applies 8 surgical patches to make Copilot CLI mode work properly:
 
 PATCH 1 — cli.js: Disable Statsig feature gate that blocks bypass permissions
 PATCH 2 — extension.js: Make canUseTool() auto-approve all tool calls (no Apply dialogs)
@@ -11,6 +11,7 @@ PATCH 4 — cli.js: Enable stream watchdog (prevents infinite hang on dropped SS
 PATCH 5 — cli.js: Reduce stream idle timeout (30s hard timeout instead of 60s)
 PATCH 6 — cli.js: Reduce stall detection threshold (15s instead of 30s)
 PATCH 7 — extension.js: Add 5-minute total timeout to task status polling loop
+PATCH 8 — extension.js: Fix auth dialog respawn in new windows (prevent globalState reset)
 
 Usage:
     python tools/patch_copilot_vsix.py              # Auto-detect extension dir
@@ -529,6 +530,113 @@ def patch_polling_timeout(ext_dir, verify_only=False):
     return True
 
 
+def patch_auth_dialog_respawn(ext_dir, verify_only=False):
+    """
+    PATCH 8: Fix permissive auth dialog respawning in every new window.
+
+    ROOT CAUSE: The extension's askToUpgradeAuthPermissions flow has a race
+    condition. When a new VS Code window opens, auth sessions are briefly empty
+    during initialization. The registerListeners handler sees anyGitHubSession
+    as null and RESETS the copilot.shownPermissiveTokenModal globalState key
+    to false. Once the session loads moments later, the extension sees a basic
+    session without permissive scope and re-shows the "Connect to GitHub" dialog.
+
+    This causes EVERY new window (including Skynet worker windows) to spawn
+    a login dialog, even though the user already signed in.
+
+    The fix: Remove the globalState reset so the "already prompted" flag
+    persists across windows. The user is still prompted ONCE on first use.
+    After they accept or dismiss, the flag stays true and new windows skip
+    the dialog. The manual trigger (Account menu) still works.
+
+    This is NOT circumventing authentication — the user still authenticates
+    once, and the permissive upgrade is still available via:
+    - Account menu in VS Code
+    - Command: github.copilot.chat.triggerPermissiveSignIn
+
+    FIND:    this._extensionContext.globalState.update(gN.AUTH_UPGRADE_ASK_KEY,!1)
+    REPLACE: void 0/*PATCHED:prevent_auth_dialog_respawn*/
+    """
+    ext_path = os.path.join(ext_dir, "dist", "extension.js")
+    if not os.path.isfile(ext_path):
+        print("PATCH 8 [extension.js]: FILE NOT FOUND")
+        return False
+
+    content = open(ext_path, "r", encoding="utf-8", errors="replace").read()
+
+    PATCHED_MARKER = "PATCHED:prevent_auth_dialog_respawn"
+    if PATCHED_MARKER in content:
+        print("PATCH 8 [extension.js]: ALREADY APPLIED \u2713")
+        return True
+
+    # The exact minified pattern in the registerListeners handler:
+    # if(!this._authenticationService.anyGitHubSession){
+    #   this._extensionContext.globalState.update(gN.AUTH_UPGRADE_ASK_KEY,!1);
+    #   return}
+    # We need to find the globalState.update call with !1 (false) for the
+    # AUTH_UPGRADE_ASK_KEY. The class name gN may vary across builds.
+    # Strategy: find the pattern via the surrounding context.
+
+    # First try exact known pattern from current build
+    ORIGINAL = 'this._extensionContext.globalState.update(gN.AUTH_UPGRADE_ASK_KEY,!1)'
+    PATCHED = 'void 0/*PATCHED:prevent_auth_dialog_respawn*/'
+
+    if ORIGINAL in content:
+        if verify_only:
+            print("PATCH 8 [extension.js]: NOT APPLIED -- needs patching")
+            return False
+        backup_file(ext_path)
+        content = content.replace(ORIGINAL, PATCHED, 1)
+        open(ext_path, "w", encoding="utf-8").write(content)
+        print("PATCH 8 [extension.js]: APPLIED \u2713 (auth dialog respawn fix)")
+        return True
+
+    # Fallback: regex for different class variable names
+    # Pattern: this._extensionContext.globalState.update(XX.AUTH_UPGRADE_ASK_KEY,!1)
+    pattern = re.search(
+        r'this\._extensionContext\.globalState\.update\((\w+)\.AUTH_UPGRADE_ASK_KEY,!1\)',
+        content,
+    )
+    if pattern:
+        original = pattern.group(0)
+        if verify_only:
+            print(f"PATCH 8 [extension.js]: NOT APPLIED -- needs patching (class: {pattern.group(1)})")
+            return False
+        backup_file(ext_path)
+        content = content.replace(original, PATCHED, 1)
+        open(ext_path, "w", encoding="utf-8").write(content)
+        print(f"PATCH 8 [extension.js]: APPLIED \u2713 (class: {pattern.group(1)})")
+        return True
+
+    # Last fallback: search for shownPermissiveTokenModal reset
+    pattern2 = re.search(
+        r'globalState\.update\([^,]+,!1\)',
+        content,
+    )
+    if pattern2:
+        # Verify it's the auth key by checking context
+        idx = pattern2.start()
+        context = content[max(0, idx - 200):idx + 100]
+        if 'anyGitHubSession' in context and 'permissiveGitHubSession' in context:
+            original = pattern2.group(0)
+            if verify_only:
+                print("PATCH 8 [extension.js]: NOT APPLIED -- needs patching (fallback match)")
+                return False
+            backup_file(ext_path)
+            content = content.replace(original, PATCHED.replace('globalState.update(', ''), 1)
+            open(ext_path, "w", encoding="utf-8").write(content)
+            print("PATCH 8 [extension.js]: APPLIED \u2713 (fallback match)")
+            return True
+
+    print("PATCH 8 [extension.js]: PATTERN NOT FOUND -- extension may have changed")
+    # Help debugging
+    idx = content.find("AUTH_UPGRADE_ASK_KEY")
+    if idx >= 0:
+        snippet = content[max(0, idx - 100):idx + 100]
+        print(f"  Found AUTH_UPGRADE_ASK_KEY at offset {idx}: ...{snippet[:160]}...")
+    return False
+
+
 def revert_patches(ext_dir):
     """Revert all patches from .bak backups."""
     files = ["dist/cli.js", "dist/extension.js", "package.json"]
@@ -571,6 +679,7 @@ def main():
     results.append(patch_stream_timeout(ext_dir, verify_only=args.verify))
     results.append(patch_stall_threshold(ext_dir, verify_only=args.verify))
     results.append(patch_polling_timeout(ext_dir, verify_only=args.verify))
+    results.append(patch_auth_dialog_respawn(ext_dir, verify_only=args.verify))
 
     total = len(results)
     print()
