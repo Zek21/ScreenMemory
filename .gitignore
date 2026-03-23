@@ -1,77 +1,55 @@
-# Credentials and secrets
-.env
-*.key
-keystore.dat
-data/secrets.json
+# ===================================================================
+# SECURITY-CRITICAL .gitignore — ScreenMemory is a RESEARCH project
+# Only README.md, requirements.txt, and paper checklist are public.
+# EVERYTHING else is internal implementation — NOT open source.
+# ===================================================================
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-dist/
-build/
-*.egg
+# Block EVERYTHING by default
+*
 
-# Databases
-*.db
-*.db-shm
-*.db-wal
-*.sqlite
-
-# Data directory -- exclude ALL runtime state and config (SECURITY: no internal files public)
+# Whitelist ONLY public files
+!.gitignore
+!README.md
+!requirements.txt
+!data/
 data/*
-!data/.gitkeep
 !data/paper_final_checklist.md
 
-# Skynet operational protocol -- NEVER commit publicly
-AGENTS.md
-
-# Skynet internal architecture docs -- NEVER commit publicly
-docs/DELIVERY_PIPELINE.md
-docs/DAEMON_ARCHITECTURE.md
-docs/BUS_COMMUNICATION.md
-docs/SELF_AWARENESS_ARCHITECTURE.md
-docs/SKYNET_ARCHITECTURE_OVERVIEW.md
-docs/SKYNET_API.md
-docs/SKYNET_TOOLS.md
-docs/SKYNET_MANUAL.md
-docs/WORKER_BOOT_PROCEDURE.txt
-
-# Logs
+# Block all directories explicitly (defense in depth)
+docs/
+.github/
+Skynet/
+tools/
+core/
+tests/
+ui/
 logs/
-!logs/.gitkeep
-!logs/__init__.py
-
-# Screenshots (runtime captures)
 screenshots/
-!screenshots/.gitkeep
-
-# Runtime PID/state files
-*.pid
-
-# IDE
-.vscode/
-*.swp
-*.swo
-
-# OS
-Thumbs.db
-Desktop.ini
-.DS_Store
-
-# Node
+data/
+__pycache__/
 node_modules/
-
-# Chrome bridge dist/proof artifacts
-tools/chrome_bridge/dist/proof/chrome-profile/
-tools/chrome_bridge/server-live.log
-
-# Playwright MCP logs
-tools/.playwright-mcp/
-
-# Lance vector DB
 *.lance/
+.vscode/
 
-# Chrome CDP non-default user data (Chrome v146+ requires this for --remote-debugging-port)
-data/chrome_cdp_userdata/
+# Block all sensitive file types
+*.py
+*.ps1
+*.go
+*.exe
+*.bak
+*.bak2
+*.html
+*.json
+*.pid
+*.db
+*.sqlite
+*.key
+*.pem
+*.png
+*.txt
+*.md
+
+# Re-whitelist the specific safe files (override blocks above)
+!.gitignore
+!README.md
+!requirements.txt
