@@ -254,6 +254,146 @@ def audit_deprecated_usage() -> list[tuple[str, int, str, str]]:
 
     return results
 
+# ─── Semantic Content Validation (INCIDENT 020 defense) ──────────────────────
+
+# Patterns that MUST exist in the boot script (pyautogui for Chromium overlays)
+_REQUIRED_PATTERNS = {
+    "pyautogui_import": {
+        "pattern": r"^\s*import\s+pyautogui",
+        "description": "pyautogui must be imported (INCIDENT 013: only hardware-level input reaches Chromium overlays)",
+    },
+    "pyperclip_import": {
+        "pattern": r"^\s*import\s+pyperclip",
+        "description": "pyperclip must be imported for clipboard save/restore",
+    },
+    "pyautogui_click": {
+        "pattern": r"pyautogui\.click\s*\(",
+        "description": "pyautogui.click() must be used for Chromium dropdown interactions",
+    },
+    "pyautogui_press": {
+        "pattern": r"pyautogui\.press\s*\(",
+        "description": "pyautogui.press() must be used for dropdown navigation",
+    },
+    "pyautogui_hotkey": {
+        "pattern": r"pyautogui\.hotkey\s*\(",
+        "description": "pyautogui.hotkey() must be used for clipboard paste (Ctrl+V)",
+    },
+}
+
+# Patterns that MUST NOT exist (Win32 methods that cannot reach Chromium overlays)
+_FORBIDDEN_PATTERNS = {
+    "shadow_input_import": {
+        "pattern": r"(?:from\s+tools\.shadow_input\s+import|import\s+.*shadow_input)",
+        "description": "shadow_input uses PostMessage/keybd_event which CANNOT reach Chromium overlays (INCIDENT 013)",
+    },
+    "postmessage_click": {
+        "pattern": r"PostMessage.*WM_LBUTTONDOWN",
+        "description": "PostMessage WM_LBUTTONDOWN cannot click Chromium-rendered dropdowns (INCIDENT 013)",
+    },
+    "keybd_event_nav": {
+        "pattern": r"keybd_event.*(?:VK_DOWN|VK_UP|VK_RETURN)",
+        "description": "keybd_event cannot navigate Chromium quickpick overlays (INCIDENT 013)",
+    },
+    "sendinput_usage": {
+        "pattern": r"SendInput\s*\(",
+        "description": "SendInput cannot interact with Chromium-rendered VS Code overlays",
+    },
+}
+
+
+def validate_boot_content(alert_bus: bool = False) -> tuple[bool, dict]:
+    """Semantic validation of boot script content.
+
+    Ensures the boot script uses pyautogui (hardware-level input) for
+    Chromium overlay interactions, NOT Win32 PostMessage/keybd_event.
+
+    This check exists because of INCIDENT 020: a worker replaced pyautogui
+    with shadow_input (PostMessage/keybd_event), which CANNOT interact with
+    Chromium-rendered VS Code dropdowns (proven by INCIDENT 013). The hash
+    guard was useless because the worker updated the hash after rewriting.
+
+    Returns (ok, details) with per-check results.
+    """
+    boot_script = ROOT / AUTHORIZED_BOOT_SCRIPT
+    details: dict = {
+        "boot_script_exists": boot_script.is_file(),
+        "required_missing": [],
+        "forbidden_found": [],
+    }
+
+    if not boot_script.is_file():
+        details["required_missing"].append({
+            "check": "file_exists",
+            "description": "Boot script file is missing entirely",
+        })
+        if alert_bus:
+            _post_semantic_alert(details)
+        return False, details
+
+    try:
+        source = boot_script.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        details["required_missing"].append({
+            "check": "file_readable",
+            "description": f"Cannot read boot script: {e}",
+        })
+        return False, details
+
+    ok = True
+
+    # Check required patterns
+    for name, spec in _REQUIRED_PATTERNS.items():
+        if not re.search(spec["pattern"], source, re.MULTILINE):
+            details["required_missing"].append({
+                "check": name,
+                "description": spec["description"],
+            })
+            ok = False
+
+    # Check forbidden patterns (skip comments)
+    source_lines = source.splitlines()
+    for name, spec in _FORBIDDEN_PATTERNS.items():
+        rx = re.compile(spec["pattern"], re.IGNORECASE)
+        for lineno, line in enumerate(source_lines, 1):
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue  # skip comments
+            if rx.search(line):
+                details["forbidden_found"].append({
+                    "check": name,
+                    "description": spec["description"],
+                    "line": lineno,
+                    "text": line.strip(),
+                })
+                ok = False
+
+    if not ok and alert_bus:
+        _post_semantic_alert(details)
+
+    return ok, details
+
+
+def _post_semantic_alert(details: dict):
+    """POST a CRITICAL semantic violation alert to the Skynet bus."""
+    try:
+        from tools.skynet_spam_guard import guarded_publish
+        missing = [m["check"] for m in details.get("required_missing", [])]
+        forbidden = [f["check"] for f in details.get("forbidden_found", [])]
+        parts = []
+        if missing:
+            parts.append(f"MISSING: {','.join(missing)}")
+        if forbidden:
+            parts.append(f"FORBIDDEN: {','.join(forbidden)}")
+        guarded_publish({
+            "sender": "boot_guard",
+            "topic": "orchestrator",
+            "type": "alert",
+            "content": f"BOOT_SEMANTIC_VIOLATION (INCIDENT 020): {'; '.join(parts)}",
+        })
+    except Exception:
+        pass
+
+
 # ─── Boot Log ────────────────────────────────────────────────────────────────
 
 def log_boot_attempt(
@@ -397,10 +537,45 @@ def _cmd_update_hash(args):
     print(f"  Timestamp        : {record['last_verified']}")
 
 
+def _cmd_semantic(args):
+    ok, details = validate_boot_content(alert_bus=args.alert)
+
+    if ok:
+        print("BOOT SEMANTIC CHECK: OK")
+        print("  All required patterns present (pyautogui, pyperclip)")
+        print("  No forbidden patterns found (shadow_input, PostMessage)")
+    else:
+        print("!! BOOT SEMANTIC CHECK: FAILED !!")
+        print("  INCIDENT 013/020: Boot script MUST use pyautogui for Chromium overlays.")
+        print()
+        for m in details.get("required_missing", []):
+            print(f"  [MISSING] {m['check']}: {m['description']}")
+        for f in details.get("forbidden_found", []):
+            print(f"  [FORBIDDEN] {f['check']} at line {f['line']}: {f['description']}")
+            print(f"              {f['text']}")
+        print()
+        print("  Win32 PostMessage/keybd_event/SendInput CANNOT reach Chromium overlays.")
+        print("  Only pyautogui (hardware-level input) works. See INCIDENT 013.")
+        sys.exit(1)
+
+
 def _cmd_status(args):
     print("=" * 60)
     print("  BOOT GUARD STATUS REPORT")
     print("=" * 60)
+
+    # Semantic check (INCIDENT 020 — highest priority)
+    print()
+    print("--- Semantic Content Check (INCIDENT 020) ---")
+    sem_ok, sem_details = validate_boot_content(alert_bus=False)
+    if sem_ok:
+        print("  Status: OK — pyautogui confirmed, no forbidden Win32 input methods")
+    else:
+        print("  Status: !! FAILED !!")
+        for m in sem_details.get("required_missing", []):
+            print(f"    [MISSING] {m['check']}: {m['description']}")
+        for f in sem_details.get("forbidden_found", []):
+            print(f"    [FORBIDDEN] {f['check']} L{f['line']}: {f['text']}")
 
     # Integrity
     print()
@@ -476,6 +651,10 @@ def main():
     # audit
     sub.add_parser("audit", help="Scan for deprecated boot method usage")
 
+    # semantic
+    p_sem = sub.add_parser("semantic", help="Validate boot script uses pyautogui (INCIDENT 020)")
+    p_sem.add_argument("--alert", action="store_true", help="POST alert to bus on violation")
+
     # log
     p_log = sub.add_parser("log", help="Show recent boot log entries")
     p_log.add_argument("--limit", type=int, default=20, help="Number of entries to show")
@@ -501,6 +680,8 @@ def main():
         _cmd_verify(args)
     elif args.command == "audit":
         _cmd_audit(args)
+    elif args.command == "semantic":
+        _cmd_semantic(args)
     elif args.command == "log":
         _cmd_log(args)
     elif args.command == "status":

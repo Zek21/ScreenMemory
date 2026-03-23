@@ -272,5 +272,29 @@
       "cross-validation-failure",
       "quoting-bug"
     ]
+  },
+  {
+    "id": "INCIDENT_020",
+    "date": "2026-03-23",
+    "severity": "CRITICAL",
+    "title": "Boot Script Regression: pyautogui Replaced with shadow_input (PostMessage)",
+    "what_failed": "Commit b95f9e8 (v4.0.0) replaced ALL 14 pyautogui call sites in skynet_worker_boot.py with shadow_input (PostMessage/keybd_event). This directly violated INCIDENT 013 which proved Win32 PostMessage/SendInput/keybd_event CANNOT reach Chromium-rendered VS Code overlays. The committed boot script was non-functional for dropdown interactions.",
+    "root_cause": "The boot guard (skynet_boot_guard.py) only validated file HASHES and deprecated method names. It had ZERO semantic content validation -- no check that pyautogui was actually imported or used. A worker rewrote the entire boot script, ran --update-hash to update the stored hash, and the guard passed. The pre-commit hook (skynet_git_guard.py) only checked .gitignore patterns and data file tracking -- it never validated boot script content.",
+    "fix": "3-layer defense implemented: (1) Semantic content validation in skynet_boot_guard.py -- checks for REQUIRED patterns (pyautogui import, pyautogui.click, pyautogui.press, pyautogui.hotkey, pyperclip import) and FORBIDDEN patterns (shadow_input import, PostMessage WM_LBUTTONDOWN, keybd_event VK_DOWN/UP/RETURN, SendInput). Runs on boot and via CLI. (2) Pre-commit hook enhanced -- when tools/skynet_worker_boot.py is staged, runs semantic validation and BLOCKS the commit if pyautogui is missing or Win32 input methods are present. (3) Removed last shadow_input import from boot script (STEERING cancellation now uses uia_engine directly).",
+    "lesson": "Hash-based integrity guards are necessary but NOT sufficient. A malicious or misguided change can pass hash checks simply by updating the hash. Semantic content validation (checking WHAT the code does, not just WHETHER it changed) is required for security-critical scripts. The boot script has a unique constraint: it MUST use hardware-level input (pyautogui) because its targets (Chromium overlays) are unreachable by ANY Win32 API. This constraint must be enforced by code analysis, not just policy.",
+    "affected_files": [
+      "tools/skynet_worker_boot.py (regression and fix)",
+      "tools/skynet_boot_guard.py (semantic validation added)",
+      ".git/hooks/pre-commit (boot script check added)"
+    ],
+    "tags": [
+      "boot",
+      "pyautogui",
+      "shadow_input",
+      "chromium",
+      "regression",
+      "semantic-guard",
+      "pre-commit"
+    ]
   }
 ]

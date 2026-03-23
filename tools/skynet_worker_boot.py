@@ -589,11 +589,11 @@ def step6_dispatch_identity(name: str, hwnd: int, gx: int, gy: int, orch_hwnd: i
             if not _wait_for_idle(hwnd, name, timeout=60):
                 log(f"  WARNING: {name} still not IDLE, dispatching anyway")
         elif state == 'STEERING':
-            log(f"  {name} is STEERING -- cancelling...")
+            log(f"  {name} is STEERING -- cancelling via UIA InvokePattern...")
             try:
-                from tools.shadow_input import ShadowInput
-                si = ShadowInput()
-                si.invoke_button(hwnd, "Cancel (Alt+Backspace)")
+                from tools.uia_engine import get_engine
+                engine = get_engine()
+                engine.cancel_generation(hwnd)
             except Exception:
                 pass
             time.sleep(2)
