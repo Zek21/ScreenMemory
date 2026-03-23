@@ -677,7 +677,7 @@ def get_worker_state_uia(hwnd):
     return get_engine().get_state(hwnd)
 
 
-def wait_for_idle_uia(hwnd, timeout=60, poll_interval=2.0):
+def wait_for_idle_uia(hwnd, timeout=600, poll_interval=5.0):
     """Poll worker state via COM UIA engine until IDLE or timeout. Returns True if became IDLE."""
     from tools.uia_engine import get_engine
     engine = get_engine()
@@ -2733,7 +2733,7 @@ def _scan_bus_messages_for_key(msgs, key_lower, seen_ids):
 
 
 def _wait_via_realtime_file(key_lower, seen_ids, deadline, realtime_path):
-    """Poll data/realtime.json at 0.5s resolution for a matching message."""
+    """Poll data/realtime.json at 2s resolution for a matching message."""
     while time.time() < deadline:
         try:
             with open(realtime_path, "r", encoding="utf-8") as f:
@@ -2744,7 +2744,7 @@ def _wait_via_realtime_file(key_lower, seen_ids, deadline, realtime_path):
                 return match
         except (json.JSONDecodeError, OSError, ValueError, TypeError) as e:
             pass  # Transient file read errors during polling — retry next cycle  # signed: beta
-        time.sleep(0.5)
+        time.sleep(2.0)
     return None
 
 
@@ -2764,14 +2764,15 @@ def _wait_via_http_polling(key_lower, seen_ids, deadline, poll, skynet_url):
     return None
 
 
-def wait_for_bus_result(key, timeout=90, poll=2.0, skynet_url="http://localhost:8420",
+def wait_for_bus_result(key, timeout=600, poll=5.0, skynet_url="http://localhost:8420",
                         auto_recover=True, _original_task=None):
     """Block until a bus message matching `key` (substring in content or sender) appears.
 
     Returns the matching message dict, or None on timeout.
     Tries file-based realtime wait first (0.5s resolution via data/realtime.json),
-    falls back to HTTP polling (2.0s resolution) if realtime daemon is not running.
+    falls back to HTTP polling (5.0s resolution) if realtime daemon is not running.
     If auto_recover=True and timeout is reached, cancels stuck workers and retries once.
+    Default timeout is 600s (10 minutes) — workers must be given adequate time.
     """
     if not key or not key.strip():
         log("wait_for_bus_result called with empty key — returning None", "ERR")  # signed: beta
@@ -2822,13 +2823,13 @@ def wait_for_bus_result(key, timeout=90, poll=2.0, skynet_url="http://localhost:
 
 
 def _try_cancel_and_wait_idle(engine, hwnd, wname):
-    """Cancel generation on a worker and wait up to 3s for IDLE. Returns True if worker became IDLE."""
+    """Cancel generation on a worker and wait up to 30s for IDLE. Returns True if worker became IDLE."""
     try:
         engine.cancel_generation(int(hwnd))
     except Exception as e:
         log(f"Auto-recover: cancel failed for {wname.upper()}: {e}", "ERR")
         return False
-    idle_deadline = time.time() + 3.0
+    idle_deadline = time.time() + 30.0
     while time.time() < idle_deadline:
         if engine.get_state(int(hwnd)) == "IDLE":
             return True

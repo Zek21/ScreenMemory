@@ -1090,7 +1090,7 @@ _worker_productivity: dict = {}  # name -> {tasks_completed, first_seen, last_re
 _idle_since: dict = {}           # name -> epoch when IDLE streak started
 _idle_unproductive_last: dict = {}  # name -> {signature, timestamp}
 _health_trend: collections.deque = collections.deque(maxlen=200)  # bounded trend snapshots
-_IDLE_UNPRODUCTIVE_THRESHOLD = 300  # 5 minutes idle with pending work = unproductive
+_IDLE_UNPRODUCTIVE_THRESHOLD = 600  # 10 minutes idle with pending work = unproductive (raised from 300s)
 IDLE_UNPRODUCTIVE_DEDUP_WINDOW = 3600  # suppress unchanged idle-backlog blame alerts for 1 hour
 _MAX_HEALTH_TREND = 200            # kept for reference; deque maxlen enforces this
 

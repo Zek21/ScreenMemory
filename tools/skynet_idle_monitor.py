@@ -176,8 +176,8 @@ def dispatch_self_invoke(worker_name):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--timeout", type=float, default=12.0, help="Hours to run")
-    parser.add_argument("--interval", type=int, default=30, help="Poll interval seconds")
-    parser.add_argument("--cooldown", type=int, default=120,
+    parser.add_argument("--interval", type=int, default=60, help="Poll interval seconds")
+    parser.add_argument("--cooldown", type=int, default=600,
                         help="Min seconds between redispatches to same worker")
     args = parser.parse_args()
 

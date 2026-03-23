@@ -231,8 +231,8 @@ def consume_all() -> list:
     return new_ids
 
 
-def wait(key: str, timeout: float = 90) -> dict | None:
-    """Block until a result matching key appears. Polls FILE every 0.5s."""
+def wait(key: str, timeout: float = 600) -> dict | None:
+    """Block until a result matching key appears. Polls FILE every 2s."""
     consumed = _read_consumed()
     deadline = time.time() + timeout
     print(f"{C_CYAN}Waiting for result matching '{key}' (timeout {timeout}s)...{C_RESET}")
@@ -263,11 +263,12 @@ def wait(key: str, timeout: float = 90) -> dict | None:
                         pass
                 return m
 
-        time.sleep(0.5)
+        time.sleep(2.0)
 
     # Bus HTTP fallback: if realtime.json had no match, try live bus  # signed: delta
     try:
         import urllib.request
+        import urllib.error  # signed: beta
         r = urllib.request.urlopen(f"{SKYNET}/bus/messages?limit=20", timeout=3)
         fallback_msgs = json.loads(r.read())
         if isinstance(fallback_msgs, list):
@@ -290,8 +291,10 @@ def wait(key: str, timeout: float = 90) -> dict | None:
                         except Exception:
                             pass
                     return m
-    except Exception:
-        pass  # signed: delta
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as e:
+        print(f"{C_DIM}[DEBUG] Bus fallback failed: {type(e).__name__}: {e}{C_RESET}", file=sys.stderr)  # signed: beta
+    except json.JSONDecodeError as e:
+        print(f"{C_DIM}[DEBUG] Bus response not valid JSON: {e}{C_RESET}", file=sys.stderr)  # signed: beta
 
     print(f"{C_RED}Timeout waiting for '{key}'.{C_RESET}")
     return None
@@ -319,8 +322,13 @@ def _scan_bus_for_results(workers: list, consumed: set, results: dict):
     return newly_found
 
 
-def wait_all(workers: list | None = None, timeout: float = 120, non_blocking: bool = False) -> dict:
-    """Block until ALL specified workers have posted results since last consume_all."""
+def wait_all(workers: list | None = None, timeout: float = 600, non_blocking: bool = False) -> tuple[dict, bool]:
+    """Block until ALL specified workers have posted results since last consume_all.
+
+    Returns:
+        (results_dict, all_complete) -- results_dict maps worker name to message,
+        all_complete is True only if every requested worker responded before timeout.
+    """  # signed: beta
     if workers is None:
         workers = ["alpha", "beta", "gamma", "delta"]
 
@@ -337,13 +345,17 @@ def wait_all(workers: list | None = None, timeout: float = 120, non_blocking: bo
                 print(f"  {C_GREEN}{w.upper()}{C_RESET}: {(results[w].get('content', ''))[:60]}")
         if missing:
             print(f"{C_GOLD}Still waiting: {', '.join(missing)}{C_RESET}")
-        return results
+        return results, len(missing) == 0
 
     return _poll_until_all(workers, consumed, results, timeout)
 
 
-def _poll_until_all(workers: list, consumed: set, results: dict, timeout: float) -> dict:
-    """Poll bus until all workers respond or timeout."""
+def _poll_until_all(workers: list, consumed: set, results: dict, timeout: float) -> tuple[dict, bool]:
+    """Poll bus until all workers respond or timeout.
+
+    Returns:
+        (results_dict, all_complete) -- all_complete is False on timeout with missing workers.
+    """  # signed: beta
     deadline = time.time() + timeout
     print(f"{C_CYAN}Waiting for results from: {', '.join(workers)} (timeout {timeout}s)...{C_RESET}")
 
@@ -354,12 +366,12 @@ def _poll_until_all(workers: list, consumed: set, results: dict, timeout: float)
 
         if all(w in results for w in workers):
             print(f"{C_GREEN}All {len(workers)} workers responded.{C_RESET}")
-            return results
-        time.sleep(0.5)
+            return results, True
+        time.sleep(2.0)
 
     missing = [w for w in workers if w not in results]
     print(f"{C_RED}Timeout. Missing: {', '.join(missing)}{C_RESET}")
-    return results
+    return results, False
 
 
 def health():
@@ -439,7 +451,7 @@ def bus_messages(n: int = 10):
 
 # ── Dispatch Integration ──────────────────────────────────────────
 
-def dispatch_and_wait(worker: str, task: str, timeout: float = 90) -> dict | None:
+def dispatch_and_wait(worker: str, task: str, timeout: float = 600) -> dict | None:
     """Dispatch to a worker and wait for result.
     1. consume_all() to clear old results
     2. Dispatch via skynet_dispatch.py CLI
@@ -464,13 +476,13 @@ def dispatch_and_wait(worker: str, task: str, timeout: float = 90) -> dict | Non
     return wait(worker, timeout)
 
 
-def dispatch_parallel_and_wait(task: str, timeout: float = 120) -> dict:
+def dispatch_parallel_and_wait(task: str, timeout: float = 600) -> tuple[dict, bool]:
     """Dispatch to all workers in parallel and wait for all results.
     1. consume_all()
     2. Dispatch via --parallel
     3. wait_all(timeout)
-    4. Return dict of worker -> result
-    """
+    4. Return (dict of worker -> result, all_complete bool)
+    """  # signed: beta
     consume_all()
 
     cmd = [sys.executable, str(ROOT / "tools" / "skynet_dispatch.py"),
@@ -480,10 +492,10 @@ def dispatch_parallel_and_wait(task: str, timeout: float = 120) -> dict:
                               cwd=str(ROOT), encoding='utf-8', errors='replace')  # signed: delta
         if proc.returncode != 0:
             print(f"{C_RED}Parallel dispatch failed: {proc.stderr[:200]}{C_RESET}")
-            return {}
+            return {}, False
     except subprocess.TimeoutExpired:
         print(f"{C_RED}Parallel dispatch timed out.{C_RESET}")
-        return {}
+        return {}, False
 
     return wait_all(timeout=timeout)
 
@@ -505,10 +517,10 @@ def _build_realtime_parser():
 
     p_wait = sub.add_parser("wait", help="Wait for a result matching key")
     p_wait.add_argument("key", help="Key to match (worker name, keyword)")
-    p_wait.add_argument("--timeout", type=float, default=90)
+    p_wait.add_argument("--timeout", type=float, default=600)
 
     p_wa = sub.add_parser("wait-all", help="Wait for all workers to respond")
-    p_wa.add_argument("--timeout", type=float, default=120)
+    p_wa.add_argument("--timeout", type=float, default=600)
     p_wa.add_argument("--workers", nargs="*", default=None)
     p_wa.add_argument("--non-blocking", action="store_true",
                        help="Return immediately with current state instead of blocking")
@@ -521,11 +533,11 @@ def _build_realtime_parser():
     p_dw = sub.add_parser("dispatch-wait", help="Dispatch to worker and wait")
     p_dw.add_argument("--worker", required=True)
     p_dw.add_argument("--task", required=True)
-    p_dw.add_argument("--timeout", type=float, default=90)
+    p_dw.add_argument("--timeout", type=float, default=600)
 
     p_dpw = sub.add_parser("dispatch-parallel-wait", help="Dispatch to all and wait")
     p_dpw.add_argument("--task", required=True)
-    p_dpw.add_argument("--timeout", type=float, default=120)
+    p_dpw.add_argument("--timeout", type=float, default=600)
 
     return parser
 

@@ -680,8 +680,8 @@ Institutional memory for Skynet. Every incident is stored in `data/incidents.jso
 ### INCIDENT 004 -- Gamma Stuck PROCESSING on Simple ACK
 - **What:** Gamma entered PROCESSING state on a simple ACK/dispatch-test task and remained stuck for 10+ minutes. The orchestrator waited repeatedly, burning turns, with no result.
 - **Root cause:** No auto-cancel mechanism existed. `wait_for_bus_result()` would timeout and give up, but never cancelled the stuck generation. `skynet_monitor.py` only alerted on dead windows, not stuck workers. PROCESSING was assumed to mean "working" -- it didn't.
-- **Fix:** (1) `skynet_monitor.py` now detects PROCESSING > 180s and auto-cancels via `uia_engine.cancel_generation(hwnd)`. (2) `wait_for_bus_result()` in `skynet_dispatch.py` auto-cancels on timeout and re-dispatches once. (3) Stuck Worker Auto-Recovery section added to AGENTS.md.
-- **Rule:** PROCESSING > 180s = stuck, not working. Auto-cancel and re-dispatch.
+- **Fix:** (1) `skynet_monitor.py` now detects PROCESSING > 600s (10 minutes) and auto-cancels via `uia_engine.cancel_generation(hwnd)`. (2) `wait_for_bus_result()` in `skynet_dispatch.py` auto-cancels on timeout and re-dispatches once. (3) Stuck Worker Auto-Recovery section added to AGENTS.md.
+- **Rule:** PROCESSING > 600s (10 minutes) = stuck. Auto-cancel and re-dispatch. Do NOT cancel before 10 minutes — workers need time to think and execute.
 
 ### INCIDENT 005 -- Orchestrator Manual Bootstrap Failure
 - **What:** Orchestrator manually moved worker windows with `ctypes`, called `fix_model` directly, and blast-dispatched to all workers simultaneously.
@@ -924,22 +924,32 @@ Manual polling wastes orchestrator turns (each `Start-Sleep` burns a full respon
 
 ## Stuck Worker Auto-Recovery
 
-PROCESSING does NOT mean working. A worker stuck in PROCESSING is dead weight.
+PROCESSING does NOT mean working. A worker stuck in PROCESSING is dead weight. However, **workers MUST be given a full 10 minutes before being considered stuck.** Premature cancellation and re-dispatch wastes resources and triggers abuse detection. The orchestrator must use `--wait-result` or `orch_realtime.py dispatch-wait` instead of blind polling loops.
 
 ### Detection Rules
 
 | Task Type | Stuck Threshold | Action |
 |-----------|----------------|--------|
-| Simple (ACK, status check, file read) | > 120s | Auto-cancel via UIA |
-| Standard (code edit, analysis, test) | > 180s | Auto-cancel via UIA |
-| Complex (multi-file refactor, full audit) | > 300s | Alert orchestrator, manual review |
+| ALL tasks (no exceptions) | > 600s (10 min) | Auto-cancel via UIA |
+
+**There is ONE threshold: 10 minutes. No task-type differentiation.** Workers are intelligent Claude Opus 4.6 instances — they need time to think, read files, and execute. Cancelling at 120s or 180s causes cascading re-dispatches that waste resources.
+
+### Anti-Polling Rule (MANDATORY)
+
+**The orchestrator MUST NOT poll worker states in a loop.** Instead:
+1. Use `python tools/orch_realtime.py dispatch-wait --worker NAME --task "task" --timeout 600` — blocks intelligently
+2. Use `python tools/skynet_dispatch.py --worker NAME --task "task" --wait-result KEY --timeout 600` — dispatch + wait
+3. Use `python tools/skynet_brain_dispatch.py "goal"` — auto handles everything
+4. **NEVER** use `Start-Sleep` + `Invoke-RestMethod` polling loops
+5. **NEVER** re-dispatch to a different worker because the first one "didn't respond" within 90 seconds
+6. **ONE dispatch per task.** If a worker doesn't respond in 10 minutes, THEN try another worker. Not before.
 
 ### Auto-Recovery Pipeline
 
-1. `skynet_monitor.py` detects PROCESSING > 180s on any worker
+1. `skynet_monitor.py` detects PROCESSING > 600s (10 minutes) on any worker
 2. Calls `uia_engine.cancel_generation(hwnd)` to invoke the Cancel button via UIA InvokePattern
 3. Waits for state transition to IDLE (polls every 2s, max 30s)
-4. Posts recovery event to bus: `{sender: "monitor", topic: "orchestrator", type: "alert", content: "STUCK_RECOVERED: worker was stuck 200s, auto-cancelled"}`
+4. Posts recovery event to bus: `{sender: "monitor", topic: "orchestrator", type: "alert", content: "STUCK_RECOVERED: worker was stuck >600s, auto-cancelled"}`
 5. Worker is now IDLE and available for re-dispatch
 
 ### Dispatch Wait Auto-Recovery
@@ -951,7 +961,7 @@ PROCESSING does NOT mean working. A worker stuck in PROCESSING is dead weight.
 
 ### Anti-Pattern: Assuming PROCESSING = Working
 
-**NEVER assume a worker in PROCESSING is making progress.** If a simple task (ACK, status check, single file read) shows PROCESSING for > 120s, the worker is stuck -- not thinking deeply. The correct response is always: cancel and re-dispatch.
+**Workers MUST be given a full 10 minutes (600s) before being considered stuck.** Do NOT cancel and re-dispatch before 10 minutes. Do NOT poll in a loop checking if a worker is done. Use `--wait-result` with a 600s timeout instead. Re-dispatching the same task to multiple workers because "the first one didn't respond" within 90 seconds is the #1 cause of wasted resources and abuse detection triggers.
 
 ## Self-Awareness
 

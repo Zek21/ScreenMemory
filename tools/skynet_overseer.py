@@ -89,17 +89,17 @@ def _hidden_check_output(args, **kwargs):
 PYTHON, _DAEMON_ENV = _resolve_real_python()
 
 # Thresholds
-IDLE_STALL_S = 180       # IDLE >3min with pending TODOs = STALLED  # signed: delta
-PROCESSING_STUCK_S = 300 # PROCESSING >5min = POTENTIALLY_STUCK
-DELIVERY_TIMEOUT_S = 180 # dispatched >3min with no result = UNDELIVERED
-BUS_SILENCE_S = 300      # 0 messages in 5min while PROCESSING = suspicious
+IDLE_STALL_S = 600       # IDLE >10min with pending TODOs = STALLED (raised from 180s — workers need time to finish)
+PROCESSING_STUCK_S = 600 # PROCESSING >10min = POTENTIALLY_STUCK (raised from 300s — no premature cancellation)
+DELIVERY_TIMEOUT_S = 600 # dispatched >10min with no result = UNDELIVERED (raised from 180s)
+BUS_SILENCE_S = 600      # 0 messages in 10min while PROCESSING = suspicious (raised from 300s)
 
 # Intervals
-WORKER_SCAN_INTERVAL = 30
-TASK_VERIFY_INTERVAL = 60
-SERVICE_CHECK_INTERVAL = 60
-BUS_SCAN_INTERVAL = 30
-REPORT_INTERVAL = 300  # 5 minutes
+WORKER_SCAN_INTERVAL = 60
+TASK_VERIFY_INTERVAL = 120
+SERVICE_CHECK_INTERVAL = 120
+BUS_SCAN_INTERVAL = 60
+REPORT_INTERVAL = 600  # 10 minutes
 
 user32 = ctypes.windll.user32
 
