@@ -119,7 +119,7 @@
     "title": "HardwareEnter Focus Theft -- Stuck Unsubmitted Prompt in Beta",
     "date": "2026-03-19",
     "severity": "HIGH",
-    "status": "OPEN",
+    "status": "RESOLVED",
     "affected_worker": "beta",
     "affected_hwnd": 5638328,
     "symptom": "V8 paper revision task text visible in Beta input box but NEVER SUBMITTED. dispatch_log shows success=True result_received=False.",
@@ -182,7 +182,8 @@
       "300ms_gap_is_vulnerability_window": "The 300ms Sleep between Ctrl+V and HardwareEnter exists to let Chromium process the paste. But any dialog/overlay/internal focus shift during this window causes Enter to go to wrong target.",
       "apply_dialog_steals_focus": "VS Code Apply dialog (file diff review) is rendered at top of Copilot CLI window. It competes with chat input for Chromium internal keyboard focus. Particularly dangerous during paste operations.",
       "idle_idle_is_ambiguous": "IDLE->IDLE after polling means EITHER (a) message submitted and processed fast OR (b) Enter never reached chat input. Cannot distinguish without checking input text state."
-    }
+    },
+    "resolution_note": "FIX_B (IDLE->IDLE false positive) applied at skynet_dispatch.py L2147-2151,L2177-2180 as part of INCIDENT_018 fix. Retry logic at L1969-1993 handles unverified delivery correctly. PostMessageEnter (FIX_A) also applied for CHROME_RENDER paths. Closed 2026-03-23."
   },
   {
     "id": "INCIDENT_018",
@@ -271,35 +272,5 @@
       "cross-validation-failure",
       "quoting-bug"
     ]
-  },
-  {
-    "id": "auto_restart_bus_persist_restart_1774004485",
-    "timestamp": "2026-03-20T19:01:25",
-    "what_happened": "Service bus_persist_restart died (PID 20972)",
-    "root_cause": "Service process exited or became unresponsive",
-    "fix_applied": "Watchdog auto-restarted service (new PID 15676)",
-    "rule_created": "Auto-restart on health check failure"
-  },
-  {
-    "id": "bus_persist_restart",
-    "timestamp": "2026-03-20T19:01:27.413926",
-    "old_pid": 20972,
-    "new_pid": 15676,
-    "type": "auto_restart"
-  },
-  {
-    "id": "auto_restart_bus_persist_restart_1774007058",
-    "timestamp": "2026-03-20T19:44:18",
-    "what_happened": "Service bus_persist_restart died (PID 0)",
-    "root_cause": "Service process exited or became unresponsive",
-    "fix_applied": "Watchdog auto-restarted service (new PID 6584)",
-    "rule_created": "Auto-restart on health check failure"
-  },
-  {
-    "id": "bus_persist_restart",
-    "timestamp": "2026-03-20T19:44:20.930196",
-    "old_pid": 0,
-    "new_pid": 6584,
-    "type": "auto_restart"
   }
 ]
