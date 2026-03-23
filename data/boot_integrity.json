@@ -1,7 +1,0 @@
-{
-  "boot_script_hash": "c506ac6769c65a516796c25440147008b9d9931a27eae771401562f240091df3",
-  "procedure_doc_hash": "0fdffb076e6de699d146e3a8956fc966059ef782981f8f21a46a70889d8f411c",
-  "last_verified": "2026-03-23T08:02:18",
-  "last_updated_by": "orchestrator",
-  "update_reason": "INCIDENT 020: removed shadow_input import from STEERING handler, replaced with uia_engine"
-}

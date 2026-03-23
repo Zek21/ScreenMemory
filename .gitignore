@@ -19,20 +19,24 @@ build/
 *.db-wal
 *.sqlite
 
-# Data directory -- exclude all runtime state, whitelist config
-# NOTE: Use data/* (not data/) so negation patterns work. Git ignores
-# negations when the parent DIRECTORY is excluded (data/) but honors
-# them when only the directory CONTENTS are excluded (data/*).
+# Data directory -- exclude ALL runtime state and config (SECURITY: no internal files public)
 data/*
 !data/.gitkeep
-!data/agent_profiles.json
-!data/boot_protocol.json
-!data/brain_config.json
-!data/critical_processes.json
-!data/incidents.json
-!data/level4_architecture.md
-!data/skynet_bootstrap.md
-!data/version_history.json
+!data/paper_final_checklist.md
+
+# Skynet operational protocol -- NEVER commit publicly
+AGENTS.md
+
+# Skynet internal architecture docs -- NEVER commit publicly
+docs/DELIVERY_PIPELINE.md
+docs/DAEMON_ARCHITECTURE.md
+docs/BUS_COMMUNICATION.md
+docs/SELF_AWARENESS_ARCHITECTURE.md
+docs/SKYNET_ARCHITECTURE_OVERVIEW.md
+docs/SKYNET_API.md
+docs/SKYNET_TOOLS.md
+docs/SKYNET_MANUAL.md
+docs/WORKER_BOOT_PROCEDURE.txt
 
 # Logs
 logs/
