@@ -20,6 +20,7 @@ Usage:
 
 import json
 import os
+import re
 import sys
 import time
 import ctypes
@@ -31,6 +32,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Global lock to serialize clipboard operations (SetText + Ctrl+V)
 # Without this, parallel dispatch corrupts clipboard between threads
 _dispatch_lock = threading.Lock()
+
+# Module-level dispatch counter for fairness check throttling  # signed: alpha
+_dispatch_count = 0
 
 # Cross-process named Mutex for clipboard isolation.
 # threading.Lock only protects within a single Python process. If multiple
@@ -77,7 +81,7 @@ if hasattr(sys.stdout, 'reconfigure'):
     try: sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     except Exception: pass
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Reflexion hook — learns from dispatch failures, injects past lessons  # signed: alpha
 try:
@@ -1998,7 +2002,72 @@ def dispatch_to_worker(worker_name, task, workers=None, orch_hwnd=None, context=
         else:
             _reset_dispatch_failures(worker_name)  # signed: beta
 
+    # Post-dispatch fairness check every 10 dispatches  # signed: alpha
+    global _dispatch_count
+    _dispatch_count += 1
+    if _dispatch_count % 10 == 0:
+        try:
+            check_dispatch_fairness()
+        except Exception:
+            pass  # Non-critical — never block dispatch on fairness logging
+
     return ok
+
+
+def check_dispatch_fairness():
+    """Read dispatch_log.json, calculate per-worker task %, warn if any worker
+    deviates more than 10% from fair share (25% for 4 workers).
+    Posts DISPATCH_FAIRNESS_WARNING to bus when deviation detected."""  # signed: alpha
+    try:
+        log_path = DATA_DIR / "dispatch_log.json"
+        if not log_path.exists():
+            return
+        entries = json.loads(log_path.read_text(encoding="utf-8"))
+        if not isinstance(entries, list) or len(entries) < 4:
+            return  # Too few entries to judge fairness
+        # Count dispatches per worker (only successful ones)
+        counts = {}
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            if not e.get("success", False):
+                continue
+            name = e.get("worker", e.get("target", ""))
+            if name:
+                counts[name] = counts.get(name, 0) + 1
+        total = sum(counts.values())
+        if total < 4:
+            return
+        n_workers = len(counts) if counts else 4
+        fair_share = 1.0 / max(1, n_workers)
+        deviation_found = False
+        details = []
+        for worker, count in sorted(counts.items()):
+            pct = count / total
+            deviation = abs(pct - fair_share)
+            if deviation > 0.10:
+                deviation_found = True
+                direction = "OVER" if pct > fair_share else "UNDER"
+                detail = f"{worker}={pct:.0%}({direction},Δ={deviation:.0%})"
+                details.append(detail)
+                log(
+                    f"⚠ FAIRNESS: {worker} has {pct:.0%} of dispatches "
+                    f"({direction}-represented, fair={fair_share:.0%}, Δ={deviation:.0%})",
+                    "WARN"
+                )
+        if deviation_found:  # signed: alpha
+            try:
+                from tools.skynet_spam_guard import guarded_publish
+                guarded_publish({
+                    'sender': 'system',
+                    'topic': 'orchestrator',
+                    'type': 'alert',
+                    'content': f'DISPATCH_FAIRNESS_WARNING: {"; ".join(details)} (total={total})'
+                })
+            except Exception as pub_err:
+                log(f"Fairness alert publish failed: {pub_err}", "WARN")
+    except Exception as e:
+        log(f"Fairness check error: {e}", "WARN")
 
 
 def _verify_delivery(hwnd, worker_name, pre_state, timeout_s=8):
@@ -2471,14 +2540,67 @@ def scan_all_states(workers=None):
     return {name: r.state for name, r in results.items()}
 
 
+def _recent_dispatch_counts(window_minutes=60, last_n_entries=50):
+    """Count successful dispatches per worker from recent log entries.  # signed: beta
+
+    Uses a dual filter: takes the last *last_n_entries* entries from
+    dispatch_log.json, then further filters to those within *window_minutes*.
+    Returns {worker_name: count}.  Workers who received more recent
+    dispatches get higher counts and therefore lower fairness scores.
+    """
+    try:
+        log_data = json.loads(DISPATCH_LOG.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(log_data, list):
+        return {}
+    # Take only the last N entries (most recent are at end)  # signed: beta
+    if last_n_entries and last_n_entries > 0:
+        log_data = log_data[-last_n_entries:]
+    cutoff = datetime.now() - timedelta(minutes=window_minutes)
+    counts = {}
+    for entry in log_data:
+        ts_str = entry.get("timestamp", "")
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except (ValueError, TypeError):
+            continue
+        if ts >= cutoff and entry.get("success", False):
+            worker = entry.get("worker", "")
+            if worker:
+                counts[worker] = counts.get(worker, 0) + 1
+    return counts
+
+
+def _fairness_score(worker_name, dispatch_counts):
+    """Score 0.0 (most dispatched recently) to 1.0 (least dispatched recently).
+
+    Workers with fewer recent dispatches get higher fairness scores,
+    breaking the alpha-always-first bias inherent in stable sorting.
+    """  # signed: beta
+    if not dispatch_counts:
+        return 1.0
+    max_count = max(dispatch_counts.values()) if dispatch_counts else 0
+    if max_count == 0:
+        return 1.0
+    worker_count = dispatch_counts.get(worker_name, 0)
+    return 1.0 - (worker_count / max_count)
+
+
 def _load_routing_config():
-    """Load expertise_weight and load_weight from brain_config.json."""
+    """Load expertise_weight, load_weight, fairness_weight, and window settings from brain_config.json.  # signed: beta"""
     try:
         bc = json.loads((DATA_DIR / "brain_config.json").read_text(encoding="utf-8"))
         routing = bc.get("routing", {})
-        return routing.get("expertise_weight", 0.6), routing.get("load_weight", 0.4)
+        return (
+            routing.get("expertise_weight", 0.5),
+            routing.get("load_weight", 0.3),
+            routing.get("fairness_weight", 0.2),
+            routing.get("fairness_window_minutes", 60),
+            routing.get("fairness_last_n_entries", 50),
+        )
     except (json.JSONDecodeError, OSError, KeyError, UnicodeDecodeError):  # signed: beta
-        return 0.6, 0.4
+        return 0.25, 0.40, 0.35, 60, 50  # signed: gamma — match brain_config.json
 
 
 def _load_worker_profiles():
@@ -2492,12 +2614,17 @@ def _load_worker_profiles():
 
 
 def _expertise_score(worker_name, task_lower, task_words, profiles):
-    """Score 0.0 (no match) to 1.0 (perfect match) based on specializations."""
+    """Score 0.0 (no match) to 1.0 (perfect match) based on specializations.
+    Uses word-boundary regex to prevent false positives like 'ui' matching 'building'.
+    """  # signed: gamma
     profile = profiles.get(worker_name, {})
     specs = profile.get("specializations", [])
     if not specs:
         return 0.0
-    matches = sum(1 for s in specs if s.lower() in task_lower or any(s.lower() in w for w in task_words))
+    matches = sum(
+        1 for s in specs
+        if re.search(r'\b' + re.escape(s.lower()) + r'\b', task_lower)
+    )  # signed: gamma
     return min(1.0, matches / max(1, len(specs) * 0.3))
 
 
@@ -2514,10 +2641,14 @@ def _load_score(worker_name, states, bus_statuses):
 def smart_dispatch(task, workers=None, orch_hwnd=None, n_workers=1, use_resilience=False):
     """Auto-route task to the best available worker(s).
 
-    Uses expertise-aware routing: score = expertise_match * expertise_weight + inverse_load * load_weight.
+    Uses fairness-aware routing:  # signed: beta
+      score = expertise * expertise_weight + inverse_load * load_weight + fairness * fairness_weight
+    Fairness penalizes workers who received disproportionately many recent dispatches.
+    Random shuffle before stable sort breaks alphabetical tie bias.
     use_resilience: If True, uses resilient_dispatch_to_worker for single-worker
                     dispatch and passes resilience flag to dispatch_parallel. # signed: alpha
     """
+    import random  # signed: beta
     if not workers:
         workers = load_workers()
     if not orch_hwnd:
@@ -2525,24 +2656,40 @@ def smart_dispatch(task, workers=None, orch_hwnd=None, n_workers=1, use_resilien
 
     states = scan_all_states(workers)
     bus_statuses = get_worker_statuses()
-    expertise_weight, load_weight = _load_routing_config()
+    expertise_weight, load_weight, fairness_weight, fairness_window, fairness_n = _load_routing_config()
     profiles = _load_worker_profiles()
+    dispatch_counts = _recent_dispatch_counts(fairness_window, last_n_entries=fairness_n)  # signed: beta
     task_lower = task.lower()
     task_words = set(task_lower.split())
+
+    # Check if all expertise scores tie at zero -- use round-robin fallback  # signed: beta
+    all_exp_zero = all(
+        _expertise_score(w["name"], task_lower, task_words, profiles) == 0.0
+        for w in workers
+    )
 
     def _combined_score(worker):
         name = worker["name"]
         exp = _expertise_score(name, task_lower, task_words, profiles)
         load = 1.0 - _load_score(name, states, bus_statuses)
-        return exp * expertise_weight + load * load_weight
+        fair = _fairness_score(name, dispatch_counts)  # signed: beta
+        if all_exp_zero:
+            # Round-robin fallback: only fairness and load matter  # signed: beta
+            return load * 0.4 + fair * 0.6
+        return exp * expertise_weight + load * load_weight + fair * fairness_weight
 
-    ranked = sorted(workers, key=lambda w: -_combined_score(w))
+    # Random shuffle before stable sort breaks alphabetical tie bias  # signed: beta
+    shuffled = list(workers)
+    random.shuffle(shuffled)
+    ranked = sorted(shuffled, key=lambda w: -_combined_score(w))
 
+    routing_mode = "round-robin" if all_exp_zero else "expertise"  # signed: beta
     for w in ranked[:4]:
         name = w["name"]
         exp = _expertise_score(name, task_lower, task_words, profiles)
         load = _load_score(name, states, bus_statuses)
-        log(f"smart_route: {name} exp={exp:.2f} load={load:.2f} combined={_combined_score(w):.2f} state={states.get(name, '?')}")
+        fair = _fairness_score(name, dispatch_counts)  # signed: beta
+        log(f"smart_route({routing_mode}): {name} exp={exp:.2f} load={load:.2f} fair={fair:.2f} combined={_combined_score(w):.2f} state={states.get(name, '?')}")
 
     selected = [w for w in ranked if states.get(w["name"]) == "IDLE"][:n_workers]
     if not selected:
@@ -2800,6 +2947,12 @@ def dispatch_to_idle(task, exclude=None, workers=None, orch_hwnd=None):
     if not idle:
         log("No idle workers available for sub-delegation", "WARN")
         return None
+
+    # Round-robin: pick the idle worker with fewest recent dispatches  # signed: beta
+    import random
+    dispatch_counts = _recent_dispatch_counts(60, last_n_entries=50)
+    random.shuffle(idle)  # break ties randomly before stable sort  # signed: beta
+    idle.sort(key=lambda w: dispatch_counts.get(w, 0))
 
     target = idle[0]
     ok = dispatch_to_worker(target, task, workers, orch_hwnd)

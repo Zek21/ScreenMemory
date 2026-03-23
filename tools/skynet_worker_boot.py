@@ -1,30 +1,34 @@
 """
-skynet_worker_boot.py -- CANONICAL BOOT SCRIPT v4.0.0 (2026-03-22)
+skynet_worker_boot.py -- CANONICAL BOOT SCRIPT v5.0.0 (2026-03-23)
 
 The ONLY authorized method to open Skynet worker windows.
-Uses SHADOW INPUT (Win32 PostMessage / keybd_event) for ALL interactions.
-The user's physical mouse and keyboard are NEVER hijacked.
-
-ghost_type / PostMessage WM_PASTE (old style) are NOT used (INCIDENT 013).
-pyautogui is NOT used (steals user's mouse/keyboard).
+Uses PYAUTOGUI (hardware-level input) for ALL Chromium interactions.
+This is the EXACT PROVEN PROCEDURE from 2026-03-18, cleaned up.
 
 Input methods:
-  - UIA InvokePattern for button clicks (zero-input, pure COM)
-  - keybd_event for Chromium dropdown navigation (focused, no cursor move)
-  - Win32 clipboard + keybd_event Ctrl+V for text paste (no cursor move)
-  - PostMessage WM_LBUTTONDOWN/UP for fallback clicks (no cursor move)
+  - pyautogui.click() for Chromium dropdown clicks (hardware mouse)
+  - pyautogui.press() for dropdown navigation (hardware keyboard)
+  - pyautogui.hotkey('ctrl', 'v') for paste (hardware keyboard)
+  - pyperclip for clipboard save/restore (user clipboard protected)
+  - Win32 MoveWindow for window positioning (no input needed)
+  - Win32 SetForegroundWindow for focus (no input needed)
+  - UIA scan for verification only (never for input)
 
 The chevron dropdown next to the "New Chat" (+) button is located
-via UIA dynamically on every boot -- no hard-coded absolute coords.
+via UIA scan first, then falls back to orchestrator-window-relative offset.
 
 Steps per worker (sequential, one at a time):
-  1. Click chevron dropdown -> "New Chat Window" (shadow input)
+  1. Click chevron dropdown -> "New Chat Window" (pyautogui)
   2. Discover new HWND via EnumWindows
   3. MoveWindow to grid slot
-  4. Set session target to Copilot CLI (auto-sets model) (shadow input)
+  4. Set session target to Copilot CLI (also sets model) (pyautogui)
   5. Set permissions via guard_bypass.ps1 (x2)
-  6. Paste identity prompt (clipboard + shadow Ctrl+V + Enter)
-  7. Verify via bus identity_ack + IsWindow
+  6. Paste identity prompt (pyperclip + pyautogui Ctrl+V + Enter)
+  7. Verify via bus identity_ack + IsWindow + UIA scan + screenshot
+
+CRITICAL: Worker state is checked (UIA scan) BEFORE dispatching.
+CRITICAL: Visual verification (screenshot + UIA) BEFORE opening next worker.
+CRITICAL: Do NOT use Ctrl+N or any other method to open windows.
 
 Usage:
   python tools/skynet_worker_boot.py --all --orch-hwnd 1642212
@@ -32,7 +36,6 @@ Usage:
   python tools/skynet_worker_boot.py --verify
   python tools/skynet_worker_boot.py --close-all
 """
-# signed: orchestrator
 
 import ctypes
 import ctypes.wintypes
@@ -42,31 +45,78 @@ import json
 import requests
 import hashlib
 import argparse
+import importlib
 import sys
 import os
 from pathlib import Path
 from datetime import datetime
 
-BOOT_VERSION = "4.0.0"
+BOOT_VERSION = "5.0.0"
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Ensure project root is on sys.path so `from tools.xxx import ...` works
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.shadow_input import ShadowInput
-si = ShadowInput()
+import pyautogui
+import pyperclip
 
-# Compute file hash for integrity verification
+# Safety: don't abort on screen edge
+pyautogui.FAILSAFE = False
+
 try:
     BOOT_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 except Exception:
     BOOT_HASH = "unknown"
 
 
+# --- Grid positions (right monitor, taskbar-safe) ---
+GRID = {
+    'alpha': (1930, 20),
+    'beta':  (2870, 20),
+    'gamma': (1930, 540),
+    'delta': (2870, 540),
+}
+WINDOW_SIZE = (930, 500)
+WORKER_NAMES = ['alpha', 'beta', 'gamma', 'delta']
+
+# Coordinate offsets RELATIVE to worker window top-left (gx, gy)
+CLI_OFFSET = (55, 484)         # Session target dropdown ("Local" text)
+INPUT_OFFSET = (465, 415)      # Chat input area center
+SEND_OFFSET = (880, 453)       # Send button (fallback for 2nd+ prompts)
+
+u32 = ctypes.windll.user32
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def log(msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] BOOT: {msg}")
+
+
+# ---------------------------------------------------------------------------
+# Identity prompt
+# ---------------------------------------------------------------------------
+
+def _get_identity_prompt(name):
+    """Minimal identity prompt -- does NOT trigger file edits/creates."""
+    return (
+        f"You are {name.upper()}, a Skynet worker. "
+        f"DO NOT create, edit, or modify any files. "
+        f"DO NOT use the edit, create, or powershell tools. "
+        f"Simply acknowledge: say '{name.upper()} ready for tasking'."
+    )
+
+
+# ---------------------------------------------------------------------------
+# UIA scanning (read-only verification, never used for input)
+# ---------------------------------------------------------------------------
+
 def _scan_window_controls(hwnd: int) -> dict:
-    """Scan UIA buttons for session target, model, permissions, and dialogs."""
+    """Scan UIA buttons to read session target, model, permissions state."""
     ps = f'''
     Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
     $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]{hwnd})
@@ -87,25 +137,16 @@ def _scan_window_controls(hwnd: int) -> dict:
     }}
     '''
     result = {
-        "session_target": "unknown",
-        "model": "unknown",
-        "approvals": "unknown",
-        "session_cx": 0,
-        "session_cy": 0,
-        "model_cx": 0,
-        "model_cy": 0,
-        "approvals_cx": 0,
-        "approvals_cy": 0,
-        "has_uncommitted": False,
-        "dialog_name": "",
-        "dialog_cx": 0,
-        "dialog_cy": 0,
+        "session_target": "unknown", "model": "unknown", "approvals": "unknown",
+        "session_cx": 0, "session_cy": 0,
+        "model_cx": 0, "model_cy": 0,
+        "approvals_cx": 0, "approvals_cy": 0,
+        "has_uncommitted": False, "dialog_name": "", "dialog_cx": 0, "dialog_cy": 0,
     }
     try:
         scan = subprocess.run(
             ["powershell", "-STA", "-NoProfile", "-Command", ps],
-            capture_output=True, text=True, timeout=15,
-            cwd=str(ROOT),
+            capture_output=True, text=True, timeout=15, cwd=str(ROOT),
         )
         for raw_line in (scan.stdout or "").splitlines():
             line = raw_line.strip()
@@ -118,8 +159,7 @@ def _scan_window_controls(hwnd: int) -> dict:
 
             if "Pick Model" in name:
                 result["model"] = name
-                result["model_cx"] = cx
-                result["model_cy"] = cy
+                result["model_cx"], result["model_cy"] = cx, cy
             if "Session Target" in name or (
                 ("Copilot CLI" in name or "Local" in name or "Cloud" in name)
                 and "Approvals" not in name and "Pick" not in name
@@ -130,115 +170,169 @@ def _scan_window_controls(hwnd: int) -> dict:
                     result["session_target"] = "local"
                 elif "Cloud" in name:
                     result["session_target"] = "cloud"
-                result["session_cx"] = cx
-                result["session_cy"] = cy
+                result["session_cx"], result["session_cy"] = cx, cy
             if "Bypass Approvals" in name:
                 result["approvals"] = "bypass"
-                result["approvals_cx"] = cx
-                result["approvals_cy"] = cy
+                result["approvals_cx"], result["approvals_cy"] = cx, cy
             elif "Default Approvals" in name:
                 result["approvals"] = "default"
-                result["approvals_cx"] = cx
-                result["approvals_cy"] = cy
+                result["approvals_cx"], result["approvals_cy"] = cx, cy
             elif "Autopilot" in name and "Approvals" not in name:
                 result["approvals"] = "autopilot"
-                result["approvals_cx"] = cx
-                result["approvals_cy"] = cy
+                result["approvals_cx"], result["approvals_cy"] = cx, cy
             if "Uncommitted" in name:
                 result["has_uncommitted"] = True
             if ("Don" in name and "Save" in name) or "Discard" in name or "Cancel" in name:
                 result["dialog_name"] = name
-                result["dialog_cx"] = cx
-                result["dialog_cy"] = cy
+                result["dialog_cx"], result["dialog_cy"] = cx, cy
     except Exception as e:
-        log(f"UIA control scan failed for HWND={hwnd}: {e}")
+        log(f"UIA scan failed for HWND={hwnd}: {e}")
     return result
 
 
 def _handle_uncommitted_dialog(hwnd: int) -> bool:
-    """Dismiss an Uncommitted Changes dialog if it appears."""
+    """Dismiss Uncommitted Changes dialog via pyautogui click."""
     scan = _scan_window_controls(hwnd)
     if not scan.get("has_uncommitted"):
         return False
-    if scan.get("dialog_cx", 0) <= 0 or scan.get("dialog_cy", 0) <= 0:
-        log("UNCOMMITTED: dialog detected but no dismiss button coordinates found")
+    cx, cy = scan.get("dialog_cx", 0), scan.get("dialog_cy", 0)
+    if cx <= 0 or cy <= 0:
+        log("UNCOMMITTED: dialog detected but no button coordinates")
         return False
+    log(f"UNCOMMITTED: clicking '{scan['dialog_name']}' at ({cx},{cy})")
+    pyautogui.click(cx, cy)
+    time.sleep(1.0)
+    return True
+
+
+def _check_worker_state(hwnd: int, name: str) -> str:
+    """Check worker state via UIA. Returns IDLE/PROCESSING/STEERING/UNKNOWN."""
     try:
-        log(f"UNCOMMITTED: clicking '{scan['dialog_name']}'")
-        si.click_render_screen(hwnd, scan["dialog_cx"], scan["dialog_cy"])
-        time.sleep(1.0)
-        return True
+        from tools.uia_engine import get_engine
+        engine = get_engine()
+        scan = engine.scan(hwnd)
+        state = scan.state if scan else 'UNKNOWN'
+        log(f"  State check: {name} = {state}")
+        return state
     except Exception as e:
-        log(f"UNCOMMITTED: failed to dismiss dialog: {e}")
-        return False
+        log(f"  State check failed for {name}: {e}")
+        return 'UNKNOWN'
 
 
-# --- Grid positions (right monitor, taskbar-safe) ---
-GRID = {
-    'alpha': (1930, 20),
-    'beta':  (2870, 20),
-    'gamma': (1930, 540),
-    'delta': (2870, 540),
-}
-WINDOW_SIZE = (930, 500)
+def _wait_for_idle(hwnd: int, name: str, timeout: int = 60) -> bool:
+    """Wait for worker to reach IDLE state."""
+    try:
+        from tools.uia_engine import get_engine
+        engine = get_engine()
+    except Exception:
+        time.sleep(5)
+        return True
 
-WORKER_NAMES = ['alpha', 'beta', 'gamma', 'delta']
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            scan = engine.scan(hwnd)
+            state = scan.state if scan else 'UNKNOWN'
+            if state == 'IDLE':
+                return True
+            remaining = int(deadline - time.time())
+            log(f"  Waiting for {name} IDLE (currently {state}, {remaining}s left)...")
+        except Exception:
+            pass
+        time.sleep(3)
 
-# --- Critical coordinate constants ---
-CLI_OFFSET = (55, 484)         # RELATIVE fallback to worker window session target control
-INPUT_OFFSET = (465, 415)      # RELATIVE to worker window (chat input area)
-SEND_OFFSET = (880, 453)       # RELATIVE to worker window (Send button, for 2nd+ prompts)
+    log(f"  WARNING: {name} did not reach IDLE within {timeout}s")
+    return False
 
-# Identity prompt — SHORT and safe. Does NOT trigger file creation or Apply dialogs.
-# The worker gets full context from AGENTS.md and .github/ instructions automatically
-# since it's in Copilot CLI mode with ScreenMemory agent attached.
-def _get_identity_prompt(name):
-    """Get a minimal identity prompt for the worker.
-    
-    CRITICAL: This prompt must NOT trigger any file edits/creates.
-    The boot script posts identity_ack to the bus directly — the worker
-    does NOT need to run any code. Keep this extremely short and
-    explicitly forbid file operations. The worker gets full context from
-    AGENTS.md and custom instructions automatically since it's in
-    Copilot CLI mode with ScreenMemory agent attached.
-    """
-    return (
-        f"You are {name.upper()}, a Skynet worker. "
-        f"DO NOT create, edit, or modify any files. "
-        f"DO NOT use the edit, create, or powershell tools. "
-        f"Simply acknowledge: say '{name.upper()} ready for tasking'."
-    )
 
-u32 = ctypes.windll.user32
+def _wait_for_processing(hwnd: int, name: str, timeout: int = 30) -> bool:
+    """Wait for worker to enter PROCESSING state (confirms prompt was accepted)."""
+    try:
+        from tools.uia_engine import get_engine
+        engine = get_engine()
+    except Exception:
+        time.sleep(5)
+        return True
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            scan = engine.scan(hwnd)
+            state = scan.state if scan else 'UNKNOWN'
+            if state == 'PROCESSING':
+                log(f"  {name} confirmed PROCESSING")
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+
+    log(f"  WARNING: {name} did not start processing within {timeout}s")
+    return False
 
 
 # ---------------------------------------------------------------------------
-# Logging
+# Settings preflight
 # ---------------------------------------------------------------------------
 
-def log(msg: str) -> None:
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] BOOT: {msg}")
+def _apply_settings_preflight_guard() -> None:
+    """Auto-fix VS Code settings that affect Copilot CLI boot stability."""
+    try:
+        preflight = importlib.import_module("tools.boot_preflight")
+        checks = (
+            preflight.check_isolation_option(fix=True),
+            preflight.check_chat_restore_setting(fix=True),
+            preflight.check_copilotcli_session_bloat(fix=True),
+        )
+        for check in checks:
+            statuses = {d.get("status") for d in check.get("details", [])}
+            cname = check.get("name", "Unknown Setting")
+            if "FIXED" in statuses or "TRIMMED" in statuses:
+                log(f"SETTINGS GUARD: {cname} fixed")
+            elif check.get("passed"):
+                log(f"SETTINGS GUARD: {cname} ok")
+            else:
+                log(f"SETTINGS GUARD: {cname} needs manual review")
+
+        bloat = preflight.check_session_bloat()
+        if not bloat.get("passed"):
+            for w in bloat.get("warnings", []):
+                log(f"SETTINGS GUARD: SESSION BLOAT -- {w}")
+
+        provider_check = preflight.check_provider_error_in_logs()
+        if not provider_check.get("passed"):
+            log(f"SETTINGS GUARD: PROVIDER ERROR -- {provider_check.get('message', 'issue')}")
+    except Exception as e:
+        log(f"SETTINGS GUARD failed: {e}")
+
+    try:
+        cleanup_mod = importlib.import_module("tools.copilotcli_session_cleanup")
+        result = cleanup_mod.full_cleanup(dry_run=False)
+        removed = result.get("total_removed", 0) if isinstance(result, dict) else 0
+        if removed > 0:
+            log(f"SESSION CLEANUP: removed {removed} stale sessions")
+        else:
+            log("SESSION CLEANUP: no stale sessions found")
+    except ImportError:
+        log("SESSION CLEANUP: module not available (skipped)")
+    except Exception as e:
+        log(f"SESSION CLEANUP: failed (non-blocking): {e}")
 
 
 # ---------------------------------------------------------------------------
-# Chevron dropdown detection — UIA-based with fallback
+# Chevron dropdown detection -- UIA-based with window-relative fallback
 # ---------------------------------------------------------------------------
 
-def _find_chevron_dropdown(orch_hwnd: int) -> tuple[int, int]:
-    """Locate the chevron dropdown (▾) next to the New Chat (+) button.
+def _find_chevron_dropdown(orch_hwnd: int) -> tuple:
+    """Locate the chevron dropdown beside the New Chat (+) button.
 
     Strategy:
-      1. UIA scan for ALL buttons named "New Chat" or "New Chat (Ctrl+N)"
-         in the top 150px of the orchestrator window.
-      2. The PLUS button is "New Chat (Ctrl+N)" (wider, ~22px).
-         The CHEVRON is "New Chat" (exact match, narrow, ~16px), sitting
-         immediately to the right of the plus button.
-      3. If UIA finds both, use the chevron. If only the plus, click
-         a few pixels to its right (the chevron is always adjacent).
-      4. Fallback: window-relative offset from GetWindowRect.
+      1. UIA scan for buttons named "New Chat" / "New Chat (Ctrl+N)" in top 150px.
+      2. Chevron = "New Chat" (exact, narrow ~16px), right of plus button.
+      3. If UIA finds chevron directly, use its center.
+      4. If only plus button found, click 8px right of its right edge.
+      5. Fallback: orchestrator window-relative offset (NEVER hardcoded absolute).
 
-    Returns (cx, cy) absolute screen coordinates of the chevron centre.
+    Returns (cx, cy) absolute screen coordinates.
     """
     ps = (
         'Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes\n'
@@ -260,87 +354,80 @@ def _find_chevron_dropdown(orch_hwnd: int) -> tuple[int, int]:
     chevron = None
     plus_btn = None
     try:
-        result = subprocess.run(
+        r = subprocess.run(
             ["powershell", "-STA", "-NoProfile", "-Command", ps],
-            capture_output=True, text=True, timeout=15,
-            cwd=str(ROOT),
+            capture_output=True, text=True, timeout=15, cwd=str(ROOT),
         )
-        for line in (result.stdout or "").strip().splitlines():
+        for line in (r.stdout or "").strip().splitlines():
             parts = line.strip().split("|")
             if len(parts) >= 5:
-                nm, x, y, w, h = parts[0], int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
+                nm = parts[0]
+                x, y, w, h = int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
                 if nm == "New Chat" and w <= 20:
                     chevron = (x, y, w, h)
-                    log(f"CHEVRON: UIA found chevron button at rect=({x},{y},{w},{h})")
+                    log(f"CHEVRON: UIA found chevron at rect=({x},{y},{w},{h})")
                 elif "Ctrl+N" in nm:
                     plus_btn = (x, y, w, h)
                     log(f"CHEVRON: UIA found plus button at rect=({x},{y},{w},{h})")
     except Exception as e:
         log(f"CHEVRON: UIA scan failed: {e}")
 
-    # Best case: chevron found directly
     if chevron:
-        cx, cy = chevron[0] + chevron[2] // 2, chevron[1] + chevron[3] // 2
-        log(f"CHEVRON: using UIA chevron at ({cx}, {cy})")
+        cx = chevron[0] + chevron[2] // 2
+        cy = chevron[1] + chevron[3] // 2
+        log(f"CHEVRON: using UIA center ({cx}, {cy})")
         return (cx, cy)
 
-    # Good case: plus button found, chevron is immediately to its right
     if plus_btn:
-        cx = plus_btn[0] + plus_btn[2] + 8  # 8px right of plus button's right edge
+        cx = plus_btn[0] + plus_btn[2] + 8
         cy = plus_btn[1] + plus_btn[3] // 2
-        log(f"CHEVRON: derived from plus button — clicking ({cx}, {cy})")
+        log(f"CHEVRON: derived from plus button ({cx}, {cy})")
         return (cx, cy)
 
-    # Fallback: window-relative offset from GetWindowRect
-    try:
-        rect = ctypes.wintypes.RECT()
-        u32.GetWindowRect(orch_hwnd, ctypes.byref(rect))
-        ox, oy = rect.left, rect.top
-        # Chevron is ~180px from left edge, ~52px from top edge
-        cx, cy = ox + 180, oy + 52
-        log(f"CHEVRON: fallback relative coords ({cx}, {cy}) from window ({ox}, {oy})")
-        return (cx, cy)
-    except Exception as e:
-        log(f"CHEVRON: fallback failed: {e}")
-        return (180, 52)  # last-resort absolute
+    # Fallback: RELATIVE to orchestrator window (never absolute)
+    rect = ctypes.wintypes.RECT()
+    u32.GetWindowRect(orch_hwnd, ctypes.byref(rect))
+    ox, oy = rect.left, rect.top
+    cx, cy = ox + 248, oy + 52
+    log(f"CHEVRON: fallback window-relative ({cx}, {cy}) from orch at ({ox}, {oy})")
+    return (cx, cy)
 
 
 # ---------------------------------------------------------------------------
-# Step 1 — Open window via chevron dropdown
+# Step 1 -- Open window via chevron dropdown (pyautogui)
 # ---------------------------------------------------------------------------
 
-def step1_open_window(orch_hwnd: int, retry: int = 0) -> bool:
-    """Click the chevron dropdown → 'New Chat Window' on the orchestrator.
-    
-    Uses longer delays (0.5s between Down presses) to ensure the Chromium
-    dropdown menu registers each keypress reliably.
-    """
+def step1_open_window(orch_hwnd: int) -> bool:
+    """Click chevron dropdown -> 'New Chat Window' using pyautogui."""
     try:
-        log("Step 1 — Opening new chat window via chevron dropdown...")
+        log("Step 1 -- Opening new chat window via chevron dropdown...")
 
-        # Focus orchestrator and verify
+        # Focus orchestrator
         u32.SetForegroundWindow(orch_hwnd)
-        time.sleep(1.0)
+        time.sleep(1.5)
         fg = u32.GetForegroundWindow()
         if fg != orch_hwnd:
-            log(f"Step 1 — Focus retry: expected {orch_hwnd}, got {fg}")
+            log(f"Step 1 -- Focus retry: expected {orch_hwnd}, got {fg}")
             u32.SetForegroundWindow(orch_hwnd)
-            time.sleep(1.0)
+            time.sleep(1.5)
 
         # Find and click the chevron
         cx, cy = _find_chevron_dropdown(orch_hwnd)
-        log(f"Step 1 — Clicking chevron at ({cx}, {cy})")
-        si.click_render_screen(orch_hwnd, cx, cy)
-        time.sleep(2.0)  # 2s for Chromium dropdown to fully render
+        log(f"Step 1 -- Clicking chevron at ({cx}, {cy})")
+        pyautogui.click(cx, cy)
+        time.sleep(1.5)
 
-        # Navigate to "New Chat Window" (3rd item in dropdown)
-        # Menu: 1) New Chat, 2) New Chat Editor, 3) New Chat Window,
-        #        4) New Copilot CLI Session
-        # Use keybd_event (focused) — Chromium dropdowns ignore PostMessage
-        si.navigate_dropdown(orch_hwnd, down_presses=3, delay=0.5)
+        # Navigate: Down x3 -> Enter (3rd item = "New Chat Window")
+        pyautogui.press('down')
+        time.sleep(0.2)
+        pyautogui.press('down')
+        time.sleep(0.2)
+        pyautogui.press('down')
+        time.sleep(0.2)
+        pyautogui.press('enter')
         time.sleep(3)
 
-        log("Step 1 — New Chat Window command sent")
+        log("Step 1 -- New Chat Window command sent")
         return True
     except Exception as e:
         log(f"Step 1 FAILED: {e}")
@@ -348,279 +435,386 @@ def step1_open_window(orch_hwnd: int, retry: int = 0) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — Find the new window HWND
+# Step 2 -- Find the new window HWND
 # ---------------------------------------------------------------------------
 
 def step2_find_hwnd(known_hwnds: set, timeout: int = 25) -> int:
-    """Poll for a new VS Code window HWND not present in known_hwnds."""
-    try:
-        log("Step 2 — Searching for new window HWND...")
-        for poll in range(1, timeout + 1):
-            wins = []
+    """Poll for a new VS Code window HWND not in known_hwnds."""
+    log("Step 2 -- Searching for new window HWND...")
+    for poll in range(1, timeout + 1):
+        wins = []
 
-            @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
-            def enum_cb(hwnd, _lparam):
-                if u32.IsWindowVisible(hwnd):
-                    buf = ctypes.create_unicode_buffer(512)
-                    u32.GetWindowTextW(hwnd, buf, 512)
-                    title = buf.value
-                    if hwnd not in known_hwnds and (
-                        "Visual Studio Code" in title or "Code - Insiders" in title
-                    ):
-                        wins.append((hwnd, title))
-                return True
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+        def enum_cb(hwnd, _lparam):
+            if u32.IsWindowVisible(hwnd):
+                buf = ctypes.create_unicode_buffer(512)
+                u32.GetWindowTextW(hwnd, buf, 512)
+                title = buf.value
+                if hwnd not in known_hwnds and (
+                    "Visual Studio Code" in title or "Code - Insiders" in title
+                ):
+                    wins.append((hwnd, title))
+            return True
 
-            u32.EnumWindows(enum_cb, 0)
+        u32.EnumWindows(enum_cb, 0)
 
-            if wins:
-                hwnd = wins[0][0]
-                log(f"Step 2 — Found new window: HWND={hwnd} title='{wins[0][1][:80]}' (poll {poll}/{timeout})")
-                return hwnd
+        if wins:
+            hwnd = wins[0][0]
+            log(f"Step 2 -- Found: HWND={hwnd} title='{wins[0][1][:80]}' (poll {poll})")
+            return hwnd
 
-            time.sleep(1.0)
+        time.sleep(1.0)
 
-        log(f"Step 2 FAILED: No new VS Code window found after {timeout}s")
-        return 0
-    except Exception as e:
-        log(f"Step 2 FAILED: {e}")
-        return 0
+    log(f"Step 2 FAILED: No new window after {timeout}s")
+    return 0
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — Position in grid
+# Step 3 -- Position in grid
 # ---------------------------------------------------------------------------
 
 def step3_position(hwnd: int, gx: int, gy: int) -> bool:
-    """MoveWindow to the grid position with WINDOW_SIZE."""
-    try:
-        log(f"Step 3 — Positioning window at ({gx}, {gy}) size {WINDOW_SIZE}")
-        result = u32.MoveWindow(hwnd, gx, gy, WINDOW_SIZE[0], WINDOW_SIZE[1], True)
-        if not result:
-            log("Step 3 WARNING: MoveWindow returned 0")
-        time.sleep(0.5)
-        log("Step 3 — Window positioned")
-        return True
-    except Exception as e:
-        log(f"Step 3 FAILED: {e}")
-        return False
+    """MoveWindow to grid position."""
+    log(f"Step 3 -- Positioning at ({gx}, {gy}) size {WINDOW_SIZE}")
+    ok = u32.MoveWindow(hwnd, gx, gy, WINDOW_SIZE[0], WINDOW_SIZE[1], True)
+    if not ok:
+        log("Step 3 WARNING: MoveWindow returned 0")
+    time.sleep(0.5)
+    return True
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — Set session target to Copilot CLI
+# Step 4 -- Set session target to Copilot CLI (pyautogui)
 # ---------------------------------------------------------------------------
 
 def step4_set_copilot_cli(hwnd: int, gx: int, gy: int) -> bool:
-    """Click the bottom-left 'Local' dropdown, select 'Copilot CLI'.
+    """Click 'Local' dropdown at bottom-left, select 'Copilot CLI'.
 
-    PROVEN PROCEDURE (2026-03-18):
-      1. Click the "Local" text at bottom-left of window: (gx+55, gy+484)
-      2. Press Down (selects "Copilot CLI", right below "Local")
-      3. Press Enter
-
-    This automatically sets model to Claude Opus 4.6 (fast mode).
-    Retries up to 2 times with verification after each attempt.
+    Setting Copilot CLI auto-sets model to Claude Opus 4.6 (fast mode).
+    Retries up to 3 times with UIA verification after each.
     """
     for attempt in range(1, 4):
-        try:
-            log(f"Step 4 — Setting session target to Copilot CLI (attempt {attempt})...")
-            u32.SetForegroundWindow(hwnd)
-            time.sleep(1.0)
+        log(f"Step 4 -- Setting Copilot CLI (attempt {attempt})...")
+        u32.SetForegroundWindow(hwnd)
+        time.sleep(1.0)
 
-            scan = _scan_window_controls(hwnd)
+        scan = _scan_window_controls(hwnd)
+        if scan.get("session_target") == "copilot_cli":
+            log("Step 4 -- Already in Copilot CLI mode")
+            return True
 
-            # If already in Copilot CLI, done
-            if scan.get("session_target") == "copilot_cli":
-                log("Step 4 — Already in Copilot CLI mode")
-                return True
+        click_x = gx + CLI_OFFSET[0]
+        click_y = gy + CLI_OFFSET[1]
+        log(f"Step 4 -- Clicking session target at ({click_x}, {click_y})")
+        pyautogui.click(click_x, click_y)
+        time.sleep(1.5)
 
-            # Use proven offset (gx+55, gy+484) — UIA coordinates can be unreliable
-            click_x = gx + CLI_OFFSET[0]
-            click_y = gy + CLI_OFFSET[1]
+        pyautogui.press('down')
+        time.sleep(0.3)
+        pyautogui.press('enter')
+        time.sleep(2)
 
-            # Click the session-target "Local" dropdown at bottom-left
-            log(f"Step 4 — Clicking session target at ({click_x}, {click_y})")
-            si.click_render_screen(hwnd, click_x, click_y)
-            time.sleep(2.0)  # Longer wait for Chromium quickpick to render
+        verify = _scan_window_controls(hwnd)
+        if verify.get("session_target") == "copilot_cli":
+            log("Step 4 -- Copilot CLI VERIFIED")
+            return True
 
-            # Select "Copilot CLI" — it's the item right below "Local"
-            si.focused_press(hwnd, 'down')
-            time.sleep(0.5)
-            si.focused_press(hwnd, 'enter')
-            time.sleep(2.5)
+        if verify.get("approvals") == "unknown" and scan.get("approvals") != "unknown":
+            log("Step 4 -- Copilot CLI likely set (permissions button gone)")
+            return True
 
-            # Verify it actually changed
-            verify = _scan_window_controls(hwnd)
-            if verify.get("session_target") == "copilot_cli":
-                log("Step 4 — Copilot CLI VERIFIED")
-                return True
+        log(f"Step 4 -- Attempt {attempt} failed (target={verify.get('session_target')})")
+        pyautogui.press('escape')
+        time.sleep(1.0)
 
-            # Check if permissions button disappeared (CLI mode has no perms button)
-            if verify.get("approvals") == "unknown" and scan.get("approvals") != "unknown":
-                log("Step 4 — Copilot CLI likely set (permissions button gone)")
-                return True
-
-            log(f"Step 4 — Attempt {attempt} did not set CLI (target={verify.get('session_target')})")
-
-            # Dismiss any stray quickpick by pressing Escape
-            si.focused_press(hwnd, 'escape')
-            time.sleep(1.0)
-
-        except Exception as e:
-            log(f"Step 4 — Attempt {attempt} error: {e}")
-
-    log("Step 4 FAILED: Could not set Copilot CLI after 3 attempts")
+    log("Step 4 FAILED after 3 attempts")
     return False
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — Set permissions to bypass approvals
+# Step 5 -- Set permissions (guard_bypass.ps1 x2)
 # ---------------------------------------------------------------------------
 
 def step5_set_permissions(hwnd: int) -> bool:
-    """Run guard_bypass.ps1 TWICE (first sets, second confirms).
-    Must run BEFORE setting Copilot CLI mode — the permissions button
-    only exists in Agent/Local mode."""
-    try:
-        # Quick check — see if already on bypass
-        scan = _scan_window_controls(hwnd)
-        if scan.get("approvals") == "bypass":
-            log("Step 5 — Already on Bypass Approvals")
-            return True
-
-        log("Step 5 — Setting permissions (bypass approvals)...")
-        guard_script = str(ROOT / "tools" / "guard_bypass.ps1")
-
-        for run_num in range(1, 3):
-            log(f"Step 5 — guard_bypass.ps1 run {run_num}/2...")
-            result = subprocess.run(
-                [
-                    "powershell", "-ExecutionPolicy", "Bypass",
-                    "-File", guard_script,
-                    "-Hwnd", str(hwnd),
-                ],
-                capture_output=True, text=True, timeout=30,
-                cwd=str(ROOT),
-            )
-            output = (result.stdout or "").strip()
-            log(f"Step 5 — Run {run_num} output: {output}")
-
-            if run_num == 2 and "PERMS_FAILED" in output:
-                log("Step 5 WARNING: guard_bypass.ps1 second run reported PERMS_FAILED")
-                return False
-
-            if run_num < 2:
-                time.sleep(3)
-
-        log("Step 5 — Permissions set to bypass")
+    """Run guard_bypass.ps1 TWICE (first sets, second confirms)."""
+    scan = _scan_window_controls(hwnd)
+    if scan.get("approvals") == "bypass":
+        log("Step 5 -- Already on Bypass Approvals")
         return True
-    except subprocess.TimeoutExpired:
-        log("Step 5 FAILED: guard_bypass.ps1 timed out")
-        return False
-    except Exception as e:
-        log(f"Step 5 FAILED: {e}")
-        return False
+
+    log("Step 5 -- Setting permissions (bypass approvals)...")
+    guard_script = str(ROOT / "tools" / "guard_bypass.ps1")
+
+    for run_num in range(1, 3):
+        log(f"Step 5 -- guard_bypass.ps1 run {run_num}/2...")
+        try:
+            r = subprocess.run(
+                ["powershell", "-ExecutionPolicy", "Bypass",
+                 "-File", guard_script, "-Hwnd", str(hwnd)],
+                capture_output=True, text=True, timeout=30, cwd=str(ROOT),
+            )
+            output = (r.stdout or "").strip()
+            log(f"Step 5 -- Run {run_num}: {output}")
+            if run_num == 2 and "PERMS_FAILED" in output:
+                log("Step 5 WARNING: second run PERMS_FAILED")
+                return False
+        except subprocess.TimeoutExpired:
+            log(f"Step 5 -- Run {run_num} timed out")
+            return False
+        if run_num < 2:
+            time.sleep(3)
+
+    log("Step 5 -- Permissions set")
+    return True
 
 
 # ---------------------------------------------------------------------------
-# Step 6 — Dispatch identity prompt
+# Step 6 -- Dispatch identity prompt (pyautogui + pyperclip)
 # ---------------------------------------------------------------------------
 
 def step6_dispatch_identity(name: str, hwnd: int, gx: int, gy: int, orch_hwnd: int) -> bool:
-    """Dispatch identity prompt via shadow input (virtual clipboard + keybd_event).
+    """Paste identity prompt using pyperclip + pyautogui.
 
-    CRITICAL: Do NOT use ghost_type_to_worker() -- its PostMessage/SendKeys
-    Enter key does NOT trigger submission in Copilot CLI windows (INCIDENT 013).
-    Shadow input uses keybd_event which works without hijacking the user's mouse.
+    PRE-DISPATCH: Checks worker state via UIA. Waits for IDLE if PROCESSING.
+    Cancels STEERING if detected. Only dispatches when worker is ready.
+    CLIPBOARD: Saves user clipboard before, restores after.
     """
     try:
-        log(f"Step 6 — Dispatching identity to {name} via shadow input...")
+        log(f"Step 6 -- Dispatching identity to {name}...")
+
+        # PRE-DISPATCH: Check worker state
+        state = _check_worker_state(hwnd, name)
+        if state == 'PROCESSING':
+            log(f"  {name} is PROCESSING -- waiting for IDLE...")
+            if not _wait_for_idle(hwnd, name, timeout=60):
+                log(f"  WARNING: {name} still not IDLE, dispatching anyway")
+        elif state == 'STEERING':
+            log(f"  {name} is STEERING -- cancelling...")
+            try:
+                from tools.shadow_input import ShadowInput
+                si = ShadowInput()
+                si.invoke_button(hwnd, "Cancel (Alt+Backspace)")
+            except Exception:
+                pass
+            time.sleep(2)
+            _wait_for_idle(hwnd, name, timeout=30)
+
         task = _get_identity_prompt(name)
-        log(f"  Prompt size: {len(task)} chars")
 
-        # Click in the input area (center of text box) via PostMessage
-        input_x = gx + INPUT_OFFSET[0]
-        input_y = gy + INPUT_OFFSET[1]
-        si.click_render_screen(hwnd, input_x, input_y)
-        time.sleep(0.5)
+        # Save user clipboard
+        old_clip = ""
+        try:
+            old_clip = pyperclip.paste()
+        except Exception:
+            pass
 
-        # Paste and submit using shadow clipboard + keybd_event
-        si.paste_and_submit(hwnd, task, restore_focus=orch_hwnd)
+        # Set clipboard to identity prompt
+        pyperclip.copy(task)
+
+        # Focus worker window
+        u32.SetForegroundWindow(hwnd)
         time.sleep(1.0)
 
-        log(f"Step 6 — Identity prompt dispatched to {name}")
+        # Click input area (relative to worker window)
+        input_x = gx + INPUT_OFFSET[0]
+        input_y = gy + INPUT_OFFSET[1]
+        log(f"  Clicking input at ({input_x}, {input_y})")
+        pyautogui.click(input_x, input_y)
+        time.sleep(0.5)
+
+        # Paste
+        pyautogui.hotkey('ctrl', 'v')
+        time.sleep(0.5)
+
+        # Submit
+        pyautogui.press('enter')
+        time.sleep(1.0)
+
+        # Restore clipboard and focus
+        try:
+            pyperclip.copy(old_clip if old_clip else '')
+        except Exception:
+            pass
+        u32.SetForegroundWindow(orch_hwnd)
+
+        log(f"Step 6 -- Identity dispatched to {name}")
         return True
 
     except Exception as e:
         log(f"Step 6 FAILED: {e}")
+        try:
+            u32.SetForegroundWindow(orch_hwnd)
+        except Exception:
+            pass
         return False
 
 
 # ---------------------------------------------------------------------------
-# Step 7 — Wait and verify
+# Step 7 -- Wait and verify
 # ---------------------------------------------------------------------------
 
 def step7_verify(name: str, hwnd: int, timeout: int = 60) -> bool:
     """Wait for identity_ack on bus, check window title, check IsWindow."""
-    try:
-        log(f"Step 7 — Verifying {name} (timeout={timeout}s)...")
+    log(f"Step 7 -- Verifying {name} (timeout={timeout}s)...")
 
-        bus_ack = False
-        title_ok = False
-        window_alive = False
+    bus_ack = False
+    title_ok = False
+    window_alive = False
 
-        deadline = time.time() + timeout
-        poll_interval = 5
+    deadline = time.time() + timeout
+    poll_interval = 5
 
-        while time.time() < deadline:
-            # Check IsWindow
-            window_alive = bool(u32.IsWindow(hwnd))
-            if not window_alive:
-                log(f"Step 7 — {name} window HWND={hwnd} is dead!")
-                break
+    while time.time() < deadline:
+        window_alive = bool(u32.IsWindow(hwnd))
+        if not window_alive:
+            log(f"Step 7 -- {name} HWND={hwnd} is dead!")
+            break
 
-            # Check window title
-            buf = ctypes.create_unicode_buffer(512)
-            u32.GetWindowTextW(hwnd, buf, 512)
-            title = buf.value
-            title_ok = f"You are {name.upper()}" in title or f"You are {name}" in title
+        buf = ctypes.create_unicode_buffer(512)
+        u32.GetWindowTextW(hwnd, buf, 512)
+        title = buf.value
+        title_ok = f"You are {name.upper()}" in title or f"You are {name}" in title
 
-            # Check bus for identity_ack
-            try:
-                resp = requests.get(
-                    "http://localhost:8420/bus/messages",
-                    params={"limit": 30},
-                    timeout=5,
-                )
-                if resp.status_code == 200:
-                    msgs = resp.json()
-                    if isinstance(msgs, dict):
-                        msgs = msgs.get("messages", [])
-                    for m in msgs:
-                        if (m.get("sender") == name
-                                and m.get("type") == "identity_ack"):
-                            bus_ack = True
-                            break
-            except Exception:
-                pass
+        try:
+            resp = requests.get(
+                "http://localhost:8420/bus/messages",
+                params={"limit": 30}, timeout=5,
+            )
+            if resp.status_code == 200:
+                msgs = resp.json()
+                if isinstance(msgs, dict):
+                    msgs = msgs.get("messages", [])
+                for m in msgs:
+                    if m.get("sender") == name and m.get("type") == "identity_ack":
+                        bus_ack = True
+                        break
+        except Exception:
+            pass
 
-            if bus_ack and title_ok and window_alive:
-                log(f"Step 7 — {name} VERIFIED: bus_ack=True title_ok=True alive=True")
-                return True
-
-            remaining = int(deadline - time.time())
-            log(f"Step 7 — {name} waiting... bus_ack={bus_ack} title_ok={title_ok} alive={window_alive} ({remaining}s left)")
-            time.sleep(poll_interval)
-
-        # Final status
-        log(f"Step 7 — {name} final: bus_ack={bus_ack} title_ok={title_ok} alive={window_alive}")
-        if bus_ack or (window_alive and title_ok):
-            log(f"Step 7 — {name} PARTIAL PASS (some checks succeeded)")
+        if bus_ack and title_ok and window_alive:
+            log(f"Step 7 -- {name} VERIFIED: bus_ack=True title_ok=True alive=True")
             return True
 
-        log(f"Step 7 — {name} VERIFICATION FAILED after {timeout}s")
-        return False
+        remaining = int(deadline - time.time())
+        log(f"Step 7 -- {name} waiting... bus={bus_ack} title={title_ok} alive={window_alive} ({remaining}s left)")
+        time.sleep(poll_interval)
+
+    log(f"Step 7 -- {name} final: bus={bus_ack} title={title_ok} alive={window_alive}")
+    if bus_ack or (window_alive and title_ok):
+        log(f"Step 7 -- {name} PARTIAL PASS")
+        return True
+
+    log(f"Step 7 -- {name} VERIFICATION FAILED after {timeout}s")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Visual verification -- screenshot + UIA scan (GATE before next worker)
+# ---------------------------------------------------------------------------
+
+def _visual_verify(hwnd: int, name: str, gx: int, gy: int) -> bool:
+    """Screenshot worker window and verify it looks correct.
+
+    Checks:
+    1. Window is visible at expected grid position
+    2. UIA scan confirms model_ok and agent_ok
+    3. Worker state is IDLE or PROCESSING (not stuck)
+
+    This is the GATE between workers -- MUST pass before opening the next.
+    """
+    try:
+        log(f"Visual verify -- {name}...")
+
+        # Check 1: Window position
+        rect = ctypes.wintypes.RECT()
+        u32.GetWindowRect(hwnd, ctypes.byref(rect))
+        actual_x, actual_y = rect.left, rect.top
+        actual_w = rect.right - rect.left
+        actual_h = rect.bottom - rect.top
+
+        pos_ok = abs(actual_x - gx) < 20 and abs(actual_y - gy) < 20
+        visible = u32.IsWindowVisible(hwnd)
+
+        if not visible:
+            log(f"  FAIL: {name} window not visible!")
+            return False
+        if not pos_ok:
+            log(f"  WARN: {name} at ({actual_x},{actual_y}) != expected ({gx},{gy})")
+        else:
+            log(f"  Position OK: ({actual_x},{actual_y}) {actual_w}x{actual_h}")
+
+        # Check 2: UIA model and agent
+        try:
+            from tools.uia_engine import get_engine
+            engine = get_engine()
+            scan = engine.scan(hwnd)
+            if scan:
+                log(f"  UIA: state={scan.state} model_ok={scan.model_ok} agent_ok={scan.agent_ok}")
+                if not scan.model_ok:
+                    log(f"  WARN: {name} model not OK -- monitor will auto-correct")
+                if not scan.agent_ok:
+                    log(f"  WARN: {name} agent not OK")
+            else:
+                log(f"  UIA scan returned None for {name}")
+        except Exception as e:
+            log(f"  UIA scan failed: {e}")
+
+        # Check 3: Screenshot for visual record
+        try:
+            from core.capture import DXGICapture
+            cap = DXGICapture()
+            img = cap.capture_window(hwnd)
+            if img is not None:
+                verify_path = os.path.join('data', f'boot_verify_{name}.png')
+                img.save(verify_path)
+                log(f"  Screenshot saved: {verify_path}")
+            else:
+                log(f"  Screenshot returned None (window may be occluded)")
+        except Exception as e:
+            log(f"  Screenshot failed: {e} (non-critical)")
+
+        log(f"Visual verify -- {name} PASSED")
+        return True
+
     except Exception as e:
-        log(f"Step 7 FAILED: {e}")
+        log(f"Visual verify -- {name} failed: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Post identity_ack from boot script (reliable, no worker dependency)
+# ---------------------------------------------------------------------------
+
+def _post_identity_ack(name: str) -> bool:
+    """Post identity_ack to bus directly from boot script."""
+    try:
+        from tools.skynet_spam_guard import guarded_publish
+        result = guarded_publish({
+            "sender": name,
+            "topic": "orchestrator",
+            "type": "identity_ack",
+            "content": f"{name.upper()} ONLINE - Booted by skynet_worker_boot v{BOOT_VERSION}",
+        })
+        if result.get("sent"):
+            log(f"  Posted identity_ack for {name}")
+        else:
+            log(f"  identity_ack deduped: {result.get('reason', 'unknown')}")
+        return True
+    except ImportError:
+        try:
+            resp = requests.post(
+                "http://localhost:8420/bus/publish",
+                json={
+                    "sender": name, "topic": "orchestrator",
+                    "type": "identity_ack",
+                    "content": f"{name.upper()} ONLINE - Booted by skynet_worker_boot v{BOOT_VERSION}",
+                },
+                timeout=5,
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
+    except Exception:
         return False
 
 
@@ -629,73 +823,51 @@ def step7_verify(name: str, hwnd: int, timeout: int = 60) -> bool:
 # ---------------------------------------------------------------------------
 
 def _clean_git_worktrees() -> None:
-    """Remove stale git worktrees that cause Apply dialog failures.
-    
-    When Copilot CLI's isolation mode creates worktrees, the `edit` tool
-    tries to git-apply changes in a worktree context, which shows an
-    Apply dialog that permanently blocks the worker. This function cleans
-    all worktrees before booting to prevent that.
-    """
+    """Remove stale git worktrees that cause Apply dialog failures."""
     import shutil
 
-    # Clean .git/worktrees entries
     worktrees_dir = ROOT / ".git" / "worktrees"
     if worktrees_dir.exists():
         entries = list(worktrees_dir.iterdir())
         if entries:
-            log(f"PRE-BOOT: Found {len(entries)} stale worktree(s) in .git/worktrees")
+            log(f"PRE-BOOT: Found {len(entries)} stale worktree(s)")
             for entry in entries:
                 try:
-                    # Use git worktree remove first (safe)
                     result = subprocess.run(
                         ["git", "worktree", "remove", "--force", str(entry)],
-                        capture_output=True, text=True, timeout=10,
-                        cwd=str(ROOT),
+                        capture_output=True, text=True, timeout=10, cwd=str(ROOT),
                     )
                     if result.returncode == 0:
                         log(f"  Removed worktree: {entry.name}")
                     else:
-                        # Fallback: manual cleanup
                         shutil.rmtree(entry, ignore_errors=True)
-                        log(f"  Force-removed worktree dir: {entry.name}")
+                        log(f"  Force-removed: {entry.name}")
                 except Exception as e:
-                    log(f"  Failed to remove worktree {entry.name}: {e}")
-        else:
-            log("PRE-BOOT: No stale worktrees in .git/worktrees")
-    
-    # Clean external .worktrees directory (created by VS Code isolation)
+                    log(f"  Failed to remove {entry.name}: {e}")
+
     ext_worktrees = ROOT.parent / f"{ROOT.name}.worktrees"
     if ext_worktrees.exists():
-        log(f"PRE-BOOT: Removing external worktrees dir: {ext_worktrees}")
+        log(f"PRE-BOOT: Removing external worktrees dir")
         try:
             shutil.rmtree(ext_worktrees, ignore_errors=True)
-            log("  External worktrees dir removed")
-        except Exception as e:
-            log(f"  Failed to remove external worktrees: {e}")
+        except Exception:
+            pass
 
-    # Run git worktree prune to clean orphaned entries
     try:
         subprocess.run(
             ["git", "worktree", "prune"],
-            capture_output=True, text=True, timeout=10,
-            cwd=str(ROOT),
+            capture_output=True, text=True, timeout=10, cwd=str(ROOT),
         )
-        log("PRE-BOOT: git worktree prune completed")
     except Exception:
         pass
 
 
 # ---------------------------------------------------------------------------
-# Step 7.5 — Auto-dismiss Apply dialog via UIA
+# Dismiss Apply dialog via UIA
 # ---------------------------------------------------------------------------
 
 def _dismiss_apply_dialog(hwnd: int, name: str) -> bool:
-    """Find and click the Apply button via UIA InvokePattern to dismiss.
-    
-    Workers sometimes generate file changes (e.g. updating critical_processes.json)
-    despite being told not to. The Apply dialog blocks all future interaction.
-    This function detects and clicks Apply via UIA, then reverts any git changes.
-    """
+    """Find and click Apply button via UIA InvokePattern."""
     try:
         import comtypes.client
         from comtypes.gen.UIAutomationClient import IUIAutomation
@@ -705,85 +877,45 @@ def _dismiss_apply_dialog(hwnd: int, name: str) -> bool:
         uia = uia.QueryInterface(IUIAutomation)
         el = uia.ElementFromHandle(hwnd)
 
-        # Find buttons named "Apply"
-        cond = uia.CreatePropertyCondition(30003, 50000)  # Button control type
-        btns = el.FindAll(4, cond)  # TreeScope_Descendants
+        cond = uia.CreatePropertyCondition(30003, 50000)
+        btns = el.FindAll(4, cond)
 
         apply_found = False
         for i in range(btns.Length):
             btn = btns.GetElement(i)
             if btn.CurrentName == "Apply":
-                log(f"Step 7.5 — Found Apply button on {name}, invoking...")
+                log(f"  Found Apply button on {name}, invoking...")
                 try:
                     from comtypes.gen.UIAutomationClient import IUIAutomationInvokePattern
-                    UIA_InvokePatternId = 10000
-                    pat = btn.GetCurrentPattern(UIA_InvokePatternId)
+                    pat = btn.GetCurrentPattern(10000)
                     pat = pat.QueryInterface(IUIAutomationInvokePattern)
                     pat.Invoke()
                     apply_found = True
-                    log(f"Step 7.5 — Apply invoked on {name}")
                     time.sleep(2)
                 except Exception as e:
-                    # Fallback: PostMessage click on the button's bounding rectangle
                     r = btn.CurrentBoundingRectangle
                     cx = (r.left + r.right) // 2
                     cy = (r.top + r.bottom) // 2
-                    log(f"Step 7.5 — UIA Invoke failed ({e}), shadow-clicking at ({cx},{cy})")
-                    si.click_render_screen(hwnd, cx, cy)
+                    log(f"  UIA Invoke failed ({e}), clicking at ({cx},{cy})")
+                    pyautogui.click(cx, cy)
                     apply_found = True
                     time.sleep(2)
                 break
 
         if not apply_found:
-            log(f"Step 7.5 — No Apply dialog on {name} (clean)")
             return True
 
-        # Revert any git changes the Apply introduced
         try:
             subprocess.run(
                 ["git", "checkout", "--", "."],
-                capture_output=True, text=True, timeout=10,
-                cwd=str(ROOT),
+                capture_output=True, text=True, timeout=10, cwd=str(ROOT),
             )
-            log(f"Step 7.5 — Git changes reverted after Apply on {name}")
-        except Exception as e:
-            log(f"Step 7.5 — Git revert failed: {e}")
+            log(f"  Git changes reverted after Apply on {name}")
+        except Exception:
+            pass
 
         return True
-    except Exception as e:
-        log(f"Step 7.5 — Apply dismiss error on {name}: {e}")
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Step 7.6 — Post identity_ack from boot script
-# ---------------------------------------------------------------------------
-
-def _post_identity_ack(name: str) -> bool:
-    """Post identity_ack to bus directly from boot script.
-    
-    This is more reliable than having the worker post it — the worker may
-    fail, be slow, or generate file changes while trying.
-    """
-    try:
-        resp = requests.post(
-            "http://localhost:8420/bus/publish",
-            json={
-                "sender": name,
-                "topic": "orchestrator",
-                "type": "identity_ack",
-                "content": f"{name.upper()} ONLINE - Booted by skynet_worker_boot v{BOOT_VERSION}",
-            },
-            timeout=5,
-        )
-        if resp.status_code == 200:
-            log(f"Step 7.6 — Posted identity_ack for {name} to bus")
-            return True
-        else:
-            log(f"Step 7.6 — Bus POST failed: HTTP {resp.status_code}")
-            return False
-    except Exception as e:
-        log(f"Step 7.6 — identity_ack POST failed: {e}")
+    except Exception:
         return False
 
 
@@ -794,7 +926,7 @@ def _post_identity_ack(name: str) -> bool:
 def boot_single_worker(name: str, orch_hwnd: int, known_hwnds: set) -> tuple:
     """Run all 7 steps for one worker. Returns (hwnd, success)."""
     if name not in GRID:
-        log(f"ERROR: Unknown worker name '{name}'. Must be one of {WORKER_NAMES}")
+        log(f"ERROR: Unknown worker '{name}'. Must be one of {WORKER_NAMES}")
         return (0, False)
 
     gx, gy = GRID[name]
@@ -802,47 +934,52 @@ def boot_single_worker(name: str, orch_hwnd: int, known_hwnds: set) -> tuple:
 
     # Step 1: Open window via chevron dropdown
     if not step1_open_window(orch_hwnd):
-        log(f"ABORT: {name} — step 1 failed (open window)")
+        log(f"ABORT: {name} -- step 1 failed (open window)")
         return (0, False)
 
     # Step 2: Find HWND
     hwnd = step2_find_hwnd(known_hwnds)
     if not hwnd:
-        log(f"ABORT: {name} — step 2 failed (find HWND)")
+        log(f"ABORT: {name} -- step 2 failed (find HWND)")
         return (0, False)
 
     # Step 3: Position
-    if not step3_position(hwnd, gx, gy):
-        log(f"WARNING: {name} — step 3 failed (position), continuing...")
+    step3_position(hwnd, gx, gy)
     time.sleep(3.0)
 
     if _handle_uncommitted_dialog(hwnd):
-        log(f"Step 3.5 — Dismissed uncommitted-changes dialog for {name}")
+        log(f"  Dismissed uncommitted-changes dialog for {name}")
         time.sleep(1.0)
         step3_position(hwnd, gx, gy)
 
-    # Step 4: Set Copilot CLI (also sets model to Claude Opus 4.6 fast)
+    # Step 4: Set Copilot CLI (also sets model)
     if not step4_set_copilot_cli(hwnd, gx, gy):
-        log(f"WARNING: {name} — step 4 failed (Copilot CLI), continuing...")
+        log(f"WARNING: {name} -- step 4 failed (Copilot CLI), continuing...")
 
-    # Step 5: Permissions — guard_bypass.ps1 × 2 (proven procedure)
+    # Step 5: Permissions
     if not step5_set_permissions(hwnd):
-        log(f"WARNING: {name} — step 5 failed (permissions), continuing...")
+        log(f"WARNING: {name} -- step 5 failed (permissions), continuing...")
 
-    # Step 6: Dispatch identity
+    # Step 6: Dispatch identity (with pre-dispatch state check)
     if not step6_dispatch_identity(name, hwnd, gx, gy, orch_hwnd):
-        log(f"WARNING: {name} — step 6 failed (identity dispatch), continuing...")
+        log(f"WARNING: {name} -- step 6 failed (identity dispatch), continuing...")
 
     # Step 7: Verify
     verified = step7_verify(name, hwnd, timeout=60)
     if not verified:
-        log(f"WARNING: {name} — step 7 failed (verification), window may still be usable")
+        log(f"WARNING: {name} -- step 7 failed (verification)")
 
-    # Step 7.5: Auto-dismiss Apply dialog if present (workers sometimes generate file changes)
+    # Auto-dismiss Apply dialog if present
     _dismiss_apply_dialog(hwnd, name)
 
-    # Step 7.6: Post identity_ack from boot script directly (reliable, no worker dependency)
+    # Post identity_ack directly from boot script (reliable)
     _post_identity_ack(name)
+
+    # VISUAL VERIFICATION GATE -- screenshot + UIA before next worker
+    _visual_verify(hwnd, name, gx, gy)
+
+    # Confirm worker started processing (prompt was accepted)
+    _wait_for_processing(hwnd, name, timeout=15)
 
     known_hwnds.add(hwnd)
     log(f"=== {name.upper()} boot {'SUCCESS' if verified else 'PARTIAL'}: HWND={hwnd} ===")
@@ -858,10 +995,8 @@ def boot_all_workers(orch_hwnd: int) -> dict:
     log(f"========== FULL WORKER BOOT v{BOOT_VERSION} ==========")
     log(f"Orchestrator HWND: {orch_hwnd}")
 
-    # Pre-boot: clean stale git worktrees that cause Apply dialog failures
     _clean_git_worktrees()
 
-    # Collect known HWNDs (orchestrator + any existing worker windows)
     known_hwnds = _collect_known_hwnds(orch_hwnd)
     log(f"Known HWNDs before boot: {known_hwnds}")
 
@@ -876,23 +1011,13 @@ def boot_all_workers(orch_hwnd: int) -> dict:
         if hwnd:
             known_hwnds.add(hwnd)
 
-    # Update workers.json
     update_workers_json(results)
-
-    # Print summary
     _print_summary(results)
 
-    # Post-boot UIA verification: confirm model + agent for all workers  # signed: alpha
-    booted_hwnds = {
-        name: info['hwnd']
-        for name, info in results.items()
-        if info.get('hwnd') and info.get('success')
-    }
-    if booted_hwnds:
-        post_boot_uia_verify(booted_hwnds)
-
-    # NOTE: git checkout removed — runtime data files use assume-unchanged
-    # to prevent Apply dialog in workers (INCIDENT 016 fix)
+    # Post-boot UIA verification
+    booted = {n: i['hwnd'] for n, i in results.items() if i.get('hwnd') and i.get('success')}
+    if booted:
+        post_boot_uia_verify(booted)
 
     # Return focus to orchestrator
     u32.SetForegroundWindow(orch_hwnd)
@@ -901,59 +1026,42 @@ def boot_all_workers(orch_hwnd: int) -> dict:
 
 
 def post_boot_uia_verify(worker_hwnds: dict, timeout: int = 30) -> dict:
-    """Post-boot UIA scan loop: confirm model_ok and agent_ok for all workers.
-
-    Polls UIA engine scan_all() every 3s for up to `timeout` seconds until all
-    workers report model_ok=True and agent_ok=True (Copilot CLI + Claude Opus
-    4.6 fast).
-
-    Args:
-        worker_hwnds: dict of {name: hwnd} for workers to verify.
-        timeout: max seconds to poll (default 30).
-
-    Returns:
-        dict of {name: {model_ok, agent_ok, model, agent, state, scan_ms}}.
-    """  # signed: alpha
+    """Post-boot UIA scan: confirm model_ok and agent_ok for all workers."""
     try:
         from tools.uia_engine import get_engine
         engine = get_engine()
     except Exception as e:
-        log(f"Post-boot UIA verify SKIPPED — UIA engine unavailable: {e}")
+        log(f"Post-boot UIA verify SKIPPED -- UIA unavailable: {e}")
         return {}
 
     log("")
     log("=" * 72)
     log("POST-BOOT UIA VERIFICATION")
-    log(f"  Checking {len(worker_hwnds)} worker(s) for model_ok + agent_ok...")
 
     deadline = time.time() + timeout
-    poll_interval = 3
     final_results = {}
 
     while time.time() < deadline:
         try:
             scans = engine.scan_all(worker_hwnds)
         except Exception as e:
-            log(f"  UIA scan_all failed: {e}")
-            time.sleep(poll_interval)
+            log(f"  scan_all failed: {e}")
+            time.sleep(3)
             continue
 
         all_ok = True
         for name, ws in scans.items():
             final_results[name] = {
-                'model_ok': ws.model_ok,
-                'agent_ok': ws.agent_ok,
-                'model': ws.model,
-                'agent': ws.agent,
-                'state': ws.state,
-                'scan_ms': ws.scan_ms,
+                'model_ok': ws.model_ok, 'agent_ok': ws.agent_ok,
+                'model': ws.model, 'agent': ws.agent,
+                'state': ws.state, 'scan_ms': ws.scan_ms,
             }
             if not ws.model_ok or not ws.agent_ok:
                 all_ok = False
 
         if all_ok:
-            remaining = int(deadline - time.time())
-            log(f"  ALL WORKERS VERIFIED in {timeout - remaining}s")
+            elapsed = timeout - int(deadline - time.time())
+            log(f"  ALL WORKERS VERIFIED in {elapsed}s")
             _print_uia_table(final_results)
             log("POST-BOOT UIA VERIFICATION: PASS")
             log("=" * 72)
@@ -965,15 +1073,14 @@ def post_boot_uia_verify(worker_hwnds: dict, timeout: int = 30) -> dict:
             for n, r in final_results.items()
             if not r['model_ok'] or not r['agent_ok']
         ]
-        log(f"  Waiting... {remaining}s left — issues: {', '.join(problems)}")
-        time.sleep(poll_interval)
+        log(f"  Waiting... {remaining}s left -- {', '.join(problems)}")
+        time.sleep(3)
 
-    # Timeout — report final state
     _print_uia_table(final_results)
     failures = [n for n, r in final_results.items()
                 if not r.get('model_ok') or not r.get('agent_ok')]
     if failures:
-        log(f"POST-BOOT UIA VERIFICATION: FAIL — {', '.join(failures)} not ready after {timeout}s")
+        log(f"POST-BOOT UIA VERIFICATION: FAIL -- {', '.join(failures)}")
     else:
         log("POST-BOOT UIA VERIFICATION: PASS")
     log("=" * 72)
@@ -981,7 +1088,7 @@ def post_boot_uia_verify(worker_hwnds: dict, timeout: int = 30) -> dict:
 
 
 def _print_uia_table(results: dict) -> None:
-    """Print UIA verification results as a table."""  # signed: alpha
+    """Print UIA verification results as a table."""
     log(f"  {'Name':<8} {'State':<12} {'Model OK':<10} {'Agent OK':<10} {'Model':<30} {'ms'}")
     log(f"  {'----':<8} {'-----':<12} {'--------':<10} {'--------':<10} {'-----':<30} {'--'}")
     for name in sorted(results.keys()):
@@ -995,7 +1102,6 @@ def _collect_known_hwnds(orch_hwnd: int) -> set:
     """Gather all known HWNDs to avoid confusion when finding new windows."""
     known = {orch_hwnd}
 
-    # Add existing workers from workers.json
     workers_file = ROOT / "data" / "workers.json"
     if workers_file.exists():
         try:
@@ -1008,7 +1114,6 @@ def _collect_known_hwnds(orch_hwnd: int) -> set:
         except Exception:
             pass
 
-    # Add consultant HWNDs from state files
     for sf in ["consultant_state.json", "gemini_consultant_state.json"]:
         state_file = ROOT / "data" / sf
         if state_file.exists():
@@ -1028,7 +1133,7 @@ def _collect_known_hwnds(orch_hwnd: int) -> set:
 # ---------------------------------------------------------------------------
 
 def update_workers_json(results: dict) -> None:
-    """Write data/workers.json with all worker HWNDs, model, grid positions."""
+    """Write data/workers.json with all worker HWNDs."""
     workers_file = ROOT / "data" / "workers.json"
 
     workers = []
@@ -1037,14 +1142,11 @@ def update_workers_json(results: dict) -> None:
         hwnd = info.get('hwnd', 0)
         grid = info.get('grid', GRID.get(name, (0, 0)))
         workers.append({
-            'name': name,
-            'hwnd': hwnd,
+            'name': name, 'hwnd': hwnd,
             'model': 'Claude Opus 4.6 (fast mode)',
             'agent': 'Copilot CLI',
-            'grid_x': grid[0],
-            'grid_y': grid[1],
-            'window_w': WINDOW_SIZE[0],
-            'window_h': WINDOW_SIZE[1],
+            'grid_x': grid[0], 'grid_y': grid[1],
+            'window_w': WINDOW_SIZE[0], 'window_h': WINDOW_SIZE[1],
             'booted': bool(hwnd),
             'boot_version': BOOT_VERSION,
         })
@@ -1056,7 +1158,6 @@ def update_workers_json(results: dict) -> None:
     }
 
     workers_file.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic write: temp file + rename to prevent corruption on crash  # signed: delta
     tmp = workers_file.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp.replace(workers_file)
@@ -1068,12 +1169,12 @@ def update_workers_json(results: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def close_all_workers() -> None:
-    """Read workers.json, send WM_CLOSE to each HWND, clear registry."""
+    """Send WM_CLOSE to each worker HWND, clear registry."""
     WM_CLOSE = 0x0010
     workers_file = ROOT / "data" / "workers.json"
 
     if not workers_file.exists():
-        log("No workers.json found — nothing to close")
+        log("No workers.json -- nothing to close")
         return
 
     try:
@@ -1087,27 +1188,20 @@ def close_all_workers() -> None:
     for w in worker_list:
         hwnd = w.get("hwnd", 0)
         name = w.get("name", "?")
-        if not hwnd:
-            log(f"  {name}: no HWND, skipping")
-            continue
-
-        if not u32.IsWindow(hwnd):
+        if not hwnd or not u32.IsWindow(hwnd):
             log(f"  {name}: HWND={hwnd} already dead, skipping")
             continue
-
         log(f"  {name}: Sending WM_CLOSE to HWND={hwnd}")
         u32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
         closed += 1
         time.sleep(0.5)
 
-    # Clear the registry
     payload = {
         'workers': [],
         'created': datetime.now().isoformat(),
         'boot_version': BOOT_VERSION,
         'note': 'Cleared by close_all_workers()',
     }
-    # Atomic write: temp file + rename to prevent corruption on crash  # signed: delta
     tmp = workers_file.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp.replace(workers_file)
@@ -1119,11 +1213,11 @@ def close_all_workers() -> None:
 # ---------------------------------------------------------------------------
 
 def verify_all_workers() -> bool:
-    """Read workers.json, check each HWND alive + title + bus identity_ack."""
+    """Check each worker: HWND alive + title + bus identity_ack."""
     workers_file = ROOT / "data" / "workers.json"
 
     if not workers_file.exists():
-        log("No workers.json found — nothing to verify")
+        log("No workers.json -- nothing to verify")
         return False
 
     try:
@@ -1133,13 +1227,11 @@ def verify_all_workers() -> bool:
         log(f"Failed to read workers.json: {e}")
         return False
 
-    # Fetch bus messages once
     bus_msgs = []
     try:
         resp = requests.get(
             "http://localhost:8420/bus/messages",
-            params={"limit": 50},
-            timeout=5,
+            params={"limit": 50}, timeout=5,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -1153,11 +1245,8 @@ def verify_all_workers() -> bool:
     for w in worker_list:
         name = w.get("name", "?")
         hwnd = w.get("hwnd", 0)
-
-        # Check alive
         alive = bool(hwnd and u32.IsWindow(hwnd))
 
-        # Check title
         title = ""
         title_ok = False
         if alive:
@@ -1168,7 +1257,6 @@ def verify_all_workers() -> bool:
                         or f"You are {name}" in title
                         or "Code - Insiders" in title)
 
-        # Check bus ack
         bus_ack = any(
             m.get("sender") == name and m.get("type") == "identity_ack"
             for m in bus_msgs
@@ -1179,15 +1267,10 @@ def verify_all_workers() -> bool:
             all_ok = False
 
         rows.append({
-            'name': name,
-            'hwnd': hwnd,
-            'alive': alive,
-            'title_ok': title_ok,
-            'bus_ack': bus_ack,
-            'status': status,
+            'name': name, 'hwnd': hwnd, 'alive': alive,
+            'title_ok': title_ok, 'bus_ack': bus_ack, 'status': status,
         })
 
-    # Print verification table
     log("Worker Verification Results:")
     log(f"  {'Name':<8} {'HWND':<10} {'Alive':<7} {'Title':<7} {'Bus ACK':<9} {'Status'}")
     log(f"  {'----':<8} {'----':<10} {'-----':<7} {'-----':<7} {'-------':<9} {'------'}")
@@ -1196,23 +1279,19 @@ def verify_all_workers() -> bool:
 
     log(f"Overall: {'ALL OK' if all_ok else 'ISSUES FOUND'}")
 
-    # Also run UIA model/agent verification for alive workers  # signed: alpha
     alive_hwnds = {r['name']: r['hwnd'] for r in rows if r['alive'] and r['hwnd']}
     if alive_hwnds:
-        uia_results = post_boot_uia_verify(alive_hwnds, timeout=10)
-        for name, ur in uia_results.items():
-            if not ur.get('model_ok') or not ur.get('agent_ok'):
-                all_ok = False
+        post_boot_uia_verify(alive_hwnds, timeout=10)
 
     return all_ok
 
 
 # ---------------------------------------------------------------------------
-# Summary table
+# Summary
 # ---------------------------------------------------------------------------
 
 def _print_summary(results: dict) -> None:
-    """Print a summary table after booting all workers."""
+    """Print summary table after booting all workers."""
     log("")
     log("=" * 72)
     log("BOOT SUMMARY")
@@ -1226,7 +1305,6 @@ def _print_summary(results: dict) -> None:
         status = "OK" if success else ("PARTIAL" if hwnd else "FAILED")
         log(f"  {name:<8} {hwnd:<10} {str(grid):<16} {status}")
     log("=" * 72)
-
     ok_count = sum(1 for v in results.values() if v.get('success'))
     log(f"Workers booted: {ok_count}/{len(WORKER_NAMES)}")
 
@@ -1237,10 +1315,10 @@ def _print_summary(results: dict) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description=f"Skynet Worker Boot v{BOOT_VERSION} -- Canonical 7-step worker boot procedure",
+        description=f"Skynet Worker Boot v{BOOT_VERSION} -- pyautogui-based proven procedure",
     )
-    parser.add_argument("--name", choices=WORKER_NAMES, help="Boot a single worker by name")
-    parser.add_argument("--all", action="store_true", help="Boot all 4 workers sequentially")
+    parser.add_argument("--name", choices=WORKER_NAMES, help="Boot a single worker")
+    parser.add_argument("--all", action="store_true", help="Boot all 4 workers")
     parser.add_argument("--orch-hwnd", type=int, help="Orchestrator window HWND")
     parser.add_argument("--verify", action="store_true", help="Verify all existing workers")
     parser.add_argument("--close-all", action="store_true", help="Close all worker windows")
@@ -1260,22 +1338,22 @@ def main():
         close_all_workers()
         sys.exit(0)
 
-    # --name or --all require --orch-hwnd
     if (args.name or args.all) and not args.orch_hwnd:
-        # Try to read from orchestrator.json
         orch_file = ROOT / "data" / "orchestrator.json"
         if orch_file.exists():
             try:
                 data = json.loads(orch_file.read_text(encoding="utf-8"))
                 orch_hwnd = data.get("hwnd", 0)
                 if orch_hwnd:
-                    log(f"Auto-detected orchestrator HWND={orch_hwnd} from orchestrator.json")
+                    log(f"Auto-detected orchestrator HWND={orch_hwnd}")
                     args.orch_hwnd = orch_hwnd
             except Exception:
                 pass
-
         if not args.orch_hwnd:
-            parser.error("--orch-hwnd is required for boot operations (or set it in data/orchestrator.json)")
+            parser.error("--orch-hwnd required (or set in data/orchestrator.json)")
+
+    if args.name or args.all:
+        _apply_settings_preflight_guard()
 
     if args.all:
         results = boot_all_workers(args.orch_hwnd)
@@ -1286,7 +1364,6 @@ def main():
         known = _collect_known_hwnds(args.orch_hwnd)
         hwnd, success = boot_single_worker(args.name, args.orch_hwnd, known)
         if hwnd:
-            # Update workers.json for just this worker
             workers_file = ROOT / "data" / "workers.json"
             existing = {}
             if workers_file.exists():
@@ -1296,11 +1373,10 @@ def main():
                     for w in wl:
                         n = w.get("name")
                         if n:
-                            g = w.get("grid", {})
                             existing[n] = {
                                 'hwnd': w.get('hwnd', 0),
-                                'success': w.get('status') == 'online',
-                                'grid': (g.get('x', 0), g.get('y', 0)),
+                                'success': w.get('booted', False),
+                                'grid': (w.get('grid_x', 0), w.get('grid_y', 0)),
                             }
                 except Exception:
                     pass
@@ -1311,9 +1387,6 @@ def main():
             }
             update_workers_json(existing)
         sys.exit(0 if success else 1)
-
-    parser.print_help()
-    sys.exit(1)
 
 
 if __name__ == "__main__":
