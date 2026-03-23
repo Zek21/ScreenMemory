@@ -157,9 +157,21 @@ def _store_insights_in_learning(task_text, tags, success, insights):
         return 0
 
 
+_last_broadcast_time: float = 0.0
+_BROADCAST_COOLDOWN = 120  # 2 minutes between distiller broadcasts (was unbounded)
+# Root cause fix (2026-03-23): Distiller was broadcasting for EVERY result, producing
+# 303 noise messages that crowded the 100-message ring buffer. signed: orchestrator
+
+
 def _broadcast_top_insight(insights, tags, worker):
-    """Broadcast the top insight to the knowledge bus."""
+    """Broadcast the top insight to the knowledge bus (rate-limited)."""
+    global _last_broadcast_time
     if not insights:
+        return False
+    # Throttle: max 1 broadcast every _BROADCAST_COOLDOWN seconds
+    now = __import__('time').time()
+    if now - _last_broadcast_time < _BROADCAST_COOLDOWN:
+        logger.debug(f"Distiller broadcast throttled ({now - _last_broadcast_time:.0f}s < {_BROADCAST_COOLDOWN}s)")
         return False
     try:
         from tools.skynet_knowledge import broadcast_learning
@@ -172,6 +184,7 @@ def _broadcast_top_insight(insights, tags, worker):
             tags=tags[:5],
         )
         if ok:
+            _last_broadcast_time = now
             logger.info(f"Broadcast distilled insight: {top_insight[:80]}")
         return ok
     except Exception as e:

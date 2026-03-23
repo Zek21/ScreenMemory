@@ -113,8 +113,11 @@ HWND_IDLE_INTERVAL = 60     # interval when all workers IDLE for 3+ consecutive 
 IDLE_STREAK_THRESHOLD = 3   # consecutive all-IDLE scans before slowing down
 MODEL_CHECK_INTERVAL = 60   # seconds between model checks
 ORCH_MODEL_CHECK_INTERVAL = 30  # orchestrator checked more frequently (security-critical)
-STUCK_PROCESSING_THRESHOLD = 600  # seconds in PROCESSING before auto-recovery attempt (increased from 180 to avoid killing workers mid-task)
-STUCK_DEDUP_WINDOW = 300          # suppress duplicate stuck alerts for 5 minutes
+STUCK_PROCESSING_THRESHOLD = 300  # seconds in PROCESSING before auto-recovery attempt
+# Root cause fix (2026-03-23): 600s was too generous — workers averaged 616s stuck time
+# across 40 auto-recovery events. 300s catches stalls 2x faster while still allowing
+# legitimate complex tasks (most real tasks complete in <120s).  signed: orchestrator
+STUCK_DEDUP_WINDOW = 180          # suppress duplicate stuck alerts for 3 minutes (was 5min)
 HEARTBEAT_CYCLE_INTERVAL = 10    # post heartbeat every N cycles (~5min at 30s interval)  # signed: alpha
 MODEL_FIX_BACKOFF = 600     # 10 minutes between fix attempts per worker (prevents infinite retry)
 MODEL_FIX_MAX_ATTEMPTS = 3  # max consecutive fix attempts before giving up until restart
@@ -713,9 +716,38 @@ def _cancel_generation(hwnd: int) -> bool:
         return False
 
 
+def _find_last_dispatch_for_worker(name: str) -> dict | None:
+    """Find the most recent unresolved dispatch for a worker from dispatch_log.json."""
+    dispatch_log = DATA_DIR / "dispatch_log.json"
+    if not dispatch_log.exists():
+        return None
+    try:
+        dispatches = json.loads(dispatch_log.read_text(encoding="utf-8"))
+        # Walk backwards to find the last dispatch to this worker without a result
+        for d in reversed(dispatches):
+            if d.get("worker") == name and not d.get("result_received"):
+                return d
+    except Exception as e:
+        log(f"dispatch_log read error: {e}", "WARN")
+    return None
+
+
 def _try_recover_stuck_worker(name: str, hwnd: int, duration_s: int, now: float):
-    """Attempt auto-recovery for a stuck worker via cancel_generation."""
+    """Attempt auto-recovery for a stuck worker via cancel_generation.
+    
+    Root cause fix (2026-03-23): After cancellation, the monitor now checks
+    dispatch_log.json for the lost task and posts a TASK_LOST alert with the
+    original task text so the orchestrator can re-dispatch it. Previously,
+    tasks were permanently abandoned after auto-recovery.  signed: orchestrator
+    """
     log(f"{name.upper()}: PROCESSING for {duration_s}s (>{STUCK_PROCESSING_THRESHOLD}s) -- attempting auto-recovery", "WARN")
+    
+    # Capture the lost task BEFORE cancellation so we can report it
+    lost_dispatch = _find_last_dispatch_for_worker(name)
+    lost_task_summary = ""
+    if lost_dispatch:
+        lost_task_summary = lost_dispatch.get("task", "")[:200]
+    
     cancelled = _cancel_generation(hwnd)
     if cancelled:
         time.sleep(3)
@@ -723,11 +755,31 @@ def _try_recover_stuck_worker(name: str, hwnd: int, duration_s: int, now: float)
             _processing_since.pop(name, None)
             _stuck_alert_last[name] = now
             log(f"{name.upper()}: AUTO_RECOVERED -- was stuck PROCESSING for {duration_s}s, now IDLE", "OK")
+            
+            # Post recovery alert WITH lost task info for re-dispatch
+            recovery_content = (
+                f"AUTO_RECOVERED: {name.upper()} was stuck PROCESSING for {duration_s}s, "
+                f"cancelled generation. Worker is now IDLE."
+            )
             _guarded_bus_publish({
                 "sender": "monitor", "topic": "orchestrator", "type": "alert",
-                "content": f"AUTO_RECOVERED: {name.upper()} was stuck PROCESSING for {duration_s}s, "
-                           f"cancelled generation. Worker is now IDLE."
+                "content": recovery_content
             })
+            
+            # Post TASK_LOST alert so orchestrator can re-dispatch
+            if lost_task_summary:
+                _guarded_bus_publish({
+                    "sender": "monitor", "topic": "orchestrator", "type": "task_lost",
+                    "content": f"TASK_LOST: {name.upper()} task was abandoned after {duration_s}s stuck. "
+                               f"Original task: {lost_task_summary}",
+                    "metadata": {
+                        "worker": name,
+                        "stuck_duration_s": duration_s,
+                        "lost_task": lost_task_summary,
+                        "dispatch_timestamp": lost_dispatch.get("timestamp", ""),
+                    }
+                })
+                log(f"{name.upper()}: TASK_LOST alert posted for re-dispatch", "WARN")
             return
 
     _stuck_alert_last[name] = now

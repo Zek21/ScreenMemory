@@ -63,7 +63,10 @@ BRAIN_CONFIG = ROOT / "data" / "brain_config.json"
 PID_FILE = ROOT / "data" / "learner.pid"
 
 DEFAULT_LOOP_INTERVAL = 30
-HEALTH_REPORT_INTERVAL = 300  # 5 minutes
+HEALTH_REPORT_INTERVAL = 600  # 10 minutes (was 5min — root cause fix to reduce bus noise)
+# Root cause fix (2026-03-23): 973 daemon_health messages in archive flooding the
+# 100-message ring buffer. With 4 workers + learner + monitor all posting health,
+# real results get evicted before the orchestrator can read them.  signed: orchestrator
 _bus_fetch_failures = 0  # backoff counter for bus connectivity  # signed: delta
 
 # Domain keyword mappings for task categorization
@@ -500,6 +503,17 @@ class SkynetLearner:
                 result = self.process_result(msg)
                 results.append(result)
                 self.state["total_processed"] = self.state.get("total_processed", 0) + 1
+                
+                # Root cause fix (2026-03-23): Mark dispatch as having received result
+                # This closes the coherence gap where ALL dispatches showed result_received=False
+                sender = msg.get("sender", "")
+                if sender in ("alpha", "beta", "gamma", "delta"):
+                    try:
+                        from tools.skynet_task_tracker import mark_dispatch_result
+                        mark_dispatch_result(sender, success=result.get("success", True))
+                    except Exception as e:
+                        logger.debug(f"Dispatch result marking failed: {e}")
+                # signed: orchestrator
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
 
@@ -542,8 +556,10 @@ class SkynetLearner:
         self._shutting_down = True
 
     def _check_stale(self):
-        """Post LEARNER_STALE alert if no new episodes for >300s."""
-        STALE_THRESHOLD = 300
+        """Post LEARNER_STALE alert if no new episodes for >600s."""
+        # Root cause fix (2026-03-23): was 300s, producing false stale alerts when workers
+        # are legitimately between tasks. 600s matches the old stuck threshold.  signed: orchestrator
+        STALE_THRESHOLD = 600
         elapsed = time.time() - self._last_episode_time
         if elapsed > STALE_THRESHOLD and not self._stale_alerted:
             self._stale_alerted = True

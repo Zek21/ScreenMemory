@@ -187,6 +187,121 @@ def gc_old_tasks(days=7):
     return before - after
 
 
+# ─── Dispatch Coherence Analysis ──────────────────────────────────────────
+# Root cause fix (2026-03-23): dispatch_log showed result_received=False for
+# ALL dispatches. This correlator detects the gap between dispatches and
+# results, identifies lost tasks, and provides coherence metrics.
+# signed: orchestrator
+
+DISPATCH_LOG_FILE = DATA_DIR / "dispatch_log.json"
+STALE_DISPATCH_THRESHOLD_S = 300  # 5 minutes without result = stale
+LOST_DISPATCH_THRESHOLD_S = 600   # 10 minutes = lost
+
+
+def _load_dispatch_log() -> list:
+    """Load dispatch_log.json safely."""
+    if not DISPATCH_LOG_FILE.exists():
+        return []
+    try:
+        return json.loads(DISPATCH_LOG_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def correlate_dispatches() -> dict:
+    """Correlate dispatch log with results to find coherence gaps.
+    
+    Returns dict with coherence_ratio, per_worker stats, and stale tasks.
+    """
+    dispatches = _load_dispatch_log()
+    now = time.time()
+    
+    coherence = {
+        "total_dispatches": len(dispatches),
+        "with_results": 0,
+        "without_results": 0,
+        "success_dispatches": 0,
+        "failed_dispatches": 0,
+        "stale_tasks": [],
+        "per_worker": {},
+        "coherence_ratio": 0.0,
+    }
+    
+    for d in dispatches:
+        worker = d.get("worker", "?")
+        success = d.get("success", False)
+        has_result = d.get("result_received", False)
+        
+        if success:
+            coherence["success_dispatches"] += 1
+        else:
+            coherence["failed_dispatches"] += 1
+        
+        if has_result:
+            coherence["with_results"] += 1
+        else:
+            coherence["without_results"] += 1
+            # Check if stale
+            ts = d.get("timestamp", "")
+            if ts:
+                try:
+                    dt = datetime.fromisoformat(ts.replace("+08:00", ""))
+                    age = (datetime.now() - dt).total_seconds()
+                    if age > STALE_DISPATCH_THRESHOLD_S and success:
+                        coherence["stale_tasks"].append({
+                            "worker": worker,
+                            "task": d.get("task", "?")[:80],
+                            "age_s": int(age),
+                            "status": "LOST" if age > LOST_DISPATCH_THRESHOLD_S else "STALE",
+                        })
+                except (ValueError, TypeError):
+                    pass
+        
+        # Per-worker stats
+        ws = coherence["per_worker"].get(worker, {"dispatched": 0, "results": 0, "failures": 0})
+        ws["dispatched"] += 1
+        if has_result:
+            ws["results"] += 1
+        if not success:
+            ws["failures"] += 1
+        coherence["per_worker"][worker] = ws
+    
+    if coherence["success_dispatches"] > 0:
+        coherence["coherence_ratio"] = round(
+            coherence["with_results"] / coherence["success_dispatches"] * 100, 1
+        )
+    
+    return coherence
+
+
+def mark_dispatch_result(worker: str, success: bool = True):
+    """Mark the most recent dispatch for a worker as having received a result.
+    
+    Called by bus polling / result processing when a worker reports DONE.
+    """
+    dispatches = _load_dispatch_log()
+    changed = False
+    
+    # Walk backwards to find the most recent unresolved dispatch for this worker
+    for d in reversed(dispatches):
+        if d.get("worker") == worker and not d.get("result_received"):
+            d["result_received"] = True
+            d["result_at"] = datetime.now().isoformat()
+            d["result_success"] = success
+            changed = True
+            break
+    
+    if changed:
+        try:
+            tmp = DISPATCH_LOG_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(dispatches, indent=2, default=str), encoding="utf-8")
+            tmp.replace(DISPATCH_LOG_FILE)
+        except OSError:
+            pass
+    
+    return changed
+
+
 def get_pending_count(worker=None):
     """Quick count of pending tasks for a worker (or all)."""
     return len(get_pending(worker))
@@ -216,6 +331,8 @@ def _build_tracker_parser():
 
     g = sub.add_parser("gc", help="Garbage collect old tasks")
     g.add_argument("--days", type=int, default=7)
+
+    sub.add_parser("coherence", help="Dispatch coherence analysis")
 
     return parser
 
@@ -253,6 +370,25 @@ def _dispatch_tracker_command(args) -> int:
     if args.cmd == "gc":
         removed = gc_old_tasks(args.days)
         print(f"Removed {removed} completed task(s) older than {args.days} days")
+        return 0
+    if args.cmd == "coherence":
+        c = correlate_dispatches()
+        print(f"\n{'='*60}")
+        print(f"  SKYNET DISPATCH COHERENCE REPORT")
+        print(f"{'='*60}")
+        print(f"  Coherence Ratio: {c['coherence_ratio']}%")
+        print(f"  Total Dispatches: {c['total_dispatches']}")
+        print(f"  With Results: {c['with_results']}")
+        print(f"  Without Results: {c['without_results']}")
+        print(f"  Failed Dispatches: {c['failed_dispatches']}")
+        print()
+        for worker, ws in c["per_worker"].items():
+            ratio = round(ws["results"] / ws["dispatched"] * 100, 1) if ws["dispatched"] > 0 else 0
+            print(f"  {worker:12} dispatched={ws['dispatched']} results={ws['results']} ({ratio}%) failures={ws['failures']}")
+        if c["stale_tasks"]:
+            print(f"\n  STALE/LOST TASKS ({len(c['stale_tasks'])}):")
+            for t in c["stale_tasks"][:10]:
+                print(f"    [{t['status']}] {t['worker']:6} {t['age_s']}s ago: {t['task'][:50]}")
         return 0
     return -1
 
