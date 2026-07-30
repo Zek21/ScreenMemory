@@ -1,0 +1,66 @@
+# ===================================================================
+# SECURITY-CRITICAL .gitignore — ScreenMemory is a RESEARCH project
+# Only README.md, requirements.txt, and paper checklist are public.
+# EVERYTHING else is internal implementation — NOT open source.
+# ===================================================================
+
+# Block EVERYTHING by default
+*
+
+# Whitelist ONLY public files
+!.gitignore
+!README.md
+!requirements.txt
+!data/
+data/*
+!data/paper_final_checklist.md
+
+# Block all directories explicitly (defense in depth)
+docs/
+.github/
+Skynet/
+tools/
+core/
+tests/
+ui/
+logs/
+screenshots/
+data/
+__pycache__/
+node_modules/
+*.lance/
+.vscode/
+
+# Block all sensitive file types
+*.py
+*.ps1
+*.go
+*.exe
+*.bak
+*.bak2
+*.html
+*.json
+*.pid
+*.db
+*.sqlite
+*.key
+*.pem
+*.png
+*.txt
+*.md
+
+# Re-whitelist the specific safe files (override blocks above)
+!.gitignore
+!README.md
+!requirements.txt
+!LICENSE
+!SECURITY.md
+!.github/
+.github/*
+!.github/FUNDING.yml
+!docs/
+docs/*
+!docs/SEARCHABILITY.md
+!data/
+data/*
+!data/paper_final_checklist.md
