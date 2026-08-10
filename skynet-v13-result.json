@@ -1,0 +1,17 @@
+{
+  "aad": "skynet-v13:26635ab8c885417c7496afac",
+  "branch": "skynet-bridge-v13-64a09866",
+  "build_id": "26635ab8c885417c7496afac",
+  "ciphertext_b64": "2g89tEiAprqI6upOOogSvAC3DT32ZIk_G0ASJh4MgN13Wgj_hvJ2uwBhHtyAQZglZF6CssGHaZXImdkyh3NkjXdCYpU-Ffhr1KGNpr_I5lhbISJTodJJZRH5iL9UTifWNvK_Z581utGcPLaLPeDGLDBOY-iFNH2w7Vn4Hq4j95DJzfMLIAc50mFlJ_qbWQ1o2_CYvNwR_X9ePI9InWa61uxZvRu2HfeACW8RENEjwWnjjjKvmS_UmNBLdKrAdfOIGNfZQN0RLEOxBeQQDrCYJulDLJlODh0i1_ylj8DVRhQr4q8dpEkZiJHQd-799vH2T-uYDAvt2KLowCj5jOF8L7f4xbUDDMkQ4skjP1oqhv3GGol4AqRuhV1dyCO2YvHZB6MM9C3r4od4z4TE1wmkXc6jFcP22MS3OowdS2AJkjapGGwymqnPly8UM-5NNuKq",
+  "created_at": "2026-08-10T05:48:47.1630364Z",
+  "key_wrap": "RSA-OAEP-SHA256-3072",
+  "local_llm": false,
+  "nonce_b64": "IPLWH3QsveG9asLk",
+  "payload": "AES-256-GCM",
+  "plaintext_sha256": "61734855a0c14df13e4e27fd68b2d901f3967256f3cbce0f02e6bdef5c6c7d67",
+  "repo": "https://github.com/Zek21/ScreenMemory",
+  "result_file": "skynet-v13-result.json",
+  "schema": "skynet_browser_tabs_envelope/13",
+  "version": "13.0.0",
+  "wrapped_key_b64": "pdQK_7S7nUggw_zN_yXkniOqZLUndU-E1OZWf187gX2PGcUQnZbF51utHuL_kSR4nASNG3Ufepbk4p9i8AXMxgc-Gngukz9oDdZNUIhaRCfu5NdZIu2NM3y2h_3TB_UQ_jFDeVRkpgPFG1XOozznV4buz7GAWGXMdzMJJ5mWuufMiTfeVkRQ9OBQxQlFHq-rBoyue_y60bE0LlYoFQ1BTWZEi3wnl5GcGIBvyqcopl9-TTArBAJVw1UTbpLb8aoezLh71dnVO5_O8pqD73utZjTd1lN1z7MJiZt8QsKsZCsNzRtiVhK9Rt4OlODD0m-DyZXeTBzgGZjxx6aMtFBe0NZid1cjxWfD-dIEEveQOHKT6g97ALq9IezYbUVU8NeUBZLzSIosQgRc_Q3zss_BXihe4WFHhzWU2P2EoAHMQ9lGzVULsoLV3FZPbfWvMFLpXlr3FbO2bRHGa8N7-_RzV4QEzdApYqaiG4BFmMB1nZNbvlWQ9H535bJW1I5wB-ox"
+}
